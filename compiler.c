@@ -41,6 +41,7 @@
 #define BPF_FUNC_skb_load_bytes  26
 #define BPF_FUNC_skb_change_tail 38
 #define BPF_FUNC_skb_adjust_room 50
+#define BPF_FUNC_fib_lookup 54
 
 #define BPF_ADJ_ROOM_MAC 1 /* CRITICAL: 1 for MAC layer, 0 for NET layer */
 #define IP_CSUM_OFFSET 24
@@ -57,6 +58,13 @@
 #endif
 #ifndef BPF_JLE
 #define BPF_JLE 0xb0
+#endif
+#ifndef BPF_FIB_LOOKUP_OUTPUT
+#define BPF_FIB_LOOKUP_OUTPUT (1)
+#define BPF_FIB_LOOKUP_TBID (2)
+#define BPF_FIB_LOOKUP_SKIP_NEIGH (4)
+#define BPF_FIB_LOOKUP_SKIP_SRC (8)
+#define BPF_FIB_LOOKUP_SKIP_MARK (16)
 #endif
 
 /* Jump & ALU Opcodes */
@@ -88,7 +96,7 @@
 #define BPF_OBJ_GET 7
 #endif
 
-#define BPF_FS_DIR "/sys/fs/bpf/"
+#define BPF_FS_DIR "/sys/fs/bpf"
 
 #define BPF_MOV64_REG(DST, SRC)    ((struct bpf_insn){.code=BPF_ALU64|BPF_MOV|BPF_X, .dst_reg=DST, .src_reg=SRC})
 #define BPF_MOV64_IMM(DST, IMM)    ((struct bpf_insn){.code=BPF_ALU64|BPF_MOV|BPF_K, .dst_reg=DST, .imm=IMM})
@@ -103,6 +111,9 @@
 #define MAX_MAPS 16
 struct { char name[32]; int fd; } maps[MAX_MAPS];
 int num_maps = 0;
+
+char bpf_map_dir[255] = BPF_FS_DIR;
+uint16_t target_tc_protocol = ETH_P_ALL;
 
 /* --- Globals --- */
 #define MAX_INSNS 8192
@@ -208,6 +219,21 @@ int allocate_var(const char *name, int size) {
     strncpy(vars[num_vars].name, name, 31);
     vars[num_vars].size = size;
     return vars[num_vars++].stack_off = next_var_offset;
+}
+
+/* Maps a variable name to an explicit offset on the stack without allocating new space */
+void define_var_at_offset(const char *name, int size, int stack_off) {
+    for (int i = 0; i < num_vars; i++) {
+        if (strcmp(vars[i].name, name) == 0) {
+            vars[i].stack_off = stack_off;
+            vars[i].size = size;
+            return;
+        }
+    }
+    strncpy(vars[num_vars].name, name, 31);
+    vars[num_vars].size = size;
+    vars[num_vars].stack_off = stack_off;
+    num_vars++;
 }
 
 int get_var_offset(const char *name) {
@@ -423,6 +449,108 @@ void compile_math_bswap(const char *var, int bits) {
     else if (d_sz==2) emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, d_off));
     else if (d_sz==4) emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, d_off));
     else emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, d_off));
+}
+
+/*
+ * Emits bytecode to perform a FIB lookup using the current packet state.
+ * 'flags' can be 0 (forwarding) or BPF_FIB_LOOKUP_OUTPUT (local output).
+ */
+void compile_fib_lookup(int flags) {
+    // 1. Allocate 64 bytes for struct bpf_fib_lookup, 8-byte aligned
+    int base = next_var_offset - sizeof(struct bpf_fib_lookup);
+    next_var_offset = (base - 7) & ~7; 
+    base = next_var_offset; 
+
+    // 2. Register output variables directly mapped to the struct's internal offsets
+    int res_off = allocate_var("FIB_RESULT", 4);
+    define_var_at_offset("FIB_SMAC", 6, base + offsetof(struct bpf_fib_lookup, smac));
+    define_var_at_offset("FIB_DMAC", 6, base + offsetof(struct bpf_fib_lookup, dmac));
+    define_var_at_offset("FIB_IP_DST", 4, base + offsetof(struct bpf_fib_lookup, ipv4_dst));
+    define_var_at_offset("FIB_IP6_DST", 16, base + offsetof(struct bpf_fib_lookup, ipv6_dst));
+    define_var_at_offset("FIB_IFINDEX", 4, base + offsetof(struct bpf_fib_lookup, ifindex));
+
+
+    //printf("Sizeof struct bpf_fib_lookup: %lu\n",sizeof(struct bpf_fib_lookup));
+
+    // 3. Zero the struct memory (Mandatory for verifier safety)
+    for (unsigned int i = 0; i < sizeof(struct bpf_fib_lookup); i += 8) {
+        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, base + i, 0));
+    }
+    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, res_off, -1)); // Default FIB_RESULT = -1
+
+    // 4. Read the current EtherType (Offset 12)
+    int scratch = next_var_offset - 8;
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, 12));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=scratch}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 2));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+
+    int j_fail = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, scratch));
+
+    // 5. Branch based on IPv4 or IPv6
+    int j_ipv4 = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=htons(0x0800)}));
+    int j_ipv6 = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=htons(0x86DD)}));
+    
+    int j_not_ip = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JA, .off=0}));
+
+    // --- IPv4 Branch ---
+    prog[j_ipv4].off = prog_idx - j_ipv4 - 1;
+    emit(BPF_ST_MEM(BPF_B, BPF_REG_10, base + offsetof(struct bpf_fib_lookup, family), AF_INET));
+    // Load IP Src
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); emit(BPF_MOV64_IMM(BPF_REG_2, 26));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=base + offsetof(struct bpf_fib_lookup, ipv4_src)}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 4)); emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    // Load IP Dst
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); emit(BPF_MOV64_IMM(BPF_REG_2, 30));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=base + offsetof(struct bpf_fib_lookup, ipv4_dst)}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 4)); emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    
+    int j_ipv4_done = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JA, .off=0}));
+
+    // --- IPv6 Branch ---
+    prog[j_ipv6].off = prog_idx - j_ipv6 - 1;
+    emit(BPF_ST_MEM(BPF_B, BPF_REG_10, base + offsetof(struct bpf_fib_lookup, family), AF_INET6));
+    // Load IPv6 Src
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); emit(BPF_MOV64_IMM(BPF_REG_2, 22));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=base + offsetof(struct bpf_fib_lookup, ipv6_src)}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 16)); emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    // Load IPv6 Dst
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); emit(BPF_MOV64_IMM(BPF_REG_2, 38));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=base + offsetof(struct bpf_fib_lookup, ipv6_dst)}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 16)); emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+
+    // --- Execute FIB Lookup ---
+    prog[j_ipv4_done].off = prog_idx - j_ipv4_done - 1;
+    
+    // Set ingress ifindex
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, ingress_ifindex)));
+    emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, base + offsetof(struct bpf_fib_lookup, ifindex)));
+
+    // Execute bpf_fib_lookup(ctx, params, sizeof(params), flags)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10)); 
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_2, .imm=base}));
+    emit(BPF_MOV64_IMM(BPF_REG_3, sizeof(struct bpf_fib_lookup)));
+    
+    // Pass the parsed flags parameter into R4
+    emit(BPF_MOV64_IMM(BPF_REG_4, flags)); 
+    
+    emit(BPF_CALL_FUNC(BPF_FUNC_fib_lookup));
+
+    // Store Return Code
+    emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, res_off));
+
+    // Resolve failure bypasses
+    prog[j_fail].off = prog_idx - j_fail - 1;
+    prog[j_not_ip].off = prog_idx - j_not_ip - 1;
 }
 
 /* --- Data Extraction & Matches --- */
@@ -856,6 +984,64 @@ void compile_set_ip_field8(int offset, uint8_t new_val, const char *var) {
       
     emit(BPF_MOV64_IMM(BPF_REG_5, 2));
     emit(BPF_CALL_FUNC(BPF_FUNC_l3_csum_replace));
+}
+
+/*
+ * Emits bytecode to recalculate the Layer 4 (TCP or UDP) checksum for the entire packet.
+ * Assumes a standard 14-byte Ethernet and 20-byte IPv4 header (Base L4 Offset = 34).
+ */
+void compile_recalculate_l4_csum(int is_udp) {
+    int csum_offset = 34 + (is_udp ? 6 : 16); // TCP checksum at offset 50, UDP at 40
+
+    // 1. Clear the existing checksum in the packet to prevent calculation feedback
+    emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -8, 0)); // Store 0 on stack
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));  // R1 = ctx
+    emit(BPF_MOV64_IMM(BPF_REG_2, csum_offset)); // R2 = offset
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-8}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 2));          // R4 = 2 bytes
+    emit(BPF_MOV64_IMM(BPF_REG_5, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+
+    // 2. Load the entire payload length to calculate csum_diff
+    // R1 = ctx
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    // Load skb->len into R2
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_1, offsetof(struct __sk_buff, len)));
+    // Subtract 34 bytes (L2 + L3 header) to isolate the L4 payload length
+    emit(BPF_ALU64_IMM(BPF_SUB, BPF_REG_2, 34)); 
+    emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, -8)); // Store L4 length on stack
+
+    // 3. Call bpf_csum_diff(NULL, 0, skb->data + 34, L4_len, 0)
+    // R1 = NULL (0)
+    emit(BPF_MOV64_IMM(BPF_REG_1, 0));
+    // R2 = 0
+    emit(BPF_MOV64_IMM(BPF_REG_2, 0));
+    // R3 = Pointer to L4 payload in packet.
+    // In TC eBPF, we can read skb->data directly from the context.
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_6)); // R3 = ctx
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_3, offsetof(struct __sk_buff, data))); // R3 = skb->data
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, 34)); // R3 = skb->data + 34 (L4 start)
+    
+    // R4 = L4 length (loaded from stack)
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, -8));
+    // R5 = seed (0)
+    emit(BPF_MOV64_IMM(BPF_REG_5, 0));
+    // Call bpf_csum_diff
+    emit(BPF_CALL_FUNC(BPF_FUNC_csum_diff));
+
+    // R0 now contains the calculated checksum diff. Move it to R3.
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_0));
+
+    // 4. Call bpf_l4_csum_replace(skb, csum_offset, 0, csum_diff, flags)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));             // R1 = ctx
+    emit(BPF_MOV64_IMM(BPF_REG_2, csum_offset));           // R2 = offset
+    emit(BPF_MOV64_IMM(BPF_REG_4, 0));                     // R4 = old_val (0, since we cleared it)
+    
+    // R5 = Flags. We pass BPF_F_PSEUDO_HDR (which is 16) + BPF_F_HDR_FIELD_OMITTED (which is 1)
+    // 0x10 + 0x01 = 0x11 (17)
+    emit(BPF_MOV64_IMM(BPF_REG_5, 17));                     
+    emit(BPF_CALL_FUNC(BPF_FUNC_l4_csum_replace));
 }
 
 void compile_set_l4_port(int is_udp, int is_dst, uint16_t p, const char *var) {
@@ -1494,9 +1680,9 @@ int pin_map_fd(int fd, const char *pin_path) {
         .pathname = (unsigned long)pin_path,
         .bpf_fd   = fd,
     };
+    //printf("Pinning %d map to %s\n", fd, pin_path);
     return bpf_syscall(BPF_OBJ_PIN, &attr, sizeof(attr));
 }
-
 
 /* Looks up a Map FD by name. If it doesn't exist, creates it and pins it globally. */
 int get_or_create_map(const char *name) {
@@ -1507,24 +1693,24 @@ int get_or_create_map(const char *name) {
     
     // 2. Build the full BPF filesystem path (e.g., /sys/fs/bpf/MY_MAP)
     char pin_path[256];
-    snprintf(pin_path, sizeof(pin_path), "%s%s", BPF_FS_DIR, name);
+    snprintf(pin_path, sizeof(pin_path), "%s/%s", bpf_map_dir, name);
 
     // 3. Try to retrieve it from the global BPF filesystem
     int fd = get_pinned_map_fd(pin_path);
     
     if (fd >= 0) {
-        if (verbose_mode) printf("[!] Found existing pinned map '%s' (FD: %d)\n", name, fd);
+        if (verbose_mode) printf("[!] Found existing pinned map '%s' at %s (FD: %d)\n", name, pin_path, fd);
     } else {
         // 4. If it doesn't exist globally, create it in the kernel...
         fd = create_bpf_map(name);
         if (fd < 0) exit(1);
         
         // ...and pin it so future programs can find it.
-        if (pin_map_fd(fd, pin_path) < 0) {
+        int pin_err = pin_map_fd(fd, pin_path);
+        if (pin_err < 0) {
 	    perror("Error pinning bpf map");
-            //fprintf(stderr, "Warning: Failed to pin map to %s. Ensure /sys/fs/bpf/ is mounted.\n", pin_path);
         } else {
-            if (verbose_mode) printf("[!] Created and pinned new map '%s' (FD: %d)\n", name, fd);
+            if (verbose_mode) printf("[!] Created and pinned new map '%s' at %s (FD: %d)\n", name, pin_path, fd);
         }
     }
     
@@ -1570,7 +1756,7 @@ int attach_bpf_tc(int fd, const char *iface, const char *dir, int pri) {
     t->tcm_family=AF_UNSPEC;
     t->tcm_ifindex=idx;
     t->tcm_handle=1;
-    t->tcm_info=TC_H_MAKE(pri << 16,htons(ETH_P_ALL));
+    t->tcm_info=TC_H_MAKE(pri << 16,htons(target_tc_protocol));
     t->tcm_parent = strcmp(dir,"egress")==0 ? TC_H_MAKE(TC_H_CLSACT,TC_H_MIN_EGRESS) : TC_H_MAKE(TC_H_CLSACT,TC_H_MIN_INGRESS);
 
     r=(struct rtattr*)((char*)n + NLMSG_ALIGN(n->nlmsg_len));
@@ -1627,8 +1813,9 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i],"-i")==0) iface = argv[++i];
         else if (strcmp(argv[i],"-d")==0) dir = argv[++i];
         else if (strcmp(argv[i],"-c")==0) clean = 1;
-		else if (strcmp(argv[i],"-p")==0) pri = atoi(argv[++i]);
-		else if (strcmp(argv[i],"-v")==0) verbose_mode = 1;
+        else if (strcmp(argv[i],"-p")==0) pri = atoi(argv[++i]);
+        else if (strcmp(argv[i],"-v")==0) verbose_mode = 1;
+        else if (strcmp(argv[i],"-m")==0) strcpy(bpf_map_dir,argv[++i]);
         else instr = argv[i];
     }
     if(strcmp(dir, "ingress") && strcmp(dir, "egress")) {
@@ -1812,7 +1999,7 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"ip6-tclass")==0) { start_match_block(); compile_match_core(14, 4, htonl(atoi(val) << 20), htonl(0x0FF00000), mv); }
             else if (strcmp(f,"ip6-flow")==0) { start_match_block(); compile_match_core(14, 4, htonl(atoi(val)), htonl(0x000FFFFF), mv); }
 	    else if (strcmp(f, "val") == 0 && t > 4) {
-		 if (strcmp(tok[3],"gt") || strcmp(tok[3],"ge") || strcmp(tok[3],"lt") || strcmp(tok[3],"le") || strcmp(tok[3],"eq") || strcmp(tok[3],"ne")) {
+		 if (strcmp(tok[3],"gt") && strcmp(tok[3],"ge") && strcmp(tok[3],"lt") && strcmp(tok[3],"le") && strcmp(tok[3],"eq") && strcmp(tok[3],"ne")) {
                      printf("Invalid match val operation %s\n",tok[3]);
                      exit(2);
 		 }
@@ -1860,6 +2047,34 @@ int main(int argc, char **argv) {
         else if (strcmp(op, "pop-net-bytes")==0 && t>1) compile_pop_bytes_net(atoi(a1));
         else if (strcmp(op, "add-bytes")==0 && t>2) compile_insert_bytes(atoi(a1), atoi(a2));
         else if (strcmp(op, "del-bytes")==0 && t>2) compile_delete_bytes(atoi(a1), atoi(a2));
+	else if (strcmp(op, "recalc-tcp-csum") == 0) compile_recalculate_l4_csum(0);
+	else if (strcmp(op, "recalc-udp-csum") == 0) compile_recalculate_l4_csum(1);
+	else if (strcmp(op, "fib-lookup") == 0) {
+	    if (target_tc_protocol == ETH_P_ALL)
+	        target_tc_protocol = ETH_P_IP;
+	    //printf("Setting bind protocol to IPv4");
+	    int flags = 0;
+            // Loop through all remaining arguments to build the bitwise flag integer
+            for (int k = 1; k < t; k++) {
+                if (strcmp(tok[k], "direct") == 0)
+                    flags |= (1 << 0); // BPF_FIB_LOOKUP_DIRECT
+                else if (strcmp(tok[k], "output") == 0)
+                    flags |= (1 << 1); // BPF_FIB_LOOKUP_OUTPUT
+                else if (strcmp(tok[k], "tbid") == 0)
+                    flags |= (1 << 2); // BPF_FIB_LOOKUP_TBID
+                else if (strcmp(tok[k], "skip-neigh") == 0)
+                    flags |= (1 << 3); // BPF_FIB_LOOKUP_SKIP_NEIGH
+                else if (strcmp(tok[k], "src") == 0)
+                    flags |= (1 << 4); // BPF_FIB_LOOKUP_SRC
+                else if (strcmp(tok[k], "mark") == 0)
+                    flags |= (1 << 5); // BPF_FIB_LOOKUP_MARK
+                else {
+                    fprintf(stderr, "Warning: Unknown fib-lookup flag '%s'\n", tok[k]);
+		    exit(2);
+                }
+            }	
+	    compile_fib_lookup(flags);
+	}
         else if (strcmp(op, "drop")==0) compile_drop_packet();
         else if (strcmp(op, "continue")==0) compile_continue_packet();
         else if (strcmp(op, "accept")==0) compile_accept_packet();
