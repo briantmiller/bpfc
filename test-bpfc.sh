@@ -89,6 +89,7 @@ timeout 8 ip netns exec RX tcpdump -c 1 -lvnpi rx0 -Q in ip proto gre &>/dev/nul
 
 [ $DEBUG -ne 0 ] && echo "TX:" && ip netns exec TX tc filter show dev tx0 egress
 [ $DEBUG -ne 0 ] && echo "RX:" && ip netns exec RX tc filter show dev rx0 ingress
+#timeout 8 ip netns exec TX tcpdump -c5 -lvnpi tx0 arp &
 
 #Wait for monitors to start sniffing
 sleep 0.5s
@@ -127,12 +128,21 @@ sleep 0.5s
 echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && echo "Map PASS" || echo "Map FAIL"
 
 ip netns exec TX ./bpf_compiler $COPTS -i tx0 -c
+#ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 100 'match arp; match arp-oper 1; match arp-tpa 10.0.0.30; set arp-oper 2; get arp-spa SPA; get arp-sha SHA; set arp-sha de:ad:be:ef:ca:fe; set arp-tha %SHA; set arp-tpa %SPA; set arp-spa 10.0.0.30; clone rx0 egress'
+ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 101 'match arp; match arp-oper 1; match arp-tpa 10.0.0.30; set arp-oper 2; get arp-spa SPA; get arp-sha SHA; set arp-sha de:ad:be:ef:ca:fe; set arp-tha %SHA; set arp-tpa %SPA; set arp-spa 10.0.0.30; redirect rx0 egress'
+ip netns exec TX ping  -c2 -W 0.2 10.0.0.30 &>/dev/null
+#ip netns exec TX ip neigh show 10.0.0.30 dev tx0
+#ip netns exec TX ip neigh show 10.0.0.30 
+ip netns exec TX ip neigh show 10.0.0.30 dev br0 | grep -q "de:ad:be:ef:ca:fe" && echo "ARP-program PASS" || echo "ARP-program FAIL"
+
+
+ip netns exec TX ./bpf_compiler $COPTS -i tx0 -c
 ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 100 'match icmp; match ip-dst 2.2.2.2; set ip-dst 5.5.5.5; set dst-mac 01:23:45:67:89:fe; set src-mac 00:00:00:00:00:00; reclassify'
 #ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 101 'match icmp; match ip-dst 5.5.5.5; set ip-dst 2.2.2.2; fib-lookup; match val FIB_RESULT eq 0; set src-mac %FIB_SMAC; set dst-mac %FIB_DMAC'
 ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 101 'match icmp; match ip-dst 5.5.5.5; set ip-dst 2.2.2.2; fib-lookup output'
 #ip netns exec TX tc filter show dev tx0 egress
 #ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 101 'match icmp; match ip-dst 5.5.5.5; set ip-dst 2.2.2.2'
-timeout 5 ip netns exec TX tcpdump -c4 -lvnpi tx0 icmp &
+#timeout 5 ip netns exec TX tcpdump -c4 -lvnpi tx0 icmp &
 sleep 0.5s
 timeout 5 ip netns exec TX ping -W 0.2 -c 5 -i 0.1 2.2.2.2 &>/dev/null && echo "FIB PASS" || echo "FIB FAIL"
 
