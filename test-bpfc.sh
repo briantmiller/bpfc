@@ -19,9 +19,24 @@ done
 COPTS=""
 [ $DEBUG -eq 1 ] && COPTS=" -v "
 #Setup network
+ulimit -l unlimited
+sysctl -w net.ipv4.ip_forward=1 &>/dev/null
 ip netns add TX
 ip netns add RX
 ip netns add RX2
+ip -n TX link set lo up
+ip -n RX link set lo up
+ip -n RX2 link set lo up
+ip netns exec TX mkdir -p /var/run/bpf/TX
+ip netns exec RX mkdir -p /var/run/bpf/RX
+#unshare --mount --net=/var/run/netns/TX mount -t bpf bpffs /sys/fs/bpf
+#unshare --mount --net=/var/run/netns/RX mount -t bpf bpffs /sys/fs/bpf
+#ip netns exec TX bash -c "mount | grep /sys/fs/bpf | grep -q '^bpffs ' || (umount /sys/fs/bpf; mount -t bpf bpffs /sys/fs/bpf; mount | grep bpf)"
+#ip netns exec RX bash -c "mount | grep /sys/fs/bpf | grep -q '^bpffs ' || (umount /sys/fs/bpf; mount -t bpf bpffs /sys/fs/bpf ; mount | grep bpf)"
+#ip netns exec TX mount -t bpf bpffs /var/run/bpf/TX
+mount -t bpf bpffs /var/run/bpf/TX
+#ip netns exec RX mount -t bpf bpffs /var/run/bpf/RX
+mount -t bpf bpffs /var/run/bpf/RX
 ip link add tx0 type veth peer name rx0
 ip link add rx1 netns RX type veth peer name rx1 netns RX2
 ip -n RX  link set rx1 up
@@ -48,6 +63,7 @@ ip -n RX2 addr add 2.2.2.2/24 dev rx1
 ip -n TX link set lo0 up
 ip -n RX link set lo0 up
 ip -n TX route add 2.2.2.2/32 via 10.0.0.2
+ip -n TX route add default via 10.0.0.2
 ip -n RX route add 1.1.1.1/32 via 10.0.0.1
 ip -n RX2 route add 10.0.0.0/24 via 2.2.2.1
 
@@ -103,18 +119,29 @@ echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && echo 
 
 
 #ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 91 'match tcp; get tcp-dst TDST; calc lsh TDST 7; set map TEST TDST %TDST; set tcp-dst 777'
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 91 'match tcp; get tcp-dst TDST; calc lsh TDST 7; set map TEST TDST 0xFFFFFFFFFFFFFFFF; set tcp-dst 777'
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 92 'match tcp; match tcp-dst 777; get map TEST TDST DST; set tcp-dst %DST'
-ls -lah /sys/fs/bpf/
-timeout 5 ip netns exec RX tcpdump -c 3 -lvnnpi rx0 tcp &
-timeout 5 ip netns exec TX tcpdump -c 3 -lvnnpi tx0 tcp &
+ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 91 -m /var/run/bpf/TX 'match tcp; match tcp-dst 7; get tcp-dst TDST; calc lsh TDST 2; set map TEST TDST %TDST; set tcp-dst 777'
+ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 92 -m /var/run/bpf/TX 'match tcp; match tcp-dst 777; get map TEST TDST DST; calc rsh DST 2; set tcp-dst %DST'
+#timeout 8 ip netns exec TX tcpdump -c 4 -lvnnpi tx0 tcp &
 sleep 0.5s
+
 echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && echo "Map PASS" || echo "Map FAIL"
 
+ip netns exec TX ./bpf_compiler $COPTS -i tx0 -c
+ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 100 'match icmp; match ip-dst 2.2.2.2; set ip-dst 5.5.5.5; set dst-mac 01:23:45:67:89:fe; set src-mac 00:00:00:00:00:00; reclassify'
+#ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 101 'match icmp; match ip-dst 5.5.5.5; set ip-dst 2.2.2.2; fib-lookup; match val FIB_RESULT eq 0; set src-mac %FIB_SMAC; set dst-mac %FIB_DMAC'
+ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 101 'match icmp; match ip-dst 5.5.5.5; set ip-dst 2.2.2.2; fib-lookup output'
+#ip netns exec TX tc filter show dev tx0 egress
+#ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 101 'match icmp; match ip-dst 5.5.5.5; set ip-dst 2.2.2.2'
+timeout 5 ip netns exec TX tcpdump -c4 -lvnpi tx0 icmp &
+sleep 0.5s
+timeout 5 ip netns exec TX ping -W 0.2 -c 5 -i 0.1 2.2.2.2 &>/dev/null && echo "FIB PASS" || echo "FIB FAIL"
+
+
 ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 250 "match icmp; set dst-mac $RX2_rx1_mac; redirect rx1 egress"
-sleep 0.5
 timeout 5 ip netns exec RX2 tcpdump -c 3 -lvnpi rx1 icmp &>/dev/null && echo Redirect PASS || echo Redirect FAIL &
+sleep 0.5
 timeout 5 ip netns exec TX ping -W 0.2 -c 5 -i 0.1 2.2.2.2 &>/dev/null &
+
 
 kill -9 $TCP_PID
 wait &>/dev/null
