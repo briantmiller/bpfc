@@ -43,14 +43,14 @@
 #define BPF_FUNC_skb_change_tail 38
 #define BPF_FUNC_skb_adjust_room 50
 
-//#undef BPF_FUNC_fib_lookup
-//#ifdef RHEL_8_COMPAT
+#undef BPF_FUNC_fib_lookup
+#ifdef RHEL_8_COMPAT
 #define BPF_FUNC_redirect_neigh 152
 #define BPF_FUNC_fib_lookup 69
-//#else
-//#define BPF_FUNC_redirect_neigh 52
-//#define BPF_FUNC_fib_lookup 54
-//#endif
+#else
+#define BPF_FUNC_redirect_neigh 52
+#define BPF_FUNC_fib_lookup 54
+#endif
 
 #define BPF_ADJ_ROOM_MAC 1 /* CRITICAL: 1 for MAC layer, 0 for NET layer */
 #define IP_CSUM_OFFSET 24
@@ -2120,7 +2120,7 @@ void compile_set_map(int map_fd, const char *key_str, const char *val_str) {
  */
 int create_bpf_map(const char *name) {
     union bpf_attr attr = {
-        .map_type    = BPF_MAP_TYPE_HASH,
+        .map_type    = BPF_MAP_TYPE_LRU_HASH,
         .key_size    = 8,     // 64-bit keys
         .value_size  = 8,     // 64-bit values
         .max_entries = 10000, // Arbitrary upper limit for state tracking
@@ -2517,6 +2517,22 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Error: skb-cb index must be between 0 and 4\n");
                     exit(1);
                 }
+            }
+	    else if (strcmp(a1, "tcp-flags") == 0) {
+                start_match_block();
+                uint32_t flags_mask = 0;
+                for (int k = 2; k < t; k++) {
+                    if (strcmp(tok[k], "FIN") == 0) flags_mask |= 0x01;
+                    else if (strcmp(tok[k], "SYN") == 0) flags_mask |= 0x02;
+                    else if (strcmp(tok[k], "RST") == 0) flags_mask |= 0x04;
+                    else if (strcmp(tok[k], "PSH") == 0) flags_mask |= 0x08;
+                    else if (strcmp(tok[k], "ACK") == 0) flags_mask |= 0x10;
+                    else if (strcmp(tok[k], "URG") == 0) flags_mask |= 0x20;
+                    else fprintf(stderr, "Warning: Unknown TCP flag '%s'\n", tok[k]);
+                }
+                // Offset 47 is the TCP Flags byte (14 Eth + 20 IP + 13 TCP offset).
+                // We mask the byte with our flags, and expect the result to equal our flags.
+                compile_match_core(47, 1, flags_mask, flags_mask, NULL);
             }
 	    else if (strcmp(f, "val") == 0 && t > 4) {
 		 if (strcmp(tok[3],"gt") && strcmp(tok[3],"ge") && strcmp(tok[3],"lt") && strcmp(tok[3],"le") && strcmp(tok[3],"eq") && strcmp(tok[3],"ne")) {
