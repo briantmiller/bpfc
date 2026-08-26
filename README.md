@@ -6,9 +6,9 @@ Built for Red Team operations, SD-WAN edge routing, and high-performance network
 
 ---
 
--## Requirements
--* Linux kernel 4.18+ (Includes native RHEL 8 / CentOS 8 verifier compatability)
--* Root privileges (`CAP_NET_ADMIN` / `CAP_SYS_ADMIN`)
+## Requirements
+* Linux kernel 4.18+ (Includes native RHEL 8 / CentOS 8 verifier compatability)
+* Root privileges (`CAP_NET_ADMIN` / `CAP_SYS_ADMIN`)
 
 ---
 
