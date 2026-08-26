@@ -102,7 +102,7 @@ Allows persistent data storage across packets and network interfaces.
 
 ### 1. Stateful Firewall & Port Translation (DNAT)
 Intercept TCP traffic, enforce a connection rate limit via Maps, and dynamically translate the destination port.
-\`\`\`bash
+```bash
 ./bpf_compiler -i eth0 -p 10 "match tcp; \
     get ip-src SRC; \
     get map DDOS_BLOCK %SRC COUNT; \
@@ -113,22 +113,22 @@ Intercept TCP traffic, enforce a connection rate limit via Maps, and dynamically
         redirect-neigh eth1; \
     end-match; \
     continue"
-\`\`\`
+```
 
 ### 2. ARP Spoofing / Reflection
 Intercept an ARP Request, flip it to a Reply, dynamically swap addresses, and reflect it out the same interface.
-\`\`\`bash
+```bash
 ./bpf_compiler -i eth0 -p 5 -d ingress "match arp; match arp-oper 1; \
     get arp-sha S_MAC; get arp-spa S_IP; get arp-tpa T_IP; \
     set arp-oper 2; \
     set arp-tha %S_MAC; set arp-tpa %S_IP; \
     set arp-sha aa:bb:cc:dd:ee:ff; set arp-spa %T_IP; \
     redirect-egress eth0"
-\`\`\`
+```
 
 ### 3. SD-WAN Policy Routing (FIB Lookup + GRE)
 Route UDP 5060 (VoIP) out a fast link, and GRE tunnel everything else via the routing table.
-\`\`\`bash
+```bash
 ./bpf_compiler -i eth0 -d ingress "match ip; \
     match udp-dst 5060; \
         set ip-tos 184; \
@@ -140,5 +140,5 @@ Route UDP 5060 (VoIP) out a fast link, and GRE tunnel everything else via the ro
         redirect-neigh %FIB_IFINDEX; \
     end-match; \
     continue"
-\`\`\`
+```
 
