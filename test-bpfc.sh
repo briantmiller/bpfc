@@ -260,6 +260,10 @@ ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 100 'get bytes 14 4 
 #sleep 0.5s
 ip netns exec HOST1 ping -c 3 2.2.2.2 &>/dev/null && test_pass Add/del-l2-bytes || test_fail Add/del-l2-bytes
 
+ip netns exec TX ./bpf_compiler $COPTS -i tx0 -c
+ip netns exec TX ./bpf_compiler $COPTS -i host1 -c
+ip netns exec RX ./bpf_compiler $COPTS -i rx0 -c
+
 kill -9 $TCP_PID &>/dev/null 
 wait &>/dev/null
 ip netns del TX
