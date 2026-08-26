@@ -39,9 +39,18 @@
 #define BPF_FUNC_skb_vlan_pop    18
 #define BPF_FUNC_redirect        23
 #define BPF_FUNC_skb_load_bytes  26
+#define BPF_FUNC_csum_diff       28
 #define BPF_FUNC_skb_change_tail 38
 #define BPF_FUNC_skb_adjust_room 50
-#define BPF_FUNC_fib_lookup 54
+
+//#undef BPF_FUNC_fib_lookup
+//#ifdef RHEL_8_COMPAT
+#define BPF_FUNC_redirect_neigh 152
+#define BPF_FUNC_fib_lookup 69
+//#else
+//#define BPF_FUNC_redirect_neigh 52
+//#define BPF_FUNC_fib_lookup 54
+//#endif
 
 #define BPF_ADJ_ROOM_MAC 1 /* CRITICAL: 1 for MAC layer, 0 for NET layer */
 #define IP_CSUM_OFFSET 24
@@ -86,6 +95,7 @@
 #define BPF_RSH 0x70
 #define BPF_MOD 0x90
 #define BPF_XOR 0xa0
+#define BPF_JMP32 0x06
 
 #ifndef BPF_MAP_CREATE
 #define BPF_MAP_CREATE 0
@@ -107,8 +117,11 @@
 #define BPF_CALL_FUNC(FUNC)        ((struct bpf_insn){.code=BPF_JMP|BPF_CALL, .imm=FUNC})
 #define BPF_EXIT_INSN()            ((struct bpf_insn){.code=BPF_JMP|BPF_EXIT})
 
+#define BPF_LOG_BUF_SIZE (1 << 18) // 256KB log buffer
+
 /* --- Map Tracking (Symbol Table) --- */
 #define MAX_MAPS 16
+char verifier_log_buf[BPF_LOG_BUF_SIZE];
 struct { char name[32]; int fd; } maps[MAX_MAPS];
 int num_maps = 0;
 
@@ -138,6 +151,43 @@ int num_blocks = 0;
 int safety_jump_indices[MAX_SAFETY_JUMPS];
 int num_safety_jumps = 0;
 int verbose_mode = 0; // Tracks if -v was passed
+
+/*
+ * Arch-independent wrapper for the direct Linux bpf() system call.
+ */
+int bpf_syscall(int cmd, union bpf_attr *attr, unsigned int size) {
+    return syscall(__NR_bpf, cmd, attr, size);
+}
+
+/*
+ * Loads the compiled eBPF instructions into the kernel.
+ * If the verifier rejects the program, prints the detailed verification log.
+ */
+int load_bpf_prog_mem() {
+    // Zero out the log buffer
+    memset(verifier_log_buf, 0, BPF_LOG_BUF_SIZE);
+
+    union bpf_attr attr = {
+        .prog_type = BPF_PROG_TYPE_SCHED_CLS,
+        .insns     = (unsigned long)prog,
+        .insn_cnt  = prog_idx,
+        .license   = (unsigned long)"GPL",
+        // Enable detailed verifier logging
+        .log_buf   = (unsigned long)verifier_log_buf,
+        .log_size  = BPF_LOG_BUF_SIZE,
+        .log_level = 2, // 1 = errors only, 2 = full instruction trace
+    };
+
+    int fd = bpf_syscall(BPF_PROG_LOAD, &attr, sizeof(attr));
+
+    if (fd < 0) {
+        fprintf(stderr, "\n--- eBPF KERNEL VERIFIER REJECTION LOG ---\n");
+        fprintf(stderr, "%s", verifier_log_buf);
+        fprintf(stderr, "------------------------------------------\n");
+    }
+
+    return fd;
+}
 
 /* Helper to print indentation based on active block depth */
 void print_indent() {
@@ -215,11 +265,20 @@ int next_var_offset = -256;
     
 
 int allocate_var(const char *name, int size) {
-    next_var_offset -= ((size + 7) & ~7);
+    // OLD: next_var_offset -= ((size + 7) & ~7); (if size wasn't padded, this could misalign)
+
+    // NEW: Force strict 8-byte padding and alignment on every single allocation
+    int aligned_size = (size + 7) & ~7;
+    next_var_offset -= aligned_size;
+
+    // Double-check alignment: If next_var_offset is not divisible by 8, force align it
+    next_var_offset &= ~7;
+
     strncpy(vars[num_vars].name, name, 31);
     vars[num_vars].size = size;
     return vars[num_vars++].stack_off = next_var_offset;
 }
+
 
 /* Maps a variable name to an explicit offset on the stack without allocating new space */
 void define_var_at_offset(const char *name, int size, int stack_off) {
@@ -353,29 +412,98 @@ void compile_reclassify(void) { emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_RECLASSIFY)
     resolve_local_block();
 }
 
-void compile_redirect(int ifindex, const char *d) {
+/*
+ * Emits bytecode to redirect a packet.
+ * Supports static interface indices or dynamic variables.
+ */
+void compile_redirect_core(const char *iface_arg, int flags) {
+    if (iface_arg[0] == '%') {
+        int v_off = get_var_offset(iface_arg);
+        // Interface indices are strictly 32-bit values (BPF_W)
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+    } else {
+        int idx = atoi(iface_arg);
+        if (!idx) idx = get_ifindex(iface_arg);
+        emit(BPF_MOV64_IMM(BPF_REG_1, idx));
+    }
+    
+    emit(BPF_MOV64_IMM(BPF_REG_2, flags));
+    emit(BPF_CALL_FUNC(BPF_FUNC_redirect));
+    emit(BPF_EXIT_INSN());
+    resolve_local_block();
+}
+
+/*
+ * Emits bytecode to redirect a packet to a specific interface while asking 
+ * the kernel to automatically resolve and overwrite the destination MAC address 
+ * using the system's ARP/ND neighbor cache based on the packet's destination IP.
+ * Syntax: redirect-neigh <ifname|ifindex>
+ */
+void compile_redirect_neigh(const char *iface_arg) {
+    if (iface_arg[0] == '%') {
+        int v_off = get_var_offset(iface_arg);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+    } else {
+        int idx = atoi(iface_arg);
+        if (!idx) idx = get_ifindex(iface_arg);
+        emit(BPF_MOV64_IMM(BPF_REG_1, idx));
+    }
+
+    emit(BPF_MOV64_IMM(BPF_REG_2, 0));
+    emit(BPF_MOV64_IMM(BPF_REG_3, 0));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_redirect_neigh));
+
+    emit(BPF_EXIT_INSN());
+    resolve_local_block();
+}
+
+
+void compile_redirect(const char *iface_arg, const char *d) {
     int f = 0;
     if(strcmp(d, "ingress")==0)
         f = BPF_F_INGRESS;
     else if(strcmp(d, "egress")==0)
         f = 0; // zero is BPF_F_EGRESS;
-    emit(BPF_MOV64_IMM(BPF_REG_1, ifindex));
+    if (iface_arg[0] == '%') {
+        int v_off = get_var_offset(iface_arg);
+        // Interface indices are strictly 32-bit values (BPF_W)
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+    } else {
+        int idx = atoi(iface_arg);
+        if (!idx) idx = get_ifindex(iface_arg);
+        emit(BPF_MOV64_IMM(BPF_REG_1, idx));
+    }
     emit(BPF_MOV64_IMM(BPF_REG_2, f));
     emit(BPF_CALL_FUNC(BPF_FUNC_redirect));
     emit(BPF_EXIT_INSN());
     resolve_local_block();
 }
 
-void compile_clone(int ifindex, const char *d) {
+void compile_clone(const char *iface_arg, const char *d) {
     int f = 0;
     if(strcmp(d, "ingress")==0)
         f = BPF_F_INGRESS;
     else if(strcmp(d, "egress")==0)
         f = 0; // zero is BPF_F_EGRESS;
+
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); // skb is the first arg for clone
+
+    if (iface_arg[0] == '%') {
+        int v_off = get_var_offset(iface_arg);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+    } else {
+        int idx = atoi(iface_arg);
+        if (!idx) idx = get_ifindex(iface_arg);
+        emit(BPF_MOV64_IMM(BPF_REG_2, idx));
+    }
+    emit(BPF_MOV64_IMM(BPF_REG_3, f));
+    emit(BPF_CALL_FUNC(BPF_FUNC_clone_redirect));
+    /*
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV64_IMM(BPF_REG_2, ifindex));
     emit(BPF_MOV64_IMM(BPF_REG_3, f));
-    emit(BPF_CALL_FUNC(BPF_FUNC_clone_redirect));
+    emit(BPF_CALL_FUNC(BPF_FUNC_clone_redirect));*/
 }
 
 void compile_end_match(void) {
@@ -451,49 +579,58 @@ void compile_math_bswap(const char *var, int bits) {
     else emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, d_off));
 }
 
-/*
- * Emits bytecode to perform a FIB lookup using the current packet state.
- * 'flags' can be 0 (forwarding) or BPF_FIB_LOOKUP_OUTPUT (local output).
- */
 void compile_fib_lookup(int flags) {
-    // 1. Allocate 64 bytes for struct bpf_fib_lookup, 8-byte aligned
+    // 1. Force strict 8-byte alignment on the stack pointer before allocating
+    next_var_offset &= ~7;
+
+    // 2. Allocate 64 bytes for struct bpf_fib_lookup
     int base = next_var_offset - sizeof(struct bpf_fib_lookup);
-    next_var_offset = (base - 7) & ~7; 
-    base = next_var_offset; 
+    next_var_offset = base; 
+    next_var_offset &= ~7; // Double-check alignment
+    base = next_var_offset;
 
-    // 2. Register output variables directly mapped to the struct's internal offsets
+    // 3. Allocate a 4-byte variable for the return code (aligned to an 8-byte boundary)
     int res_off = allocate_var("FIB_RESULT", 4);
-    define_var_at_offset("FIB_SMAC", 6, base + offsetof(struct bpf_fib_lookup, smac));
-    define_var_at_offset("FIB_DMAC", 6, base + offsetof(struct bpf_fib_lookup, dmac));
-    define_var_at_offset("FIB_IP_DST", 4, base + offsetof(struct bpf_fib_lookup, ipv4_dst));
-    define_var_at_offset("FIB_IP6_DST", 16, base + offsetof(struct bpf_fib_lookup, ipv6_dst));
-    define_var_at_offset("FIB_IFINDEX", 4, base + offsetof(struct bpf_fib_lookup, ifindex));
 
+    // 4. Register variables. 
+    // We manually enforce aligned offsets relative to the 8-byte aligned 'base' pointer.
+    // This overrides the unaligned compiler paddings to guarantee 4/8-byte alignments.
+    define_var_at_offset("FIB_SMAC", 6, base + 24); // Aligned to 8
+    define_var_at_offset("FIB_DMAC", 6, base + 32); // Aligned to 8
+    
+    // We align the 4-byte ifindex and IP targets to clean multiples of 4:
+    define_var_at_offset("FIB_IFINDEX", 4, base + 56); // Force to offset 56 (aligned to 8/4)
+    define_var_at_offset("FIB_IP_DST", 4, base + 16);  // Force to offset 16 (aligned to 8/4)
+    define_var_at_offset("FIB_IP6_DST", 16, base + 16); // Force to offset 16 (aligned to 8/4)
 
-    //printf("Sizeof struct bpf_fib_lookup: %lu\n",sizeof(struct bpf_fib_lookup));
-
-    // 3. Zero the struct memory (Mandatory for verifier safety)
+    // 5. Zero the entire 64-byte structure on the stack (Mandatory for verifier safety)
     for (unsigned int i = 0; i < sizeof(struct bpf_fib_lookup); i += 8) {
         emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, base + i, 0));
     }
-    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, res_off, -1)); // Default FIB_RESULT = -1
+    
+    // Set default failure return code (-1)
+    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, res_off, -1));
 
-    // 4. Read the current EtherType (Offset 12)
+    // 6. Read the current EtherType (Offset 12) from the packet to stack scratch pad
     int scratch = next_var_offset - 8;
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, 12));
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));             // R1 = ctx
+    emit(BPF_MOV64_IMM(BPF_REG_2, 12));                    // R2 = offset 12
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=scratch}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 2));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 2));                     // R4 = 2 bytes
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
 
+    // If load fails, jump to bypass/epilogue
     int j_fail = prog_idx;
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+    
+    // Load EtherType into R1
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, scratch));
 
-    // 5. Branch based on IPv4 or IPv6
+    // 7. Branch logic based on EtherType (IPv4 vs IPv6)
     int j_ipv4 = prog_idx;
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=htons(0x0800)}));
+    
     int j_ipv6 = prog_idx;
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=htons(0x86DD)}));
     
@@ -502,53 +639,67 @@ void compile_fib_lookup(int flags) {
 
     // --- IPv4 Branch ---
     prog[j_ipv4].off = prog_idx - j_ipv4 - 1;
-    emit(BPF_ST_MEM(BPF_B, BPF_REG_10, base + offsetof(struct bpf_fib_lookup, family), AF_INET));
-    // Load IP Src
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); emit(BPF_MOV64_IMM(BPF_REG_2, 26));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=base + offsetof(struct bpf_fib_lookup, ipv4_src)}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 4)); emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
-    // Load IP Dst
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); emit(BPF_MOV64_IMM(BPF_REG_2, 30));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=base + offsetof(struct bpf_fib_lookup, ipv4_dst)}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 4)); emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    // family field is at offset 0 of the struct
+    emit(BPF_ST_MEM(BPF_B, BPF_REG_10, base, AF_INET));
+    
+    // Load IPv4 Src Address (Offset 26) to the struct's ipv4_src field (offset 12)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
+    emit(BPF_MOV64_IMM(BPF_REG_2, 26));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); 
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=base + 12}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 4)); 
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    
+    // Load IPv4 Dst Address (Offset 30) to the struct's ipv4_dst field (offset 16)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
+    emit(BPF_MOV64_IMM(BPF_REG_2, 30));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); 
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=base + 16}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 4)); 
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
     
     int j_ipv4_done = prog_idx;
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JA, .off=0}));
 
     // --- IPv6 Branch ---
     prog[j_ipv6].off = prog_idx - j_ipv6 - 1;
-    emit(BPF_ST_MEM(BPF_B, BPF_REG_10, base + offsetof(struct bpf_fib_lookup, family), AF_INET6));
-    // Load IPv6 Src
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); emit(BPF_MOV64_IMM(BPF_REG_2, 22));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=base + offsetof(struct bpf_fib_lookup, ipv6_src)}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 16)); emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
-    // Load IPv6 Dst
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); emit(BPF_MOV64_IMM(BPF_REG_2, 38));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=base + offsetof(struct bpf_fib_lookup, ipv6_dst)}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 16)); emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    emit(BPF_ST_MEM(BPF_B, BPF_REG_10, base, AF_INET6));
+    
+    // Load IPv6 Src Address (Offset 22) to ipv6_src (offset 16)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
+    emit(BPF_MOV64_IMM(BPF_REG_2, 22));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); 
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=base + 16}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 16)); 
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    
+    // Load IPv6 Dst Address (Offset 38) to ipv6_dst (offset 32)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
+    emit(BPF_MOV64_IMM(BPF_REG_2, 38));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); 
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=base + 32}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 16)); 
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
 
-    // --- Execute FIB Lookup ---
+    // --- Execute Lookup ---
     prog[j_ipv4_done].off = prog_idx - j_ipv4_done - 1;
     
-    // Set ingress ifindex
+    // Set ingress interface ID from packet context to the struct's ifindex (offset 56)
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, ingress_ifindex)));
-    emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, base + offsetof(struct bpf_fib_lookup, ifindex)));
+    emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, base + 56));
 
     // Execute bpf_fib_lookup(ctx, params, sizeof(params), flags)
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
     emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10)); 
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_2, .imm=base}));
     emit(BPF_MOV64_IMM(BPF_REG_3, sizeof(struct bpf_fib_lookup)));
-    
-    // Pass the parsed flags parameter into R4
     emit(BPF_MOV64_IMM(BPF_REG_4, flags)); 
-    
     emit(BPF_CALL_FUNC(BPF_FUNC_fib_lookup));
 
-    // Store Return Code
+    // Store helper return code into FIB_RESULT variable
     emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, res_off));
 
-    // Resolve failure bypasses
+    // Resolve bypass offsets
     prog[j_fail].off = prog_idx - j_fail - 1;
     prog[j_not_ip].off = prog_idx - j_not_ip - 1;
 }
@@ -698,6 +849,8 @@ void compile_match_gre_key(uint32_t exp_key) {
     compile_match_core(38, 4, htonl(exp_key), 0xFFFFFFFF, NULL);
 }
 
+
+
 /*
  * Emits bytecode to compare a variable against an immediate value or another variable.
  * Syntax: match val %VAR <op> <val | %VAR2>
@@ -730,6 +883,8 @@ void compile_match_var(const char *var1_name, const char *op, const char *var2_o
         exit(1);
     }
 
+    int jmp_class = (v1_sz <= 4) ? BPF_JMP32 : BPF_JMP;
+    
     // 2. Perform comparison and conditional jump
     if (var2_or_val[0] == '%') {
         int v2_off = get_var_offset(var2_or_val);
@@ -743,13 +898,13 @@ void compile_match_var(const char *var1_name, const char *op, const char *var2_o
 
         // R1 vs R2 comparison
         add_block_jump();
-        emit(((struct bpf_insn){.code = BPF_JMP | jmp_opcode | BPF_X, .dst_reg = BPF_REG_1, .src_reg = BPF_REG_2, .off = 0, .imm = 0}));
+        emit(((struct bpf_insn){.code = jmp_class | jmp_opcode | BPF_X, .dst_reg = BPF_REG_1, .src_reg = BPF_REG_2, .off = 0, .imm = 0}));
     } else {
-        long imm = strtol(var2_or_val, NULL, 0);
+        unsigned long imm = strtoul(var2_or_val, NULL, 0);
         
         // R1 vs Immediate comparison
         add_block_jump();
-        emit(((struct bpf_insn){.code = BPF_JMP | jmp_opcode | BPF_K, .dst_reg = BPF_REG_1, .src_reg = 0, .off = 0, .imm = imm}));
+        emit(((struct bpf_insn){.code = jmp_class | jmp_opcode | BPF_K, .dst_reg = BPF_REG_1, .src_reg = 0, .off = 0, .imm = imm}));
     }
 }
 
@@ -987,6 +1142,105 @@ void compile_set_ip_field8(int offset, uint8_t new_val, const char *var) {
 }
 
 /*
+ * Emits bytecode to calculate and set the ICMPv4 Checksum.
+ * Bypasses RHEL 8 verifier limitations by copying the payload to the stack 
+ * before running bpf_csum_diff, supporting up to 128 bytes of ICMP payload.
+ */
+void compile_recalculate_icmp_csum(void) {
+    target_tc_protocol = ETH_P_IP;
+    // 1. Clear the existing checksum (Offset 36)
+    emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -8, 0));
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));  
+    emit(BPF_MOV64_IMM(BPF_REG_2, 36));         
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-8}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 2));
+    emit(BPF_MOV64_IMM(BPF_REG_5, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+
+    // 2. Allocate and ZERO a 128-byte buffer on the eBPF stack
+    int buf_off = next_var_offset - 128;
+    next_var_offset = (buf_off - 7) & ~7;
+    buf_off = next_var_offset;
+    
+    for (int i = 0; i < 128; i += 8) {
+        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, buf_off + i, 0));
+    }
+
+    // 3. Load payload length into R8 (skb->len - 34)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len)));
+    emit(BPF_ALU64_IMM(BPF_SUB, BPF_REG_8, 34)); 
+
+    // 4. Bound the length: If (R8 <= 0) jump to epilogue
+    add_safety_jump();
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_8, .src_reg=0, .off=0, .imm=0}));
+    
+    // Cap the length at 128 bytes (Maximum our stack buffer can hold)
+    int j_cap_skip = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_8, .src_reg=0, .off=0, .imm=128}));
+    emit(BPF_MOV64_IMM(BPF_REG_8, 128)); // Force to 128 if greater
+    prog[j_cap_skip].off = prog_idx - j_cap_skip - 1;
+
+    // 5. Load the packet payload safely into the stack buffer
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
+    emit(BPF_MOV64_IMM(BPF_REG_2, 34)); // ICMP payload start
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=buf_off}));
+    emit(BPF_MOV64_REG(BPF_REG_4, BPF_REG_8)); // Actual length (up to 128)
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+
+    // 6. bpf_csum_diff requires the size to be a multiple of 4.
+    // Calculate aligned length in R9: R9 = (R8 + 3) & ~3
+    emit(BPF_MOV64_REG(BPF_REG_9, BPF_REG_8));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_9, 3));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_9, .imm=~3}));
+
+    // Ensure the aligned length doesn't magically exceed 128
+    int j_align_skip = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_9, .src_reg=0, .off=0, .imm=128}));
+    emit(BPF_MOV64_IMM(BPF_REG_9, 128));
+    prog[j_align_skip].off = prog_idx - j_align_skip - 1;
+
+    // 7. Calculate raw checksum using bpf_csum_diff against the STACK BUFFER
+    emit(BPF_MOV64_IMM(BPF_REG_1, 0)); 
+    emit(BPF_MOV64_IMM(BPF_REG_2, 0)); 
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=buf_off}));
+    emit(BPF_MOV64_REG(BPF_REG_4, BPF_REG_9)); // Aligned length
+    emit(BPF_MOV64_IMM(BPF_REG_5, 0)); 
+    emit(BPF_CALL_FUNC(BPF_FUNC_csum_diff));
+
+    // 8. Fold the 32-bit checksum in R0 into a 16-bit integer (One's Complement)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_0));
+    
+    // Fold 1
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_1));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_RSH|BPF_K, .dst_reg=BPF_REG_2, .imm=16}));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=0xFFFF}));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2}));
+    
+    // Fold 2
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_1));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_RSH|BPF_K, .dst_reg=BPF_REG_2, .imm=16}));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=0xFFFF}));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2}));
+
+    // Invert bits
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_XOR|BPF_K, .dst_reg=BPF_REG_1, .imm=0xFFFF}));
+
+    // 9. Store final 16-bit checksum into the packet (Offset 36)
+    emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, -8));
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
+    emit(BPF_MOV64_IMM(BPF_REG_2, 36));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-8}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 2));
+    emit(BPF_MOV64_IMM(BPF_REG_5, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+}
+
+/*
  * Emits bytecode to recalculate the Layer 4 (TCP or UDP) checksum for the entire packet.
  * Assumes a standard 14-byte Ethernet and 20-byte IPv4 header (Base L4 Offset = 34).
  */
@@ -1110,7 +1364,7 @@ void compile_set_cb(uint8_t i, uint32_t val, const char *var) {
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, get_var_offset(var)));
         emit(BPF_STX_MEM(BPF_W, BPF_REG_1, BPF_REG_2, offsetof(struct __sk_buff, cb)+(4*i)));
     } else {
-        emit(BPF_ST_MEM(BPF_W, BPF_REG_1, offsetof(struct __sk_buff, cb)+(4*1), val));
+        emit(BPF_ST_MEM(BPF_W, BPF_REG_1, offsetof(struct __sk_buff, cb)+(4*i), val));
     }
 }
 
@@ -1341,6 +1595,167 @@ void compile_pop_bytes_net(uint32_t len) {
     add_safety_jump();
 }
 
+/*
+ * Emits bytecode to insert an empty block of zeroes between L2 and L3.
+ * Uses a dynamically-sized stack allocator to safely protect the 512-byte eBPF stack limit.
+ */
+void compile_add_l2_bytes(int len) {
+    // 1. Ask kernel to expand the packet at the MAC layer
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
+    emit(BPF_MOV64_IMM(BPF_REG_2, len)); 
+    emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_MAC)); 
+    emit(BPF_MOV64_IMM(BPF_REG_4, 0)); 
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));
+    
+    // SAFETY JUMP: If kernel refuses, abort
+    add_safety_jump(); 
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JSLT|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+
+    // 2. DYNAMICALLY ALLOCATE the scratch space based on the requested length
+    // We align the size to 8 bytes for verifier safety
+    int aligned_len = (len + 7) & ~7;
+    int stack_off = next_var_offset - aligned_len;
+    
+    // Check if we are about to violate the physical eBPF stack boundary (-512)
+    if (stack_off < -512) {
+        fprintf(stderr, "Error: Stack overflow! Cannot allocate %d bytes. Stack limit exceeded.\n", aligned_len);
+        exit(1);
+    }
+    
+    // 3. Zero ONLY the allocated scratch space
+    for (int i = 0; i < aligned_len; i += 8) {
+        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, stack_off + i, 0));
+    }
+
+    // 4. Write the zeroes from the stack into the packet at offset 14
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
+    emit(BPF_MOV64_IMM(BPF_REG_2, 14)); 
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); 
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=stack_off}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, len)); // Write exact length requested
+    emit(BPF_MOV64_IMM(BPF_REG_5, 0)); 
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+}
+
+/*
+ * Emits bytecode to delete bytes immediately following the L2 MAC header.
+ * Syntax: del-l2-bytes <len>
+ */
+void compile_del_l2_bytes(int len) {
+    // 1. Ask kernel to shrink the packet at the MAC layer
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, -len)); // Negative delta shrinks
+    emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_MAC));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));
+
+    // SAFETY JUMP: If kernel refuses, abort
+    add_safety_jump();
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JSLT|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+}
+
+/*
+ * Emits bytecode to extract raw bytes (1, 2, 4, or 8) from anywhere in the packet.
+ * Automatically converts the extracted bytes from Network to Host Byte Order.
+ */
+void compile_get_raw_bytes(int offset, int size, const char *var) {
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        fprintf(stderr, "Error: get bytes length must be 1, 2, 4, or 8.\n");
+        exit(1);
+    }
+
+    int v_off = allocate_var(var, size);
+
+    // 1. Load bytes directly into the variable's stack slot
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, offset));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=v_off}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, size));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+
+    // 2. Load the value from the stack into R1
+    if (size == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, v_off));
+    else if (size == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, v_off));
+    else if (size == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+    else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, v_off));
+
+    // 3. Convert from Network Byte Order to Host Byte Order
+    // (1-byte extracts do not need swapping)
+    if (size > 1) {
+        emit(((struct bpf_insn){.code=0xdc, .dst_reg=BPF_REG_1, .imm=size*8})); // BPF_END | BPF_TO_BE
+    }
+
+    // 4. Store the swapped Host-Order value back into the variable slot
+    if (size == 1) emit(BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_1, v_off));
+    else if (size == 2) emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, v_off));
+    else if (size == 4) emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, v_off));
+    else emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, v_off));
+}
+
+/*
+ * Takes a host integer and reverses its byte order based on the specified byte length (1, 2, 4, or 8).
+ * This ensures hex constants like 0xdeadbeef land in the packet in the exact visual order.
+ */
+uint64_t swap_immediate_bytes(uint64_t val, int size) {
+    if (size == 1) return val;
+    if (size == 2) return htons((uint16_t)val);
+    if (size == 4) return htonl((uint32_t)val);
+    
+    // For 8 bytes (64-bit), manually swap
+    if (size == 8) {
+        return ((val & 0xFF00000000000000ULL) >> 56) |
+               ((val & 0x00FF000000000000ULL) >> 40) |
+               ((val & 0x0000FF0000000000ULL) >> 24) |
+               ((val & 0x000000FF00000000ULL) >> 8)  |
+               ((val & 0x00000000FF000000ULL) << 8)  |
+               ((val & 0x0000000000FF0000ULL) << 24) |
+               ((val & 0x000000000000FF00ULL) << 40) |
+               ((val & 0x00000000000000FFULL) << 56);
+    }
+    return val;
+}
+
+void compile_set_raw_bytes(int offset, int size, const char *val_str) {
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        fprintf(stderr, "Error: set bytes length must be 1, 2, 4, or 8.\n"); exit(1);
+    }
+
+    if (val_str[0] == '%') {
+        int v_off = get_var_offset(val_str);
+        
+        if (size == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, v_off));
+        else if (size == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, v_off));
+        else if (size == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+        else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, v_off));
+        
+        if (size == 1) emit(BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_1, -8));
+        else if (size == 2) emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, -8));
+        else if (size == 4) emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -8));
+        else emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, -8));
+    } else {
+        // FIX: Re-align immediate integers so hex input perfectly matches network wire output
+        uint64_t imm = strtoull(val_str, NULL, 0);
+        uint64_t net_imm = swap_immediate_bytes(imm, size);
+        
+        // Note: BPF_ST_MEM limits immediate stores to 32 bits (4 bytes).
+        // If writing 8 bytes from an immediate, we must use two 32-bit stores.
+        if (size == 8) {
+            emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -8, (uint32_t)(net_imm & 0xFFFFFFFF)));
+            emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, (uint32_t)(net_imm >> 32)));
+        } else {
+            if (size == 1) emit(BPF_ST_MEM(BPF_B, BPF_REG_10, -8, (uint32_t)net_imm));
+            else if (size == 2) emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -8, (uint32_t)net_imm));
+            else emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -8, (uint32_t)net_imm));
+        }
+    }
+    
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); emit(BPF_MOV64_IMM(BPF_REG_2, offset));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-8}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, size)); emit(BPF_MOV64_IMM(BPF_REG_5, 0)); 
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+}
+
 void compile_encap_mpls(uint32_t lbl, uint8_t bos) {
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV64_IMM(BPF_REG_2, 4));
@@ -1526,6 +1941,72 @@ void compile_decap_gre(void) {
 }
 
 /*
+ * Emits bytecode to extract a 32-bit field from the __sk_buff context into a variable.
+ */
+void compile_get_skb_field(size_t field_offset, const char *var_name) {
+    int v_off = allocate_var(var_name, 4); // Context fields are 32-bit (BPF_W)
+    // Load skb->field into R1
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, field_offset));
+    // Store R1 into the variable stack slot
+    emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, v_off));
+}
+
+/*
+ * Emits bytecode to safely overwrite a 32-bit field in the __sk_buff context.
+ * Bypasses the verifier's restriction against direct BPF_ST_MEM context writes.
+ */
+void compile_set_skb_field(size_t field_offset, const char *val_str) {
+    if (val_str[0] == '%') {
+        int v_off = get_var_offset(val_str);
+        // 1. Load the variable from the stack into R1
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+    } else {
+        uint32_t imm = strtoul(val_str, NULL, 0);
+        // 1. Load the constant into R1 (Instead of BPF_ST_MEM directly)
+        emit(BPF_MOV64_IMM(BPF_REG_1, imm));
+    }
+    // 2. Perform the register-to-memory write into the skb context pointer (R6)
+    emit(BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_1, field_offset));
+}
+
+
+/*
+ * Emits bytecode to match a 32-bit __sk_buff context field (mark, hash, or cb element).
+ * Registers 2 jumps (Load Failure & Comparison) under the active logical match block.
+ */
+void compile_match_skb_field(size_t field_offset, uint32_t expected, uint32_t mask, const char *var) {
+    // Start a new logical block for the conditional branching check
+    start_match_block();
+
+    // 1. Load the 32-bit context field from R6 (skb) into R1
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, field_offset));
+
+    // 2. If the field is uninitialized (e.g., hash is 0), handle optionally
+    // (Note: Unlike loading raw packet bytes, context reads cannot physically fail, 
+    // but we push a dummy pass jump to keep the block jump stack structure perfectly aligned).
+    add_block_jump();
+    emit(((struct bpf_insn){.code = BPF_JMP32 | BPF_JEQ | BPF_K, .dst_reg = BPF_REG_1, .src_reg = 0, .off = 0, .imm = 0xFFFFFFFF})); // Placeholder
+
+    // 3. Apply the bitwise AND mask
+    if (mask != 0xFFFFFFFF) {
+        emit(((struct bpf_insn){.code = BPF_ALU64 | BPF_AND | BPF_K, .dst_reg = BPF_REG_1, .imm = mask}));
+    }
+
+    // 4. Perform the conditional comparison jump
+    if (var) {
+        int v_off = get_var_offset(var);
+        // Load target variable into R2
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+        
+        add_block_jump();
+        emit(((struct bpf_insn){.code = BPF_JMP32 | BPF_JNE | BPF_X, .dst_reg = BPF_REG_1, .src_reg = BPF_REG_2, .off = 0, .imm = 0}));
+    } else {
+        add_block_jump();
+        emit(((struct bpf_insn){.code = BPF_JMP32 | BPF_JNE | BPF_K, .dst_reg = BPF_REG_1, .imm = expected}));
+    }
+}
+
+/*
  * Emits bytecode to retrieve a 64-bit value from a BPF map and store it in a variable.
  * Syntax: get map <MAP_FD> <KEY | %KEY_VAR> <VAL_VAR>
  */
@@ -1631,13 +2112,6 @@ void compile_set_map(int map_fd, const char *key_str, const char *val_str) {
 
     // 7. Call bpf_map_update_elem
     emit(BPF_CALL_FUNC(BPF_FUNC_map_update_elem));
-}
-
-/*
- * Arch-independent wrapper for the direct Linux bpf() system call.
- */
-int bpf_syscall(int cmd, union bpf_attr *attr, unsigned int size) {
-    return syscall(__NR_bpf, cmd, attr, size);
 }
 
 /*
@@ -1848,7 +2322,8 @@ int main(int argc, char **argv) {
 		
         if (strcmp(op, "get") == 0 && t > 2) {
             char *f = a1; char *var = a2;
-            if (strcmp(f,"ip-src")==0) compile_get_field(26,4,var);
+            if (strcmp(f,"bytes")==0 && t > 3) compile_get_raw_bytes(atoi(tok[2]), atoi(tok[3]), tok[4]);
+	    else if (strcmp(f,"ip-src")==0) compile_get_field(26,4,var);
             else if (strcmp(f,"ip-dst")==0) compile_get_field(30,4,var);
             else if (strcmp(f,"tcp-src")==0 || strcmp(f,"udp-src")==0) compile_get_field(34,2,var);
             else if (strcmp(f,"tcp-dst")==0 || strcmp(f,"udp-dst")==0) compile_get_field(36,2,var);
@@ -1873,7 +2348,19 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"ip6-proto")==0) compile_get_field(20, 1, var);
             else if (strcmp(f,"ip6-tclass")==0) compile_get_bitfield(14, 4, 20, 0xFF, var);
             else if (strcmp(f,"ip6-flow")==0) compile_get_bitfield(14, 4, 0, 0xFFFFF, var);
-	    else if (strcmp(f, "map") == 0 && t > 4) compile_get_map(get_or_create_map(tok[2]), tok[3], tok[4]);
+	    else if (strcmp(f,"map") == 0 && t > 4) compile_get_map(get_or_create_map(tok[2]), tok[3], tok[4]);
+	    else if (strcmp(f,"skb-mark") == 0) compile_get_skb_field(offsetof(struct __sk_buff, mark), var);
+            else if (strcmp(f,"skb-hash") == 0) compile_get_skb_field(offsetof(struct __sk_buff, hash), var);
+            else if (strcmp(f,"skb-cb") == 0 && t > 3) {
+                // Syntax: get skb-cb <0-4> <VAR>
+                int cb_index = atoi(tok[2]);
+                if (cb_index >= 0 && cb_index <= 4) {
+                    compile_get_skb_field(offsetof(struct __sk_buff, cb[cb_index]), tok[3]);
+                } else {
+                    fprintf(stderr, "Error: skb-cb index must be between 0 and 4\n");
+                    exit(1);
+                }
+	    }
 	    else {
                  printf("Invalid get instruction %s\n",f);
                  exit(2);
@@ -1881,7 +2368,8 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(op, "set") == 0 && t > 2) {
             char *f = a1; char *val = a2; char *v = (val[0]=='%') ? val : NULL;
-            if (strcmp(f,"dst-mac")==0) compile_set_mac(0, val);
+	    if (strcmp(f,"bytes")==0 && t > 3) compile_set_raw_bytes(atoi(tok[2]), atoi(tok[3]), tok[4]);
+	    else if (strcmp(f,"dst-mac")==0) compile_set_mac(0, val);
             else if (strcmp(f,"src-mac")==0) compile_set_mac(6, val);
             else if (strcmp(f,"ip-src")==0) compile_set_ip_addr(0, v?0:inet_addr(val), v);
             else if (strcmp(f,"ip-dst")==0) compile_set_ip_addr(1, v?0:inet_addr(val), v);
@@ -1895,9 +2383,6 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"mpls-label")==0) compile_set_mpls_field(0, v?0:atoi(val), v);
             else if (strcmp(f,"mpls-bos")==0) compile_set_mpls_field(1, v?0:atoi(val), v);
             else if (strcmp(f,"queue")==0) compile_set_queue(v?0:atoi(val), v);
-            else if (strcmp(f,"hash")==0) compile_set_hash(v?0:atoi(val), v);
-            else if (strcmp(f,"mark")==0) compile_set_mark(v?0:atoi(val), v);
-            else if (strcmp(f,"cb")==0) compile_set_cb(atoi(val), atoi(a3), a3);
             else if (strcmp(f,"arp-htype")==0) compile_set_field(14, 2, v?0:htons(atoi(val)), v);
             else if (strcmp(f,"arp-ptype")==0) compile_set_field(16, 2, v?0:htons(strtol(val,NULL,0)), v);
             else if (strcmp(f,"arp-hlen")==0) compile_set_field(18, 1, v?0:atoi(val), v);
@@ -1912,7 +2397,21 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"ip6-proto")==0) compile_set_field(20, 1, v?0:atoi(val), v);
             else if (strcmp(f,"ip6-tclass")==0) compile_set_ipv6_bitfield(1, v?0:atoi(val), v);
             else if (strcmp(f,"ip6-flow")==0) compile_set_ipv6_bitfield(0, v?0:atoi(val), v);
-	    else if (strcmp(f, "map") == 0 && t > 4) compile_set_map(get_or_create_map(tok[2]), tok[3], tok[4]);
+            else if (strcmp(f,"icmp-type")==0){ compile_set_field(34, 1, v?0:atoi(val), v); compile_recalculate_icmp_csum(); }
+	    else if (strcmp(f,"map") == 0 && t > 4) compile_set_map(get_or_create_map(tok[2]), tok[3], tok[4]);
+	    else if (strcmp(f,"skb-mark") == 0) compile_set_skb_field(offsetof(struct __sk_buff, mark), val);
+            else if (strcmp(f,"skb-hash") == 0) compile_set_skb_field(offsetof(struct __sk_buff, hash), val);
+            else if (strcmp(f,"skb-cb") == 0 && t > 3) {
+                // Syntax: set skb-cb <0-4> <VAL | %VAR>
+                int cb_index = atoi(tok[2]);
+                if (cb_index >= 0 && cb_index <= 4) {
+                    compile_set_skb_field(offsetof(struct __sk_buff, cb[cb_index]), tok[3]);
+                } else {
+                    fprintf(stderr, "Error: skb-cb index must be between 0 and 4\n");
+                    exit(1);
+                }
+            }
+
 	    else {
                  printf("Invalid set instruction %s\n",f);
                  exit(2);
@@ -1998,6 +2497,27 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"ip6-proto")==0) { start_match_block(); compile_match_core(20, 1, atoi(val), 0xFF, mv); }
             else if (strcmp(f,"ip6-tclass")==0) { start_match_block(); compile_match_core(14, 4, htonl(atoi(val) << 20), htonl(0x0FF00000), mv); }
             else if (strcmp(f,"ip6-flow")==0) { start_match_block(); compile_match_core(14, 4, htonl(atoi(val)), htonl(0x000FFFFF), mv); }
+            else if (strcmp(f,"icmp-type")==0) { start_match_block(); compile_match_core(34,1,atoi(val),0xFFFFFFFF,mv); }
+	    else if (strcmp(a1,"skb-mark")==0) {
+                compile_match_skb_field(offsetof(struct __sk_buff, mark), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
+            }
+            else if (strcmp(a1,"skb-hash")==0) {
+                compile_match_skb_field(offsetof(struct __sk_buff, hash), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
+            }
+            else if (strcmp(a1,"skb-cb")==0 && t > 3) {
+                // Syntax: match skb-cb <0-4> <expected_val | %VAR>
+                int cb_index = atoi(tok[2]);
+                char *expected_arg = tok[3];
+                char *nested_mv = (expected_arg[0]=='%') ? expected_arg : NULL;
+
+                if (cb_index >= 0 && cb_index <= 4) {
+                    uint32_t expected_val = nested_mv ? 0 : strtoul(expected_arg, NULL, 0);
+                    compile_match_skb_field(offsetof(struct __sk_buff, cb[cb_index]), expected_val, 0xFFFFFFFF, nested_mv);
+                } else {
+                    fprintf(stderr, "Error: skb-cb index must be between 0 and 4\n");
+                    exit(1);
+                }
+            }
 	    else if (strcmp(f, "val") == 0 && t > 4) {
 		 if (strcmp(tok[3],"gt") && strcmp(tok[3],"ge") && strcmp(tok[3],"lt") && strcmp(tok[3],"le") && strcmp(tok[3],"eq") && strcmp(tok[3],"ne")) {
                      printf("Invalid match val operation %s\n",tok[3]);
@@ -2041,25 +2561,26 @@ int main(int argc, char **argv) {
         else if (strcmp(op, "decap-mpls")==0) compile_decap_mpls();
         else if (strcmp(op, "encap-gre")==0 && t>6) compile_encap_gre(inet_addr(tok[2]), inet_addr(tok[4]), atoi(tok[6]));
         else if (strcmp(op, "decap-gre")==0) compile_decap_gre();
-        else if (strcmp(op, "push-mac-bytes")==0 && t>1) compile_push_bytes_mac(atoi(a1));
-        else if (strcmp(op, "pop-mac-bytes")==0 && t>1) compile_pop_bytes_mac(atoi(a1));
-        else if (strcmp(op, "push-net-bytes")==0 && t>1) compile_push_bytes_net(atoi(a1));
-        else if (strcmp(op, "pop-net-bytes")==0 && t>1) compile_pop_bytes_net(atoi(a1));
-        else if (strcmp(op, "add-bytes")==0 && t>2) compile_insert_bytes(atoi(a1), atoi(a2));
-        else if (strcmp(op, "del-bytes")==0 && t>2) compile_delete_bytes(atoi(a1), atoi(a2));
+	//else if (strcmp(op, "push-mac-bytes")==0 && t>1) compile_push_bytes_mac(atoi(a1));
+        //else if (strcmp(op, "pop-mac-bytes")==0 && t>1) compile_pop_bytes_mac(atoi(a1));
+        //else if (strcmp(op, "push-net-bytes")==0 && t>1) compile_push_bytes_net(atoi(a1));
+        //else if (strcmp(op, "pop-net-bytes")==0 && t>1) compile_pop_bytes_net(atoi(a1));
+	else if (strcmp(op, "add-l2-bytes") == 0 && t > 1) compile_add_l2_bytes(atoi(a1));
+        else if (strcmp(op, "del-l2-bytes") == 0 && t > 1) compile_del_l2_bytes(atoi(a1));
+        //else if (strcmp(op, "add-bytes")==0 && t>2) compile_insert_bytes(atoi(a1), atoi(a2));
+        //else if (strcmp(op, "del-bytes")==0 && t>2) compile_delete_bytes(atoi(a1), atoi(a2));
 	else if (strcmp(op, "recalc-tcp-csum") == 0) compile_recalculate_l4_csum(0);
 	else if (strcmp(op, "recalc-udp-csum") == 0) compile_recalculate_l4_csum(1);
 	else if (strcmp(op, "fib-lookup") == 0) {
-	    if (target_tc_protocol == ETH_P_ALL)
-	        target_tc_protocol = ETH_P_IP;
+	    target_tc_protocol = ETH_P_IP;
 	    //printf("Setting bind protocol to IPv4");
 	    int flags = 0;
             // Loop through all remaining arguments to build the bitwise flag integer
             for (int k = 1; k < t; k++) {
                 if (strcmp(tok[k], "direct") == 0)
-                    flags |= (1 << 0); // BPF_FIB_LOOKUP_DIRECT
+                    flags |= (1 << 0); // BPF_FIB_LOOKUP_DIRECT / BPF_FIB_LOOKUP_OUTPUT
                 else if (strcmp(tok[k], "output") == 0)
-                    flags |= (1 << 1); // BPF_FIB_LOOKUP_OUTPUT
+                    flags |= (1 << 1); // BPF_FIB_LOOKUP_DIRECT / BPF_FIB_LOOKUP_OUTPUT
                 else if (strcmp(tok[k], "tbid") == 0)
                     flags |= (1 << 2); // BPF_FIB_LOOKUP_TBID
                 else if (strcmp(tok[k], "skip-neigh") == 0)
@@ -2080,8 +2601,9 @@ int main(int argc, char **argv) {
         else if (strcmp(op, "accept")==0) compile_accept_packet();
         else if (strcmp(op, "reclassify")==0) compile_reclassify();
         else if (strcmp(op, "end-match")==0) compile_end_match();
-        else if (strcmp(op, "redirect")==0) { int idx=atoi(a1); if(!idx) idx=get_ifindex(a1); compile_redirect(idx, a2?a2:dir); }
-        else if (strcmp(op, "clone")==0) { int idx=atoi(a1); if(!idx) idx=get_ifindex(a1); compile_clone(idx, a2?a2:dir); }
+        else if (strcmp(op, "redirect")==0) compile_redirect(a1, a2?a2:dir);
+        else if (strcmp(op, "redirect-neigh")==0) compile_redirect_neigh(a1);
+        else if (strcmp(op, "clone")==0) compile_clone(a1, a2?a2:dir);
         else if (strcmp(op, "debug-log")==0) compile_debug_log(a1);
 	else {
              printf("Invalid instruction %s\n",op);
@@ -2119,8 +2641,9 @@ int main(int argc, char **argv) {
     }
 
     if (iface) {
-        union bpf_attr a = {.prog_type=BPF_PROG_TYPE_SCHED_CLS, .insns=(unsigned long)prog, .insn_cnt=prog_idx, .license=(unsigned long)"GPL"};
-        int fd = syscall(__NR_bpf, BPF_PROG_LOAD, &a, sizeof(a));
+        //union bpf_attr a = {.prog_type=BPF_PROG_TYPE_SCHED_CLS, .insns=(unsigned long)prog, .insn_cnt=prog_idx, .license=(unsigned long)"GPL"};
+        //int fd = syscall(__NR_bpf, BPF_PROG_LOAD, &a, sizeof(a));
+	int fd = load_bpf_prog_mem();
         if (fd < 0 || attach_bpf_tc(fd, iface, dir, pri) < 0) { 
 			perror("Load/Attach failed"); 
 			return 1; 
