@@ -63,6 +63,12 @@ ip netns add CE2
 ip netns add PE1
 ip netns add H1
 ip netns add H2
+
+ip netns exec CE1 mkdir -p /var/run/bpf/CE1
+ip netns exec CE2 mkdir -p /var/run/bpf/CE2
+mount -t bpf bpffs /var/run/bpf/CE1
+mount -t bpf bpffs /var/run/bpf/CE2
+
 for N in CE1 CE2 PE1 H1 H2
 do
 	ip -n $N link set lo up
@@ -75,6 +81,29 @@ ip link add pe1 netns CE1 type veth peer name ce1 netns PE1
 ip link add pe1 netns CE2 type veth peer name ce2 netns PE1
 
 sleep 0.1s
+
+ip -n CE1 link set h1 mtu 1800
+ip -n CE2 link set h2 mtu 1800
+ip -n CE1 link set pe1 mtu 1800
+ip -n CE2 link set pe1 mtu 1800
+ip -n PE1 link set ce1 mtu 1800
+ip -n PE1 link set ce2 mtu 1800
+
+ip -n H1 link set ce1 mtu 1500
+ip -n H2 link set ce2 mtu 1500
+
+ip netns exec H1 ethtool -K ce1 tso off gro off
+ip netns exec H2 ethtool -K ce2 tso off gro off
+ip netns exec CE1 ethtool -K h1 tso off gro off
+ip netns exec CE2 ethtool -K h2 tso off gro off
+
+ip netns exec PE1 ethtool -K ce1 tso off gro off
+ip netns exec PE1 ethtool -K ce2 tso off gro off
+
+ip -n H1 link set ce1 qlen 10000
+ip -n H2 link set ce2 qlen 10000
+ip -n CE1 link set h1 qlen 10000
+ip -n CE2 link set h2 qlen 10000
 
 ip -6 -n H1  addr flush dev ce1
 ip -6 -n H2  addr flush dev ce2
@@ -114,8 +143,8 @@ ip -6 -n CE2 addr flush dev pe1
 ip -6 -n PE1 addr flush dev ce1
 ip -6 -n PE1 addr flush dev ce2
 
-ip netns exec CE1 mkdir -p /var/run/bpf/CE1
-mount -t bpf bpffs /var/run/bpf/CE1
+#ip netns exec CE1 mkdir -p /var/run/bpf/CE1
+#mount -t bpf bpffs /var/run/bpf/CE1
 
 ip netns exec PE1 sysctl -w net.mpls.platform_labels=1048575 &>/dev/null
 ip netns exec CE1 sysctl -w net.mpls.platform_labels=1048575 &>/dev/null
@@ -132,6 +161,9 @@ ip -f mpls -n PE1 route add 19 via inet 10.0.0.6 dev ce2
 ip -f mpls -n PE1 route add 20 via inet 10.0.0.2 dev ce1
 
 ip -f mpls -n PE1 route show
+
+ip netns exec H1 iptables -t mangle -A POSTROUTING -p tcp -m tcp -j CHECKSUM --checksum-fill
+ip netns exec H2 iptables -t mangle -A POSTROUTING -p tcp -m tcp -j CHECKSUM --checksum-fill
 
 #ip -n CE1 addr flush dev h1
 #ip -6 -n CE1 addr show dev h1 | grep -q inet6 && test_fail IPv6 || test_pass IPv6
@@ -207,18 +239,26 @@ BOS=$3
 TTL=$4
 NH_LABEL=$5
 echo "decl FIB_DMAC 8; 
-#decl SMAC 8; 
-#decl DMAC 8;
 decl MPLS1 4;
 decl MPLS2 4;
+#	get len LEN;
+#match val LEN gt 1414;
+#        get map PKTS_OVR %LEN TOT;
+#        calc add TOT 1;
+#        set map PKTS_OVR %LEN %TOT;
+#end-match;
+
 fib-lookup $NH; 
-match val %FIB_RESULT eq 0; 
-	add-bytes 0 22;
-        #get eth-proto ETHP;
-        #get src-mac SMAC;
-        #get dst-mac DMAC;
-	#add-head-bytes 22;
-	#add-bytes 14 22;
+match val %FIB_RESULT eq 0;
+        #set skb-hash 0;
+	#add-bytes 0 22;
+	add-head-bytes 22;
+	#get len LEN;
+        #match val LEN gt 1436;
+        #get map PKTS_OUT %LEN TOT;
+        #calc add TOT 1;
+        #set map PKTS_OUT %LEN %TOT;
+        #end-match;
 	set val MPLS1 $NH_LABEL;
         calc lsh MPLS1 3;
         calc or MPLS1 $TC;
@@ -238,6 +278,7 @@ match val %FIB_RESULT eq 0;
 	set bytes 14 4 %MPLS1;
         set bytes 18 4 %MPLS2; 
         set eth-proto 0x8847; 
+	#set skb-proto 0x8847;
         set dst-mac %FIB_DMAC; 
         set src-mac %FIB_SMAC;
         redirect %FIB_IFINDEX egress" | tr -d '\n' | tr -d '\t'
@@ -247,26 +288,52 @@ function mpls_in()  {
 LABEL=$1
 IFACE=$2
 echo "
+        match mpls;
+        match mpls-label $LABEL;
+        #decl DATA 8;
+        get bytes 18 8 DMAC;
+        get bytes 24 8 SMAC;
+        get bytes 30 2 ETHP;
+        calc bswap %DMAC;
+        calc bswap %SMAC;
+        calc bswap %ETHP;
+        #get len LEN;
+        #decap-mpls;
+        #set eth-proto 0x0800;
+        #set bytes 14 1 0x45;
+        #del-head-bytes 18;
+        #set eth-proto 0x8847;
+        #set bytes 14 1 0xff;
+        #del-bytes 0 18;
+	del-l2-bytes 18;
+        set src-mac %SMAC;
+        set dst-mac %DMAC;
+        set eth-proto %ETHP;
+        #recalc-*-csum doesn't work right now - throws verifier errors
+        #match udp;
+        #recalc-udp-csum;
+        #end-match;
+        #match tcp;
+        #recalc-tcp-csum;
+        #end-match;
+        redirect $IFACE egress" | tr -d '\n' | tr -d '\t'
+}
+
+function mpls_in_slow()  {
+LABEL=$1
+IFACE=$2
+echo "
 	match mpls;
 	match mpls-label $LABEL;
-	#decl DATA 8;
-	#get bytes 18 8 DMAC;
-	#get bytes 24 8 SMAC;
-	#get bytes 30 2 ETHP;
-	#calc bswap %DMAC;
-	#calc bswap %SMAC;
-	#calc bswap %ETHP;
 	#get len LEN;
-	#decap-mpls;
-	#set eth-proto 0x0800;
-	#set bytes 14 1 0x45;
-	#del-head-bytes 18;
-	#set eth-proto 0x8847;
-	#set bytes 14 1 0xff;
+	#match val LEN gt 1432;
+	#get map PKTS_IN %LEN TOT;
+	#calc add TOT 1;
+	#set map PKTS_IN %LEN %TOT;
+	#end-match;
 	del-bytes 0 18;
-	#set src-mac %SMAC;
-	#set dst-mac %DMAC;
-	#set eth-proto %ETHP;
+	#get eth-proto ETHP;
+	#set skb-proto %ETHP;
         redirect $IFACE egress" | tr -d '\n' | tr -d '\t'
 }
 
@@ -282,11 +349,11 @@ echo "
 
 ip netns exec CE1 ./bpf_compiler $COPTS -i h1  -d ingress -p 100 "$(mpls_out_nh 10.0.0.6 16 1 255 19)" && test_pass CE1-pw0-out-install || test_fail CE1-pw0-out-install
 ip netns exec CE2 ./bpf_compiler $COPTS -i h2  -d ingress -p 100 "$(mpls_out_nh 10.0.0.2 18 1 255 20)" && test_pass CE2-pw0-out-install || test_fail CE2-pw0-out-install
-ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
-ip netns exec CE2 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
-ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 "$(mpls_in 18 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
+#ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
+#ip netns exec CE2 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
+ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 "$(mpls_in_slow 18 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
 #ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 101 "$(mpls_in_1 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
-ip netns exec CE2 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 "$(mpls_in 16 h2)" && test_pass CE2-pw0-in-install || test_fail CE2-pw0-in-install
+ip netns exec CE2 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 "$(mpls_in_slow 16 h2)" && test_pass CE2-pw0-in-install || test_fail CE2-pw0-in-install
 
 
 #timeout 5 ip netns exec PE1 tcpdump -levnpi ce2 -XX &> out1.txt &
@@ -294,7 +361,7 @@ ip netns exec CE2 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 "$(mpls_in 16 h
 #timeout 5 ip netns exec CE2 tcpdump -levnpi pe1 -XX &
 #timeout 5 ip netns exec CE1 tcpdump -levnpi h1 -XX &> out4.txt &
 #timeout 5 ip netns exec CE2 tcpdump -levnpi h2 -XX &
-#timeout 5 ip netns exec H2 tcpdump -levnpi ce2 -XX &
+#timeout 10 ip netns exec H2 tcpdump -levnpi ce2 -XX &
 #sleep 0.5s
 
 timeout 5 ip netns exec H1 ping -c4 -i 0.1 -W0.2 192.168.0.2 &>/dev/null && test_pass MPLS-pw || test_fail MPLS-pw
@@ -302,7 +369,84 @@ timeout 5 ip netns exec H1 ping -c4 -i 0.1 -W0.2 192.168.0.2 &>/dev/null && test
 #cat out*.txt
 #rm -f out*.txt
 
-#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r FIB_RESULT
+#timeout 10 ip netns exec H1 tcpdump -levnpi ce1 -XX &
+
+if [ 1 -eq 0 ]
+then
+	ip netns exec CE1 iperf -s &>/dev/null & P1=$!
+        ip netns exec CE2 iperf -s &>/dev/null & P2=$!
+	sleep 1
+        echo "TCP CE1->CE2"
+        ip netns exec CE1 iperf -P 10 --sum-only -i 5 -t 20 -c 10.0.0.6 | grep SUM | sed 's/^/  /g'
+        echo "TCP CE2->CE1"
+        ip netns exec CE2 iperf -P 10 --sum-only -i 5 -t 20 -c 10.0.0.2 | grep SUM | sed 's/^/  /g'
+	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
+fi
+
+if [ 1 -eq 1 ]
+then
+	ip netns exec H2 iperf -s &>/dev/null & P1=$!
+	ip netns exec H1 iperf -s &>/dev/null & P2=$!
+	IDX=$(ip -n CE1 link show dev h1 | head -n1 | cut -f 1 -d :)
+	#timeout 45 ip netns exec CE1 perf trace -e skb:kfree_skb --filter "skb_drop_reason(skb, $IDX)" &> CE1-h1-perf.log & P3=$!
+	#ip netns exec H2 iperf3 -s & P1=$!
+	#echo "start" | timeout 40 dropwatch -l kas &> dropwatch.log & P3=$!
+	sleep 1
+	echo "TCP H1->H2"
+	ip netns exec H1 iperf -P 10 --sum-only -i 5 -t 20 -c 192.168.0.2 | sed 's/^/  /g'
+	echo "TCP H2->H1"
+	ip netns exec H2 iperf -P 10 --sum-only -i 5 -t 20 -c 192.168.0.1 | sed 's/^/  /g'
+	#wait $P3
+	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
+	#echo "Interface stats H1:"
+        #ip netns exec H1 netstat -i | sed 's/^/  /g'
+        #echo "Interface stats H2:"
+        #ip netns exec H2 netstat -i | sed 's/^/  /g'
+	echo "Interface stats CE1:"
+        ip netns exec CE1 netstat -i | sed 's/^/  /g'
+        echo "Interface stats CE2:"
+        ip netns exec CE2 netstat -i | sed 's/^/  /g'
+	#echo "CE1"
+	#ip -s -d -n CE1 link show dev pe1
+	#ip -s -d -n CE1 link show dev h1
+	#ip netns exec CE1 ethtool -S pe1
+	#ip netns exec CE1 ethtool -S h1
+	#ip netns exec CE1 nstat -az | grep -iE 'drop|error|listen'
+	#ip netns exec CE1 cat /proc/net/softnet_stat
+	#ip netns exec CE1 bash -c 'for x in /sys/class/net/h1/statistics/*; do echo $x $(cat $x); done'
+	#echo "CE2"
+	#ip -s -d -n CE2 link show dev pe1
+	#ip -s -d -n CE2 link show dev h2
+	#ip netns exec CE2 nstat -az | grep -iE 'drop|error|listen'
+	#ip netns exec CE2 cat /proc/net/softnet_stat
+	#echo "TCP stats H1:"
+	#ip netns exec H1 netstat -s -t | sed 's/^/  /g'
+	#echo "TCP stats H2:"
+	#ip netns exec H2 netstat -s -t | sed 's/^/  /g'
+#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r PKTS_OVR
+#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r PKTS_IN
+#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r PKTS_OUT
+
+	#echo "TC filter CE1"
+	#ip netns exec CE1 tc -s -d filter show dev pe1 ingress | sed 's/^/  /g'
+	#echo "TC filter CE1"
+	#ip netns exec CE2 tc -s -d filter show dev pe1 ingress | sed 's/^/  /g'
+	#ip netns exec CE1 perf --no-pager script
+fi
+
+if [ 1 -eq 0 ]
+then
+	ip netns exec H2 iperf -u -s &>/dev/null & P1=$!
+	ip netns exec H1 iperf -u -s &>/dev/null & P2=$!
+	#ip netns exec H2 iperf3 -s & P1=$!
+	sleep 1
+	echo "UDP H1->H2"
+	ip netns exec H1 iperf -u -i 5 -t 20 -c 192.168.0.2 -b 50g | sed 's/^/  /g'
+	echo "UDP H2->H1"
+	ip netns exec H2 iperf -u -i 5 -t 20 -c 192.168.0.1 -b 50g | sed 's/^/  /g'
+	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
+fi
+
 
 wait &>/dev/null
 ip netns del H1
