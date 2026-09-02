@@ -3872,6 +3872,102 @@ int detach_bpf_tc(const char *iface) {
     return 0;
 }
 
+void help(const char *arg0) {
+    char *opts[] = {
+        "-i <interface>"	,"attach program to specific interface",
+        "-d ingress|egress"	,"direction to attach, default ingress",
+        "-c"			,"clear all attached program on interface",
+        "-p <priority>"		,"attachment priority, lower first",
+        "-m <dir>"		,"specify directory for BPF maps",
+        "-r <map>"		,"dump contents of specified map",
+        "-v"			,"verbose output",
+    };
+    char *cmds[] = {
+	"decl <VAR> <1|2|4|8>"			,"declare variable VAR of specified length",
+	"set <field> <INT|0x00|%VAR>"		,"set specified field to integer, hex value or value stored in variable VAR",
+	"get <field> <VAR>"			,"get specified field and store into VAR",
+	"match <field> <INT|0x00|%VAR>"		,"conditional, check if field equals value or variable, if so continue execution",
+	"end-match"				,"end current match condition",
+	"calc <op> <VAR> <INT|0x00|%VAR>"	,"perform math calculation on variable VAR and value provided or value stored in specified variable",
+	"     add"				,"add specified value to VAR",
+	"     sub"				,"subtract specified value from VAR",
+	"     mul"				,"multiply specified value with VAR",
+	"     div"				,"divide VAR by specified value",
+	"     mod"				,"modulo VAR with specified value",
+	"     or"				,"apply bit-wise OR of VAR and specified value",
+	"     and"				,"apply bit-wise AND of VAR and specified value",
+	"     xor"				,"apply bit-wise XOR of VAR and specified value",
+	"     not"				,"flip bits of VAR",
+	"     bswap"				,"switch VAR between big or little endian",
+	"     lsh"				,"shift VAR left by specified number of bits",
+	"     rsh"				,"shift VAR right by specified number of bits",
+
+    };
+    char *l2_fields[] = {
+	"src-mac"		,"source MAC address",
+	"dst-mac"		,"destination MAC address",
+	"eth-proto"		,"Ethernet protocol number",
+	"vlan-id"		,"VLAN ID",
+	"arp-htype"		,"ARP hardware type",
+	"arp-ptype"		,"ARP protocol type",
+	"arp-hlen"		,"ARP hardware length",
+	"arp-plen"		,"ARP protocol length",
+	"arp-oper"		,"ARP operation code",
+	"arp-sha"		,"ARP source hardware address",
+	"arp-tha"		,"ARP target hardware address",
+	"arp-spa"		,"ARP source protocol address",
+	"arp-tpa"		,"ARP target protocol address",
+	"mpls-label"		,"MPLS label",
+	"mpls-bos"		,"MPLS Bottom of Stack",
+    };
+    char *l3_fields[] = {
+	"ip-proto"		,"IPv4 protocol number",
+	"ip-src"		,"IPv4 source address",
+	"ip-dst"		,"IPv4 destination address",
+	"ip-tos"		,"IPv4 Type-of-Service byte",
+	"ip6-proto"		,"IPv6 protocol number (next-header)",
+	"ip6-src"		,"IPv6 source address",
+	"ip6-dst"		,"IPv6 destination address",
+	"ip6-tclass"		,"IPv6 traffic class",
+	"ip6-flow"		,"IPv6 flow label",
+    };
+    char *l4_fields[] = {
+	"icmp-type"		,"ICMP type",
+	"tcp-src"		,"TCP source port",
+	"tcp-dst"		,"TCP destination port",
+	"udp-src"		,"UDP source port",
+	"udp-dst"		,"UDP destination port",
+    };
+    printf("Usage: %s [OPTION...] 'COMMAND;COMMAND;...'\n\n", arg0);
+    int opt_num = sizeof(opts) / sizeof(opts[0]);
+    for (int i=0; i < opt_num; i+=2) {
+	printf("   %-20s %s\n",opts[i], opts[i+1]);
+    }
+
+    printf("\nCOMMANDS:\n");
+    int cmd_num = sizeof(cmds) / sizeof(cmds[0]);
+    for (int i=0; i< cmd_num; i+=2) {
+	printf("   %-34s %s\n",cmds[i], cmds[i+1]);
+    }
+
+    printf("\nFIELDS:\n");
+    printf("  Layer-2/2.5:\n");
+    int l2_num = sizeof(l2_fields) / sizeof(l2_fields[0]);
+    for (int i=0; i< l2_num; i+=2) {
+	printf("    %-20s %s\n",l2_fields[i], l2_fields[i+1]);
+    }
+    printf("\n  Layer-3:\n");
+    int l3_num = sizeof(l3_fields) / sizeof(l3_fields[0]);
+    for (int i=0; i< l3_num; i+=2) {
+	printf("    %-20s %s\n",l3_fields[i], l3_fields[i+1]);
+    }
+    printf("\n  Layer-4:\n");
+    int l4_num = sizeof(l4_fields) / sizeof(l4_fields[0]);
+    for (int i=0; i< l4_num; i+=2) {
+	printf("    %-20s %s\n",l4_fields[i], l4_fields[i+1]);
+    }
+}
+
 /* --- Main CLI & Tokenizer --- */
 int main(int argc, char **argv) {
     int pri = 0;
@@ -3885,7 +3981,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i],"-v")==0) verbose_mode = 1;
         else if (strcmp(argv[i],"-m")==0) strcpy(bpf_map_dir,argv[++i]);
 	else if (strcmp(argv[i],"-r")==0) read_map = argv[++i];
-
+	else if (strcmp(argv[i],"-h")==0) { help(argv[0]); return 0; }
         else instr = argv[i];
     }
     if (read_map) {
