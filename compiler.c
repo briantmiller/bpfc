@@ -1290,76 +1290,6 @@ void compile_match_port_range(int off, uint16_t min_p, uint16_t max_p) {
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_1, .imm=max_p}));
 }
 
-//TODO: Get this working - doesn't appear to be work at this time
-/*void compile_match_vlan_range(uint16_t min_v, uint16_t max_v) {
-    start_match_block();
-    if (min_v == max_v) { 
-	//compile_match_core_vlan_check(1, 15, 1, htons(min_v), htons(0x0FFF), NULL);
-	compile_match_core_vlan_check(1, 15, 1, htons(min_v), htons(0x0FFF), NULL);
-    	return;
-    }
-
-    //printf("Install match for vlan %u-%u\n",min_v,max_v);
-
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, 15));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-4}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 1));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
-
-    add_block_jump();
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
-    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, -4));
-    //emit(((struct bpf_insn){.code=0xdc, .dst_reg=BPF_REG_1, .imm=16}));
-    emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
-    
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=0x0FFF}));
-    
-    add_block_jump();
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLT|BPF_K, .dst_reg=BPF_REG_1, .imm=min_v}));
-    add_block_jump();
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_1, .imm=max_v}));
-}*/
-
-/*
- * Emits bytecode to match an existing outer VLAN ID against a range (inclusive).
- * Uses BPF_JMP32 and strict Endian-swapping to guarantee correct bitwise isolation.
- */
-/*void compile_match_vlan_range(uint16_t min_vid, uint16_t max_vid) {
-    start_match_block();
-
-    // 1. Read the 2-byte TCI from Offset 14 into the stack scratch pad
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, 14));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-4}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 2));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
-
-    // Jump 1: Load Failure bypass
-    add_block_jump();
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
-
-    // 2. Load the 2-byte TCI from stack into R1
-    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, -4));
-
-    // 3. Convert R1 from Network Byte Order to Host Byte Order (16-bit) FIRST!
-    emit(((struct bpf_insn){.code=BPF_ALU|BPF_END|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
-
-    // 4. NOW apply the mask to isolate the lower 12 bits (VLAN ID)
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=0x0FFF}));
-
-    // 5. Evaluate Range using 32-bit jumps to prevent sign-extension evaluation bugs
-    // Jump 2: Check Lower Bound
-    add_block_jump();
-    emit(((struct bpf_insn){.code=BPF_JMP32|BPF_JLT|BPF_K, .dst_reg=BPF_REG_1, .imm=min_vid}));
-
-    // Jump 3: Check Upper Bound
-    add_block_jump();
-    emit(((struct bpf_insn){.code=BPF_JMP32|BPF_JGT|BPF_K, .dst_reg=BPF_REG_1, .imm=max_vid}));
-}*/
-
 
 /*
  * Emits bytecode to match an existing outer VLAN ID against a range (inclusive).
@@ -1471,31 +1401,6 @@ void compile_match_var(const char *var1_name, const char *op, const char *var2_o
         emit(((struct bpf_insn){.code = jmp_class | jmp_opcode | BPF_K, .dst_reg = BPF_REG_1, .src_reg = 0, .off = 0, .imm = imm}));
     }
 }
-
-/* --- Packet Manipulation --- */
-/*void compile_set_field(int offset, int size, uint32_t net_val, const char *var) {
-    if (var) {
-        int v_off = get_var_offset(var);
-        if (size == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, v_off));
-        else if (size == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, v_off));
-        else emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
-        
-        if (size == 1) emit(BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_1, -8));
-        else if (size == 2) emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, -8));
-        else emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -8));
-    } else {
-        if (size == 1) emit(BPF_ST_MEM(BPF_B, BPF_REG_10, -8, net_val));
-        else if (size == 2) emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -8, net_val));
-        else emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -8, net_val));
-    }
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, offset));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-8}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, size));
-    emit(BPF_MOV64_IMM(BPF_REG_5, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
-}*/
 
 /*
  * Emits bytecode to overwrite a generic packet field.
@@ -2324,10 +2229,44 @@ void compile_insert_bytes(int offset, int ilen) {
     emit(BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_10, ctx_spill));
 }
 
-void compile_push_vlan(uint16_t vid, uint8_t pcp) { 
+void compile_push_vlan(const char *vid_arg, const char *pcp_arg) {
+    if (pcp_arg == NULL)
+        emit(BPF_MOV64_IMM(BPF_REG_2, 0));
+    else if (pcp_arg[0] == '%') {
+        int v_off = get_var_offset(pcp_arg);
+        int v_sz = get_var_size(pcp_arg);
+
+        // Load variable size into R2
+        if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_10, v_off));
+        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_10, v_off));
+        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+        else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, v_off));
+    } else {
+        uint32_t imm = (uint32_t)strtoul(pcp_arg, NULL, 0);
+        emit(BPF_MOV64_IMM(BPF_REG_2, imm));
+    }
+    if (vid_arg[0] == '%') {
+        int v_off = get_var_offset(vid_arg);
+        int v_sz = get_var_size(vid_arg);
+
+        // Load variable size into R2
+        if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_10, v_off));
+        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_10, v_off));
+        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+        else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_3, BPF_REG_10, v_off));
+
+    } else {
+        uint32_t imm = (uint32_t)strtoul(vid_arg, NULL, 0);
+        emit(BPF_MOV64_IMM(BPF_REG_3, imm));
+    }
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_3, .imm=0x0FFF}));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_2, .imm=0x07}));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_LSH|BPF_K, .dst_reg=BPF_REG_2, .imm=13}));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_OR|BPF_X, .dst_reg=BPF_REG_3, .src_reg=BPF_REG_2}));
+
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV32_IMM(BPF_REG_2, htons(ETH_P_8021Q)));
-    emit(BPF_MOV32_IMM(BPF_REG_3, ((pcp & 0x07) << 13) | (vid & 0x0FFF)));
+    //emit(BPF_MOV32_IMM(BPF_REG_3, ((pcp & 0x07) << 13) | (vid & 0x0FFF)));
     emit(BPF_MOV64_IMM(BPF_REG_4, 0));
     emit(BPF_MOV64_IMM(BPF_REG_5, 0));
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_vlan_push));
@@ -4049,6 +3988,8 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"udp-src")==0) compile_set_l4_port(1, 0, v?0:atoi(val), v);
             else if (strcmp(f,"udp-dst")==0) compile_set_l4_port(1, 1, v?0:atoi(val), v);
             //else if (strcmp(f,"vlan-id")==0) compile_set_vlan_id(v?0:atoi(val), v);
+            //else if (strcmp(f,"vlan-id")==0) { compile_pop_vlan(); compile_push_vlan((uint16_t)atoi(a1), t>2?atoi(a2):0);
+            else if (strcmp(f,"vlan-id")==0) { compile_pop_vlan(); compile_push_vlan(a1, t>2?a2:NULL); }
             else if (strcmp(f,"mpls-label")==0) compile_set_mpls_field(0, v?0:atoi(val), v);
             else if (strcmp(f,"mpls-bos")==0) compile_set_mpls_field(1, v?0:atoi(val), v);
             else if (strcmp(f,"queue")==0) compile_set_queue(v?0:atoi(val), v);
@@ -4245,7 +4186,8 @@ int main(int argc, char **argv) {
 	else if (strcmp(op, "decl") == 0 && t > 2) compile_decl_var(tok[1], atoi(tok[2]));
 	else if (strcmp(op, "push-eth")==0 && t>2) compile_push_eth(a1, a2);
         else if (strcmp(op, "pop-eth")==0) compile_pop_eth();
-        else if (strcmp(op, "push-vlan")==0) compile_push_vlan((uint16_t)atoi(a1), t>2?atoi(a2):0);
+        //else if (strcmp(op, "push-vlan")==0) compile_push_vlan((uint16_t)atoi(a1), t>2?atoi(a2):0);
+        else if (strcmp(op, "push-vlan")==0) compile_push_vlan(a1, t>2?a2:NULL);
         else if (strcmp(op, "pop-vlan")==0) compile_pop_vlan();
         else if (strcmp(op, "push-qinq")==0 && t>2) compile_push_qinq(atoi(a1), atoi(a2), t>3?atoi(tok[3]):0, t>4?atoi(tok[4]):0);
         else if (strcmp(op, "encap-mpls")==0 && t>4) compile_encap_mpls(atoi(tok[2]), atoi(tok[4]));
@@ -4296,34 +4238,8 @@ int main(int argc, char **argv) {
             if (is_ipv6) compile_fib_lookup6(flags, custom_dst_ip, custom_src_ip, custom_iface);
             else         compile_fib_lookup(flags, custom_dst_ip, custom_src_ip, custom_iface);
         }
-	/*else if (strcmp(op, "fib-lookup") == 0) {
-	    target_tc_protocol = ETH_P_IP;
-	    //printf("Setting bind protocol to IPv4");
-	    int flags = 0;
-            // Loop through all remaining arguments to build the bitwise flag integer
-            for (int k = 1; k < t; k++) {
-                if (strcmp(tok[k], "direct") == 0)
-                    flags |= (1 << 0); // BPF_FIB_LOOKUP_DIRECT / BPF_FIB_LOOKUP_OUTPUT
-                else if (strcmp(tok[k], "output") == 0)
-                    flags |= (1 << 1); // BPF_FIB_LOOKUP_DIRECT / BPF_FIB_LOOKUP_OUTPUT
-                else if (strcmp(tok[k], "tbid") == 0)
-                    flags |= (1 << 2); // BPF_FIB_LOOKUP_TBID
-                else if (strcmp(tok[k], "skip-neigh") == 0)
-                    flags |= (1 << 3); // BPF_FIB_LOOKUP_SKIP_NEIGH
-                else if (strcmp(tok[k], "src") == 0)
-                    flags |= (1 << 4); // BPF_FIB_LOOKUP_SRC
-                else if (strcmp(tok[k], "mark") == 0)
-                    flags |= (1 << 5); // BPF_FIB_LOOKUP_MARK
-                else {
-                    fprintf(stderr, "Warning: Unknown fib-lookup flag '%s'\n", tok[k]);
-		    exit(2);
-                }
-            }	
-	    compile_fib_lookup(flags);
-	}*/
         else if (strcmp(op, "start-loop") == 0) compile_start_loop();
         else if (strcmp(op, "loop") == 0 && t > 1) compile_loop(a1);
-	/*Legacy loop support for RHEL8 kernels*/
         else if (strcmp(op, "set-reg-loop") == 0 && t > 1) compile_set_reg_loop(a1);
         else if (strcmp(op, "dec-reg-loop") == 0) compile_dec_reg_loop();
         else if (strcmp(op, "loop-reg") == 0) compile_loop_reg();

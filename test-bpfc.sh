@@ -280,6 +280,12 @@ ip netns exec RX ./bpf_compiler $COPTS -i rx0 -c
 ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 101 'match vlan-id 100-101; pop-vlan' && test_pass VLAN match range install || test_fail VLAN match range install
 timeout 3 ip netns exec TX ping -c 3 -i 0.5 -W0.2 2.2.2.2 &>/dev/null && test_pass VLAN match range || test_fail VLAN match range
 
+ip netns exec RX ./bpf_compiler $COPTS -i rx0 -c
+ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 101 'match vlan-id 100-101; get vlan-id VLAN; calc add VLAN 20; set vlan-id %VLAN' && test_pass VLAN change install 1 || test_fail VLAN change install 1
+ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 105 'match vlan-id 120-121; pop-vlan' && test_pass VLAN change install 2 || test_fail VLAN change install 2
+timeout 3 ip netns exec TX ping -c 3 -i 0.5 -W0.2 2.2.2.2 &>/dev/null && test_pass VLAN change || test_fail VLAN change
+
+
 #ip netns exec TX ./bpf_compiler $COPTS -m /var/run/bpf/RX -r VLAN
 #ip netns exec TX ./bpf_compiler $COPTS -m /var/run/bpf/RX -r OFF14
 #kill -9 $P1
