@@ -107,7 +107,7 @@ ip netns exec HOST2 ping -c 4 -i 0.1 -W 0.2 192.168.0.1 &>/dev/null && test_pass
 ip netns exec RTR ./bpf_compiler $COPTS -i wan -d egress -p 100 -m /var/run/bpf/RTR 'match icmp; match icmp-type 8; get ip-src IP_SRC; get bytes 38 2 ICMP_IDENT; set map ICMP_NAT %ICMP_IDENT %IP_SRC; set ip-src 10.0.0.30' && test_pass ICMP-NAT-OUT || test_fail ICMP-NAT-OUT
 ip netns exec RTR ./bpf_compiler $COPTS -i wan -d ingress -p 100 -m /var/run/bpf/RTR 'match icmp; match icmp-type 0; get bytes 38 2 ICMP_IDENT; get map ICMP_NAT %ICMP_IDENT IP_DST; set ip-dst %IP_DST' && test_pass ICMP-NAT-IN || test_fail ICMP-NAT-IN
 
-#timeout 5 ip netns exec RTR tcpdump -lvnpi wan icmp &
+#timeout 5 ip netns exec RTR tcpdump -lvnpi wan icmp -XX &
 #timeout 5 ip netns exec RTR tcpdump -lvnpi wan tcp &
 #timeout 8 ip netns exec RTR tcpdump -lvnpi wan udp &
 #timeout 8 ip netns exec WAN tcpdump -lvnpi rtr udp &

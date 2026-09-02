@@ -30,7 +30,7 @@ GREEN='\e[32m'
 YELLOW='\e[33m'
 BLUE='\e[34m'
 NC='\e[0m' # No Color (Reset)
-
+IPERF="iperf"
 TEST=""
 
 function test_enabled()
@@ -371,41 +371,43 @@ timeout 5 ip netns exec H1 ping -c4 -i 0.1 -W0.2 192.168.0.2 &>/dev/null && test
 
 #timeout 10 ip netns exec H1 tcpdump -levnpi ce1 -XX &
 
-if [ 1 -eq 0 ]
+if [ 1 -eq 1 ]
 then
-	ip netns exec CE1 iperf -s &>/dev/null & P1=$!
-        ip netns exec CE2 iperf -s &>/dev/null & P2=$!
+	ip netns exec CE1 $IPERF -s &>/dev/null & P1=$!
+        ip netns exec CE2 $IPERF -s &>/dev/null & P2=$!
 	sleep 1
         echo "TCP CE1->CE2"
-        ip netns exec CE1 iperf -P 10 --sum-only -i 5 -t 20 -c 10.0.0.6 | grep SUM | sed 's/^/  /g'
+        ip netns exec CE1 $IPERF -P 10 -i 5 -t 20 -c 10.0.0.6 | sed 's/^/  /g'
         echo "TCP CE2->CE1"
-        ip netns exec CE2 iperf -P 10 --sum-only -i 5 -t 20 -c 10.0.0.2 | grep SUM | sed 's/^/  /g'
+        ip netns exec CE2 $IPERF -P 10 -i 5 -t 20 -c 10.0.0.2 | sed 's/^/  /g'
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
 fi
 
 if [ 1 -eq 1 ]
 then
-	ip netns exec H2 iperf -s &>/dev/null & P1=$!
-	ip netns exec H1 iperf -s &>/dev/null & P2=$!
+	ip netns exec H2 $IPERF -s &>/dev/null & P1=$!
+	ip netns exec H1 $IPERF -s &>/dev/null & P2=$!
 	IDX=$(ip -n CE1 link show dev h1 | head -n1 | cut -f 1 -d :)
 	#timeout 45 ip netns exec CE1 perf trace -e skb:kfree_skb --filter "skb_drop_reason(skb, $IDX)" &> CE1-h1-perf.log & P3=$!
 	#ip netns exec H2 iperf3 -s & P1=$!
 	#echo "start" | timeout 40 dropwatch -l kas &> dropwatch.log & P3=$!
 	sleep 1
 	echo "TCP H1->H2"
-	ip netns exec H1 iperf -P 10 --sum-only -i 5 -t 20 -c 192.168.0.2 | sed 's/^/  /g'
+	ip netns exec H1 $IPERF -P 10 -i 5 -t 20 -c 192.168.0.2 | sed 's/^/  /g'
 	echo "TCP H2->H1"
-	ip netns exec H2 iperf -P 10 --sum-only -i 5 -t 20 -c 192.168.0.1 | sed 's/^/  /g'
+	ip netns exec H2 $IPERF -P 10 -i 5 -t 20 -c 192.168.0.1 | sed 's/^/  /g'
 	#wait $P3
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
 	#echo "Interface stats H1:"
         #ip netns exec H1 netstat -i | sed 's/^/  /g'
         #echo "Interface stats H2:"
         #ip netns exec H2 netstat -i | sed 's/^/  /g'
-	echo "Interface stats CE1:"
-        ip netns exec CE1 netstat -i | sed 's/^/  /g'
-        echo "Interface stats CE2:"
-        ip netns exec CE2 netstat -i | sed 's/^/  /g'
+
+	#echo "Interface stats CE1:"
+        #ip netns exec CE1 netstat -i | sed 's/^/  /g'
+        #echo "Interface stats CE2:"
+        #ip netns exec CE2 netstat -i | sed 's/^/  /g'
+
 	#echo "CE1"
 	#ip -s -d -n CE1 link show dev pe1
 	#ip -s -d -n CE1 link show dev h1
@@ -434,16 +436,16 @@ then
 	#ip netns exec CE1 perf --no-pager script
 fi
 
-if [ 1 -eq 0 ]
+if [ 1 -eq 1 ]
 then
-	ip netns exec H2 iperf -u -s &>/dev/null & P1=$!
-	ip netns exec H1 iperf -u -s &>/dev/null & P2=$!
+	ip netns exec H2 $IPERF -u -s &>/dev/null & P1=$!
+	ip netns exec H1 $IPERF -u -s &>/dev/null & P2=$!
 	#ip netns exec H2 iperf3 -s & P1=$!
 	sleep 1
 	echo "UDP H1->H2"
-	ip netns exec H1 iperf -u -i 5 -t 20 -c 192.168.0.2 -b 50g | sed 's/^/  /g'
+	ip netns exec H1 $IPERF -u -i 5 -t 20 -c 192.168.0.2 -b 50g | sed 's/^/  /g'
 	echo "UDP H2->H1"
-	ip netns exec H2 iperf -u -i 5 -t 20 -c 192.168.0.1 -b 50g | sed 's/^/  /g'
+	ip netns exec H2 $IPERF -u -i 5 -t 20 -c 192.168.0.1 -b 50g | sed 's/^/  /g'
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
 fi
 
