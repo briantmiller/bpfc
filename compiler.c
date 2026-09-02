@@ -3983,6 +3983,14 @@ void help(const char *arg0) {
 	"del-bytes <off> <len>"		,"delete len bytes at offset in the packet",
 	"add-head-bytes <len>"		,"add len bytes to the beginning of the packet",
     };
+    char *skb_fields[] = {
+	"skb-mark"		,"firewall/packet mark",
+	"skb-hash"		,"software hash",
+	"skb-cb <0-4>"		,"context buffer scratch pad, 5 32-bit values can be stored and passed down the stack",
+	"skb-ifindex"		,"interface number - get/match only",
+	"skb-ingress"		,"ingress interface number - get/match only",
+	"protocol"		,"Packet protocol number",
+    };
     printf("Usage: %s [OPTION...] 'COMMAND;COMMAND;...'\n\n", arg0);
     int opt_num = sizeof(opts) / sizeof(opts[0]);
     for (int i=0; i < opt_num; i+=2) {
@@ -4015,6 +4023,11 @@ void help(const char *arg0) {
     int raw_num = sizeof(raw_fields) / sizeof(raw_fields[0]);
     for (int i=0; i< raw_num; i+=2) {
 	printf("    %-20s %s\n",raw_fields[i], raw_fields[i+1]);
+    }
+    printf("\n  Socket buffer access:\n");
+    int skb_num = sizeof(skb_fields) / sizeof(skb_fields[0]);
+    for (int i=0; i< skb_num; i+=2) {
+	printf("    %-20s %s\n",skb_fields[i], skb_fields[i+1]);
     }
 
 
@@ -4275,6 +4288,8 @@ int main(int argc, char **argv) {
 	    else if (strcmp(a1,"protocol")==0) compile_match_skb_field(offsetof(struct __sk_buff, protocol), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
 	    else if (strcmp(a1,"skb-mark")==0) compile_match_skb_field(offsetof(struct __sk_buff, mark), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-hash")==0) compile_match_skb_field(offsetof(struct __sk_buff, hash), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
+            else if (strcmp(a1,"skb-ifindex")==0) compile_match_skb_field(offsetof(struct __sk_buff, ifindex), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
+            else if (strcmp(a1,"skb-ingress")==0) compile_match_skb_field(offsetof(struct __sk_buff, ingress_ifindex), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-cb")==0 && t > 3) {
                 // Syntax: match skb-cb <0-4> <expected_val | %VAR>
                 int cb_index = atoi(tok[2]);
