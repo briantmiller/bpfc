@@ -41,13 +41,13 @@ Instructions are strictly **semicolon-separated**. Variables (denoted by `%`) ar
 * `match <field> <value>` - Opens a conditional block. If the packet field does not match the value, execution jumps past the block.
 * `match val %VAR <op> <val | %VAR>` - Compares variables logically (`lt`, `gt`, `le`, `ge`, `eq`, `ne`).
 * `end-match` - Closes the most recent conditional `match` block.
-* `continue` - Terminal. Closes local block, exits eBPF, and tells kernel to evaluate the next TC rule.
-* `drop` - Terminal. Closes local block, exits eBPF, and silently drops the packet.
-* `reclassify` - Terminal. Restarts TC evaluation from rule 0.
+* `continue` - Terminal. Closes most recent match block, exits eBPF, and tells kernel to evaluate the next TC rule.
+* `drop` - Terminal. Closes most recent match block, exits eBPF, and silently drops the packet.
+* `reclassify` - Terminal. Closes most recent match block. Restarts TC evaluation from rule 0.
 
 ### Protocol Shorthands
 Quick boolean filters for specific L2/L3 types. Use as standalone matches (e.g., `match tcp;`).
-* Supported: `ip`, `ip6`, `arp`, `icmp`, `gre`, `tcp`, `udp`, `igmp`, `ospf`, `pim`, `esp`, `rsvp`, `l2tp`.
+* Supported: `ip`, `ip6`, `arp`, `icmp`, `gre`, `tcp`, `udp`, `igmp`, `ospf`, `pim`, `esp`, `rsvp`, `l2tp`, `vlan`, `qinq`.
 
 ### Packet Data Fields (`get`, `set`, `match`)
 Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val | %VAR>`), and evaluation (`match <field> <val | %VAR>`). Subnets (`10.0.0.0/24`) and port ranges (`80-100`) are fully supported.
@@ -89,7 +89,8 @@ Allows persistent data storage across packets and network interfaces.
 * `push-eth <d_mac> <s_mac>` / `pop-eth`
 
 ### Structural Manipulation & Checksums
-* `add-bytes <offset> <len>` / `del-bytes <offset> <len>` - Shifts packet tail down/up.
+* `add-bytes <offset> <len>` / `del-bytes <offset> <len>` - Inserts `<len>` number of bytes at `<offset>` and shifts packet tail down/up.
+* `add-head-bytes <len>` - Adds bytes to head of packet.
 * `add-l2-bytes <len>` / `del-l2-bytes <len>` - Shifts memory exactly at Offset 14.
 * `recalc-tcp-csum`, `recalc-udp-csum`, `recalc-icmp-csum` - Stack-safe L4 recalculations via `bpf_csum_diff`.
 
