@@ -2051,13 +2051,14 @@ void compile_insert_bytes(int offset, int ilen) {
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_pull_data));
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    
+   
+    //Avoid overwriting REG_7 in case we're suing that for looping 
     // 1. Get original packet length (R7 = skb->len)
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1, offsetof(struct __sk_buff, len)));
+    //emit(BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1, offsetof(struct __sk_buff, len)));
     
     // Safety cap: Abort if packet is massive
-    add_safety_jump();
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_7, .imm=9000}));
+    //add_safety_jump();
+    //emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_7, .imm=9000}));
 
     // 2. Expand packet by 'ilen' bytes at the HEAD
     // This natively shifts all existing packet data down by 'ilen' bytes!
@@ -2702,6 +2703,8 @@ void compile_delete_bytes(int offset, int dlen) {
     //emit(BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1, offsetof(struct __sk_buff, data_end)));
     //emit(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_1, offsetof(struct __sk_buff, data)));
     //emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_X, .dst_reg=BPF_REG_7, .src_reg=BPF_REG_3}));
+
+    //TODO: Figure out how to not use REG_7 for deletes, since it may be used for legacy loops
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1, offsetof(struct __sk_buff, len)));
