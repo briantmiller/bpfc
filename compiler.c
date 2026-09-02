@@ -1334,16 +1334,37 @@ void compile_match_vlan_range(uint16_t min_vid, uint16_t max_vid) {
     emit(((struct bpf_insn){.code=BPF_JMP32|BPF_JGT|BPF_K, .dst_reg=BPF_REG_1, .imm=max_vid}));
 }
 
-
-void compile_match_gre_key(uint32_t exp_key) {
+void compile_match_gre_key(uint32_t exp_key, const char *var) {
     start_match_block();
     compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL);
     compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL);
     compile_match_core(34, 1, 0x20, 0x20, NULL);
-    compile_match_core(38, 4, htonl(exp_key), 0xFFFFFFFF, NULL);
+    compile_match_core(38, 4, htonl(exp_key), 0xFFFFFFFF, var);
 }
 
+void compile_match_gre_proto(uint32_t proto, const char *var) {
+    start_match_block();
+    compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL); 
+    compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL); 
+    compile_match_core(34, 2, htons(proto), 0xFFFF, var);
+}   
 
+void compile_get_gre_key(const char *var) {
+    start_match_block();
+    compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL);
+    compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL);
+    compile_match_core(34, 1, 0x20, 0x20, NULL);
+    compile_get_field(38,4,var);
+    compile_end_match();
+}
+
+void compile_get_gre_proto(const char *var) {
+    start_match_block();
+    compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL);
+    compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL);
+    compile_get_field(36,2,var);
+    compile_end_match();
+}
 
 /*
  * Emits bytecode to compare a variable against an immediate value or another variable.
@@ -3901,6 +3922,21 @@ void help(const char *arg0) {
 	"     bswap"				,"switch VAR between big or little endian",
 	"     lsh"				,"shift VAR left by specified number of bits",
 	"     rsh"				,"shift VAR right by specified number of bits",
+	"     start-loop"			,"begin loop of commands",
+	"loop <VAR>"				,"loop back to start of loop is VAR is not zero",
+	"set-reg-loop <INT|0x00|%VAR>"		,"set loop register value to integer, hex or VAR value",
+	"dec-reg-loop"				,"decrement loop register value",
+	"loop-reg"				,"loop back to start of loop if loop register is not zero",
+	"continue"				,"continue processing packet, assumes 'end-match' for most recent match block",
+	"accept"				,"accept packet without continuing down processing chain, assumes 'end-match'",
+	"reclassify"				,"restart packet processing from top chain, assumes 'end-match'",
+	"redirect <iface> [ingress|egress]"	,"send packet to specified interface, optionally specifying ingress or egress, assumes 'end-match'",
+	"redirect-neigh <iface>"		,"send packet to specified interface and apply next-hop layer-2 fields, assumes 'end-match'",
+	"clone <iface> [ingress|egress]"	,"clone and send packet to specified interface, optionally specifying ingress or egress",
+	"fib-lookup [OPTS] <ip-address>"	,"perform FIB lookup on IP address, populate FIB_SMAC, FIB_DMAC, FIB_IFINDEX and FIB_IP_DST variables",
+	"      src <ip-address>"		,"set source IP address for FIB lookup - if source based routing is needed",
+	"      iface <iface>"			,"set source IP interface for FIB lookup - if source based routing is needed",
+	"      output"				,"perform FIB lookup as an output route (sourced locally)",
 
     };
     char *l2_fields[] = {
@@ -3930,6 +3966,8 @@ void help(const char *arg0) {
 	"ip6-dst"		,"IPv6 destination address",
 	"ip6-tclass"		,"IPv6 traffic class",
 	"ip6-flow"		,"IPv6 flow label",
+	"gre-proto"		,"GRE protocol number",
+	"gre-key"		,"GRE key number",
     };
     char *l4_fields[] = {
 	"icmp-type"		,"ICMP type",
@@ -3937,6 +3975,13 @@ void help(const char *arg0) {
 	"tcp-dst"		,"TCP destination port",
 	"udp-src"		,"UDP source port",
 	"udp-dst"		,"UDP destination port",
+	"tcp-flags"		,"TCP flags - match only: FIN, SYN, RST, PSH, ACK, URG",
+    };
+    char *raw_fields[] = {
+	"bytes <off> <len> [VAL]"	,"get/set len bytes at offset in the packet",
+	"add-bytes <off> <len>"		,"insert len bytes at offset in the packet",
+	"del-bytes <off> <len>"		,"delete len bytes at offset in the packet",
+	"add-head-bytes <len>"		,"add len bytes to the beginning of the packet",
     };
     printf("Usage: %s [OPTION...] 'COMMAND;COMMAND;...'\n\n", arg0);
     int opt_num = sizeof(opts) / sizeof(opts[0]);
@@ -3956,7 +4001,7 @@ void help(const char *arg0) {
     for (int i=0; i< l2_num; i+=2) {
 	printf("    %-20s %s\n",l2_fields[i], l2_fields[i+1]);
     }
-    printf("\n  Layer-3:\n");
+    printf("\n  Layer-3/3.5:\n");
     int l3_num = sizeof(l3_fields) / sizeof(l3_fields[0]);
     for (int i=0; i< l3_num; i+=2) {
 	printf("    %-20s %s\n",l3_fields[i], l3_fields[i+1]);
@@ -3966,6 +4011,13 @@ void help(const char *arg0) {
     for (int i=0; i< l4_num; i+=2) {
 	printf("    %-20s %s\n",l4_fields[i], l4_fields[i+1]);
     }
+    printf("\n  Raw byte-level access:\n");
+    int raw_num = sizeof(raw_fields) / sizeof(raw_fields[0]);
+    for (int i=0; i< raw_num; i+=2) {
+	printf("    %-20s %s\n",raw_fields[i], raw_fields[i+1]);
+    }
+
+
 }
 
 /* --- Main CLI & Tokenizer --- */
@@ -4029,6 +4081,8 @@ int main(int argc, char **argv) {
 	    else if (strcmp(f,"tcp-seq")==0) compile_get_field(38, 4, var);
             else if (strcmp(f,"ip-tos")==0) compile_get_field(15,1,var);
             else if (strcmp(f,"ip-proto")==0) compile_get_field(23,1,var);
+            else if (strcmp(f,"gre-proto")==0) compile_get_gre_key(var);
+            else if (strcmp(f,"gre-key")==0) compile_get_gre_proto(var);
             else if (strcmp(f,"eth-proto")==0) compile_get_field(12,2,var);
             else if (strcmp(f,"dst-mac")==0) compile_get_field(0,6,var);
             else if (strcmp(f,"src-mac")==0) compile_get_field(6,6,var);
@@ -4089,8 +4143,6 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"tcp-dst")==0) compile_set_l4_port(0, 1, v?0:atoi(val), v);
             else if (strcmp(f,"udp-src")==0) compile_set_l4_port(1, 0, v?0:atoi(val), v);
             else if (strcmp(f,"udp-dst")==0) compile_set_l4_port(1, 1, v?0:atoi(val), v);
-            //else if (strcmp(f,"vlan-id")==0) compile_set_vlan_id(v?0:atoi(val), v);
-            //else if (strcmp(f,"vlan-id")==0) { compile_pop_vlan(); compile_push_vlan((uint16_t)atoi(a1), t>2?atoi(a2):0);
             else if (strcmp(f,"vlan-id")==0) { compile_pop_vlan(); compile_push_vlan(a1, t>2?a2:NULL); }
             else if (strcmp(f,"mpls-label")==0) compile_set_mpls_field(0, v?0:atoi(val), v);
             else if (strcmp(f,"mpls-bos")==0) compile_set_mpls_field(1, v?0:atoi(val), v);
@@ -4202,7 +4254,8 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"ip-dst")==0) { start_match_block(); uint32_t ip,mk; parse_ip_cidr(val,&ip,&mk); compile_match_core(30,4,ip,mk,mv); }
             else if (strcmp(f,"tcp-src")==0 || strcmp(f,"udp-src")==0) { uint16_t mn,mx; parse_port_range(val,&mn,&mx); compile_match_port_range(34,mn,mx); }
             else if (strcmp(f,"tcp-dst")==0 || strcmp(f,"udp-dst")==0) { uint16_t mn,mx; parse_port_range(val,&mn,&mx); compile_match_port_range(36,mn,mx); }
-            else if (strcmp(f,"gre-key")==0) compile_match_gre_key((uint32_t)atoi(val));
+            else if (strcmp(f,"gre-key")==0) compile_match_gre_key((uint32_t)atoi(val), mv);
+            else if (strcmp(f,"gre-proto")==0) compile_match_gre_proto((uint32_t)atoi(val), mv);
             else if (strcmp(f,"arp-htype")==0) { start_match_block(); compile_match_core(14,2,htons(atoi(val)),0xFFFFFFFF,mv); }
             else if (strcmp(f,"arp-ptype")==0) { start_match_block(); compile_match_core(16,2,htons(strtol(val,NULL,0)),0xFFFFFFFF,mv); }
             else if (strcmp(f,"arp-hlen")==0) { start_match_block(); compile_match_core(18,1,atoi(val),0xFFFFFFFF,mv); }
