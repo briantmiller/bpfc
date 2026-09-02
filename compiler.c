@@ -3990,6 +3990,7 @@ void help(const char *arg0) {
 	"skb-ifindex"		,"interface number - get/match only",
 	"skb-ingress"		,"ingress interface number - get/match only",
 	"protocol"		,"Packet protocol number",
+	"len"			,"Packet length",
     };
     printf("Usage: %s [OPTION...] 'COMMAND;COMMAND;...'\n\n", arg0);
     int opt_num = sizeof(opts) / sizeof(opts[0]);
