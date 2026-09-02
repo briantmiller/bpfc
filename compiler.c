@@ -3958,6 +3958,7 @@ int main(int argc, char **argv) {
 	    //TODO: Add support for getting a random number
 	    else if (strcmp(f,"len") == 0) compile_get_skb_field(offsetof(struct __sk_buff, len), 0,0,var);
 	    else if (strcmp(f,"data") == 0) compile_get_skb_field(offsetof(struct __sk_buff, data), 0,0,var);
+	    else if (strcmp(f,"protocol") == 0) compile_get_skb_field(offsetof(struct __sk_buff, protocol), 0,0,var);
 	    else if (strcmp(f,"skb-mark") == 0) compile_get_skb_field(offsetof(struct __sk_buff, mark), 0,0,var);
             else if (strcmp(f,"skb-hash") == 0) compile_get_skb_field(offsetof(struct __sk_buff, hash), 0,0,var);
             else if (strcmp(f,"skb-ingress") == 0) compile_get_skb_field(offsetof(struct __sk_buff, ingress_ifindex), 0,0,var);
@@ -4017,7 +4018,7 @@ int main(int argc, char **argv) {
 	    else if (strcmp(f,"data") == 0) compile_set_skb_field(offsetof(struct __sk_buff, data), val);
 	    else if (strcmp(f,"skb-mark") == 0) compile_set_skb_field(offsetof(struct __sk_buff, mark), val);
             else if (strcmp(f,"skb-hash") == 0) compile_set_skb_hash(val);
-            else if (strcmp(f,"skb-proto") == 0) compile_set_skb_proto(val);
+            else if (strcmp(f,"protocol") == 0) compile_set_skb_proto(val);
             else if (strcmp(f,"skb-cb") == 0 && t > 3) {
                 // Syntax: set skb-cb <0-4> <VAL | %VAR>
                 int cb_index = atoi(tok[2]);
@@ -4122,6 +4123,7 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"ip6-flow")==0) { start_match_block(); compile_match_core(14, 4, htonl(atoi(val)), htonl(0x000FFFFF), mv); }
             else if (strcmp(f,"icmp-type")==0) { start_match_block(); compile_match_core(34,1,atoi(val),0xFFFFFFFF,mv); }
 	    else if (strcmp(a1,"len")==0) compile_match_skb_field(offsetof(struct __sk_buff, len), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
+	    else if (strcmp(a1,"protocol")==0) compile_match_skb_field(offsetof(struct __sk_buff, protocol), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
 	    else if (strcmp(a1,"skb-mark")==0) compile_match_skb_field(offsetof(struct __sk_buff, mark), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-hash")==0) compile_match_skb_field(offsetof(struct __sk_buff, hash), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-cb")==0 && t > 3) {
