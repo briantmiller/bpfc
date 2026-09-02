@@ -3951,6 +3951,8 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"ip6-tclass")==0) compile_get_bitfield(14, 4, 20, 0xFF, var);
             else if (strcmp(f,"ip6-flow")==0) compile_get_bitfield(14, 4, 0, 0xFFFFF, var);
 	    else if (strcmp(f,"map") == 0 && t > 4) compile_get_map(get_or_create_map(tok[2]), tok[3], tok[4]);
+	    //TODO: Add time functions from here: https://docs.ebpf.io/linux/helper-function/bpf_ktime_get_boot_ns/ 
+	    //TODO: Add support for getting a random number
 	    else if (strcmp(f,"len") == 0) compile_get_skb_field(offsetof(struct __sk_buff, len), 0,0,var);
 	    else if (strcmp(f,"data") == 0) compile_get_skb_field(offsetof(struct __sk_buff, data), 0,0,var);
 	    else if (strcmp(f,"skb-mark") == 0) compile_get_skb_field(offsetof(struct __sk_buff, mark), 0,0,var);
@@ -4186,7 +4188,6 @@ int main(int argc, char **argv) {
 	else if (strcmp(op, "decl") == 0 && t > 2) compile_decl_var(tok[1], atoi(tok[2]));
 	else if (strcmp(op, "push-eth")==0 && t>2) compile_push_eth(a1, a2);
         else if (strcmp(op, "pop-eth")==0) compile_pop_eth();
-        //else if (strcmp(op, "push-vlan")==0) compile_push_vlan((uint16_t)atoi(a1), t>2?atoi(a2):0);
         else if (strcmp(op, "push-vlan")==0) compile_push_vlan(a1, t>2?a2:NULL);
         else if (strcmp(op, "pop-vlan")==0) compile_pop_vlan();
         else if (strcmp(op, "push-qinq")==0 && t>2) compile_push_qinq(atoi(a1), atoi(a2), t>3?atoi(tok[3]):0, t>4?atoi(tok[4]):0);
