@@ -4041,7 +4041,7 @@ void help(const char *arg0) {
     printf("\n  Raw byte-level access:\n");
     int raw_num = sizeof(raw_fields) / sizeof(raw_fields[0]);
     for (int i=0; i< raw_num; i+=2) {
-	printf("    %-20s %s\n",raw_fields[i], raw_fields[i+1]);
+	printf("    %-25s %s\n",raw_fields[i], raw_fields[i+1]);
     }
     printf("\n  Socket buffer access:\n");
     int skb_num = sizeof(skb_fields) / sizeof(skb_fields[0]);
