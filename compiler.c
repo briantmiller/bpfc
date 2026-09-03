@@ -3908,21 +3908,38 @@ void help(const char *arg0) {
 	"set <field> <INT|0x00|%VAR>"		,"set specified field to integer, hex value or value stored in variable VAR",
 	"get <field> <VAR>"			,"get specified field and store into VAR",
 	"match <field> <INT|0x00|%VAR>"		,"conditional, check if field equals value or variable, if so continue execution",
+	"match <shorthand>"			,"match Ethernet and optionally IP protocol",
+	"  vlan"				,"match packets encapsulated in 802.1q VLAN",
+	"  qinq"				,"match packets encapsulated in 801.1ad aka Q-in-Q",
+	"  ip"					,"match packets with Ethernet proto of 0x0800",
+	"  ip6"					,"match packets with Ethernet proto of 0x86dd",
+	"  arp"					,"match packets with Ethernet proto of 0x0806",
+	"  mpls"				,"match packets with Ethernet proto of 0x8847",
+	"  icmp"				,"match IPv4 packets with IP proto of 1",
+	"  igmp"				,"match IPv4 packets with IP proto of 2",
+	"  tcp"					,"match IPv4 packets with IP proto of 6",
+	"  udp"					,"match IPv4 packets with IP proto of 17",
+	"  pim"					,"match IPv4 packets with IP proto of 103",
+	"  esp"					,"match IPv4 packets with IP proto of 50",
+	"  gre"					,"match IPv4 packets with IP proto of 47",
+	"  ospf"				,"match IPv4 packets with IP proto of 89",
+	"  rsvp"				,"match IPv4 packets with IP proto of 46",
+	"  l2tp"				,"match IPv4 packets with IP proto of 115",
 	"end-match"				,"end current match condition",
 	"calc <op> <VAR> <INT|0x00|%VAR>"	,"perform math calculation on variable VAR and value provided or value stored in specified variable",
-	"     add"				,"add specified value to VAR",
-	"     sub"				,"subtract specified value from VAR",
-	"     mul"				,"multiply specified value with VAR",
-	"     div"				,"divide VAR by specified value",
-	"     mod"				,"modulo VAR with specified value",
-	"     or"				,"apply bit-wise OR of VAR and specified value",
-	"     and"				,"apply bit-wise AND of VAR and specified value",
-	"     xor"				,"apply bit-wise XOR of VAR and specified value",
-	"     not"				,"flip bits of VAR",
-	"     bswap"				,"switch VAR between big or little endian",
-	"     lsh"				,"shift VAR left by specified number of bits",
-	"     rsh"				,"shift VAR right by specified number of bits",
-	"     start-loop"			,"begin loop of commands",
+	"  add"					,"add specified value to VAR",
+	"  sub"					,"subtract specified value from VAR",
+	"  mul"					,"multiply specified value with VAR",
+	"  div"					,"divide VAR by specified value",
+	"  mod"					,"modulo VAR with specified value",
+	"  or"					,"apply bit-wise OR of VAR and specified value",
+	"  and"					,"apply bit-wise AND of VAR and specified value",
+	"  xor"					,"apply bit-wise XOR of VAR and specified value",
+	"  not"					,"flip bits of VAR",
+	"  bswap"				,"switch VAR between big or little endian",
+	"  lsh"					,"shift VAR left by specified number of bits",
+	"  rsh"					,"shift VAR right by specified number of bits",
+	"  start-loop"				,"begin loop of commands",
 	"loop <VAR>"				,"loop back to start of loop is VAR is not zero",
 	"set-reg-loop <INT|0x00|%VAR>"		,"set loop register value to integer, hex or VAR value",
 	"dec-reg-loop"				,"decrement loop register value",
@@ -3934,9 +3951,9 @@ void help(const char *arg0) {
 	"redirect-neigh <iface>"		,"send packet to specified interface and apply next-hop layer-2 fields, assumes 'end-match'",
 	"clone <iface> [ingress|egress]"	,"clone and send packet to specified interface, optionally specifying ingress or egress",
 	"fib-lookup [OPTS] <ip-address>"	,"perform FIB lookup on IP address, populate FIB_SMAC, FIB_DMAC, FIB_IFINDEX and FIB_IP_DST variables",
-	"      src <ip-address>"		,"set source IP address for FIB lookup - if source based routing is needed",
-	"      iface <iface>"			,"set source IP interface for FIB lookup - if source based routing is needed",
-	"      output"				,"perform FIB lookup as an output route (sourced locally)",
+	"  src <ip-address>"			,"set source IP address for FIB lookup - if source based routing is needed",
+	"  iface <iface>"			,"set source IP interface for FIB lookup - if source based routing is needed",
+	"  output"				,"perform FIB lookup as an output route (sourced locally)",
 
     };
     char *l2_fields[] = {
@@ -3984,13 +4001,14 @@ void help(const char *arg0) {
 	"add-head-bytes <len>"		,"add len bytes to the beginning of the packet",
     };
     char *skb_fields[] = {
+	"queue"			,"egress queue number",
 	"skb-mark"		,"firewall/packet mark",
 	"skb-hash"		,"software hash",
 	"skb-cb <0-4>"		,"context buffer scratch pad, 5 32-bit values can be stored and passed down the stack",
 	"skb-ifindex"		,"interface number - get/match only",
 	"skb-ingress"		,"ingress interface number - get/match only",
 	"protocol"		,"Packet protocol number",
-	"len"			,"Packet length",
+	"len"			,"Packet length - get/match only",
     };
     printf("Usage: %s [OPTION...] 'COMMAND;COMMAND;...'\n\n", arg0);
     int opt_num = sizeof(opts) / sizeof(opts[0]);
@@ -4123,6 +4141,7 @@ int main(int argc, char **argv) {
 	    else if (strcmp(f,"len") == 0) compile_get_skb_field(offsetof(struct __sk_buff, len), 0,0,var);
 	    else if (strcmp(f,"data") == 0) compile_get_skb_field(offsetof(struct __sk_buff, data), 0,0,var);
 	    else if (strcmp(f,"protocol") == 0) compile_get_skb_field(offsetof(struct __sk_buff, protocol), 0,0,var);
+	    else if (strcmp(f,"queue") == 0) compile_get_skb_field(offsetof(struct __sk_buff, queue_mapping), 0,0,var);
 	    else if (strcmp(f,"skb-mark") == 0) compile_get_skb_field(offsetof(struct __sk_buff, mark), 0,0,var);
             else if (strcmp(f,"skb-hash") == 0) compile_get_skb_field(offsetof(struct __sk_buff, hash), 0,0,var);
             else if (strcmp(f,"skb-ingress") == 0) compile_get_skb_field(offsetof(struct __sk_buff, ingress_ifindex), 0,0,var);
@@ -4286,6 +4305,7 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"ip6-flow")==0) { start_match_block(); compile_match_core(14, 4, htonl(atoi(val)), htonl(0x000FFFFF), mv); }
             else if (strcmp(f,"icmp-type")==0) { start_match_block(); compile_match_core(34,1,atoi(val),0xFFFFFFFF,mv); }
 	    else if (strcmp(a1,"len")==0) compile_match_skb_field(offsetof(struct __sk_buff, len), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
+	    else if (strcmp(a1,"protocol")==0) compile_match_skb_field(offsetof(struct __sk_buff, queue_mapping), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
 	    else if (strcmp(a1,"protocol")==0) compile_match_skb_field(offsetof(struct __sk_buff, protocol), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
 	    else if (strcmp(a1,"skb-mark")==0) compile_match_skb_field(offsetof(struct __sk_buff, mark), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-hash")==0) compile_match_skb_field(offsetof(struct __sk_buff, hash), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
