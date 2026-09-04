@@ -108,6 +108,10 @@
 #define BPF_MAP_LOOKUP_ELEM 1
 #define BPF_MAP_GET_NEXT_KEY 4
 
+#ifndef BPF_MAP_TYPE_PERCPU_ARRAY
+#define BPF_MAP_TYPE_PERCPU_ARRAY 6
+#endif
+
 #ifndef BPF_OBJ_PIN
 #define BPF_OBJ_PIN 6
 #define BPF_OBJ_GET 7
@@ -174,6 +178,20 @@ int num_safety_jumps = 0;
 int verbose_mode = 0; // Tracks if -v was passed
 
 int is_xdp = 0; // Global flag activated by -x
+
+#define MAX_LABELS 128
+struct {
+    char name[32];
+    int target_idx;
+} labels[MAX_LABELS];
+int num_labels = 0;
+
+#define MAX_UNRESOLVED_GOTOS 128
+struct {
+    char target_name[32];
+    int insn_idx; // The prog_idx where the BPF_JA instruction was emitted
+} unresolved_gotos[MAX_UNRESOLVED_GOTOS];
+int num_unresolved_gotos = 0;
 
 void emit(struct bpf_insn insn) {
         if (prog_idx < MAX_INSNS)
@@ -508,7 +526,8 @@ void compile_clone(const char *iface_arg, const char *d) {
     if(strcmp(d, "ingress")==0)
         f = BPF_F_INGRESS;
     else if(strcmp(d, "egress")==0)
-        f = 0; // zero is BPF_F_EGRESS;
+        f = BPF_F_EGRESS;
+        //f = 0; // zero is BPF_F_EGRESS;
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); // skb is the first arg for clone
 
@@ -1041,7 +1060,6 @@ void compile_get_field(int base_offset, int extract_size, const char *var) {
     else emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, v_off));
 }
 
-
 /*
  * Emits bytecode to extract bytes (1, 2, 4, 6, or 8) from the packet into a variable.
  * Preserves pre-declared variable sizes and safely handles 6-byte MAC addresses.
@@ -1187,8 +1205,17 @@ void compile_set_reg_loop(const char *val_str) {
  * Decrements the register loop counter (R7) by 1.
  * Syntax: dec-reg-loop
  */
-void compile_dec_reg_loop(void) {
-    emit(BPF_ALU64_IMM(BPF_SUB, BPF_REG_7, 1)); // R7 -= 1
+void compile_dec_reg_loop(const char *s_val) {
+    if (s_val[0] == '%') {
+        int s_off = get_var_offset(s_val), s_sz = get_var_size(s_val);
+        if (s_sz==1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_10, s_off));
+        else if (s_sz==2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_10, s_off));
+        else if (s_sz==4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, s_off));
+        else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, s_off));
+        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_X, .dst_reg=BPF_REG_7, .src_reg=BPF_REG_2}));
+    } else {
+        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_K, .dst_reg=BPF_REG_7, .imm=strtoul(s_val,NULL,0)}));
+    }
 }
 
 /*
@@ -1205,6 +1232,71 @@ void compile_loop_reg(void) {
 
     // Perform a 32-bit jump on R7: if (R7 > 0) goto start-loop
     emit(((struct bpf_insn){.code = BPF_JMP32 | BPF_JGT | BPF_K, .dst_reg = BPF_REG_7, .src_reg = 0, .off = offset, .imm = 0}));
+}
+
+/*
+ * Registers a new label target.
+ * Syntax: label <NAME>
+ */
+void compile_label(const char *name) {
+    // Check for duplicates
+    for (int i = 0; i < num_labels; i++) {
+        if (strcmp(labels[i].name, name) == 0) {
+            fprintf(stderr, "Error: Duplicate label '%s' defined.\n", name);
+            exit(1);
+        }
+    }
+
+    if (num_labels >= MAX_LABELS) {
+        fprintf(stderr, "Error: Maximum number of labels exceeded.\n");
+        exit(1);
+    }
+
+    strncpy(labels[num_labels].name, name, 31);
+    labels[num_labels].target_idx = prog_idx; // The instruction immediately following the label
+    num_labels++;
+
+    if (verbose_mode) {
+        print_indent();
+        printf("[+] Label '%s' registered at index %d\n", name, prog_idx);
+    }
+}
+
+/*
+ * Emits an unconditional jump (BPF_JA) to a label.
+ * Syntax: goto <NAME>
+ */
+void compile_goto(const char *name) {
+    // Emit a placeholder unconditional jump
+    int goto_idx = prog_idx;
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA, .dst_reg = 0, .src_reg = 0, .off = 0, .imm = 0}));
+
+    // 1. Check if the label was already defined (Backward Jump)
+    for (int i = 0; i < num_labels; i++) {
+        if (strcmp(labels[i].name, name) == 0) {
+            prog[goto_idx].off = labels[i].target_idx - goto_idx - 1;
+            if (verbose_mode) {
+                print_indent();
+                printf("--> GOTO (Backward): Patched offset %d to Label '%s'\n", prog[goto_idx].off, name);
+            }
+            return;
+        }
+    }
+
+    // 2. Not defined yet (Forward Jump). Add to unresolved queue.
+    if (num_unresolved_gotos >= MAX_UNRESOLVED_GOTOS) {
+        fprintf(stderr, "Error: Maximum number of unresolved gotos exceeded.\n");
+        exit(1);
+    }
+
+    strncpy(unresolved_gotos[num_unresolved_gotos].target_name, name, 31);
+    unresolved_gotos[num_unresolved_gotos].insn_idx = goto_idx;
+    num_unresolved_gotos++;
+
+    if (verbose_mode) {
+        print_indent();
+        printf("--> GOTO (Forward): Queued unresolved jump to Label '%s'\n", name);
+    }
 }
 
 void compile_match_core(int offset, int size, uint32_t exp, uint32_t mask, const char *var) {
@@ -1443,7 +1535,7 @@ void compile_set_field(int base_offset, int size, uint32_t net_val, const char *
 
     // Save R1 to scratch stack
     int val_scratch = next_var_offset - 8;
-    next_var_offset = val_scratch;
+    //next_var_offset = val_scratch;
     emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, val_scratch));
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
@@ -1716,35 +1808,90 @@ void compile_set_ip_addr(int is_dst, uint32_t ip, const char *var) {
     emit(BPF_CALL_FUNC(BPF_FUNC_l3_csum_replace));
 }
 
+/*
+ * Emits bytecode to overwrite a 1-byte IPv4 field (like TOS or Protocol).
+ * Aligns the 1-byte values into 16-bit words to guarantee perfect L3 Checksum recalculations.
+ */
 void compile_set_ip_field8(int offset, uint8_t new_val, const char *var) {
     if (var) {
         emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, get_var_offset(var)));
         emit(BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_1, -8));
-    } else emit(BPF_ST_MEM(BPF_B, BPF_REG_10, -8, new_val));
+    } else {
+        emit(BPF_ST_MEM(BPF_B, BPF_REG_10, -8, new_val));
+    }
 
+    // 1. Load OLD 1-byte value from packet into stack (-4)
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV64_IMM(BPF_REG_2, offset));
-       
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-4}));
     emit(BPF_MOV64_IMM(BPF_REG_4, 1));
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
 
+    // 2. Overwrite packet with NEW 1-byte value
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV64_IMM(BPF_REG_2, offset));
-       
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-8}));
     emit(BPF_MOV64_IMM(BPF_REG_4, 1));
     emit(BPF_MOV64_IMM(BPF_REG_5, 0));
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
 
+    // 3. Update the L3 Checksum
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV64_IMM(BPF_REG_2, IP_CSUM_OFFSET));
-           
+
+    // Load OLD byte into R3
     emit(BPF_LDX_MEM(BPF_B, BPF_REG_3, BPF_REG_10, -4));
+
+    // Load NEW byte into R4
     emit(BPF_LDX_MEM(BPF_B, BPF_REG_4, BPF_REG_10, -8));
-      
+
+    // --- FIX CLIPPING ALIGNMENT ---
+    // Because TOS (offset 15) and Protocol (offset 23) sit at the odd-byte
+    // boundary of a 16-bit word, their delta mathematically impacts the upper 8 bits
+    // of the checksum calculation. We must shift R3 and R4 left by 8 bits!
+    // (If we were modifying TTL at offset 22, we would not shift them).
+    if (offset % 2 != 0) {
+        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_LSH|BPF_K, .dst_reg=BPF_REG_3, .imm=8}));
+        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_LSH|BPF_K, .dst_reg=BPF_REG_4, .imm=8}));
+    }
+
+    // Tell the helper these are perfectly aligned 16-bit values (flag = 2)
+    emit(BPF_MOV64_IMM(BPF_REG_5, 2));
+    emit(BPF_CALL_FUNC(BPF_FUNC_l3_csum_replace));
+}
+
+
+void compile_set_ip_field16(int offset, uint16_t new_val, const char *var) {
+    if (var) {
+        emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, get_var_offset(var)));
+        emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, -8));
+    } else emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -8, htons(new_val)));
+
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, offset));
+
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-4}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 2));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, offset));
+
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-8}));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 2));
+    emit(BPF_MOV64_IMM(BPF_REG_5, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, IP_CSUM_OFFSET));
+
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_3, BPF_REG_10, -4));
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, -8));
+
     emit(BPF_MOV64_IMM(BPF_REG_5, 2));
     emit(BPF_CALL_FUNC(BPF_FUNC_l3_csum_replace));
 }
@@ -2594,6 +2741,26 @@ void compile_add_head_bytes(const char *len_arg) {
     prog[z_end1].off = prog_idx - z_end1 - 1;
 }
 
+void compile_set_length(const char *len_arg) {
+    if (len_arg[0] == '%') {
+        int v_off = get_var_offset(len_arg);
+        int v_sz = get_var_size(len_arg);
+        
+        // Load variable size into R2
+        if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_10, v_off));
+        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_10, v_off));
+        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+        else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, v_off));
+        
+    } else {
+        uint32_t imm = (uint32_t)strtoul(len_arg, NULL, 0);
+        emit(BPF_MOV64_IMM(BPF_REG_2, imm));
+    }
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_3, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_change_tail));
+}
+
 /*
  * Emits bytecode to delete 'dlen' bytes starting at 'offset'.
  * Hardened to prevent intermittent drops due to fragmentation or off-by-one bounds.
@@ -2709,6 +2876,7 @@ void compile_add_head_bytes(const char *len_arg) {
     // (Removed the safety drop jump here).
 }*/
 
+//void compile_set_
 
 /*
  * Emits bytecode to delete 'dlen' bytes starting at 'offset'.
@@ -2740,7 +2908,7 @@ void compile_delete_bytes(int offset, int dlen) {
     //emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGE|BPF_X, .dst_reg=BPF_REG_8, .src_reg=BPF_REG_7}));
 
     int ctx_spill = next_var_offset - 8;
-    next_var_offset = ctx_spill;
+    //next_var_offset = ctx_spill;
     emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_6, ctx_spill));
 
     // Allocate as much as possible for the scratch buffer
@@ -2749,10 +2917,11 @@ void compile_delete_bytes(int offset, int dlen) {
 	    chunk_size = 256;
     else if (504 + next_var_offset >= 128)
 	    chunk_size = 128;
-    next_var_offset &= ~7;
-    int scratch = next_var_offset - chunk_size - 8;
+    //next_var_offset &= ~7;
+    //int scratch = next_var_offset - chunk_size - 8;
+    int scratch = ctx_spill - chunk_size - 8;
     if (scratch < -512) { fprintf(stderr, "Error: Stack exhausted.\n"); exit(1); }
-    next_var_offset = scratch;
+    //next_var_offset = scratch;
 
     int max_iter = (9000 / chunk_size);
 
@@ -3760,6 +3929,179 @@ int bpf_map_get_next_key_user(int fd, const void *key, void *next_key) {
 }
 
 /*
+ * Creates a PERCPU Array Map designed to hold a single massive 9000-byte buffer
+ * for each CPU core. This avoids lock contention and race conditions.
+ */
+int create_bpf_buffer_map(const char *name, int cpu) {
+    union bpf_attr attr = {
+        .map_type    = cpu?BPF_MAP_TYPE_PERCPU_ARRAY:BPF_MAP_TYPE_LRU_HASH,
+        .key_size    = cpu?4:12,      // 32-bit key (We will just use Index 0)
+        .value_size  = 15000,   // MTU-sized payload buffer
+        .max_entries = cpu?1:10000,      // We only need 1 buffer per CPU core
+    };
+    strcpy(attr.map_name, name);
+    int fd = bpf_syscall(BPF_MAP_CREATE, &attr, sizeof(attr));
+    if (fd < 0) perror("Failed to create Per-CPU Buffer Map");
+    return fd;
+}
+
+int get_or_create_buffer_map(const char *name, int per_cpu) {
+    for (int i = 0; i < num_maps; i++) {
+        if (strcmp(maps[i].name, name) == 0) return maps[i].fd;
+    }
+
+    char pin_path[256];
+    //snprintf(pin_path, sizeof(pin_path), "%s%s", BPF_FS_DIR, name);
+    snprintf(pin_path, sizeof(pin_path), "%s/%s", bpf_map_dir, name);
+    int fd = get_pinned_map_fd(pin_path);
+
+    if (fd < 0) {
+        fd = create_bpf_buffer_map(name, per_cpu);
+        if (fd < 0) exit(1);
+        if (pin_map_fd(fd, pin_path) < 0) fprintf(stderr, "Warning: Failed to pin buffer map.\n");
+    }
+
+    strncpy(maps[num_maps].name, name, 31);
+    maps[num_maps].fd = fd;
+    return maps[num_maps++].fd;
+}
+
+/*
+ * Emits bytecode to copy 'len' bytes from the packet into the Per-CPU Buffer Map.
+ * Syntax: save-packet <MAP_NAME> <len> [src_off] [dst_off]
+ */
+void compile_save_packet(int map_fd, const char *len_arg, const char *src_off_arg, const char *dst_off_arg) {
+    // 1. Setup Key (Index 0) on stack
+    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0));
+    
+    // 2. Lookup Map Pointer
+    emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .off = 0, .imm = map_fd}));
+    emit(((struct bpf_insn){.code = 0x00, .dst_reg = 0,         .src_reg = 0, .off = 0, .imm = 0}));
+    
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
+    emit(BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    
+    // Safety abort if map lookup fails
+    add_safety_jump();
+    emit(((struct bpf_insn){.code = BPF_JMP|BPF_JEQ|BPF_K, .dst_reg = BPF_REG_0, .imm = 0}));
+
+    // 3. Resolve Length into R4
+    if (len_arg[0] == '%') {
+        int v_off = get_var_offset(len_arg);
+        int v_sz = get_var_size(len_arg);
+        if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_4, BPF_REG_10, v_off));
+        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, v_off));
+        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, v_off));
+        else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_10, v_off));
+        add_safety_jump();
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=0}));
+        int skip_cap = prog_idx;
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=9000}));
+        emit(BPF_MOV64_IMM(BPF_REG_4, 9000));
+        prog[skip_cap].off = prog_idx - skip_cap - 1;
+    } else {
+        uint32_t imm = (uint32_t)strtoul(len_arg, NULL, 0);
+        if (imm > 9000) imm = 9000;
+        if (imm == 0) return;
+        emit(BPF_MOV64_IMM(BPF_REG_4, imm));
+    }
+
+    // 4. Resolve SRC offset (from packet) into R2
+    if (src_off_arg && src_off_arg[0] == '%') {
+        int v_off = get_var_offset(src_off_arg);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off)); // Assume 32-bit variable
+    } else {
+        uint32_t imm = src_off_arg ? (uint32_t)strtoul(src_off_arg, NULL, 0) : 0;
+        emit(BPF_MOV64_IMM(BPF_REG_2, imm));
+    }
+
+    // 5. Resolve DST offset (into map buffer) and calculate R3 = Map_Ptr (R0) + DST
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_0));
+    if (dst_off_arg && dst_off_arg[0] == '%') {
+        int v_off = get_var_offset(dst_off_arg);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+        emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_3, .src_reg = BPF_REG_1}));
+    } else {
+        uint32_t imm = dst_off_arg ? (uint32_t)strtoul(dst_off_arg, NULL, 0) : 0;
+        emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_3, .imm = imm}));
+    }
+
+    // 6. Execute save (bpf_skb_load_bytes)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); // skb
+    // R2 = src_off, R3 = map_ptr + dst_off, R4 = len
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+}
+
+/*
+ * Emits bytecode to overwrite the packet using 'len' bytes from the Per-CPU Buffer Map.
+ * Syntax: load-packet <MAP_NAME> <len> [src_off] [dst_off]
+ */
+void compile_load_packet(int map_fd, const char *len_arg, const char *src_off_arg, const char *dst_off_arg) {
+    // 1. Setup Key (Index 0) on stack
+    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0));
+    
+    // 2. Lookup Map Pointer
+    emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .off = 0, .imm = map_fd}));
+    emit(((struct bpf_insn){.code = 0x00, .dst_reg = 0,         .src_reg = 0, .off = 0, .imm = 0}));
+    
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
+    emit(BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    
+    add_safety_jump();
+    emit(((struct bpf_insn){.code = BPF_JMP|BPF_JEQ|BPF_K, .dst_reg = BPF_REG_0, .imm = 0}));
+
+    // 3. Resolve Length into R4
+    if (len_arg[0] == '%') {
+        int v_off = get_var_offset(len_arg);
+        int v_sz = get_var_size(len_arg);
+        if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_4, BPF_REG_10, v_off));
+        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, v_off));
+        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, v_off));
+        else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_10, v_off));
+        
+        add_safety_jump();
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=0}));
+        int skip_cap = prog_idx;
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=9000}));
+        emit(BPF_MOV64_IMM(BPF_REG_4, 9000));
+        prog[skip_cap].off = prog_idx - skip_cap - 1;
+    } else {
+        uint32_t imm = (uint32_t)strtoul(len_arg, NULL, 0);
+        if (imm > 9000) imm = 9000;
+        if (imm == 0) return;
+        emit(BPF_MOV64_IMM(BPF_REG_4, imm));
+    }
+
+    // 4. Resolve SRC offset (from map buffer) and calculate R3 = Map_Ptr (R0) + SRC
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_0));
+    if (src_off_arg && src_off_arg[0] == '%') {
+        int v_off = get_var_offset(src_off_arg);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+        emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_3, .src_reg = BPF_REG_1}));
+    } else {
+        uint32_t imm = src_off_arg ? (uint32_t)strtoul(src_off_arg, NULL, 0) : 0;
+        emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_3, .imm = imm}));
+    }
+
+    // 5. Resolve DST offset (into packet) into R2
+    if (dst_off_arg && dst_off_arg[0] == '%') {
+        int v_off = get_var_offset(dst_off_arg);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off)); 
+    } else {
+        uint32_t imm = dst_off_arg ? (uint32_t)strtoul(dst_off_arg, NULL, 0) : 0;
+        emit(BPF_MOV64_IMM(BPF_REG_2, imm));
+    }
+
+    // 6. Execute load (bpf_skb_store_bytes)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); // skb
+    // R2 = dst_off, R3 = map_ptr + src_off, R4 = len
+    emit(BPF_MOV64_IMM(BPF_REG_5, 0));         // flags = 0
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+}
+
+/*
  * Retrieves an active Map FD from the filesystem, iterates through all
  * populated entries, and prints them in Hex format.
  */
@@ -3893,6 +4235,63 @@ int detach_bpf_tc(const char *iface) {
     return 0;
 }
 
+/*
+ * Reads instructions from a file or STDIN into a dynamically allocated buffer.
+ * Strips \n, \r, and \t characters, converting tabs to spaces.
+ */
+char* read_instructions_from_file(const char *filename) {
+    FILE *f;
+    if (strcmp(filename, "-") == 0) {
+        f = stdin;
+    } else {
+        f = fopen(filename, "r");
+        if (!f) {
+            fprintf(stderr, "Error: Could not open file '%s'\n", filename);
+            exit(1);
+        }
+    }
+
+    // Allocate an initial 8KB buffer
+    size_t buf_size = 8192;
+    char *buffer = malloc(buf_size);
+    if (!buffer) {
+        perror("malloc");
+        exit(1);
+    }
+
+    size_t len = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        // Expand buffer if needed
+        if (len + 2 >= buf_size) {
+            buf_size *= 2;
+            buffer = realloc(buffer, buf_size);
+            if (!buffer) {
+                perror("realloc");
+                exit(1);
+            }
+        }
+        
+        // Strip newlines and carriage returns
+        if (c == '\n' || c == '\r') {
+            continue;
+        }
+        
+        // Convert tabs to spaces for the tokenizer
+        if (c == '\t') {
+            c = ' ';
+        }
+        
+        buffer[len++] = (char)c;
+    }
+    
+    buffer[len] = '\0';
+    if (f != stdin) fclose(f);
+    
+    return buffer;
+}
+
+
 void help(const char *arg0) {
     char *opts[] = {
         "-i <interface>"	,"attach program to specific interface",
@@ -3901,6 +4300,7 @@ void help(const char *arg0) {
         "-p <priority>"		,"attachment priority, lower first",
         "-m <dir>"		,"specify directory for BPF maps",
         "-r <map>"		,"dump contents of specified map",
+        "-f <file>"		,"read command instructions from file, - for STDIN",
         "-v"			,"verbose output",
     };
     char *cmds[] = {
@@ -3939,7 +4339,7 @@ void help(const char *arg0) {
 	"  bswap"				,"switch VAR between big or little endian",
 	"  lsh"					,"shift VAR left by specified number of bits",
 	"  rsh"					,"shift VAR right by specified number of bits",
-	"  start-loop"				,"begin loop of commands",
+	"start-loop"				,"begin loop of commands",
 	"loop <VAR>"				,"loop back to start of loop is VAR is not zero",
 	"set-reg-loop <INT|0x00|%VAR>"		,"set loop register value to integer, hex or VAR value",
 	"dec-reg-loop"				,"decrement loop register value",
@@ -4048,14 +4448,13 @@ void help(const char *arg0) {
     for (int i=0; i< skb_num; i+=2) {
 	printf("    %-20s %s\n",skb_fields[i], skb_fields[i+1]);
     }
-
-
 }
 
 /* --- Main CLI & Tokenizer --- */
 int main(int argc, char **argv) {
     int pri = 0;
     char *iface = NULL, *dir = "ingress", *instr = NULL; int clean = 0;
+    char *filename = NULL;
     char *read_map = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i],"-i")==0) iface = argv[++i];
@@ -4065,6 +4464,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i],"-v")==0) verbose_mode = 1;
         else if (strcmp(argv[i],"-m")==0) strcpy(bpf_map_dir,argv[++i]);
 	else if (strcmp(argv[i],"-r")==0) read_map = argv[++i];
+	else if (strcmp(argv[i],"-f")==0) filename = argv[++i];
 	else if (strcmp(argv[i],"-h")==0) { help(argv[0]); return 0; }
         else instr = argv[i];
     }
@@ -4077,33 +4477,44 @@ int main(int argc, char **argv) {
         instr = NULL;
     }
     if (clean) return detach_bpf_tc(iface) < 0 ? 1 : 0;
+    if (filename) {
+        instr = read_instructions_from_file(filename);
+    }
     if (!instr) { printf("Usage: %s -i <iface> [-d ingress|egress] \"<cmds>\"\n", argv[0]); return 1; }
 
     emit(BPF_MOV64_REG(BPF_REG_6, BPF_REG_1)); 
 
     char *save_c, *save_w, *cmd = strtok_r(instr, ";", &save_c);
     while (cmd) {
-        char *tok[16]; int t = 0;
+        char *tok[16];
+	int t = 0;
+	while (*cmd == '\n' || *cmd == '\r' || *cmd == ' ' || *cmd == '\t') {
+		++cmd;
+	}
         char *w = strtok_r(cmd, " ", &save_w);
-        while (w && t < 16) { tok[t++] = w; w = strtok_r(NULL, " ", &save_w); }
+        while (w && t < 16) { 
+		tok[t++] = w; 
+		w = strtok_r(NULL, " ", &save_w); 
+	}
         if (t == 0) { cmd = strtok_r(NULL, ";", &save_c); continue; }
         
         char *op = tok[0]; 
 	char *a1 = t>1 ? tok[1] : NULL; 
 	char *a2 = t>2 ? tok[2] : NULL; 
 	char *a3 = t>3 ? tok[3] : NULL; 
-        
-		if (verbose_mode) {
+
+	if (verbose_mode) {
             print_indent();
-            printf("[%03d] Command: %s", prog_idx, op);
+            printf("[%03d] Command: '%s'", prog_idx, op);
             for (int k = 1; k < t; k++) printf(" %s", tok[k]);
-            printf("\n");
+	            printf("\n");
         }
 		
-        if (op[0] == '#') {
+        if (strlen(op) == 0 || op[0] == '#') {
 	    cmd = strtok_r(NULL, ";", &save_c);
 	    continue;
-	} else if (strcmp(op, "get") == 0 && t > 2) {
+	}
+	if (strcmp(op, "get") == 0 && t > 2) {
             char *f = a1; char *var = a2;
             if (strcmp(f,"bytes")==0 && t > 3) compile_get_raw_bytes(atoi(tok[2]), atoi(tok[3]), tok[4]);
 	    else if (strcmp(f,"ip-src")==0) compile_get_field(26,4,var);
@@ -4112,6 +4523,8 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"tcp-dst")==0 || strcmp(f,"udp-dst")==0) compile_get_field(36,2,var);
 	    else if (strcmp(f,"tcp-seq")==0) compile_get_field(38, 4, var);
             else if (strcmp(f,"ip-tos")==0) compile_get_field(15,1,var);
+            else if (strcmp(f,"ip-len")==0) compile_get_field(16,2,var);
+            else if (strcmp(f,"ip-frag")==0) compile_get_field(20,2,var);
             else if (strcmp(f,"ip-proto")==0) compile_get_field(23,1,var);
             else if (strcmp(f,"gre-proto")==0) compile_get_gre_key(var);
             else if (strcmp(f,"gre-key")==0) compile_get_gre_proto(var);
@@ -4172,6 +4585,8 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"ip-dst")==0) compile_set_ip_addr(1, v?0:inet_addr(val), v);
             else if (strcmp(f,"ip-tos")==0) compile_set_ip_field8(15, v?0:atoi(val), v);
             else if (strcmp(f,"ip-proto")==0) compile_set_ip_field8(23, v?0:atoi(val), v);
+            else if (strcmp(f,"ip-len")==0) compile_set_ip_field16(16, v?0:atoi(val), v);
+            else if (strcmp(f,"ip-frag")==0) compile_set_ip_field16(20, v?0:atoi(val), v);
             else if (strcmp(f,"tcp-src")==0) compile_set_l4_port(0, 0, v?0:atoi(val), v);
             else if (strcmp(f,"tcp-dst")==0) compile_set_l4_port(0, 1, v?0:atoi(val), v);
             else if (strcmp(f,"udp-src")==0) compile_set_l4_port(1, 0, v?0:atoi(val), v);
@@ -4197,6 +4612,7 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"icmp-type")==0){ compile_set_field(34, 1, v?0:atoi(val), v); compile_recalculate_icmp_csum(); }
 	    else if (strcmp(f,"map") == 0 && t > 4) compile_set_map(get_or_create_map(tok[2]), tok[3], tok[4]);
 	    else if (strcmp(f,"data") == 0) compile_set_skb_field(offsetof(struct __sk_buff, data), val);
+	    else if (strcmp(f,"len") == 0) compile_set_length(val);
 	    else if (strcmp(f,"skb-mark") == 0) compile_set_skb_field(offsetof(struct __sk_buff, mark), val);
             else if (strcmp(f,"skb-hash") == 0) compile_set_skb_hash(val);
             else if (strcmp(f,"protocol") == 0) compile_set_skb_proto(val);
@@ -4283,6 +4699,8 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"mpls-bos")==0) { start_match_block(); compile_match_core(14,4,htonl((atoi(val)&1)<<8),htonl(0x00000100),mv); }
             else if (strcmp(f,"ip-proto")==0) { start_match_block(); compile_match_core(23,1,atoi(val),0xFFFFFFFF,mv); }
             else if (strcmp(f,"ip-tos")==0) { start_match_block(); compile_match_core(15,1,atoi(val),0xFFFFFFFF,mv); }
+            else if (strcmp(f,"ip-frag")==0) { start_match_block(); compile_match_core(20,2,atoi(val),0xFFFFFFFF,mv); }
+            else if (strcmp(f,"ip-len")==0) { start_match_block(); compile_match_core(16,2,atoi(val),0xFFFFFFFF,mv); }
             else if (strcmp(f,"ip-src")==0) { start_match_block(); uint32_t ip,mk; parse_ip_cidr(val,&ip,&mk); compile_match_core(26,4,ip,mk,mv); }
             else if (strcmp(f,"ip-dst")==0) { start_match_block(); uint32_t ip,mk; parse_ip_cidr(val,&ip,&mk); compile_match_core(30,4,ip,mk,mv); }
             else if (strcmp(f,"tcp-src")==0 || strcmp(f,"udp-src")==0) { uint16_t mn,mx; parse_port_range(val,&mn,&mx); compile_match_port_range(34,mn,mx); }
@@ -4432,8 +4850,10 @@ int main(int argc, char **argv) {
         else if (strcmp(op, "start-loop") == 0) compile_start_loop();
         else if (strcmp(op, "loop") == 0 && t > 1) compile_loop(a1);
         else if (strcmp(op, "set-reg-loop") == 0 && t > 1) compile_set_reg_loop(a1);
-        else if (strcmp(op, "dec-reg-loop") == 0) compile_dec_reg_loop();
+        else if (strcmp(op, "dec-reg-loop") == 0 && t > 1) compile_dec_reg_loop(a1);
         else if (strcmp(op, "loop-reg") == 0) compile_loop_reg();
+        else if (strcmp(op, "label") == 0 && t > 1) compile_label(a1);
+        else if (strcmp(op, "goto") == 0 && t > 1) compile_goto(a1);
         else if (strcmp(op, "drop")==0) compile_drop_packet();
         else if (strcmp(op, "continue")==0) compile_continue_packet();
         else if (strcmp(op, "accept")==0) compile_accept_packet();
@@ -4443,12 +4863,44 @@ int main(int argc, char **argv) {
         else if (strcmp(op, "redirect-neigh")==0) compile_redirect_neigh(a1);
         else if (strcmp(op, "clone")==0) compile_clone(a1, a2?a2:dir);
         else if (strcmp(op, "debug-log")==0) compile_debug_log(a1);
-	else {
+	else if (strcmp(op, "save-packet") == 0 && t > 2) {
+            // Syntax: save-packet <MAP_NAME> <len> [src_off] [dst_off]
+            int map_fd = get_or_create_buffer_map(a1,1);
+            char *src_off = t > 3 ? tok[3] : NULL;
+            char *dst_off = t > 4 ? tok[4] : NULL;
+            compile_save_packet(map_fd, tok[2], src_off, dst_off);
+        } else if (strcmp(op, "load-packet") == 0 && t > 2) {
+            // Syntax: load-packet <MAP_NAME> <len> [src_off] [dst_off]
+            int map_fd = get_or_create_buffer_map(a1,1);
+            char *src_off = t > 3 ? tok[3] : NULL;
+            char *dst_off = t > 4 ? tok[4] : NULL;
+            compile_load_packet(map_fd, tok[2], src_off, dst_off);
+        } else {
              printf("Invalid instruction %s\n",op);
 	     exit(2);
 	}
 
         cmd = strtok_r(NULL, ";", &save_c);
+    }
+
+    // --- RESOLVE FORWARD GOTOS ---
+    for (int i = 0; i < num_unresolved_gotos; i++) {
+        int found = 0;
+        for (int j = 0; j < num_labels; j++) {
+            if (strcmp(unresolved_gotos[i].target_name, labels[j].name) == 0) {
+                int g_idx = unresolved_gotos[i].insn_idx;
+                prog[g_idx].off = labels[j].target_idx - g_idx - 1;
+                found = 1;
+                if (verbose_mode) {
+                    printf("[*] Resolved forward GOTO to Label '%s' (Offset: %d)\n", labels[j].name, prog[g_idx].off);
+                }
+                break;
+            }
+        }
+        if (!found) {
+            fprintf(stderr, "Fatal Compile Error: Undefined goto target label '%s'\n", unresolved_gotos[i].target_name);
+            exit(1);
+        }
     }
 
     int need_epilogue = 0;
