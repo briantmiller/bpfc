@@ -242,24 +242,39 @@ echo "
 match ip;
 	decl IPFRAG 2;
 	decl FRAG2 2;
-	decl IPLEN 2;
-	decl NEWLEN 2;
-	decl TLEN 2;
+	decl IPLEN 4;
+	decl NEWLEN 4;
+	decl TLEN 4;
+	decl L1 4;
+	decl L2 4;
 	get ip-frag IPFRAG;
 	set val FRAG2 %IPFRAG;
 	#calc and IPFRAG 0xFF1F;
 	#calc and IPFRAG 8191;
 	#calc bswap IPFRAG;
-	calc and IPFRAG 0x1FFF;
+	calc and IPFRAG 0x00001FFF;
 	get ip-len IPLEN;
-	set map DEFRAG %IPLEN %IPLEN;
+	#set map DEFRAG %IPFRAG %IPLEN;
 	match val IPFRAG gt 0;
 		#calc bswap IPLEN;
 		#calc sub IPLEN 20;
 		#FRAGEMENT OFFSET * 8 + IP LEN = new length
-		calc mul IPFRAG 8;
-		set val NEWLEN %IPLEN;
+		set val NEWLEN 0;
 		calc add NEWLEN %IPFRAG;
+		calc lsh NEWLEN 3;
+		calc add NEWLEN %IPLEN;
+		calc lsh IPFRAG 3;
+		set map DEFRAG %IPFRAG %NEWLEN;
+		set val L1 34;
+		calc add L1 %IPLEN;
+		calc add IPFRAG %IPLEN;
+		get len L2;
+		match val IPFRAG le %L2;
+		match val L1 lt %L2;
+			save-packet DEFRAG_BUF %IPLEN 34 %IPFRAG;
+		end-match;
+		end-match;
+		#
 		#load-packet DEFRAG_BUF 20 14 14;
 		#calc bswap FRAG2;
 		#set ip-frag FRAG2;
@@ -287,7 +302,7 @@ match ip;
 		#set map DEFRAG %NEWLEN %FRAG2;
 		#calc sub IPFRAG 14;
 		set val TLEN %NEWLEN;
-		calc add TLEN 14;
+		calc add TLEN 34;
 		set len %TLEN;
 		load-packet DEFRAG_BUF %NEWLEN 14 14;
 		set ip-len %NEWLEN;
@@ -589,11 +604,11 @@ ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 -m /var/run/bpf/
 #timeout 5 ip netns exec CE1 tcpdump -levnpi pe1 -Q out -XX &
 #timeout 5 ip netns exec CE2 tcpdump -levnpi pe1 -XX &
 #timeout 5 ip netns exec CE1 tcpdump -levnpi h1 -XX &> out4.txt &
-#timeout 5 ip netns exec CE1 tcpdump -levnpi h1 -XX &
+#timeout 5 ip netns exec CE1 tcpdump -levnpi h1 -XX icmp &> out.ce1.txt &
 #timeout 5 ip netns exec CE2 tcpdump -levnpi h2 -XX &
-#timeout 3 ip netns exec H1 tcpdump -levnpi ce1 -XX &
+#timeout 3 ip netns exec H1 tcpdump -levnpi ce1 -XX icmp &> out.h1.txt &
 #timeout 5 ip netns exec H1 tcpdump -levnpi ce1 -Q out &
-timeout 3 ip netns exec H2 tcpdump -levnpi ce2 -XX &
+timeout 3 ip netns exec H2 tcpdump -levnpi ce2 -XX icmp &
 sleep 0.5s
 
 timeout 3 ip netns exec H1 ping -c1 -s 380 -i 0.1 -W0.2 192.168.0.2 &>/dev/null && test_pass MPLS-pw || test_fail MPLS-pw
@@ -686,7 +701,10 @@ fi
 
 wait &>/dev/null
 ip netns exec CE2 ./bpf_compiler $COPTS -m /var/run/bpf/CE2 -r DEFRAG
-
+for C in H1 H2 H3 CE1 CE2 PE1
+do      
+        umount /var/run/bpf/$C &>/dev/null
+done
 ip netns del H1
 ip netns del H2
 ip netns del PE1
