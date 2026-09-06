@@ -80,8 +80,10 @@ ip netns exec RX mkdir -p /var/run/bpf/RX
 #ip netns exec TX bash -c "mount | grep /sys/fs/bpf | grep -q '^bpffs ' || (umount /sys/fs/bpf; mount -t bpf bpffs /sys/fs/bpf; mount | grep bpf)"
 #ip netns exec RX bash -c "mount | grep /sys/fs/bpf | grep -q '^bpffs ' || (umount /sys/fs/bpf; mount -t bpf bpffs /sys/fs/bpf ; mount | grep bpf)"
 ip netns exec TX mount -t bpf bpffs /var/run/bpf/TX
+umount /var/run/bpf/TX &>/dev/null
 mount -t bpf bpffs /var/run/bpf/TX
 ip netns exec RX mount -t bpf bpffs /var/run/bpf/RX
+umount /var/run/bpf/RX &>/dev/null
 #mount -t bpf bpffs /var/run/bpf/RX
 ip link add tx0 type veth peer name rx0
 ip link add rx1 netns RX type veth peer name rx1 netns RX2
@@ -162,8 +164,21 @@ ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 99 'match tcp; match 
 echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_fail TCP-drop || test_pass TCP-drop
 
 #Test rewriting TCP destination port
+#ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 90 'decl TDST 2;match tcp; get tcp-dst TDST; set tcp-dst %TDST'
+#ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 90 'match tcp; get tcp-dst TDST; calc sub TDST 8; set tcp-dst %TDST'
+#timeout 3 ip netns exec TX tcpdump -lvnnpi tx0 &
+#timeout 3 ip netns exec RX tcpdump -lvnpi rx0 
+#sleep 0.5s
+#ip netns exec TX ping -c 1 2.2.2.2
+#echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_pass Get/Set tcp-dst || test_fail Get/Set tcp-dst
+
+#Test rewriting TCP destination port
 ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 90 'match tcp; get tcp-dst TDST; calc add TDST 8; set tcp-dst %TDST'
 ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 90 'match tcp; get tcp-dst TDST; calc sub TDST 8; set tcp-dst %TDST'
+#timeout 3 ip netns exec TX tcpdump -lvnnpi tx0 &
+#timeout 3 ip netns exec RX tcpdump -lvnpi rx0 
+#sleep 0.5s
+#ip netns exec TX ping -c 1 2.2.2.2
 echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_pass Calc || test_fail Calc
 
 #ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 92 'match tcp; push-net-bytes 20'
@@ -172,8 +187,8 @@ echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_
 
 
 #ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 91 'match tcp; get tcp-dst TDST; calc lsh TDST 7; set map TEST TDST %TDST; set tcp-dst 777'
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 91 -m /var/run/bpf/TX 'match tcp; match tcp-dst 7; get tcp-dst TDST; calc lsh TDST 2; set map TEST TDST %TDST; set tcp-dst 777'
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 92 -m /var/run/bpf/TX 'match tcp; match tcp-dst 777; get map TEST TDST DST; calc rsh DST 2; set tcp-dst %DST'
+ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 91 -m /var/run/bpf/TX 'match tcp; match tcp-dst 7; get tcp-dst TDST; calc lsh TDST 2; set map TEST TDST %TDST; set tcp-dst 777' || test_fail Map-install-1
+ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 92 -m /var/run/bpf/TX 'match tcp; match tcp-dst 777; get map TEST TDST DST; calc rsh DST 2; set tcp-dst %DST' || test_fail Map-install-2
 #timeout 8 ip netns exec TX tcpdump -c 4 -lvnnpi tx0 tcp &
 sleep 0.5s
 
@@ -181,13 +196,13 @@ echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_
 
 ip netns exec TX ./bpf_compiler $COPTS -i tx0 -c
 
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 101 'match arp; match arp-oper 1; match arp-tpa 10.0.0.30; set arp-oper 2; get arp-spa SPA; get arp-sha SHA; set arp-sha de:ad:be:ef:ca:fe; set arp-tha %SHA; set arp-tpa %SPA; set arp-spa 10.0.0.30; redirect rx0 egress'
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 102 'match icmp; match icmp-type 8; set icmp-type 0; match ip-dst 10.0.0.30; get ip-src IP_SRC; set ip-dst %IP_SRC; set ip-src 10.0.0.30; get dst-mac DMAC; get src-mac SMAC; set dst-mac %SMAC; set src-mac %DMAC; redirect rx0 egress'
-#timeout 3 ip netns exec TX tcpdump -c5 -levnnpi tx0 icmp &
-#sleep 0.5s 
+ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 101 'match arp; match arp-oper 1; match arp-tpa 10.0.0.30; set arp-oper 2; get arp-spa SPA; get arp-sha SHA; set arp-sha de:ad:be:ef:ca:fe; set arp-tha %SHA; set arp-tpa %SPA; set arp-spa 10.0.0.30; redirect rx0 egress' || test_fail ICMP-Echo-Install-1
+ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 102 'match icmp; match icmp-type 8; set icmp-type 0; match ip-dst 10.0.0.30; get ip-src IP_SRC; set ip-dst %IP_SRC; set ip-src 10.0.0.30; get dst-mac DMAC; get src-mac SMAC; set dst-mac %SMAC; set src-mac %DMAC; redirect rx0 egress' || test_fail ICMP-Echo-Install-2
+#timeout 3 ip netns exec TX tcpdump -c5 -levnnpi tx0 icmp & P1=$!
+sleep 0.5s 
 timeout 4 ip netns exec TX ping -c2 -i 0.1 -W 0.2 10.0.0.30 &>/dev/null && test_pass ICMP-Echo || test_fail ICMP-Echo
 ip netns exec TX ip neigh show 10.0.0.30 dev br0 | grep -q "de:ad:be:ef:ca:fe" && test_pass ARP-reply || test_pass ARP-reply
-
+#kill -9 $P1
 
 
 
@@ -292,6 +307,10 @@ timeout 3 ip netns exec TX ping -c 3 -i 0.5 -W0.2 2.2.2.2 &>/dev/null && test_pa
 
 kill -9 $TCP_PID &>/dev/null 
 wait &>/dev/null
+for C in TX RX RX2 HOST1
+do      
+        umount /var/run/bpf/$C &>/dev/null
+done
 ip netns del TX
 ip netns del RX
 ip netns del RX2

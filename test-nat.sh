@@ -67,6 +67,7 @@ ip -n WAN link set lo up
 ip -n HOST1 link set lo up
 ip -n HOST2 link set lo up
 ip netns exec RTR mkdir -p /var/run/bpf/RTR
+umount /var/run/bpf/RTR &>/dev/null
 mount -t bpf bpffs /var/run/bpf/RTR
 ip link add wan netns RTR type veth peer name rtr netns WAN
 ip link add host1 netns RTR type veth peer name rtr netns HOST1
@@ -148,6 +149,10 @@ echo "UDP Echo" | timeout 4 ip netns exec HOST1 ncat -u 10.0.0.1 7
 kill -9 $TCP_PID &>/dev/null 
 kill -9 $UDP_PID &>/dev/null 
 wait &>/dev/null
+for C in RTR WAN HOST1 HOST2
+do      
+        umount /var/run/bpf/$C &>/dev/null
+done
 ip netns del RTR
 ip netns del WAN
 ip netns del HOST1
