@@ -16,6 +16,37 @@
 #include <linux/tc_act/tc_bpf.h>
 #include <linux/if_ether.h>
 
+// 1. Check for GCC/Clang built-in macros
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && defined(__ORDER_BIG_ENDIAN__)
+    #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        #define HOST_LITTLE_ENDIAN 1
+    #elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        #define HOST_BIG_ENDIAN 1
+    #endif
+
+// 2. Check GLIBC / Linux system headers 
+#elif defined(__linux__) || defined(__GLIBC__)
+    #include <endian.h>
+    #if __BYTE_ORDER == __LITTLE_ENDIAN
+        #define HOST_LITTLE_ENDIAN 1
+    #elif __BYTE_ORDER == __BIG_ENDIAN
+        #define HOST_BIG_ENDIAN 1
+    #endif
+
+// 3. Check Windows / MSVC (Windows is almost exclusively Little Endian)
+#elif defined(_WIN32) || defined(_WIN64)
+    #define HOST_LITTLE_ENDIAN 1
+
+// 4. Check Apple macOS / iOS
+#elif defined(__APPLE__)
+    #include <machine/endian.h>
+    #if BYTE_ORDER == LITTLE_ENDIAN
+        #define HOST_LITTLE_ENDIAN 1
+    #elif BYTE_ORDER == BIG_ENDIAN
+        #define HOST_BIG_ENDIAN 1
+    #endif
+#endif
+
 /* --- eBPF Macros & Definitions --- */
 #define BPF_REG_0 0
 #define BPF_REG_1 1
@@ -448,7 +479,8 @@ void compile_accept_packet(void) {
     resolve_local_block();
 }
 	
-void compile_reclassify(void) { emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_RECLASSIFY));
+void compile_reclassify(void) { 
+    emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_RECLASSIFY));
     emit(BPF_EXIT_INSN());
     resolve_local_block();
 }
@@ -1052,6 +1084,11 @@ void compile_get_field(int base_offset, int extract_size, const char *var) {
         emit(((struct bpf_insn){.code=BPF_ALU64|BPF_OR|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2}));
     } 
     else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_8, 0));
+
+    #if defined(HOST_LITTLE_ENDIAN)
+    if (extract_size > 1)
+        emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=8 * extract_size}));
+    #endif
     
     // 4. Store into the variable slot on the stack based on its pre-declared physical size
     if (v_sz == 1) emit(BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_1, v_off));
@@ -1866,6 +1903,9 @@ void compile_set_ip_field8(int offset, uint8_t new_val, const char *var) {
 void compile_set_ip_field16(int offset, uint16_t new_val, const char *var) {
     if (var) {
         emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, get_var_offset(var)));
+#if defined(HOST_LITTLE_ENDIAN)
+        emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
+#endif
         emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, -8));
     } else emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -8, htons(new_val)));
 
@@ -3941,11 +3981,10 @@ int create_bpf_buffer_map(const char *name, int cpu) {
     };
     strcpy(attr.map_name, name);
     int fd = bpf_syscall(BPF_MAP_CREATE, &attr, sizeof(attr));
-    if (fd < 0) perror("Failed to create Per-CPU Buffer Map");
     return fd;
 }
 
-int get_or_create_buffer_map(const char *name, int per_cpu) {
+int get_or_create_buffer_map(const char *name, int per_cpu, int exonerr) {
     for (int i = 0; i < num_maps; i++) {
         if (strcmp(maps[i].name, name) == 0) return maps[i].fd;
     }
@@ -3957,7 +3996,13 @@ int get_or_create_buffer_map(const char *name, int per_cpu) {
 
     if (fd < 0) {
         fd = create_bpf_buffer_map(name, per_cpu);
-        if (fd < 0) exit(1);
+        if (fd < 0) {
+		if (exonerr) {
+			perror("Failed to create Per-CPU Buffer Map");
+			exit(1);
+		} else
+			return -1;
+	}
         if (pin_map_fd(fd, pin_path) < 0) fprintf(stderr, "Warning: Failed to pin buffer map.\n");
     }
 
@@ -4099,6 +4144,128 @@ void compile_load_packet(int map_fd, const char *len_arg, const char *src_off_ar
     // R2 = dst_off, R3 = map_ptr + src_off, R4 = len
     emit(BPF_MOV64_IMM(BPF_REG_5, 0));         // flags = 0
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+}
+
+void compile_ip_frag(int mtu, int max, const char *dir) {
+    uint32_t max_len = mtu + 14;
+    uint32_t ip_max  = (( mtu - 20 ) / 8 ) * 8;
+    uint32_t ip_tlen = 20 + ip_max;
+    uint32_t loops   = (( max  - 34 ) / mtu ) + 1;
+    char len_str1[5];
+    char len_str2[5];
+    //decl __IPLEN__ 2
+    int iplen_off = allocate_var("__IPLEN__", 2);
+    //decl __LEN__ 2
+    int len_off = allocate_var("__LEN__", 4);
+
+    //match ip
+    start_match_block(); 
+    compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+    //match ip-mf
+    start_match_block();
+    compile_match_core(20,1,0x20,0x20,NULL);
+    //continue, which closes 'match ip-mf'
+    compile_continue_packet();
+    //get len __LEN__
+    compile_get_skb_field(offsetof(struct __sk_buff, len), 0,0,"__LEN__");
+    //match val __LEN__ gt IP_MAX_TLEN
+    snprintf(len_str1,sizeof(len_str1),"%hu",ip_tlen);
+    compile_match_var("__LEN__", "gt", len_str1);
+    //get skb-ifindex __IDX__;
+    compile_get_skb_field(offsetof(struct __sk_buff, ifindex), 0,0,"__IDX__");
+    //IP_FRAG_BUF 
+    int map_fd = get_or_create_buffer_map("__IP_FRAG_BUF",1,1);
+    //save-packet __IP_FRAG_BUF__ %__LEN__
+    compile_save_packet(map_fd, "%__LEN__", NULL, NULL);
+    //set val __IPLEN__ %__LEN__
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, len_off));
+    emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, iplen_off));
+    //calc sub IPLEN 34;
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, iplen_off));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_K, .dst_reg=BPF_REG_1, .imm=34}));
+    emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, iplen_off));
+    //set len max_len
+    emit(BPF_MOV64_IMM(BPF_REG_2, max_len));
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_3, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_change_tail));
+    //set ip-len ip_tlen
+    compile_set_ip_field16(16, ip_tlen, NULL);
+    //Begin unrolled loop for fragmenting packet
+    int frag_offset = 0;
+    for (unsigned int i = 0; i<loops; i++) {
+	frag_offset = (i * ip_max / 8 );
+	uint16_t frag_mf = (1<<13) | frag_offset;
+	uint32_t packet_offset = 34 + ((i+1) * ip_max);
+	//set ip-frag frag_mf
+        compile_set_ip_field16(20, frag_mf, NULL);
+	//clone %__IDX__
+	compile_clone("%__IDX__", dir);
+	//calc sub IPLEN $IPMAX;
+	emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, iplen_off));
+	emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_K, .dst_reg=BPF_REG_1, .imm=ip_max}));
+	emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, iplen_off));
+	//calc sub LEN $IPMAX;
+	emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, len_off));
+	emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_K, .dst_reg=BPF_REG_1, .imm=ip_max}));
+	emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, len_off));
+	//load-packet BACKUP_BUF $IPMAX $OFF 34;
+	//printf("IPMAX: %u OFFSET: %u\n",ip_max,packet_offset);
+	snprintf(len_str1,sizeof(len_str1),"%hu",ip_max);
+	snprintf(len_str2,sizeof(len_str2),"%hu",packet_offset);
+	compile_load_packet(map_fd, len_str1, len_str2, "34");
+	//match val __IPLEN__ lt ip_max
+    	compile_match_var("__IPLEN__", "le", len_str1);
+	//goto FRAG_DONE;
+	compile_goto("__IP_FRAG_DONE__");
+	//end-match
+	compile_end_match();
+    }
+    //label FRAG_DONE
+    compile_label("__IP_FRAG_DONE__");
+    //set len $__LEN__
+    compile_set_length("%__LEN__");
+    //set ip-frag frag_offset
+    compile_set_ip_field16(20, frag_offset , NULL);
+    //calc bswap __IPLEN__
+    //compile_math_bswap("__IPLEN__", 16);
+    //set ip-len %__IPLEN__
+    compile_set_ip_field16(16, 0 ,"%__IPLEN__");
+    //clone %__IDX__
+    compile_clone("%__IDX__", dir);
+    //drop
+    compile_drop_packet();
+    // drop naturally ends the 'match val __LEN__ gt IP_MAX_TLEN' 
+    // end 'match ip'
+    compile_end_match();
+}
+
+void compile_delete_bytes_buffered(int offset, int dlen) {
+    int map_fd = get_or_create_buffer_map("__IP_DEL_BYTES_BUF",1,0);
+    if (map_fd < 1) {
+        compile_delete_bytes(offset,dlen);
+	return;
+    }
+    char len_str1[5];
+    char len_str2[5];
+
+    int len_off = allocate_var("__LEN__", 4);
+    compile_get_skb_field(offsetof(struct __sk_buff, len), 0,0,"__LEN__");
+    compile_save_packet(map_fd, "%__LEN__", NULL, NULL);
+
+    if (offset) {
+        snprintf(len_str1,sizeof(len_str1),"%hu",offset);
+        compile_save_packet(map_fd, len_str1, NULL, NULL);
+    } else
+        snprintf(len_str1,sizeof(len_str1),"0");
+    snprintf(len_str2,sizeof(len_str2),"%hu",offset+dlen);
+    compile_save_packet(map_fd, "%__LEN__", len_str2, len_str1);
+
+    //calc sub LEN $IPMAX;
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, len_off));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_K, .dst_reg=BPF_REG_1, .imm=dlen}));
+    emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, len_off));
+    compile_set_length("%__LEN__");
 }
 
 /*
@@ -4526,6 +4693,7 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"ip-len")==0) compile_get_field(16,2,var);
             else if (strcmp(f,"ip-frag")==0) compile_get_field(20,2,var);
             else if (strcmp(f,"ip-proto")==0) compile_get_field(23,1,var);
+            else if (strcmp(f,"ip-ident")==0) compile_get_field(18,2,var);
             else if (strcmp(f,"gre-proto")==0) compile_get_gre_key(var);
             else if (strcmp(f,"gre-key")==0) compile_get_gre_proto(var);
             else if (strcmp(f,"eth-proto")==0) compile_get_field(12,2,var);
@@ -4678,6 +4846,14 @@ int main(int argc, char **argv) {
                 start_match_block();
                 compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
                 compile_match_core(23,1,115,0xFFFFFFFF,NULL);
+            } else if (strcmp(f,"ip-df")==0) {
+                start_match_block();
+                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                compile_match_core(20,1,0x40,0x40,NULL);
+            } else if (strcmp(f,"ip-mf")==0) {
+                start_match_block();
+                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                compile_match_core(20,1,0x20,0x20,NULL);
             } else if (strcmp(f,"vlan")==0) {
                 start_match_block();
 		compile_match_skb_field(offsetof(struct __sk_buff, vlan_proto), htons(ETH_P_8021Q), 0xFFFFFFFF, NULL);
@@ -4700,6 +4876,7 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"ip-proto")==0) { start_match_block(); compile_match_core(23,1,atoi(val),0xFFFFFFFF,mv); }
             else if (strcmp(f,"ip-tos")==0) { start_match_block(); compile_match_core(15,1,atoi(val),0xFFFFFFFF,mv); }
             else if (strcmp(f,"ip-frag")==0) { start_match_block(); compile_match_core(20,2,atoi(val),0xFFFFFFFF,mv); }
+            else if (strcmp(f,"ip-frag-off")==0) { start_match_block(); compile_match_core(20,2,atoi(val),htons(0x1FFF),mv); }
             else if (strcmp(f,"ip-len")==0) { start_match_block(); compile_match_core(16,2,atoi(val),0xFFFFFFFF,mv); }
             else if (strcmp(f,"ip-src")==0) { start_match_block(); uint32_t ip,mk; parse_ip_cidr(val,&ip,&mk); compile_match_core(26,4,ip,mk,mv); }
             else if (strcmp(f,"ip-dst")==0) { start_match_block(); uint32_t ip,mk; parse_ip_cidr(val,&ip,&mk); compile_match_core(30,4,ip,mk,mv); }
@@ -4813,7 +4990,7 @@ int main(int argc, char **argv) {
 	else if (strcmp(op, "add-head-bytes") == 0 && t > 1) compile_add_head_bytes(a1);
 	//else if (strcmp(op, "del-head-bytes") == 0 && t > 1) compile_del_head_bytes(a1);
         else if (strcmp(op, "add-bytes")==0 && t>2) compile_insert_bytes(atoi(a1), atoi(a2));
-        else if (strcmp(op, "del-bytes")==0 && t>2) compile_delete_bytes(atoi(a1), atoi(a2));
+        else if (strcmp(op, "del-bytes")==0 && t>2) compile_delete_bytes_buffered(atoi(a1), atoi(a2));
 	else if (strcmp(op, "recalc-tcp-csum") == 0) compile_recalculate_l4_csum(0);
 	else if (strcmp(op, "recalc-udp-csum") == 0) compile_recalculate_l4_csum(1);
 	else if (strcmp(op, "fib-lookup") == 0 || strcmp(op, "fib-lookup6") == 0) {
@@ -4862,16 +5039,17 @@ int main(int argc, char **argv) {
         else if (strcmp(op, "redirect")==0) compile_redirect(a1, a2?a2:dir);
         else if (strcmp(op, "redirect-neigh")==0) compile_redirect_neigh(a1);
         else if (strcmp(op, "clone")==0) compile_clone(a1, a2?a2:dir);
+        else if (strcmp(op, "ip-frag")==0) compile_ip_frag(atoi(a1), atoi(a2), a3?a3:dir);
         else if (strcmp(op, "debug-log")==0) compile_debug_log(a1);
 	else if (strcmp(op, "save-packet") == 0 && t > 2) {
             // Syntax: save-packet <MAP_NAME> <len> [src_off] [dst_off]
-            int map_fd = get_or_create_buffer_map(a1,1);
+            int map_fd = get_or_create_buffer_map(a1,1,1);
             char *src_off = t > 3 ? tok[3] : NULL;
             char *dst_off = t > 4 ? tok[4] : NULL;
             compile_save_packet(map_fd, tok[2], src_off, dst_off);
         } else if (strcmp(op, "load-packet") == 0 && t > 2) {
             // Syntax: load-packet <MAP_NAME> <len> [src_off] [dst_off]
-            int map_fd = get_or_create_buffer_map(a1,1);
+            int map_fd = get_or_create_buffer_map(a1,1,1);
             char *src_off = t > 3 ? tok[3] : NULL;
             char *dst_off = t > 4 ? tok[4] : NULL;
             compile_load_packet(map_fd, tok[2], src_off, dst_off);
