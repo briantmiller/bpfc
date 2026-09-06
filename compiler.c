@@ -794,7 +794,9 @@ void compile_fib_lookup(int flags, const char *dst_ip_arg, const char *src_ip_ar
         emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
 
         emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, scratch));
+#if defined(HOST_LITTLE_ENDIAN)
         emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16})); // BPF_TO_BE swap
+#endif
         emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, base + bpf_fib_len_off));
     }
 
@@ -1041,7 +1043,7 @@ void compile_fib_lookup6(int flags, const char *dst_ip_arg, const char *src_ip_a
  * Dynamically shifts the target offset by +4 or +8 bytes if 802.1Q or 802.1ad VLAN tags are detected.
  */
 void compile_get_field(int base_offset, int extract_size, const char *var) {
-    int v_off = allocate_var(var, extract_size); 
+    int v_off = allocate_var(var, extract_size==6?8:extract_size); 
     int v_sz = get_var_size(var); 
 
     // 1. Load context data pointers
@@ -1086,8 +1088,9 @@ void compile_get_field(int base_offset, int extract_size, const char *var) {
     else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_8, 0));
 
     #if defined(HOST_LITTLE_ENDIAN)
-    if (extract_size > 1)
-        emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=8 * extract_size}));
+    //TODO: Handle 6-byte MAC
+    if (v_sz > 1)
+        emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=8 * v_sz}));
     #endif
     
     // 4. Store into the variable slot on the stack based on its pre-declared physical size
@@ -1157,8 +1160,10 @@ void compile_get_bitfield(int offset, int size, int shift, uint32_t mask, const 
     if (size==1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, -4));
     else if (size==2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, -4));
     else emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, -4));
-
-    emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=size*8}));
+    #if defined(HOST_LITTLE_ENDIAN)
+    if (size > 1)
+        emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=size*8}));
+    #endif
     // TO_BE
     if (shift > 0) emit(((struct bpf_insn){.code=BPF_ALU64|BPF_RSH|BPF_K, .dst_reg=BPF_REG_1, .imm=shift}));
     if (mask > 0)  emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=mask}));
@@ -1410,7 +1415,9 @@ void compile_match_port_range(int off, uint16_t min_p, uint16_t max_p) {
     add_block_jump();
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, -4));
+    #if defined(HOST_LITTLE_ENDIAN)
     emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
+    #endif
     
     
     add_block_jump();
@@ -1566,6 +1573,10 @@ void compile_set_field(int base_offset, int size, uint32_t net_val, const char *
         else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, v_off));
         else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
         else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, v_off));
+#if defined(HOST_LITTLE_ENDIAN)
+	if (v_sz > 1)
+	    emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=v_sz * 8}));
+#endif
     } else {
         emit(BPF_MOV64_IMM(BPF_REG_1, net_val));
     }
@@ -1667,7 +1678,9 @@ void compile_set_ipv6_bitfield(int is_tclass, uint32_t val, const char *var) {
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
 
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, -4));
+    #if defined(HOST_LITTLE_ENDIAN)
     emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=32}));
+    #endif
     
 
     if (is_tclass) emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=0xF00FFFFF}));
@@ -1686,9 +1699,10 @@ void compile_set_ipv6_bitfield(int is_tclass, uint32_t val, const char *var) {
         if (is_tclass) emit(((struct bpf_insn){.code=BPF_ALU64|BPF_OR|BPF_K, .dst_reg=BPF_REG_1, .imm=((val & 0xFF) << 20)}));
         else emit(((struct bpf_insn){.code=BPF_ALU64|BPF_OR|BPF_K, .dst_reg=BPF_REG_1, .imm=(val & 0xFFFFF)}));
     }
-
+#if defined(HOST_LITTLE_ENDIAN)
     emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=32}));
-    
+#endif
+
     emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -4));
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV64_IMM(BPF_REG_2, 14));
@@ -1818,6 +1832,9 @@ void compile_set_ip_addr(int is_dst, uint32_t ip, const char *var) {
     int off = is_dst ? 30 : 26;
     if (var) {
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, get_var_offset(var)));
+#if defined(HOST_LITTLE_ENDIAN)
+        emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=32}));
+#endif
         emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -8));
     } else emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -8, ip));
 
@@ -2176,9 +2193,10 @@ void compile_set_vlan_id(uint16_t vid, const char *var) {
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
 
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, -4));
-      
+#if defined(HOST_LITTLE_ENDIAN)      
     emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
-    
+#endif    
+
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=0xF000}));
     
 
@@ -2189,9 +2207,9 @@ void compile_set_vlan_id(uint16_t vid, const char *var) {
     } else {
         emit(((struct bpf_insn){.code=BPF_ALU64|BPF_OR|BPF_K,  .dst_reg=BPF_REG_1, .imm=(vid & 0x0FFF)}));
     }
-
+#if defined(HOST_LITTLE_ENDIAN)
     emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
-    
+#endif
     emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, -4));
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV64_IMM(BPF_REG_2, 14));
@@ -2212,8 +2230,9 @@ void compile_set_mpls_field(int is_bos, uint32_t val, const char *var) {
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
 
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, -4));
+#if defined(HOST_LITTLE_ENDIAN)
     emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=32}));
-    
+#endif
 
     if (is_bos) emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=~(1<<8)}));
     else        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=0x00000FFF}));
@@ -2233,8 +2252,9 @@ void compile_set_mpls_field(int is_bos, uint32_t val, const char *var) {
         else        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_OR|BPF_K, .dst_reg=BPF_REG_1, .imm=((val & 0xFFFFF) << 12)}));
     }
 
+#if defined(HOST_LITTLE_ENDIAN)
     emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=32}));
-    
+#endif
     emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -4));
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
@@ -2637,9 +2657,13 @@ void compile_add_l2_bytes(int len) {
 
     // Convert tot_len to Host Byte Order, add len, and convert back
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, stack_off));
+#if defined(HOST_LITTLE_ENDIAN)
     emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16})); 
+#endif
     emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, len));
+#if defined(HOST_LITTLE_ENDIAN)
     emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16})); 
+#endif
     emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, stack_off));
 
     // 5. Write the updated tot_len back to the IP header
@@ -3351,11 +3375,13 @@ void compile_get_raw_bytes(int offset, int size, const char *var) {
     else if (size == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
     else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, v_off));
 
+#if defined(HOST_LITTLE_ENDIAN)
     // 3. Convert from Network Byte Order to Host Byte Order
     // (1-byte extracts do not need swapping)
     if (size > 1) {
         emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=size*8})); // BPF_END | BPF_TO_BE
     }
+#endif
 
     // 4. Store the swapped Host-Order value back into the variable slot
     if (size == 1) emit(BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_1, v_off));
@@ -3576,8 +3602,10 @@ void compile_encap_gre(uint32_t src, uint32_t dst, uint32_t key) {
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_3, .imm=0xFFFF}));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_X, .dst_reg=BPF_REG_3, .src_reg=BPF_REG_4}));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_XOR|BPF_K, .dst_reg=BPF_REG_3, .imm=0xFFFF}));
+#if defined(HOST_LITTLE_ENDIAN)
     emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_2, .imm=16}));
     emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_3, .imm=16}));
+#endif
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, -6));
     emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -32, htons(0x4500)));
     emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_2, -30));
@@ -4000,8 +4028,9 @@ int get_or_create_buffer_map(const char *name, int per_cpu, int exonerr) {
 		if (exonerr) {
 			perror("Failed to create Per-CPU Buffer Map");
 			exit(1);
-		} else
+		} else {
 			return -1;
+		}
 	}
         if (pin_map_fd(fd, pin_path) < 0) fprintf(stderr, "Warning: Failed to pin buffer map.\n");
     }
@@ -4255,9 +4284,11 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
 void compile_delete_bytes_buffered(int offset, int dlen) {
     int map_fd = get_or_create_buffer_map("__IP_DEL_BYTES_BUF",1,0);
     if (map_fd < 1) {
+	printf("Using unrolled loop for del-bytes\n");
         compile_delete_bytes(offset,dlen);
 	return;
     }
+    printf("Using save/load-packet for del-bytes\n");
     char len_str1[5];
     char len_str2[5];
 
@@ -4272,7 +4303,9 @@ void compile_delete_bytes_buffered(int offset, int dlen) {
         snprintf(len_str1,sizeof(len_str1),"0");
     snprintf(len_str2,sizeof(len_str2),"%hu",offset+dlen);
     compile_save_packet(map_fd, "%__LEN__", len_str2, len_str1);
+    
 
+    compile_load_packet(map_fd, "%__LEN__", NULL, NULL);
     //calc sub LEN $IPMAX;
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, len_off));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_K, .dst_reg=BPF_REG_1, .imm=dlen}));
