@@ -1091,6 +1091,8 @@ void compile_get_field(int base_offset, int extract_size, const char *var) {
     //TODO: Handle 6-byte MAC
     if (v_sz > 1)
         emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=8 * v_sz}));
+    if (extract_size==6)
+        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_RSH|BPF_K, .dst_reg=BPF_REG_1, .imm=16}));
     #endif
     
     // 4. Store into the variable slot on the stack based on its pre-declared physical size
