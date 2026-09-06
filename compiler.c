@@ -4155,8 +4155,10 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
     char len_str2[5];
     //decl __IPLEN__ 2
     int iplen_off = allocate_var("__IPLEN__", 2);
-    //decl __LEN__ 2
+    //decl __LEN__ 4
     int len_off = allocate_var("__LEN__", 4);
+    //decl __IP_FRAG__ 2
+    int frag_off = allocate_var("__IP_FRAG__", 2);
 
     //match ip
     start_match_block(); 
@@ -4192,15 +4194,19 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
     //set ip-len ip_tlen
     compile_set_ip_field16(16, ip_tlen, NULL);
     //Begin unrolled loop for fragmenting packet
-    int frag_offset = 0;
+    uint32_t frag_offset = 0;
+    uint16_t frag_mf = (1<<13);
+    //set ip-frag frag_mf
+    compile_set_ip_field16(20, frag_mf, NULL);
     for (unsigned int i = 0; i<loops; i++) {
-	frag_offset = (i * ip_max / 8 );
-	uint16_t frag_mf = (1<<13) | frag_offset;
+	frag_offset = ((i+1) * ip_max / 8 );
+	frag_mf = (1<<13) | frag_offset;
+	printf("Frag: %x Network order: %x\n",frag_mf,htons(frag_mf));
 	uint32_t packet_offset = 34 + ((i+1) * ip_max);
-	//set ip-frag frag_mf
-        compile_set_ip_field16(20, frag_mf, NULL);
 	//clone %__IDX__
 	compile_clone("%__IDX__", dir);
+	//set ip-frag frag_mf
+        compile_set_ip_field16(20, frag_mf, NULL);
 	//calc sub IPLEN $IPMAX;
 	emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, iplen_off));
 	emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_K, .dst_reg=BPF_REG_1, .imm=ip_max}));
@@ -4225,8 +4231,14 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
     compile_label("__IP_FRAG_DONE__");
     //set len $__LEN__
     compile_set_length("%__LEN__");
-    //set ip-frag frag_offset
-    compile_set_ip_field16(20, frag_offset , NULL);
+    //get ip-frag __IP_FRAG__
+    compile_get_field(20,2,"__IP_FRAG__");
+    //calc and __IP_FRAG__ 0x1FFF
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, frag_off));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=0x1FFF}));
+    emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, frag_off));
+    //set ip-frag __IP_FRAG__
+    compile_set_ip_field16(20, 0 , "__IP_FRAG__");
     //calc bswap __IPLEN__
     //compile_math_bswap("__IPLEN__", 16);
     //set ip-len %__IPLEN__
