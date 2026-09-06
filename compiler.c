@@ -4034,6 +4034,7 @@ int get_or_create_buffer_map(const char *name, int per_cpu, int exonerr) {
 			perror("Failed to create Per-CPU Buffer Map");
 			exit(1);
 		} else {
+			//printf("Could not pin buffer map %s\n",pin_path);
 			return -1;
 		}
 	}
@@ -4287,34 +4288,39 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
 }
 
 void compile_delete_bytes_buffered(int offset, int dlen) {
-    int map_fd = get_or_create_buffer_map("__IP_DEL_BYTES_BUF",1,0);
-    if (map_fd < 1) {
-	printf("Using unrolled loop for del-bytes\n");
+    int map_fd = get_or_create_buffer_map("__DEL_B_BUF__",1,0);
+    if (map_fd < 0) {
+	//printf("Using unrolled loop for del-bytes\n");
         compile_delete_bytes(offset,dlen);
 	return;
     }
-    printf("Using save/load-packet for del-bytes\n");
+    //printf("Using save/load-packet for del-bytes\n");
     char len_str1[5];
     char len_str2[5];
 
     int len_off = allocate_var("__LEN__", 4);
-    compile_get_skb_field(offsetof(struct __sk_buff, len), 0,0,"__LEN__");
-    compile_save_packet(map_fd, "%__LEN__", NULL, NULL);
+    compile_get_skb_field(offsetof(struct __sk_buff, len), 0, 0, "__LEN__");
+    //compile_save_packet(map_fd, "%__LEN__", NULL, NULL);
 
     if (offset) {
         snprintf(len_str1,sizeof(len_str1),"%hu",offset);
-        compile_save_packet(map_fd, len_str1, NULL, NULL);
+	//Copy head of packet up to offset
+	compile_save_packet(map_fd,len_str1,"0","0");
+        //snprintf(len_str2,sizeof(len_str2),"%hu",offset+dlen);
+        //compile_save_packet(map_fd, len_str1, len_str2, len_str1);
+	//map, length, src_off, dst_off
     } else
         snprintf(len_str1,sizeof(len_str1),"0");
     snprintf(len_str2,sizeof(len_str2),"%hu",offset+dlen);
-    compile_save_packet(map_fd, "%__LEN__", len_str2, len_str1);
+    //Copy packet starting at offset len_str2 and write to destination offset len_str1
     
 
-    compile_load_packet(map_fd, "%__LEN__", NULL, NULL);
     //calc sub LEN $IPMAX;
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, len_off));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_K, .dst_reg=BPF_REG_1, .imm=dlen}));
     emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, len_off));
+    compile_save_packet(map_fd, "%__LEN__", len_str2, len_str1);
+    compile_load_packet(map_fd, "%__LEN__", "0", "0");
     compile_set_length("%__LEN__");
 }
 
