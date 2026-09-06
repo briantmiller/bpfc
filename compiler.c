@@ -4201,7 +4201,7 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
     for (unsigned int i = 0; i<loops; i++) {
 	frag_offset = ((i+1) * ip_max / 8 );
 	frag_mf = (1<<13) | frag_offset;
-	printf("Frag: %x Network order: %x\n",frag_mf,htons(frag_mf));
+	//printf("Frag: %x Network order: %x\n",frag_mf,htons(frag_mf));
 	uint32_t packet_offset = 34 + ((i+1) * ip_max);
 	//clone %__IDX__
 	compile_clone("%__IDX__", dir);
