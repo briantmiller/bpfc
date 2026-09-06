@@ -2116,6 +2116,9 @@ void compile_set_l4_port(int is_udp, int is_dst, uint16_t p, const char *var) {
     int off = 34 + (is_dst?2:0), coff = 34 + (is_udp?6:16);
     if (var) {
         emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, get_var_offset(var)));
+#if defined(HOST_LITTLE_ENDIAN)
+        emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
+#endif 
         emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, -8));
     } else emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -8, htons(p)));
 
