@@ -64,6 +64,9 @@ ip netns add PE1
 ip netns add H1
 ip netns add H2
 
+umount /var/run/bpf/CE1 &>/dev/null
+umount /var/run/bpf/CE2 &>/dev/null
+
 ip netns exec CE1 mkdir -p /var/run/bpf/CE1
 ip netns exec CE2 mkdir -p /var/run/bpf/CE2
 mount -t bpf bpffs /var/run/bpf/CE1
@@ -351,9 +354,9 @@ ip netns exec CE1 ./bpf_compiler $COPTS -i h1  -d ingress -p 100 "$(mpls_out_nh 
 ip netns exec CE2 ./bpf_compiler $COPTS -i h2  -d ingress -p 100 "$(mpls_out_nh 10.0.0.2 18 1 255 20)" && test_pass CE2-pw0-out-install || test_fail CE2-pw0-out-install
 #ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
 #ip netns exec CE2 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
-ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 "$(mpls_in_slow 18 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
+ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_in_slow 18 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
 #ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 101 "$(mpls_in_1 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
-ip netns exec CE2 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 "$(mpls_in_slow 16 h2)" && test_pass CE2-pw0-in-install || test_fail CE2-pw0-in-install
+ip netns exec CE2 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_in_slow 16 h2)" && test_pass CE2-pw0-in-install || test_fail CE2-pw0-in-install
 
 
 #timeout 5 ip netns exec PE1 tcpdump -levnpi ce2 -XX &> out1.txt &
@@ -371,7 +374,7 @@ timeout 5 ip netns exec H1 ping -c4 -i 0.1 -W0.2 192.168.0.2 &>/dev/null && test
 
 #timeout 10 ip netns exec H1 tcpdump -levnpi ce1 -XX &
 
-if [ 1 -eq 1 ]
+if [ 1 -eq 0 ]
 then
 	ip netns exec CE1 $IPERF -s &>/dev/null & P1=$!
         ip netns exec CE2 $IPERF -s &>/dev/null & P2=$!
@@ -383,7 +386,7 @@ then
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
 fi
 
-if [ 1 -eq 1 ]
+if [ 1 -eq 0 ]
 then
 	ip netns exec H2 $IPERF -s &>/dev/null & P1=$!
 	ip netns exec H1 $IPERF -s &>/dev/null & P2=$!
@@ -436,7 +439,7 @@ then
 	#ip netns exec CE1 perf --no-pager script
 fi
 
-if [ 1 -eq 1 ]
+if [ 1 -eq 0 ]
 then
 	ip netns exec H2 $IPERF -u -s &>/dev/null & P1=$!
 	ip netns exec H1 $IPERF -u -s &>/dev/null & P2=$!
@@ -451,6 +454,10 @@ fi
 
 
 wait &>/dev/null
+for C in H1 H2 H3 CE1 CE2 PE1
+do
+	umount /var/run/bpf/$C &>/dev/null
+done
 ip netns del H1
 ip netns del H2
 ip netns del PE1
