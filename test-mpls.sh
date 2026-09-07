@@ -92,8 +92,8 @@ ip -n CE2 link set pe1 mtu 1800
 ip -n PE1 link set ce1 mtu 1800
 ip -n PE1 link set ce2 mtu 1800
 
-ip -n H1 link set ce1 mtu 1500
-ip -n H2 link set ce2 mtu 1500
+ip -n H1 link set ce1 mtu 1770
+ip -n H2 link set ce2 mtu 1770
 
 ip netns exec H1 ethtool -K ce1 tso off gro off
 ip netns exec H2 ethtool -K ce2 tso off gro off
@@ -103,10 +103,10 @@ ip netns exec CE2 ethtool -K h2 tso off gro off
 ip netns exec PE1 ethtool -K ce1 tso off gro off
 ip netns exec PE1 ethtool -K ce2 tso off gro off
 
-ip -n H1 link set ce1 qlen 10000
-ip -n H2 link set ce2 qlen 10000
-ip -n CE1 link set h1 qlen 10000
-ip -n CE2 link set h2 qlen 10000
+ip -n H1 link set ce1 qlen 1000
+ip -n H2 link set ce2 qlen 1000
+ip -n CE1 link set h1 qlen 1000
+ip -n CE2 link set h2 qlen 1000
 
 ip -6 -n H1  addr flush dev ce1
 ip -6 -n H2  addr flush dev ce2
@@ -386,7 +386,7 @@ then
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
 fi
 
-if [ 1 -eq 0 ]
+if [ 1 -eq 1 ]
 then
 	ip netns exec H2 $IPERF -s &>/dev/null & P1=$!
 	ip netns exec H1 $IPERF -s &>/dev/null & P2=$!
