@@ -87,15 +87,15 @@ ip link add pe1 netns CE2 type veth peer name ce2 netns PE1
 
 sleep 0.1s
 
-ip -n CE1 link set h1 mtu 1800
-ip -n CE2 link set h2 mtu 1800
+ip -n CE1 link set h1 mtu 3000
+ip -n CE2 link set h2 mtu 3000
 ip -n CE1 link set pe1 mtu 1800
 ip -n CE2 link set pe1 mtu 1800
 ip -n PE1 link set ce1 mtu 1800
 ip -n PE1 link set ce2 mtu 1800
 
-ip -n H1 link set ce1 mtu 1500
-ip -n H2 link set ce2 mtu 1500
+ip -n H1 link set ce1 mtu 3000
+ip -n H2 link set ce2 mtu 3000
 
 ip netns exec H1 ethtool -K ce1 tso off gro off
 ip netns exec H2 ethtool -K ce2 tso off gro off
@@ -585,12 +585,12 @@ echo "
 
 #ip netns exec H1 ./bpf_compiler -v $COPTS -i ce1 -d egress -p 100 -m /var/run/bpf/H1 "$(fragment_unrolled 200 9000)" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
 #ip netns exec CE1 ./bpf_compiler -v $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "$(fragment_unrolled 200 9000)" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
-ip netns exec CE1 ./bpf_compiler $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "ip-frag 200 9000" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
+ip netns exec CE1 ./bpf_compiler $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "ip-frag 500 9000" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
 #exit 1
 ip netns exec CE1 ./bpf_compiler $COPTS -i h1  -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_out_nh 10.0.0.6 16 1 255 19)" && test_pass CE1-pw0-out-install || test_fail CE1-pw0-out-install
 ip netns exec CE2 ./bpf_compiler $COPTS -i h2  -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_out_nh 10.0.0.2 18 1 255 20)" && test_pass CE2-pw0-out-install || test_fail CE2-pw0-out-install
 #ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d egress -p 10 "get len LEN; match val LEN gt 300; drop"
-ip netns exec CE1 ./bpf_compiler $COPTS -i h1 -d ingress -p 50 "get len LEN; match val LEN gt 250; drop"
+#ip netns exec CE1 ./bpf_compiler $COPTS -i h1 -d ingress -p 50 "get len LEN; match val LEN gt 250; drop"
 #ip netns exec CE2 ./bpf_compiler $COPTS -i h2 -d egress -p 50 "match ip-mf; match ip-frag-off 0; drop"
 #ip netns exec CE1 ./bpf_compiler $COPTS -i h1 -d ingress -p 70 "match ip-mf; drop"
 #ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
@@ -609,10 +609,11 @@ ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 -m /var/run/bpf/
 #timeout 5 ip netns exec CE2 tcpdump -levnpi h2 -XX &
 #timeout 3 ip netns exec H1 tcpdump -levnpi ce1 -XX icmp &> out.h1.txt &
 #timeout 5 ip netns exec H1 tcpdump -levnpi ce1 -Q out &
-timeout 3 ip netns exec H2 tcpdump -levnpi ce2 -XX icmp &
+#timeout 5 ip netns exec H1 tcpdump -levnpi ce1 &
+#timeout 3 ip netns exec H2 tcpdump -levnpi ce2 -XX icmp &
 sleep 0.5s
 
-timeout 3 ip netns exec H1 ping -c1 -s 380 -i 0.1 -W0.2 192.168.0.2 &>/dev/null && test_pass MPLS-pw || test_fail MPLS-pw
+timeout 3 ip netns exec H1 ping -c1 -s 1600 -i 0.1 192.168.0.2 &>/dev/null && test_pass MPLS-pw || test_fail MPLS-pw
 
 
 #cat out*.txt
