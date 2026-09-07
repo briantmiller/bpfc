@@ -4188,21 +4188,33 @@ int get_or_create_buffer_map(const char *name, int per_cpu, int exonerr) {
  * Emits bytecode to copy 'len' bytes from the packet into the Per-CPU Buffer Map.
  * Syntax: save-packet <MAP_NAME> <len> [src_off] [dst_off]
  */
-void compile_save_packet(int map_fd, const char *len_arg, const char *src_off_arg, const char *dst_off_arg) {
+void compile_save_packet(int map_fd, const char *key, const char *len_arg, const char *src_off_arg, const char *dst_off_arg) {
     //store packet length into REG8
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len)));
     //emit(BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_1, offsetof(struct __sk_buff, len)));
 
     // 1. Setup Key (Index 0) on stack
-    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0));
+    if (key) {
+	if (key[0] == '%') {
+            int v_off = get_var_offset(key);
+            emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, v_off));
+	} else
+            //emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, 0, atoi(key)));
+            emit(BPF_MOV64_IMM(BPF_REG_2, atoi(key)));
+
+        //emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, 0, key));
+    } else {
+        //emit(BPF_MOV64_IMM(BPF_REG_2, 0));
+        emit(BPF_ST_MEM(BPF_W, BPF_REG_2, -4, 0));
+        emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
+    }
     
     // 2. Lookup Map Pointer
     emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .off = 0, .imm = map_fd}));
     emit(((struct bpf_insn){.code = 0x00, .dst_reg = 0,         .src_reg = 0, .off = 0, .imm = 0}));
     
-    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
-    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
+    //emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
     emit(BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
     
     // Safety abort if map lookup fails
@@ -4718,7 +4730,7 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
     //IP_FRAG_BUF 
     int map_fd = get_or_create_buffer_map("__IP_FRAG_BUF",1,1);
     //save-packet __IP_FRAG_BUF__ %__LEN__
-    compile_save_packet(map_fd, "%__LEN__", NULL, NULL);
+    compile_save_packet(map_fd, 0, "%__LEN__", NULL, NULL);
     //set val __IPLEN__ %__LEN__
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, len_off));
     emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, iplen_off));
@@ -4810,7 +4822,7 @@ void compile_delete_bytes_buffered(int offset, int dlen) {
     if (offset) {
         snprintf(len_str1,sizeof(len_str1),"%hu",offset);
 	//Copy head of packet up to offset
-	compile_save_packet(map_fd,len_str1,"0","0");
+	compile_save_packet(map_fd,0,len_str1,"0","0");
         //snprintf(len_str2,sizeof(len_str2),"%hu",offset+dlen);
         //compile_save_packet(map_fd, len_str1, len_str2, len_str1);
 	//map, length, src_off, dst_off
@@ -4824,7 +4836,7 @@ void compile_delete_bytes_buffered(int offset, int dlen) {
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, len_off));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_K, .dst_reg=BPF_REG_1, .imm=dlen}));
     emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, len_off));
-    compile_save_packet(map_fd, "%__LEN__", len_str2, len_str1);
+    compile_save_packet(map_fd, 0,"%__LEN__", len_str2, len_str1);
     compile_load_packet(map_fd, "%__LEN__", "0", "0");
     compile_set_length("%__LEN__");
 }
@@ -5602,12 +5614,22 @@ int main(int argc, char **argv) {
         else if (strcmp(op, "clone")==0) compile_clone(a1, a2?a2:dir);
         else if (strcmp(op, "ip-frag")==0) compile_ip_frag(atoi(a1), atoi(a2), a3?a3:dir);
         else if (strcmp(op, "debug-log")==0) compile_debug_log(a1);
-	else if (strcmp(op, "save-packet") == 0 && t > 2) {
+        else if (strcmp(op, "buffer-map")==0 && t > 1) {
+            get_or_create_buffer_map(a1,1,1);
+	} else if (strcmp(op, "shared-buffer-map")==0 && t > 1) {
+            get_or_create_buffer_map(a1,0,1);
+	} else if (strcmp(op, "save-packet") == 0 && t > 2) {
             // Syntax: save-packet <MAP_NAME> <len> [src_off] [dst_off]
             int map_fd = get_or_create_buffer_map(a1,1,1);
             char *src_off = t > 3 ? tok[3] : NULL;
             char *dst_off = t > 4 ? tok[4] : NULL;
-            compile_save_packet(map_fd, tok[2], src_off, dst_off);
+            compile_save_packet(map_fd, 0, tok[2], src_off, dst_off);
+	} else if (strcmp(op, "save-packet-keyed") == 0 && t > 3) {
+            // Syntax: save-packet <MAP_NAME> <len> [src_off] [dst_off]
+            int map_fd = get_or_create_buffer_map(a1,0,1);
+            char *src_off = t > 4 ? tok[5] : NULL;
+            char *dst_off = t > 5 ? tok[5] : NULL;
+            compile_save_packet(map_fd, a2, tok[3], src_off, dst_off);
         } else if (strcmp(op, "load-packet") == 0 && t > 2) {
             // Syntax: load-packet <MAP_NAME> <len> [src_off] [dst_off]
             int map_fd = get_or_create_buffer_map(a1,1,1);
