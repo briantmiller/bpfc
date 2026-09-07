@@ -585,7 +585,7 @@ echo "
 
 #ip netns exec H1 ./bpf_compiler -v $COPTS -i ce1 -d egress -p 100 -m /var/run/bpf/H1 "$(fragment_unrolled 200 9000)" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
 #ip netns exec CE1 ./bpf_compiler -v $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "$(fragment_unrolled 200 9000)" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
-ip netns exec CE1 ./bpf_compiler $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "ip-frag 500 9000" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
+ip netns exec CE1 ./bpf_compiler $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "ip-frag 110 3000" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
 #exit 1
 ip netns exec CE1 ./bpf_compiler $COPTS -i h1  -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_out_nh 10.0.0.6 16 1 255 19)" && test_pass CE1-pw0-out-install || test_fail CE1-pw0-out-install
 ip netns exec CE2 ./bpf_compiler $COPTS -i h2  -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_out_nh 10.0.0.2 18 1 255 20)" && test_pass CE2-pw0-out-install || test_fail CE2-pw0-out-install
@@ -702,7 +702,7 @@ fi
 
 
 wait &>/dev/null
-ip netns exec CE2 ./bpf_compiler $COPTS -m /var/run/bpf/CE2 -r DEFRAG
+#ip netns exec CE2 ./bpf_compiler $COPTS -m /var/run/bpf/CE2 -r DEFRAG
 for C in H1 H2 H3 CE1 CE2 PE1
 do      
         umount /var/run/bpf/$C &>/dev/null
