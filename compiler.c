@@ -3355,6 +3355,144 @@ void compile_delete_bytes(int offset, int dlen) {
 }*/
 
 /*
+ * Emits bytecode to copy a variable or fixed number of bytes from a packet offset
+ * into an eBPF Buffer Map at a dynamic/variable offset.
+ *
+ * Syntax: copy-pkt-to-map <MAP_NAME> <pkt_offset> <size | %VAR_SIZE> <%VAR_MAP_OFFSET>
+ */
+void compile_copy_pkt_to_map(int map_fd, int pkt_offset, const char *size_arg, const char *var_map_off) {
+    // 1. Resolve and strictly bound the Length into R4
+    if (size_arg[0] == '%') {
+        int v_off = get_var_offset(size_arg);
+        int v_sz = get_var_size(size_arg);
+        if (v_sz == 1)      emit(BPF_LDX_MEM(BPF_B, BPF_REG_4, BPF_REG_10, v_off));
+        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, v_off));
+        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, v_off));
+        else                emit(BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_10, v_off));
+
+        // Verifier safety: Length must be > 0 and <= 1500
+        add_safety_jump();
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JLE | BPF_K, .dst_reg = BPF_REG_4, .imm = 0}));
+
+        int skip_cap = prog_idx;
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JLE | BPF_K, .dst_reg = BPF_REG_4, .imm = 1500}));
+        emit(BPF_MOV64_IMM(BPF_REG_4, 1500));
+        prog[skip_cap].off = prog_idx - skip_cap - 1;
+    } else {
+        uint32_t imm = (uint32_t)strtoul(size_arg, NULL, 0);
+        if (imm > 1500) imm = 1500;
+        if (imm == 0) return;
+        emit(BPF_MOV64_IMM(BPF_REG_4, imm));
+    }
+
+    // Save bounded length (R4) to scratchpad for loop control
+    int len_spill = next_var_offset - 8;
+    next_var_offset = len_spill;
+    emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_4, len_spill));
+
+    // 2. Lookup the Map Value Pointer (Key = 0) -> Returned in R0
+    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0));
+    emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .off = 0, .imm = map_fd}));
+    emit(((struct bpf_insn){.code = 0x00, .dst_reg = 0,         .src_reg = 0, .off = 0, .imm = 0}));
+
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(((struct bpf_insn){.code = BPF_ALU64 | BPF_ADD | BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
+    emit(BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+
+    add_safety_jump();
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JEQ | BPF_K, .dst_reg = BPF_REG_0, .imm = 0}));
+
+    // 3. Load dynamic map offset variable into R2
+    int v_off = get_var_offset(var_map_off);
+    int v_sz = get_var_size(var_map_off);
+    if (v_sz == 1)      emit(BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_10, v_off));
+    else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_10, v_off));
+    else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+    else                emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, v_off));
+
+    // --- VERIFIER BOUNDS CHECK 1: Map Buffer Boundary ---
+    // Restore length to R4, prove: R2 (map_offset) + R4 (len) <= 1500
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, len_spill));
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_2));
+    emit(((struct bpf_insn){.code = BPF_ALU64 | BPF_ADD | BPF_X, .dst_reg = BPF_REG_1, .src_reg = BPF_REG_4}));
+   
+    add_safety_jump();
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JGT | BPF_K, .dst_reg = BPF_REG_1, .imm = 1500}));
+
+    // --- VERIFIER BOUNDS CHECK 2: Packet Boundary ---
+    // Prove: pkt_offset + R4 (len) <= skb->len
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); // skb context
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1, offsetof(struct __sk_buff, len)));
+    emit(BPF_MOV64_IMM(BPF_REG_1, pkt_offset));
+    emit(((struct bpf_insn){.code = BPF_ALU64 | BPF_ADD | BPF_X, .dst_reg = BPF_REG_1, .src_reg = BPF_REG_4}));
+   
+    add_safety_jump();
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JGT | BPF_X, .dst_reg = BPF_REG_1, .src_reg = BPF_REG_7}));
+
+    // 4. Base pointers setup
+    // R8 = Target Map Write Pointer (map_ptr [R0] + dynamic_offset [R2])
+    emit(BPF_MOV64_REG(BPF_REG_8, BPF_REG_0));
+    emit(((struct bpf_insn){.code = BPF_ALU64 | BPF_ADD | BPF_X, .dst_reg = BPF_REG_8, .src_reg = BPF_REG_2}));
+
+    // R9 = Packet Read Offset Tracker (starts at pkt_offset)
+    emit(BPF_MOV64_IMM(BPF_REG_9, pkt_offset));
+
+    // Save Context (R6) to stack scratchpad
+    int ctx_spill = next_var_offset - 8;
+    next_var_offset = ctx_spill;
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_6, ctx_spill));
+
+    // 5. Unrolled copy cascade using powers-of-two (64, 32, 16, 8, 4, 2, 1)
+    int chunk_sizes[] = {64, 32, 16, 8, 4, 2, 1};
+    int opcodes[]     = {BPF_DW, BPF_DW, BPF_DW, BPF_DW, BPF_W, BPF_H, BPF_B};
+
+    for (int i = 0; i < 7; i++) {
+        int chunk = chunk_sizes[i];
+
+        // Read remaining length from stack
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, len_spill));
+
+        // Condition: if (remaining_len < chunk) skip this size block
+        int skip_chunk = prog_idx;
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JLT | BPF_K, .dst_reg = BPF_REG_4, .imm = chunk}));
+
+        // Load 'chunk' bytes from packet into stack scratchpad (-8)
+        emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, ctx_spill)); // Restore skb context
+        emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_9));                    // Packet offset
+        emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+        emit(((struct bpf_insn){.code = BPF_ALU64 | BPF_ADD | BPF_K, .dst_reg = BPF_REG_3, .imm = -8}));
+        emit(BPF_MOV64_IMM(BPF_REG_4, chunk));
+        emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+
+        add_safety_jump();
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JSLT | BPF_K, .dst_reg = BPF_REG_0, .imm = 0}));
+
+        // Move chunk bytes from scratchpad into register R1
+        if (chunk >= 8)     emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, -8));
+        else if (chunk == 4) emit(BPF_LDX_MEM(BPF_W,  BPF_REG_1, BPF_REG_10, -8));
+        else if (chunk == 2) emit(BPF_LDX_MEM(BPF_H,  BPF_REG_1, BPF_REG_10, -8));
+        else                 emit(BPF_LDX_MEM(BPF_B,  BPF_REG_1, BPF_REG_10, -8));
+
+        // Write R1 directly into current map pointer (R8)
+        emit(BPF_STX_MEM(opcodes[i], BPF_REG_8, BPF_REG_1, 0));
+
+        // Advance pointers and decrement remaining length
+        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_8, chunk)); // map_ptr += chunk
+        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_9, chunk)); // pkt_offset += chunk
+
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, len_spill));
+        emit(BPF_ALU64_IMM(BPF_SUB, BPF_REG_4, chunk));
+        emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_4, len_spill));
+
+        // Resolve skip jump
+        prog[skip_chunk].off = prog_idx - skip_chunk - 1;
+    }
+
+    // 6. Restore Context Register (R6)
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_10, ctx_spill));
+}
+
+/*
  * Emits bytecode to extract raw bytes (1, 2, 4, or 8) from anywhere in the packet.
  * Automatically converts the extracted bytes from Network to Host Byte Order.
  */
@@ -4009,7 +4147,7 @@ int create_bpf_buffer_map(const char *name, int cpu) {
     union bpf_attr attr = {
         .map_type    = cpu?BPF_MAP_TYPE_PERCPU_ARRAY:BPF_MAP_TYPE_LRU_HASH,
         .key_size    = cpu?4:12,      // 32-bit key (We will just use Index 0)
-        .value_size  = 15000,   // MTU-sized payload buffer
+        .value_size  = 18000,   // MTU-sized payload buffer
         .max_entries = cpu?1:10000,      // We only need 1 buffer per CPU core
     };
     strcpy(attr.map_name, name);
@@ -4051,6 +4189,11 @@ int get_or_create_buffer_map(const char *name, int per_cpu, int exonerr) {
  * Syntax: save-packet <MAP_NAME> <len> [src_off] [dst_off]
  */
 void compile_save_packet(int map_fd, const char *len_arg, const char *src_off_arg, const char *dst_off_arg) {
+    //store packet length into REG8
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len)));
+    //emit(BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_1, offsetof(struct __sk_buff, len)));
+
     // 1. Setup Key (Index 0) on stack
     emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0));
     
@@ -4066,20 +4209,101 @@ void compile_save_packet(int map_fd, const char *len_arg, const char *src_off_ar
     add_safety_jump();
     emit(((struct bpf_insn){.code = BPF_JMP|BPF_JEQ|BPF_K, .dst_reg = BPF_REG_0, .imm = 0}));
 
+    // 4. Resolve SRC offset (from packet) into R2
+    if (src_off_arg && src_off_arg[0] == '%') {
+        int v_off = get_var_offset(src_off_arg);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off)); // Assume 32-bit variable
+        //TODO: ensure length + source is less than 9000
+    } else {
+        uint32_t imm = src_off_arg ? (uint32_t)strtoul(src_off_arg, NULL, 0) : 0;
+        emit(BPF_MOV64_IMM(BPF_REG_2, imm));
+    }
+
+    // 5. Resolve DST offset (into map buffer) and calculate R3 = Map_Ptr (R0) + DST
+    /*emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_0));
+    if (dst_off_arg && dst_off_arg[0] == '%') {
+        int v_off = get_var_offset(dst_off_arg);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+
+        //TODO: ensure length + dst is less than packet length in REG8
+        //emit(BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_4, 0));
+        //emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_9, .src_reg = BPF_REG_1}));
+        //int skip_cap = prog_idx;
+        //emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_8, .src_reg=BPF_REG_9}));
+        //emit(BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_8, 0));
+        //emit(((struct bpf_insn){.code = BPF_ALU64|BPF_SUB|BPF_X, .dst_reg = BPF_REG_9, .src_reg = BPF_REG_3}));
+        //emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_9, 0));
+        //prog[skip_cap].off = prog_idx - skip_cap - 1;
+	int skip_cap = prog_idx;
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_1, .imm=9000}));
+        emit(BPF_MOV64_IMM(BPF_REG_1, 9000));
+        prog[skip_cap].off = prog_idx - skip_cap - 1;
+        emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_3, .src_reg = BPF_REG_1}));
+    } else {
+        uint32_t imm = dst_off_arg ? (uint32_t)strtoul(dst_off_arg, NULL, 0) : 0;
+        emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_3, .imm = imm}));
+        emit(BPF_MOV64_IMM(BPF_REG_1, imm));
+    }*/
+
     // 3. Resolve Length into R4
     if (len_arg[0] == '%') {
         int v_off = get_var_offset(len_arg);
         int v_sz = get_var_size(len_arg);
-        if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_4, BPF_REG_10, v_off));
-        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, v_off));
-        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, v_off));
-        else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_10, v_off));
+        if (v_sz == 1) {
+	       	emit(BPF_LDX_MEM(BPF_B, BPF_REG_4, BPF_REG_10, v_off));
+	       	emit(BPF_LDX_MEM(BPF_B, BPF_REG_9, BPF_REG_10, v_off));
+	} else if (v_sz == 2) { 
+		emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, v_off));
+		emit(BPF_LDX_MEM(BPF_H, BPF_REG_9, BPF_REG_10, v_off));
+	} else if (v_sz == 4) { 
+		emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, v_off));
+		emit(BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_10, v_off));
+	} else { 
+		emit(BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_10, v_off));
+		emit(BPF_LDX_MEM(BPF_DW, BPF_REG_9, BPF_REG_10, v_off));
+        }
         add_safety_jump();
         emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=0}));
+        add_safety_jump();
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_4, .src_reg=BPF_REG_8}));
+        add_safety_jump();
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_2, .src_reg=BPF_REG_8}));
+
         int skip_cap = prog_idx;
         emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=9000}));
         emit(BPF_MOV64_IMM(BPF_REG_4, 9000));
         prog[skip_cap].off = prog_idx - skip_cap - 1;
+
+	/*
+	//TODO: Fix whatever is broken here - causing compiler errors and also breaking MPLS
+	//Check if len + dst_off > pkt_len
+	//R9 = R9 (len) + R1 (dst offset)
+	emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_9, .src_reg = BPF_REG_1}));
+	skip_cap = prog_idx;
+	//emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLT|BPF_X, .dst_reg=BPF_REG_9, .src_reg=BPF_REG_8}));
+	emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_9, .imm=9000}));
+        emit(BPF_MOV64_IMM(BPF_REG_4, 9000));
+	//R4 = R8 (pkt len)
+	//emit(BPF_MOV64_REG(BPF_REG_4, BPF_REG_8));
+	//R4 = R4 - R1 (dst offset)
+	emit(((struct bpf_insn){.code = BPF_ALU64|BPF_SUB|BPF_X, .dst_reg = BPF_REG_4, .src_reg = BPF_REG_1}));
+	//emit(BPF_MOV64_REG(BPF_REG_9, BPF_REG_4));
+        prog[skip_cap].off = prog_idx - skip_cap - 1;
+
+	//Check if len + src_off > pkt_len
+	//R9 = R9 (len) + R2 (src offset)
+	emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_9, .src_reg = BPF_REG_2}));
+	skip_cap = prog_idx;
+	emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLT|BPF_X, .dst_reg=BPF_REG_9, .src_reg=BPF_REG_8}));
+	//R4 = R8 (pkt len)
+	emit(BPF_MOV64_REG(BPF_REG_4, BPF_REG_8));
+	//R4 = R4 - R2 (src offset)
+	emit(((struct bpf_insn){.code = BPF_ALU64|BPF_SUB|BPF_X, .dst_reg = BPF_REG_4, .src_reg = BPF_REG_2}));
+        prog[skip_cap].off = prog_idx - skip_cap - 1;*/
+
+	add_safety_jump();
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=0}));
+
     } else {
         uint32_t imm = (uint32_t)strtoul(len_arg, NULL, 0);
         if (imm > 9000) imm = 9000;
@@ -4087,37 +4311,277 @@ void compile_save_packet(int map_fd, const char *len_arg, const char *src_off_ar
         emit(BPF_MOV64_IMM(BPF_REG_4, imm));
     }
 
-    // 4. Resolve SRC offset (from packet) into R2
-    if (src_off_arg && src_off_arg[0] == '%') {
-        int v_off = get_var_offset(src_off_arg);
-        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off)); // Assume 32-bit variable
-    } else {
-        uint32_t imm = src_off_arg ? (uint32_t)strtoul(src_off_arg, NULL, 0) : 0;
-        emit(BPF_MOV64_IMM(BPF_REG_2, imm));
-    }
-
     // 5. Resolve DST offset (into map buffer) and calculate R3 = Map_Ptr (R0) + DST
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_0));
     if (dst_off_arg && dst_off_arg[0] == '%') {
         int v_off = get_var_offset(dst_off_arg);
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+
+        //TODO: ensure length + dst is less than packet length in REG8
+        //emit(BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_4, 0));
+        //emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_9, .src_reg = BPF_REG_1}));
+        //int skip_cap = prog_idx;
+        //emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_8, .src_reg=BPF_REG_9}));
+        //emit(BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_8, 0));
+        //emit(((struct bpf_insn){.code = BPF_ALU64|BPF_SUB|BPF_X, .dst_reg = BPF_REG_9, .src_reg = BPF_REG_3}));
+        //emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_9, 0));
+        //prog[skip_cap].off = prog_idx - skip_cap - 1;
+	
+
+        int skip_cap = prog_idx;
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_1, .imm=9000}));
+        emit(BPF_MOV64_IMM(BPF_REG_1, 9000));
+        prog[skip_cap].off = prog_idx - skip_cap - 1;
+
+        
+	//emit(BPF_MOV64_REG(BPF_REG_9, BPF_REG_1));
+        //emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_9, .src_reg = BPF_REG_1}));
+
+	//add_safety_jump();
+	//emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_9, .imm=9000}));
+	add_safety_jump();
+	emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLT|BPF_K, .dst_reg=BPF_REG_1, .imm=0}));
+        
+
+
         emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_3, .src_reg = BPF_REG_1}));
     } else {
         uint32_t imm = dst_off_arg ? (uint32_t)strtoul(dst_off_arg, NULL, 0) : 0;
         emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_3, .imm = imm}));
+        emit(BPF_MOV64_IMM(BPF_REG_1, imm));
     }
+
+    /*int skip_cap1 = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_4, .imm=9000}));
+    int skip_cap2 = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=0}));
+    int skip_cap3 = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLT|BPF_K, .dst_reg=BPF_REG_3, .imm=0}));
+    int skip_cap4 = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLT|BPF_K, .dst_reg=BPF_REG_2, .imm=0}));
+    int skip_cap5 = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGE|BPF_K, .dst_reg=BPF_REG_2, .imm=9000}));
+
+    emit(BPF_MOV64_REG(BPF_REG_9, BPF_REG_4));
+    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_9, .src_reg = BPF_REG_2}));
+    int skip_cap6 = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGE|BPF_K, .dst_reg=BPF_REG_9, .imm=9000}));
+*/
+    /*emit(BPF_MOV64_REG(BPF_REG_9, BPF_REG_4));
+    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_9, .src_reg = BPF_REG_3}));
+    int skip_cap7 = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGE|BPF_K, .dst_reg=BPF_REG_9, .imm=9000}));*/
 
     // 6. Execute save (bpf_skb_load_bytes)
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); // skb
     // R2 = src_off, R3 = map_ptr + dst_off, R4 = len
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+
+    /*prog[skip_cap1].off = prog_idx - skip_cap1 - 1;
+    prog[skip_cap2].off = prog_idx - skip_cap2 - 1;
+    prog[skip_cap3].off = prog_idx - skip_cap3 - 1;
+    prog[skip_cap4].off = prog_idx - skip_cap4 - 1;
+    prog[skip_cap5].off = prog_idx - skip_cap5 - 1;
+    prog[skip_cap6].off = prog_idx - skip_cap6 - 1;*/
+    //prog[skip_cap7].off = prog_idx - skip_cap7 - 1;
 }
+
+/*
+ * Emits bytecode to copy 'len' bytes from the packet into the Per-CPU Buffer Map.
+ * Restricts map buffer offsets strictly to compile-time static constants to satisfy
+ * the Linux verifier's prohibition against variable-offset map pointers.
+ */
+/*void compile_save_packet(int map_fd, const char *len_arg, const char *src_off_arg, const char *dst_off_arg) {
+    // 1. Setup Key (Index 0) on stack
+    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0));
+
+    // 2. Lookup Map Pointer (Returns Map Pointer in R0)
+    emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .off = 0, .imm = map_fd}));
+    emit(((struct bpf_insn){.code = 0x00, .dst_reg = 0,         .src_reg = 0, .off = 0, .imm = 0}));
+
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
+    emit(BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+
+    add_safety_jump();
+    emit(((struct bpf_insn){.code = BPF_JMP|BPF_JEQ|BPF_K, .dst_reg = BPF_REG_0, .imm = 0}));
+
+    // Save Map Pointer (R0) to stack scratchpad
+    int map_ptr_spill = next_var_offset - 8;
+    next_var_offset = map_ptr_spill;
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, map_ptr_spill));
+
+    // 3. Resolve and strictly bound Length into R4
+    if (len_arg[0] == '%') {
+        int v_off = get_var_offset(len_arg);
+        int v_sz = get_var_size(len_arg);
+        if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_4, BPF_REG_10, v_off));
+        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, v_off));
+        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, v_off));
+        else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_10, v_off));
+
+        add_safety_jump();
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=0}));
+
+        int skip_cap = prog_idx;
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=1500}));
+        emit(BPF_MOV64_IMM(BPF_REG_4, 1500));
+        prog[skip_cap].off = prog_idx - skip_cap - 1;
+    } else {
+        uint32_t imm = (uint32_t)strtoul(len_arg, NULL, 0);
+        if (imm > 1500) imm = 1500;
+        if (imm == 0) return;
+        emit(BPF_MOV64_IMM(BPF_REG_4, imm));
+    }
+
+    // 4. Resolve SRC offset (packet offset) into R2
+    // (Packet offsets CAN be dynamic variables because skb_load_bytes handles packet offsets natively!)
+    if (src_off_arg && src_off_arg[0] == '%') {
+        int v_off = get_var_offset(src_off_arg);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+    } else {
+        uint32_t imm = src_off_arg ? (uint32_t)strtoul(src_off_arg, NULL, 0) : 0;
+        emit(BPF_MOV64_IMM(BPF_REG_2, imm));
+    }
+
+    // Packet Bounds Check: src_offset (R2) + length (R4) <= skb->len
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); // skb
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1, offsetof(struct __sk_buff, len)));
+
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_2));
+    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_1, .src_reg = BPF_REG_4}));
+
+    add_safety_jump();
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_7}));
+
+    // 5. Resolve DST offset (map offset) statically into R3
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_3, BPF_REG_10, map_ptr_spill)); // R3 = map_ptr
+
+    if (dst_off_arg && dst_off_arg[0] == '%') {
+        fprintf(stderr, "Error: Map offsets must be constant integers to satisfy verifier pointer safety.\n");
+        exit(1);
+    }
+
+    uint32_t dst_imm = dst_off_arg ? (uint32_t)strtoul(dst_off_arg, NULL, 0) : 0;
+    if (dst_imm > 0) {
+        // We apply the offset strictly as a STATIC IMMEDIATE (BPF_K).
+        // This keeps the Map Pointer mathematically bounded in the verifier's tracker!
+        emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_3, .imm = dst_imm}));
+    }
+
+    // 6. Execute save (bpf_skb_load_bytes)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); // R1 = skb
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+}*/
+
+
+/*
+ * Emits bytecode to overwrite the packet using 'len' bytes from the Per-CPU Buffer Map.
+ * Includes explicit dual-boundary verifier checks.
+ */
+/*void compile_load_packet(int map_fd, const char *len_arg, const char *src_off_arg, const char *dst_off_arg) {
+    // 1. Setup Key (Index 0) on stack
+    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0));
+
+    // 2. Lookup Map Pointer
+    emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .off = 0, .imm = map_fd}));
+    emit(((struct bpf_insn){.code = 0x00, .dst_reg = 0,         .src_reg = 0, .off = 0, .imm = 0}));
+
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
+    emit(BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+
+    add_safety_jump();
+    emit(((struct bpf_insn){.code = BPF_JMP|BPF_JEQ|BPF_K, .dst_reg = BPF_REG_0, .imm = 0}));
+
+    // Save Map Pointer (R0) to stack scratchpad
+    int map_ptr_spill = next_var_offset - 8;
+    next_var_offset = map_ptr_spill;
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, map_ptr_spill));
+
+    // 3. Resolve and bound Length into R4
+    if (len_arg[0] == '%') {
+        int v_off = get_var_offset(len_arg);
+        int v_sz = get_var_size(len_arg);
+        if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_4, BPF_REG_10, v_off));
+        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, v_off));
+        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, v_off));
+        else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_10, v_off));
+
+        add_safety_jump();
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=0}));
+
+        int skip_cap = prog_idx;
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=1500}));
+        emit(BPF_MOV64_IMM(BPF_REG_4, 1500));
+        prog[skip_cap].off = prog_idx - skip_cap - 1;
+    } else {
+        uint32_t imm = (uint32_t)strtoul(len_arg, NULL, 0);
+        if (imm > 1500) imm = 1500;
+        if (imm == 0) return;
+        emit(BPF_MOV64_IMM(BPF_REG_4, imm));
+    }
+
+    // 4. Resolve SRC offset (map offset) and calculate R3 = Map_Ptr + SRC
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_3, BPF_REG_10, map_ptr_spill)); // R3 = map_ptr
+
+    // Calculate SRC offset scalar into R5
+    if (src_off_arg && src_off_arg[0] == '%') {
+        int v_off = get_var_offset(src_off_arg);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_10, v_off));
+    } else {
+        uint32_t imm = src_off_arg ? (uint32_t)strtoul(src_off_arg, NULL, 0) : 0;
+        emit(BPF_MOV64_IMM(BPF_REG_5, imm));
+    }
+
+    // --- VERIFIER BOUNDS CHECK 1: Map Buffer Boundary ---
+    // Prove: src_offset (R5) + length (R4) <= 1500 (Map size)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_5));
+    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_1, .src_reg = BPF_REG_4}));
+
+    add_safety_jump();
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_1, .imm=1500}));
+
+    // R3 = map_ptr + src_offset
+    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_3, .src_reg = BPF_REG_5}));
+
+    // 5. Resolve DST offset (packet offset) into R2
+    if (dst_off_arg && dst_off_arg[0] == '%') {
+        int v_off = get_var_offset(dst_off_arg);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+    } else {
+        uint32_t imm = dst_off_arg ? (uint32_t)strtoul(dst_off_arg, NULL, 0) : 0;
+        emit(BPF_MOV64_IMM(BPF_REG_2, imm));
+    }
+
+    // --- VERIFIER BOUNDS CHECK 2: Packet Boundary ---
+    // Prove: dst_offset (R2) + length (R4) <= skb->len
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); // skb
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1, offsetof(struct __sk_buff, len))); // R7 = skb->len
+
+    // R1 = R2 (dst_offset) + R4 (len)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_2));
+    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_1, .src_reg = BPF_REG_4}));
+
+    add_safety_jump();
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_7}));
+
+    // 6. Execute load (bpf_skb_store_bytes)
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); // R1 = skb
+    // R2 = dst_off, R3 = map_ptr + src_off, R4 = len
+    emit(BPF_MOV64_IMM(BPF_REG_5, 0));         // flags = 0
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+}*/
+
 
 /*
  * Emits bytecode to overwrite the packet using 'len' bytes from the Per-CPU Buffer Map.
  * Syntax: load-packet <MAP_NAME> <len> [src_off] [dst_off]
  */
 void compile_load_packet(int map_fd, const char *len_arg, const char *src_off_arg, const char *dst_off_arg) {
+    //store packet length into REG7
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1, offsetof(struct __sk_buff, len)));
     // 1. Setup Key (Index 0) on stack
     emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0));
     
@@ -4132,21 +4596,55 @@ void compile_load_packet(int map_fd, const char *len_arg, const char *src_off_ar
     add_safety_jump();
     emit(((struct bpf_insn){.code = BPF_JMP|BPF_JEQ|BPF_K, .dst_reg = BPF_REG_0, .imm = 0}));
 
+    // 5. Resolve DST offset (into packet) into R2
+    if (dst_off_arg && dst_off_arg[0] == '%') {
+        int v_off = get_var_offset(dst_off_arg);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+        //TODO: Check that dst + length is less than packet length
+    } else {
+        uint32_t imm = dst_off_arg ? (uint32_t)strtoul(dst_off_arg, NULL, 0) : 0;
+        emit(BPF_MOV64_IMM(BPF_REG_2, imm));
+    }
+
     // 3. Resolve Length into R4
     if (len_arg[0] == '%') {
         int v_off = get_var_offset(len_arg);
         int v_sz = get_var_size(len_arg);
-        if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_4, BPF_REG_10, v_off));
-        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, v_off));
-        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, v_off));
-        else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_10, v_off));
+        if (v_sz == 1) {
+		emit(BPF_LDX_MEM(BPF_B, BPF_REG_4, BPF_REG_10, v_off));
+		emit(BPF_LDX_MEM(BPF_B, BPF_REG_9, BPF_REG_10, v_off));
+	} else if (v_sz == 2) {
+		emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, v_off));
+		emit(BPF_LDX_MEM(BPF_H, BPF_REG_9, BPF_REG_10, v_off));
+        } else if (v_sz == 4) {
+		emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, v_off));
+		emit(BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_10, v_off));
+        }else {
+		emit(BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_10, v_off));
+		emit(BPF_LDX_MEM(BPF_DW, BPF_REG_9, BPF_REG_10, v_off));
+	}
         
         add_safety_jump();
         emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=0}));
+
         int skip_cap = prog_idx;
         emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_4, .imm=9000}));
         emit(BPF_MOV64_IMM(BPF_REG_4, 9000));
         prog[skip_cap].off = prog_idx - skip_cap - 1;
+	/*
+	//Ensure dst + length is less than pkt length in R8
+	//R9 = R4(length) + R2(dst offset)
+	//emit(BPF_LDX_MEM(BPF_DW, BPF_REG_9, BPF_REG_4, 0));
+	emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_9, .src_reg = BPF_REG_2}));
+        skip_cap = prog_idx;
+	//If R9 > R8 (pkt len) 
+	//emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_3, .src_reg=BPF_REG_9}));
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLT|BPF_K, .dst_reg=BPF_REG_9, .src_reg=BPF_REG_8}));
+	//R4 = R8 (pkt len) - R2 (dst offset)
+	emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_8, 0));
+	emit(((struct bpf_insn){.code = BPF_ALU64|BPF_SUB|BPF_X, .dst_reg = BPF_REG_4, .src_reg = BPF_REG_2}));
+
+        prog[skip_cap].off = prog_idx - skip_cap - 1;*/
     } else {
         uint32_t imm = (uint32_t)strtoul(len_arg, NULL, 0);
         if (imm > 9000) imm = 9000;
@@ -4160,6 +4658,12 @@ void compile_load_packet(int map_fd, const char *len_arg, const char *src_off_ar
         int v_off = get_var_offset(src_off_arg);
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
         emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_X, .dst_reg = BPF_REG_3, .src_reg = BPF_REG_1}));
+
+	//TODO: Check that src + length is less than 9000
+	//int skip_cap = prog_idx;
+        //emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_3, .imm=9000}));
+        //emit(BPF_MOV64_IMM(BPF_REG_4, 9000));
+        //prog[skip_cap].off = prog_idx - skip_cap - 1;
     } else {
         uint32_t imm = src_off_arg ? (uint32_t)strtoul(src_off_arg, NULL, 0) : 0;
         emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_3, .imm = imm}));
@@ -4168,7 +4672,8 @@ void compile_load_packet(int map_fd, const char *len_arg, const char *src_off_ar
     // 5. Resolve DST offset (into packet) into R2
     if (dst_off_arg && dst_off_arg[0] == '%') {
         int v_off = get_var_offset(dst_off_arg);
-        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off)); 
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+        //TODO:	Check that dst + length is less than packet length
     } else {
         uint32_t imm = dst_off_arg ? (uint32_t)strtoul(dst_off_arg, NULL, 0) : 0;
         emit(BPF_MOV64_IMM(BPF_REG_2, imm));
@@ -5109,6 +5614,10 @@ int main(int argc, char **argv) {
             char *src_off = t > 3 ? tok[3] : NULL;
             char *dst_off = t > 4 ? tok[4] : NULL;
             compile_load_packet(map_fd, tok[2], src_off, dst_off);
+	} else if (strcmp(op, "copy-pkt-to-map") == 0 && t > 4) {
+            // Syntax: copy-pkt-to-map <MAP_NAME> <pkt_offset> <size | %VAR_SIZE> <%VAR_MAP_OFFSET>
+            int map_fd = get_or_create_buffer_map(tok[1],1,1);
+            compile_copy_pkt_to_map(map_fd, atoi(tok[2]), tok[3], tok[4]);
         } else {
              printf("Invalid instruction %s\n",op);
 	     exit(2);
