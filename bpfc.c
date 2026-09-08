@@ -4961,7 +4961,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i],"-m")==0) strcpy(bpf_map_dir,argv[++i]);
         else if (strcmp(argv[i],"-r")==0) read_map = argv[++i];
         else if (strcmp(argv[i],"-f")==0) filename = argv[++i];
-        else if (strcmp(argv[i],"-h")==0) { help(argv[0]); return 0; }
+        else if (strcmp(argv[i],"-h")==0 || strcmp(argv[i],"--help")==0) { help(argv[0]); return 0; }
         else instr = argv[i];
     }
     if (read_map) {
