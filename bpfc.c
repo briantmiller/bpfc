@@ -4383,6 +4383,10 @@ void help(const char *arg0) {
 	"clone <iface> [ingress|egress]"	,"clone and send packet to specified interface, optionally specifying ingress or egress",
 	"ip-frag <size> <input-mtu-max>"	,"fragment IP packets into <size> payload packets up to <input-mtu-max>",
 	"ip-defrag"				,"reassemble fragmented IP packets into a single packet",
+	"save-packet <len> <src> <dst>"		,"save packet data of length into a per-CPU map, optionally specify src and/or dst offset variables supported",
+	"load-packet <len> <src> <dst>"		,"load data of length from per-CPU map into packet, optionally specify src and/or dst offset variables supported",
+	"save-packet-keyed <len> <key> ..."	,"save packet data of length into a shared map at key, optionally specify src and/or dst offset variables supported",
+	"load-packet-keyed <len> <key> ..."	,"load data of length from shared map at key into packet, optionally specify src and/or dst offset variables supported",
 	"fib-lookup [OPTS] <ip-address>"	,"perform FIB lookup on IP address, populate FIB_SMAC, FIB_DMAC, FIB_IFINDEX and FIB_IP_DST variables",
 	"  src <ip-address>"			,"set source IP address for FIB lookup - if source based routing is needed",
 	"  iface <iface>"			,"set source IP interface for FIB lookup - if source based routing is needed",
@@ -4443,6 +4447,9 @@ void help(const char *arg0) {
 	"protocol"		,"Packet protocol number",
 	"len"			,"Packet length - get/match only",
     };
+    char *misc_fields[] = {
+	"map <key> <val>"	,"get/set value from persistent map",
+    };
     printf("Usage: %s [OPTION...] 'COMMAND;COMMAND;...'\n\n", arg0);
     int opt_num = sizeof(opts) / sizeof(opts[0]);
     for (int i=0; i < opt_num; i+=2) {
@@ -4480,6 +4487,11 @@ void help(const char *arg0) {
     int skb_num = sizeof(skb_fields) / sizeof(skb_fields[0]);
     for (int i=0; i< skb_num; i+=2) {
 	printf("    %-20s %s\n",skb_fields[i], skb_fields[i+1]);
+    }
+    printf("\n  Persistent storage:\n");
+    int misc_num = sizeof(misc_fields) / sizeof(misc_fields[0]);
+    for (int i=0; i< misc_num; i+=2) {
+	printf("    %-20s %s\n",misc_fields[i], misc_fields[i+1]);
     }
 }
 
