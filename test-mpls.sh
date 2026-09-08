@@ -350,13 +350,13 @@ echo "
 	" | tr -d '\n' | tr -d '\t' 
 }
 
-ip netns exec CE1 ./bpf_compiler $COPTS -i h1  -d ingress -p 100 "$(mpls_out_nh 10.0.0.6 16 1 255 19)" && test_pass CE1-pw0-out-install || test_fail CE1-pw0-out-install
-ip netns exec CE2 ./bpf_compiler $COPTS -i h2  -d ingress -p 100 "$(mpls_out_nh 10.0.0.2 18 1 255 20)" && test_pass CE2-pw0-out-install || test_fail CE2-pw0-out-install
-#ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
-#ip netns exec CE2 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
-ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_in_slow 18 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
-#ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 101 "$(mpls_in_1 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
-ip netns exec CE2 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_in_slow 16 h2)" && test_pass CE2-pw0-in-install || test_fail CE2-pw0-in-install
+ip netns exec CE1 ./bpfc $COPTS -i h1  -d ingress -p 100 "$(mpls_out_nh 10.0.0.6 16 1 255 19)" && test_pass CE1-pw0-out-install || test_fail CE1-pw0-out-install
+ip netns exec CE2 ./bpfc $COPTS -i h2  -d ingress -p 100 "$(mpls_out_nh 10.0.0.2 18 1 255 20)" && test_pass CE2-pw0-out-install || test_fail CE2-pw0-out-install
+#ip netns exec CE1 ./bpfc $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
+#ip netns exec CE2 ./bpfc $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
+ip netns exec CE1 ./bpfc $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_in_slow 18 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
+#ip netns exec CE1 ./bpfc $COPTS -i pe1 -d ingress -p 101 "$(mpls_in_1 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
+ip netns exec CE2 ./bpfc $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_in_slow 16 h2)" && test_pass CE2-pw0-in-install || test_fail CE2-pw0-in-install
 
 
 #timeout 5 ip netns exec PE1 tcpdump -levnpi ce2 -XX &> out1.txt &
@@ -428,9 +428,9 @@ then
 	#ip netns exec H1 netstat -s -t | sed 's/^/  /g'
 	#echo "TCP stats H2:"
 	#ip netns exec H2 netstat -s -t | sed 's/^/  /g'
-#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r PKTS_OVR
-#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r PKTS_IN
-#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r PKTS_OUT
+#ip netns exec CE1 ./bpfc $COPTS -m /var/run/bpf/CE1 -r PKTS_OVR
+#ip netns exec CE1 ./bpfc $COPTS -m /var/run/bpf/CE1 -r PKTS_IN
+#ip netns exec CE1 ./bpfc $COPTS -m /var/run/bpf/CE1 -r PKTS_OUT
 
 	#echo "TC filter CE1"
 	#ip netns exec CE1 tc -s -d filter show dev pe1 ingress | sed 's/^/  /g'

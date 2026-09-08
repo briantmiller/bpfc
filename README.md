@@ -16,10 +16,10 @@ Built for Red Team operations, SD-WAN edge routing, and high-performance network
 
 ```bash
 # Install to an interface
-sudo ./bpf_compiler -i <interface> [-d ingress|egress] [-p <priority>] [-m <map_dir>] [-v] "<instructions>"
+sudo ./bpfc -i <interface> [-d ingress|egress] [-p <priority>] [-m <map_dir>] [-v] "<instructions>"
 
 # Clean / Detach from an interface
-sudo ./bpf_compiler -i <interface> -c
+sudo ./bpfc -i <interface> -c
 ```
 
 | Flag | Description |
@@ -115,7 +115,7 @@ Allows persistent data storage across packets and network interfaces.
 ### 1. Stateful Firewall & Port Translation (DNAT)
 Intercept TCP traffic, enforce a connection rate limit via Maps, and dynamically translate the destination port.
 ```bash
-./bpf_compiler -i eth0 -p 10 "match tcp; \
+./bpfc -i eth0 -p 10 "match tcp; \
     get ip-src SRC; \
     get map DDOS_BLOCK %SRC COUNT; \
     match val %COUNT gt 5000; debug-log BLOCKED; drop; end-match; \
@@ -130,7 +130,7 @@ Intercept TCP traffic, enforce a connection rate limit via Maps, and dynamically
 ### 2. ARP Spoofing / Reflection
 Intercept an ARP Request, flip it to a Reply, dynamically swap addresses, and reflect it out the same interface.
 ```bash
-./bpf_compiler -i eth0 -p 5 -d ingress "match arp; match arp-oper 1; \
+./bpfc -i eth0 -p 5 -d ingress "match arp; match arp-oper 1; \
     get arp-sha S_MAC; get arp-spa S_IP; get arp-tpa T_IP; \
     set arp-oper 2; \
     set arp-tha %S_MAC; set arp-tpa %S_IP; \
@@ -141,7 +141,7 @@ Intercept an ARP Request, flip it to a Reply, dynamically swap addresses, and re
 ### 3. SD-WAN Policy Routing (FIB Lookup + GRE)
 Route UDP 5060 (VoIP) out a fast link, and GRE tunnel everything else via the routing table.
 ```bash
-./bpf_compiler -i eth0 -d ingress "match ip; \
+./bpfc -i eth0 -d ingress "match ip; \
     match udp-dst 5060; \
         set ip-tos 184; \
         redirect-neigh eth1; \
@@ -157,7 +157,7 @@ Route UDP 5060 (VoIP) out a fast link, and GRE tunnel everything else via the ro
 ### 4. MPLS pseudowires
 Encapsulate all packets on an interface eth1 within MPLS pseudowire of label 16 and next-hop label of 20 and send to 10.0.0.6.
 ```bash
-./bpf_compiler -i eth1 -d ingress "decl MPLS1 4; \
+./bpfc -i eth1 -d ingress "decl MPLS1 4; \
 decl MPLS2 4; \
 fib-lookup 10.0.0.6; \ 
 match val %FIB_RESULT eq 0; \
@@ -196,7 +196,7 @@ match val %FIB_RESULT eq 0; \
 
 Decapsulate pseudowire packets and send to interface eth2 - assume next-hop label `20` has been stripped off by PE router. 
 ```bash
-./bpf_compiler -i eth0 -d ingress "match mpls; \
+./bpfc -i eth0 -d ingress "match mpls; \
         match mpls-label 16; \
         del-bytes 0 18; \
         redirect eth2 egress"
@@ -222,7 +222,7 @@ This implementation uses the normal Linux routing FIB, so there is no need to do
 NAT ICMP traffic on eth0
 ```bash
 #Store ICMP "echo request" flow information into map and change source IP to address of eth0
-bpf_compiler -i eth0 -d egress -p 100 "\
+bpfc -i eth0 -d egress -p 100 "\
 match icmp; \
 	match icmp-type 8; \
 		decl FLOW_KEY 8; \
@@ -235,7 +235,7 @@ match icmp; \
 		set ip-src 10.0.0.30"
 
 #Change the IP destination of ICMP "echo reply" packets received on eth0 to NAT'ed address
-bpf_compiler -i eth0 -d ingress -p 100 "\
+bpfc -i eth0 -d ingress -p 100 "\
 match icmp; \
 	match icmp-type 0; \
 		decl FLOW_KEY 8; \
@@ -250,7 +250,7 @@ match icmp; \
 NAT TCP traffic on eth0
 ```bash
 #Match new TCP flows and create entry for flow in map
-bpf_compiler -i eth0 -d egress -p 160 "\
+bpfc -i eth0 -d egress -p 160 "\
 match tcp; \
 	match tcp-flags SYN; \
 		decl FLOW_KEY 8; \
@@ -265,10 +265,10 @@ match tcp; \
 		calc or FLOW_KEY %TCP_DST; \
 		set map TCP_NAT %FLOW_KEY %IP_SRC"
 #Change source IP to IP address of eth0
-bpf_compiler -i eth0 -d egress -p 164 'match tcp; set ip-src 10.0.0.30'
+bpfc -i eth0 -d egress -p 164 'match tcp; set ip-src 10.0.0.30'
 
 #Change the IP destination of TCP packets received on eth0 to NAT'ed address
-bpf_compiler -i eth0 -d ingress -p 160 "\
+bpfc -i eth0 -d ingress -p 160 "\
 match tcp; \
 	decl FLOW_KEY 8; \
 	decl TCP_DST 4; \
@@ -286,7 +286,7 @@ match tcp; \
 NAT UDP traffic on eth0
 ```bash
 #Store UDP flow information into map and change source IP to address of eth0
-bpf_compiler -i eth0 -d egress -p 117 "\
+bpfc -i eth0 -d egress -p 117 "\
 match udp; \
 	decl FLOW_KEY 8; \
 	get ip-dst FLOW_KEY; \
@@ -298,7 +298,7 @@ match udp; \
 	set ip-src 10.0.0.30"
 
 #Change the IP destination of UDP packets received on eth0 to NAT'ed address
-bpf_compiler -i eth0 -d ingress -p 117 "\
+bpfc -i eth0 -d ingress -p 117 "\
 match udp; \
 	decl FLOW_KEY 8; \
 	get ip-src FLOW_KEY; \
