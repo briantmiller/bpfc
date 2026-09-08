@@ -363,7 +363,7 @@ then
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
 fi
 
-if [ 1 -eq 1 ]
+if [ 1 -eq 0 ]
 then
 	ip netns exec H2 $IPERF -s &>/dev/null & P1=$!
 	ip netns exec H1 $IPERF -s &>/dev/null & P2=$!
