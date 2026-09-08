@@ -10,7 +10,7 @@ setns = libc.setns
 
 
 # Path to our compiler binary
-COMPILER_BIN = "./bpf_compiler"
+COMPILER_BIN = "./bpfc"
 
 # Network Namespace and Interface Names
 NS_TX = "ns_tx"

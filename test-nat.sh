@@ -105,8 +105,8 @@ ip netns exec HOST1 ping -c 4 -i 0.1 -W 0.2 192.168.0.1 &>/dev/null && test_pass
 ip netns exec HOST2 ping -c 4 -i 0.1 -W 0.2 192.168.0.1 &>/dev/null && test_pass HOST2-RTR || test_fail HOST2-RTR &
 
 #ICMP NAT testing
-ip netns exec RTR ./bpf_compiler $COPTS -i wan -d egress -p 100 -m /var/run/bpf/RTR 'match icmp; match icmp-type 8; get ip-src IP_SRC; get bytes 38 2 ICMP_IDENT; set map ICMP_NAT %ICMP_IDENT %IP_SRC; set ip-src 10.0.0.30' && test_pass ICMP-NAT-OUT || test_fail ICMP-NAT-OUT
-ip netns exec RTR ./bpf_compiler $COPTS -i wan -d ingress -p 100 -m /var/run/bpf/RTR 'match icmp; match icmp-type 0; get bytes 38 2 ICMP_IDENT; get map ICMP_NAT %ICMP_IDENT IP_DST; set ip-dst %IP_DST' && test_pass ICMP-NAT-IN || test_fail ICMP-NAT-IN
+ip netns exec RTR ./bpfc $COPTS -i wan -d egress -p 100 -m /var/run/bpf/RTR 'match icmp; match icmp-type 8; get ip-src IP_SRC; get bytes 38 2 ICMP_IDENT; set map ICMP_NAT %ICMP_IDENT %IP_SRC; set ip-src 10.0.0.30' && test_pass ICMP-NAT-OUT || test_fail ICMP-NAT-OUT
+ip netns exec RTR ./bpfc $COPTS -i wan -d ingress -p 100 -m /var/run/bpf/RTR 'match icmp; match icmp-type 0; get bytes 38 2 ICMP_IDENT; get map ICMP_NAT %ICMP_IDENT IP_DST; set ip-dst %IP_DST' && test_pass ICMP-NAT-IN || test_fail ICMP-NAT-IN
 
 #timeout 5 ip netns exec RTR tcpdump -lvnpi wan icmp -XX &
 #timeout 5 ip netns exec RTR tcpdump -lvnpi wan tcp &
@@ -124,19 +124,19 @@ ip netns exec HOST1 ping -c 3 10.0.0.1 &>/dev/null && test_pass ICMP-NAT || test
 #TCP NAT testing
 
 #Register new TCP connections into TCP NAT table
-ip netns exec RTR ./bpf_compiler $COPTS -i wan -d egress -p 106 -m /var/run/bpf/RTR 'match tcp; match tcp-flags SYN; get ip-src IP_SRC; get tcp-src TCP_SRC; set map TCP_NAT %TCP_SRC %IP_SRC' && test_pass TCP-NAT-OUT || test_fail TCP-NAT-OUT
+ip netns exec RTR ./bpfc $COPTS -i wan -d egress -p 106 -m /var/run/bpf/RTR 'match tcp; match tcp-flags SYN; get ip-src IP_SRC; get tcp-src TCP_SRC; set map TCP_NAT %TCP_SRC %IP_SRC' && test_pass TCP-NAT-OUT || test_fail TCP-NAT-OUT
 #Change all outgoing TCP packets to be sourced from wan interface
-ip netns exec RTR ./bpf_compiler $COPTS -i wan -d egress -p 1061 -m /var/run/bpf/RTR 'match tcp; set ip-src 10.0.0.30' && test_pass TCP-NAT-OUT || test_fail TCP-NAT-OUT
+ip netns exec RTR ./bpfc $COPTS -i wan -d egress -p 1061 -m /var/run/bpf/RTR 'match tcp; set ip-src 10.0.0.30' && test_pass TCP-NAT-OUT || test_fail TCP-NAT-OUT
 #Change the IP destination of TCP packets back to NAT'ed address
-ip netns exec RTR ./bpf_compiler $COPTS -i wan -d ingress -p 106 -m /var/run/bpf/RTR 'match tcp; get tcp-dst TCP_DST; get map TCP_NAT %TCP_DST IP_DST; set ip-dst %IP_DST' && test_pass TCP-NAT-IN || test_fail TCP-NAT-IN
+ip netns exec RTR ./bpfc $COPTS -i wan -d ingress -p 106 -m /var/run/bpf/RTR 'match tcp; get tcp-dst TCP_DST; get map TCP_NAT %TCP_DST IP_DST; set ip-dst %IP_DST' && test_pass TCP-NAT-IN || test_fail TCP-NAT-IN
 
 echo "TCP Echo" | timeout 4 ip netns exec HOST1 nc -w 1 10.0.01 7 && test_pass TCP-NAT || test_fail TCP-NAT
 
 
 #UDP NAT testing
 
-ip netns exec RTR ./bpf_compiler $COPTS -i wan -d egress -p 117 -m /var/run/bpf/RTR 'match udp; get ip-src IP_SRC; get udp-src UDP_SRC; set map UDP_NAT %UDP_SRC %IP_SRC;set ip-src 10.0.0.30' && test_pass UDP-NAT-OUT || test_fail UDP-NAT-OUT
-ip netns exec RTR ./bpf_compiler $COPTS -i wan -d ingress -p 117 -m /var/run/bpf/RTR 'match udp; get udp-dst UDP_DST; get map UDP_NAT %UDP_DST IP_DST; set ip-dst %IP_DST' && test_pass UDP-NAT-IN || test_fail UDP-NAT-IN
+ip netns exec RTR ./bpfc $COPTS -i wan -d egress -p 117 -m /var/run/bpf/RTR 'match udp; get ip-src IP_SRC; get udp-src UDP_SRC; set map UDP_NAT %UDP_SRC %IP_SRC;set ip-src 10.0.0.30' && test_pass UDP-NAT-OUT || test_fail UDP-NAT-OUT
+ip netns exec RTR ./bpfc $COPTS -i wan -d ingress -p 117 -m /var/run/bpf/RTR 'match udp; get udp-dst UDP_DST; get map UDP_NAT %UDP_DST IP_DST; set ip-dst %IP_DST' && test_pass UDP-NAT-IN || test_fail UDP-NAT-IN
 
 timeout 5 ip netns exec HOST1 tcpdump -c 1 -lvnpi rtr udp and ip src 10.0.0.1 &>/dev/null && test_pass UDP-NAT || test_fail UDP-NAT &
 sleep 0.5s 

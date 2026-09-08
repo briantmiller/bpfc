@@ -125,13 +125,13 @@ ip -n HOST1 route add default via 10.1.1.1
 
 RX2_rx1_mac=$(ip netns exec RX2 bash -c 'cat /sys/class/net/rx1/address')
 #Encapsulate only ICMP packets with GRE from TX namespace
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 100 'match icmp; encap-gre ip-src 10.0.0.1 ip-dst 10.0.0.2 key 100' &
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match icmp; encap-gre ip-src 10.0.0.1 ip-dst 10.0.0.2 key 100' &
 #Drop ICMP packets leaving TX if not GRE encapsulated
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 999 'match icmp; drop' &
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 999 'match icmp; drop' &
 #Drop IPv6 packets - can cause noise with the monitors if in debug mode
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 8 'match ip6; drop' &
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 8 'match ip6; drop' &
 #Decapsulate GRE packets on RX namespace
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 100 'match gre-key 100; decap-gre; reclassify' &
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 100 'match gre-key 100; decap-gre; reclassify' &
 wait
 
 #Start monitors
@@ -160,12 +160,12 @@ fi
 echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 && echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 && test_pass Echo || test_fail Echo
 
 #Test drop rule
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 99 'match tcp; match tcp-dst 7; drop'
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 99 'match tcp; match tcp-dst 7; drop'
 echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_fail TCP-drop || test_pass TCP-drop
 
 #Test rewriting TCP destination port
-#ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 90 'decl TDST 2;match tcp; get tcp-dst TDST; set tcp-dst %TDST'
-#ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 90 'match tcp; get tcp-dst TDST; calc sub TDST 8; set tcp-dst %TDST'
+#ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 90 'decl TDST 2;match tcp; get tcp-dst TDST; set tcp-dst %TDST'
+#ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 90 'match tcp; get tcp-dst TDST; calc sub TDST 8; set tcp-dst %TDST'
 #timeout 3 ip netns exec TX tcpdump -lvnnpi tx0 &
 #timeout 3 ip netns exec RX tcpdump -lvnpi rx0 
 #sleep 0.5s
@@ -173,31 +173,31 @@ echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_
 #echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_pass Get/Set tcp-dst || test_fail Get/Set tcp-dst
 
 #Test rewriting TCP destination port
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 90 'match tcp; get tcp-dst TDST; calc add TDST 8; set tcp-dst %TDST'
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 90 'match tcp; get tcp-dst TDST; calc sub TDST 8; set tcp-dst %TDST'
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 90 'match tcp; get tcp-dst TDST; calc add TDST 8; set tcp-dst %TDST'
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 90 'match tcp; get tcp-dst TDST; calc sub TDST 8; set tcp-dst %TDST'
 #timeout 3 ip netns exec TX tcpdump -lvnnpi tx0 &
 #timeout 3 ip netns exec RX tcpdump -lvnpi rx0 
 #sleep 0.5s
 #ip netns exec TX ping -c 1 2.2.2.2
 echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_pass Calc || test_fail Calc
 
-#ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 92 'match tcp; push-net-bytes 20'
-#ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 92 'match tcp; pop-net-bytes 20'
+#ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 92 'match tcp; push-net-bytes 20'
+#ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 92 'match tcp; pop-net-bytes 20'
 #echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && echo "Push-net-bytes PASS" || echo "Push-net-bytes FAIL"
 
 
-#ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 91 'match tcp; get tcp-dst TDST; calc lsh TDST 7; set map TEST TDST %TDST; set tcp-dst 777'
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 91 -m /var/run/bpf/TX 'match tcp; match tcp-dst 7; get tcp-dst TDST; calc lsh TDST 2; set map TEST TDST %TDST; set tcp-dst 777' || test_fail Map-install-1
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 92 -m /var/run/bpf/TX 'match tcp; match tcp-dst 777; get map TEST TDST DST; calc rsh DST 2; set tcp-dst %DST' || test_fail Map-install-2
+#ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 91 'match tcp; get tcp-dst TDST; calc lsh TDST 7; set map TEST TDST %TDST; set tcp-dst 777'
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 91 -m /var/run/bpf/TX 'match tcp; match tcp-dst 7; get tcp-dst TDST; calc lsh TDST 2; set map TEST TDST %TDST; set tcp-dst 777' || test_fail Map-install-1
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 92 -m /var/run/bpf/TX 'match tcp; match tcp-dst 777; get map TEST TDST DST; calc rsh DST 2; set tcp-dst %DST' || test_fail Map-install-2
 #timeout 8 ip netns exec TX tcpdump -c 4 -lvnnpi tx0 tcp &
 sleep 0.5s
 
 echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_pass Map || test_fail Map
 
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -c
+ip netns exec TX ./bpfc $COPTS -i tx0 -c
 
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 101 'match arp; match arp-oper 1; match arp-tpa 10.0.0.30; set arp-oper 2; get arp-spa SPA; get arp-sha SHA; set arp-sha de:ad:be:ef:ca:fe; set arp-tha %SHA; set arp-tpa %SPA; set arp-spa 10.0.0.30; redirect rx0 egress' || test_fail ICMP-Echo-Install-1
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 102 'match icmp; match icmp-type 8; set icmp-type 0; match ip-dst 10.0.0.30; get ip-src IP_SRC; set ip-dst %IP_SRC; set ip-src 10.0.0.30; get dst-mac DMAC; get src-mac SMAC; set dst-mac %SMAC; set src-mac %DMAC; redirect rx0 egress' || test_fail ICMP-Echo-Install-2
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 101 'match arp; match arp-oper 1; match arp-tpa 10.0.0.30; set arp-oper 2; get arp-spa SPA; get arp-sha SHA; set arp-sha de:ad:be:ef:ca:fe; set arp-tha %SHA; set arp-tpa %SPA; set arp-spa 10.0.0.30; redirect rx0 egress' || test_fail ICMP-Echo-Install-1
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 102 'match icmp; match icmp-type 8; set icmp-type 0; match ip-dst 10.0.0.30; get ip-src IP_SRC; set ip-dst %IP_SRC; set ip-src 10.0.0.30; get dst-mac DMAC; get src-mac SMAC; set dst-mac %SMAC; set src-mac %DMAC; redirect rx0 egress' || test_fail ICMP-Echo-Install-2
 #timeout 3 ip netns exec TX tcpdump -c5 -levnnpi tx0 icmp & P1=$!
 sleep 0.5s 
 timeout 4 ip netns exec TX ping -c2 -i 0.1 -W 0.2 10.0.0.30 &>/dev/null && test_pass ICMP-Echo || test_fail ICMP-Echo
@@ -206,28 +206,28 @@ ip netns exec TX ip neigh show 10.0.0.30 dev br0 | grep -q "de:ad:be:ef:ca:fe" &
 
 
 
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -c
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -c
+ip netns exec TX ./bpfc $COPTS -i tx0 -c
+ip netns exec RX ./bpfc $COPTS -i rx0 -c
 #ip -n TX neigh get 10.0.0.2 dev br0 | cut -f 5 -d ' ' 
-ip netns exec TX ./bpf_compiler $COPTS -i host1 -d ingress -p 100 'match ip-dst 2.2.2.2; encap-gre ip-src 10.0.0.1 ip-dst 10.0.0.2 key 100; redirect-neigh br0'
-#ip netns exec TX ./bpf_compiler $COPTS -i host1 -d ingress -p 100 'match ip-dst 2.2.2.2; encap-gre ip-src 10.0.0.1 ip-dst 10.0.0.2 key 100; redirect br0 egress'
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 100 'match gre-key 100; decap-gre; match icmp; match ip-dst 2.2.2.2; match icmp-type 8; set icmp-type 0; get ip-src IP_SRC; set ip-dst %IP_SRC; set ip-src 2.2.2.2; redirect-neigh br0'
-#ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 100 'match gre-key 100; decap-gre; match icmp; match ip-dst 2.2.2.2; redirect br0 ingress'
+ip netns exec TX ./bpfc $COPTS -i host1 -d ingress -p 100 'match ip-dst 2.2.2.2; encap-gre ip-src 10.0.0.1 ip-dst 10.0.0.2 key 100; redirect-neigh br0'
+#ip netns exec TX ./bpfc $COPTS -i host1 -d ingress -p 100 'match ip-dst 2.2.2.2; encap-gre ip-src 10.0.0.1 ip-dst 10.0.0.2 key 100; redirect br0 egress'
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 100 'match gre-key 100; decap-gre; match icmp; match ip-dst 2.2.2.2; match icmp-type 8; set icmp-type 0; get ip-src IP_SRC; set ip-dst %IP_SRC; set ip-src 2.2.2.2; redirect-neigh br0'
+#ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 100 'match gre-key 100; decap-gre; match icmp; match ip-dst 2.2.2.2; redirect br0 ingress'
 #timeout 5 ip netns exec TX tcpdump -levnnpi tx0 icmp or ip proto gre &
 #timeout 5 ip netns exec RX tcpdump -levnnpi rx0 icmp or ip proto gre &
 #timeout 5 ip netns exec RX tcpdump -levnnpi br0 icmp or ip proto gre &
 #sleep 0.5s
 ip netns exec HOST1 ping -c 3 2.2.2.2 &>/dev/null && test_pass Redirect-neigh || test_fail Redirect-neigh
 
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -c
-ip netns exec TX ./bpf_compiler $COPTS -i host1 -c
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -c
-ip netns exec TX ./bpf_compiler $COPTS -i host1 -d ingress -p 100 'match ip-dst 2.2.2.2; set dst-mac 0;'
-ip netns exec TX ./bpf_compiler $COPTS -i host1 -d ingress -p 101 'match ip-dst 2.2.2.2; get ip-dst IP_DST; fib-lookup %IP_DST; match val FIB_RESULT eq 0; set src-mac %FIB_SMAC; set dst-mac %FIB_DMAC; redirect %FIB_IFINDEX egress; '
+ip netns exec TX ./bpfc $COPTS -i tx0 -c
+ip netns exec TX ./bpfc $COPTS -i host1 -c
+ip netns exec RX ./bpfc $COPTS -i rx0 -c
+ip netns exec TX ./bpfc $COPTS -i host1 -d ingress -p 100 'match ip-dst 2.2.2.2; set dst-mac 0;'
+ip netns exec TX ./bpfc $COPTS -i host1 -d ingress -p 101 'match ip-dst 2.2.2.2; get ip-dst IP_DST; fib-lookup %IP_DST; match val FIB_RESULT eq 0; set src-mac %FIB_SMAC; set dst-mac %FIB_DMAC; redirect %FIB_IFINDEX egress; '
 ip netns exec HOST1 ping -c 3 2.2.2.2 &>/dev/null && test_pass Fib-lookup || test_fail Fib-lookup
 
-ip netns exec TX ./bpf_compiler $COPTS -i host1 -c
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 100 'match ip-dst 2.2.2.2; clone br0 ingress; set ip-dst 10.2.2.2; redirect-neigh rx1'
+ip netns exec TX ./bpfc $COPTS -i host1 -c
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 100 'match ip-dst 2.2.2.2; clone br0 ingress; set ip-dst 10.2.2.2; redirect-neigh rx1'
 timeout 3 ip netns exec RX2 tcpdump -c 2 -levnnpi rx1 icmp &>/dev/null && test_pass Clone-1 || test_fail Clone-1 &
 sleep 0.5s
 ip netns exec HOST1 ping -c 3 2.2.2.2 &>/dev/null && test_pass Clone-2 || test_fail Clone-2
@@ -235,41 +235,41 @@ ip netns exec HOST1 ping -c 3 2.2.2.2 &>/dev/null && test_pass Clone-2 || test_f
 if [ 0 -eq 1 ]
 then
 ip netns exec TX ip route get 2.2.2.2 || echo "Setup for FIB testing FAIL"
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -c
-#ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 100 'match icmp; match ip-dst 2.2.2.2; set ip-dst 5.5.5.5; set dst-mac 01:23:45:67:89:fe; set src-mac 00:00:00:00:00:00; reclassify'
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 100 'match icmp; match ip-tos 192; continue; match src-mac 00:00:00:00:00:00; continue ; match ip-dst 2.2.2.2; set dst-mac 01:23:45:67:89:fe; set src-mac 00:00:00:00:00:00; set ip-tos 192; continue'
-#ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 101 'match icmp; match ip-dst 5.5.5.5; set ip-dst 2.2.2.2; fib-lookup; set src-mac %FIB_SMAC; set dst-mac %FIB_DMAC'
-#ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 101 'match icmp; fib-lookup direct; set src-mac %FIB_SMAC; set dst-mac %FIB_DMAC'
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 101 'match icmp; match src-mac 00:00:00:00:00:00; redirect-neigh tx0'
-#ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 101 'match icmp; match ip-dst 5.5.5.5; set ip-dst 2.2.2.2'
+ip netns exec TX ./bpfc $COPTS -i tx0 -c
+#ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match icmp; match ip-dst 2.2.2.2; set ip-dst 5.5.5.5; set dst-mac 01:23:45:67:89:fe; set src-mac 00:00:00:00:00:00; reclassify'
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match icmp; match ip-tos 192; continue; match src-mac 00:00:00:00:00:00; continue ; match ip-dst 2.2.2.2; set dst-mac 01:23:45:67:89:fe; set src-mac 00:00:00:00:00:00; set ip-tos 192; continue'
+#ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 101 'match icmp; match ip-dst 5.5.5.5; set ip-dst 2.2.2.2; fib-lookup; set src-mac %FIB_SMAC; set dst-mac %FIB_DMAC'
+#ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 101 'match icmp; fib-lookup direct; set src-mac %FIB_SMAC; set dst-mac %FIB_DMAC'
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 101 'match icmp; match src-mac 00:00:00:00:00:00; redirect-neigh tx0'
+#ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 101 'match icmp; match ip-dst 5.5.5.5; set ip-dst 2.2.2.2'
 timeout 5 ip netns exec TX tcpdump -c4 -levnnpi tx0 icmp &
 sleep 0.5s
 timeout 5 ip netns exec TX ping -W 0.2 -c 5 -i 0.1 2.2.2.2 &>/dev/null && echo "FIB PASS" || echo "FIB FAIL"
 
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 250 "match icmp; set dst-mac $RX2_rx1_mac; redirect rx1 egress"
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 250 "match icmp; set dst-mac $RX2_rx1_mac; redirect rx1 egress"
 timeout 5 ip netns exec RX2 tcpdump -c 3 -lvnpi rx1 icmp &>/dev/null && test_pass Redirect || test_fail Redirect &
 sleep 0.5
 timeout 5 ip netns exec TX ping -W 0.2 -c 5 -i 0.1 10.2.2.2 &>/dev/null &
 
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -c
-ip netns exec TX ./bpf_compiler $COPTS -i host1 -c
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -c
+ip netns exec TX ./bpfc $COPTS -i tx0 -c
+ip netns exec TX ./bpfc $COPTS -i host1 -c
+ip netns exec RX ./bpfc $COPTS -i rx0 -c
 
 #skb-cb will get cleared when going through br0, so we can't rely on that, but mark persists within the same namespace
-ip netns exec TX ./bpf_compiler $COPTS -i host1 -d ingress -p 101 'match icmp; match ip-dst 2.2.2.2; set skb-mark 100'
+ip netns exec TX ./bpfc $COPTS -i host1 -d ingress -p 101 'match icmp; match ip-dst 2.2.2.2; set skb-mark 100'
 #Before sending to the RX namespace, set the cb value since the mark will not persist across namespace changes
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 100 'match skb-mark 100; set skb-cb 0 100; continue; drop'
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match skb-mark 100; set skb-cb 0 100; continue; drop'
 #Only allow ICMP packets that have been tagged from our peer with cb 0 = 100, otherwise drop
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 100 'match icmp; match ip-dst 2.2.2.2; match skb-cb 0 100; continue; drop'
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 100 'match icmp; match ip-dst 2.2.2.2; match skb-cb 0 100; continue; drop'
 ip netns exec HOST1 ping -c 3 2.2.2.2 &>/dev/null && test_pass Skb-mark-cb || test_fail Skb-mark-cb
 
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -c
-ip netns exec TX ./bpf_compiler $COPTS -i host1 -c
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -c
+ip netns exec TX ./bpfc $COPTS -i tx0 -c
+ip netns exec TX ./bpfc $COPTS -i host1 -c
+ip netns exec RX ./bpfc $COPTS -i rx0 -c
 
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 100 'match ip; add-l2-bytes 4; set bytes 14 4 0xdeadbeef; continue' && test_pass Add-l2-bytes-install || test_fail Add-l2-bytes-install
-#ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 100 'get bytes 14 2 L25_1; get bytes 16 2 L25_2; match val L25_1 eq 0xdead; match val L25_2 eq 0xbeef; del-l2-bytes 4' && test_pass Del-l2-bytes-install || test_fail Del-l2-bytes-install
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 100 'get bytes 14 4 L25; match val L25 eq 0xdeadbeef; del-l2-bytes 4' && test_pass Del-l2-bytes-install || test_fail Del-l2-bytes-install
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match ip; add-l2-bytes 4; set bytes 14 4 0xdeadbeef; continue' && test_pass Add-l2-bytes-install || test_fail Add-l2-bytes-install
+#ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 100 'get bytes 14 2 L25_1; get bytes 16 2 L25_2; match val L25_1 eq 0xdead; match val L25_2 eq 0xbeef; del-l2-bytes 4' && test_pass Del-l2-bytes-install || test_fail Del-l2-bytes-install
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 100 'get bytes 14 4 L25; match val L25 eq 0xdeadbeef; del-l2-bytes 4' && test_pass Del-l2-bytes-install || test_fail Del-l2-bytes-install
 #timeout 12 ip netns exec TX tcpdump -levnnpi tx0 -XX &
 #sleep 0.5s
 #Currently not working, need to fix add/del l2-bytes
@@ -277,32 +277,32 @@ ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 100 'get bytes 14 4 
 
 fi
 
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -c
-ip netns exec TX ./bpf_compiler $COPTS -i host1 -c
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -c
+ip netns exec TX ./bpfc $COPTS -i tx0 -c
+ip netns exec TX ./bpfc $COPTS -i host1 -c
+ip netns exec RX ./bpfc $COPTS -i rx0 -c
 
 #ip netns exec RX tcpdump -levnnpi rx0 icmp & P1=$!
 #sleep 0.5s
 
-ip netns exec TX ./bpf_compiler $COPTS -i tx0 -d egress -p 100 'match ip-dst 2.2.2.2; push-vlan 100; accept' && test_pass VLAN push install || test_fail VLAN push install
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 104 'match vlan; match ip-dst 2.2.2.2; pop-vlan' && test_pass VLAN pop install || test_fail VLAN pop install
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match ip-dst 2.2.2.2; push-vlan 100; accept' && test_pass VLAN push install || test_fail VLAN push install
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 104 'match vlan; match ip-dst 2.2.2.2; pop-vlan' && test_pass VLAN pop install || test_fail VLAN pop install
 timeout 3 ip netns exec TX ping -c 3 -i 0.5 -W0.2 2.2.2.2 &>/dev/null && test_pass VLAN push/pop || test_fail VLAN push/pop
 
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -c
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 101 'match vlan-id 100; pop-vlan' && test_pass VLAN match install || test_fail VLAN match install
+ip netns exec RX ./bpfc $COPTS -i rx0 -c
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 101 'match vlan-id 100; pop-vlan' && test_pass VLAN match install || test_fail VLAN match install
 timeout 3 ip netns exec TX ping -c 3 -i 0.5 -W0.2 2.2.2.2 &>/dev/null && test_pass VLAN match || test_fail VLAN match
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -c
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 101 'match vlan-id 100-101; pop-vlan' && test_pass VLAN match range install || test_fail VLAN match range install
+ip netns exec RX ./bpfc $COPTS -i rx0 -c
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 101 'match vlan-id 100-101; pop-vlan' && test_pass VLAN match range install || test_fail VLAN match range install
 timeout 3 ip netns exec TX ping -c 3 -i 0.5 -W0.2 2.2.2.2 &>/dev/null && test_pass VLAN match range || test_fail VLAN match range
 
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -c
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 101 'match vlan-id 100-101; get vlan-id VLAN; calc add VLAN 20; set vlan-id %VLAN' && test_pass VLAN change install 1 || test_fail VLAN change install 1
-ip netns exec RX ./bpf_compiler $COPTS -i rx0 -d ingress -p 105 'match vlan-id 120-121; pop-vlan' && test_pass VLAN change install 2 || test_fail VLAN change install 2
+ip netns exec RX ./bpfc $COPTS -i rx0 -c
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 101 'match vlan-id 100-101; get vlan-id VLAN; calc add VLAN 20; set vlan-id %VLAN' && test_pass VLAN change install 1 || test_fail VLAN change install 1
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 105 'match vlan-id 120-121; pop-vlan' && test_pass VLAN change install 2 || test_fail VLAN change install 2
 timeout 3 ip netns exec TX ping -c 3 -i 0.5 -W0.2 2.2.2.2 &>/dev/null && test_pass VLAN change || test_fail VLAN change
 
 
-#ip netns exec TX ./bpf_compiler $COPTS -m /var/run/bpf/RX -r VLAN
-#ip netns exec TX ./bpf_compiler $COPTS -m /var/run/bpf/RX -r OFF14
+#ip netns exec TX ./bpfc $COPTS -m /var/run/bpf/RX -r VLAN
+#ip netns exec TX ./bpfc $COPTS -m /var/run/bpf/RX -r OFF14
 #kill -9 $P1
 
 kill -9 $TCP_PID &>/dev/null 

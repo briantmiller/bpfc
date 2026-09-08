@@ -1,11 +1,11 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2
-TARGET = bpf_compiler
+TARGET = bpfc
 
 all: $(TARGET)
 
-$(TARGET): compiler.c
-	$(CC) $(CFLAGS) -o $(TARGET) compiler.c
+$(TARGET): bpfc.c
+	$(CC) $(CFLAGS) -o $(TARGET) bpfc.c
 
 clean:
 	rm -f $(TARGET) output.bpf
