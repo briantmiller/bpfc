@@ -1,5 +1,7 @@
 #!/bin/bash
 
+FRAG_SIZE=1100
+
 if [ $(whoami) != "root" ]
 then
 	echo "Must be run as root"
@@ -67,12 +69,16 @@ ip netns add H2
 ip netns exec CE1 mkdir -p /var/run/bpf/CE1
 ip netns exec CE2 mkdir -p /var/run/bpf/CE2
 ip netns exec H1 mkdir -p /var/run/bpf/H1
+ip netns exec H2 mkdir -p /var/run/bpf/H2
 mount -t bpf bpffs /var/run/bpf/CE1
 mount -t bpf bpffs /var/run/bpf/CE2
 mount -t bpf bpffs /var/run/bpf/H1
+mount -t bpf bpffs /var/run/bpf/H2
 
 rm -f /var/run/bpf/CE1/*
+rm -f /var/run/bpf/CE2/*
 rm -f /var/run/bpf/H1/*
+rm -f /var/run/bpf/H2/*
 
 for N in CE1 CE2 PE1 H1 H2
 do
@@ -91,8 +97,8 @@ ip -n CE1 link set h1 mtu 3000
 ip -n CE2 link set h2 mtu 3000
 ip -n CE1 link set pe1 mtu 1800
 ip -n CE2 link set pe1 mtu 1800
-ip -n PE1 link set ce1 mtu 1800
-ip -n PE1 link set ce2 mtu 1800
+ip -n PE1 link set ce1 mtu 1500
+ip -n PE1 link set ce2 mtu 1500
 
 ip -n H1 link set ce1 mtu 3000
 ip -n H2 link set ce2 mtu 3000
@@ -148,9 +154,6 @@ ip -6 -n CE2 addr flush dev pe1
 ip -6 -n PE1 addr flush dev ce1
 ip -6 -n PE1 addr flush dev ce2
 
-#ip netns exec CE1 mkdir -p /var/run/bpf/CE1
-#mount -t bpf bpffs /var/run/bpf/CE1
-
 ip netns exec PE1 sysctl -w net.mpls.platform_labels=1048575 &>/dev/null
 ip netns exec CE1 sysctl -w net.mpls.platform_labels=1048575 &>/dev/null
 ip netns exec CE2 sysctl -w net.mpls.platform_labels=1048575 &>/dev/null
@@ -165,7 +168,7 @@ ip netns exec CE2 sysctl -w net.mpls.conf.pe1.input=1 &>/dev/null
 ip -f mpls -n PE1 route add 19 via inet 10.0.0.6 dev ce2
 ip -f mpls -n PE1 route add 20 via inet 10.0.0.2 dev ce1
 
-ip -f mpls -n PE1 route show
+#ip -f mpls -n PE1 route show
 
 ip netns exec H1 iptables -t mangle -A POSTROUTING -p tcp -m tcp -j CHECKSUM --checksum-fill
 ip netns exec H2 iptables -t mangle -A POSTROUTING -p tcp -m tcp -j CHECKSUM --checksum-fill
@@ -241,58 +244,36 @@ MAX=$1
 echo "
 match ip;
 	decl IPFRAG 2;
-	#decl FRAG2 2;
-	#decl IPLEN 2;
 	decl NEWLEN 2;
 	decl TLEN 4;
+	decl IPID 4;
 	decl L1 4;
 	decl L2 4;
 	get ip-frag IPFRAG;
-	#set val FRAG2 %IPFRAG;
-	#calc and IPFRAG 0xFF1F;
-	#calc and IPFRAG 8191;
-	#calc bswap IPFRAG;
 	calc and IPFRAG 0x1FFF;
 	get ip-len IPLEN;
-	#set map DEFRAG %IPFRAG %IPLEN;
+	get ip-ident IPID;
 	match val IPFRAG gt 0;
-		#calc bswap IPLEN;
-		#calc sub IPLEN 20;
-		#FRAGEMENT OFFSET * 8 + IP LEN = new length
-		#set len 9000;
 		set val L1 0;
 		calc add L1 %IPLEN;
-		#calc sub L1 20;
 		set val NEWLEN 0;
 		calc add NEWLEN %IPFRAG;
 		calc lsh NEWLEN 3;
 		calc add NEWLEN %IPLEN;
 		calc lsh IPFRAG 3;
 		calc add IPFRAG 34;
-		#set val L1 34;
-		#calc add L1 %IPLEN;
-		#calc add IPFRAG %IPLEN;
-		#get len L2;
-		#match val IPFRAG le %L2;
-		#match val L1 lt %L2;
-		#del-bytes 0 34;
-		#save-packet DEFRAG_BUF %L1 34 %IPFRAG;
-		#save-packet DEFRAG_BUF 1500 34 %IPFRAG;
-		#save-packet DEFRAG_BUF 20 34 240;
 		decl TEST 2;
 		set val TEST 300;
-		#save-packet DEFRAG_BUF %L1 34 %TEST;
-		save-packet DEFRAG_BUF %L1 34 %IPFRAG;
+		save-packet-keyed DEFRAG_BUF %IPID 34;
+		save-packet-keyed DEFRAG_BUF %IPID %L1 34 %IPFRAG;
 		calc sub L1 20;
-		save-packet DEFRAG_BUF %L1 34 %IPFRAG;
+		save-packet-keyed DEFRAG_BUF %IPID %L1 34 %IPFRAG;
 		set map DEFRAG %IPFRAG %NEWLEN;
 	end-match;
 	match ip-mf;
 		match ip-frag-off 0;
 			get len LEN;
-			get ip-ident IPID;
-			#set map DEFRAG %IPID %IPFRAG;
-			save-packet DEFRAG_BUF %LEN;
+			save-packet-keyed DEFRAG_BUF %IPID %LEN;
 		end-match;
 		drop;
 	#end-match;
@@ -301,184 +282,13 @@ match ip;
 		calc add TLEN 34;
 		set len %TLEN;
 		calc add NEWLEN 20;
-		load-packet DEFRAG_BUF %NEWLEN 14 14;
+		load-packet-keyed DEFRAG_BUF %IPID %NEWLEN 14 14;
 		set ip-tos 192;
 		set ip-len %NEWLEN;
 		set ip-frag 0;
-		#match icmp;
-		#	set icmp-type 8;
-		#end-match;
-		#calc bswap NEWLEN;
 	end-match;
 end-match;
 " #>/dev/null
-}
-
-function fragment_unrolled() {
-MAX=$1
-INMAX=$2
-MAXL=$(( 14 + $MAX ))
-IPMAX=$(( $MAX - 20 ))
-IPMAX=$(( $IPMAX / 8 ))
-IPMAX=$(( $IPMAX * 8 ))
-MAXL=$(( 34 + $IPMAX ))
-IPTOTL=$(( 20 + $IPMAX ))
-LOOPS=$(( $INMAX - 34 ))
-LOOPS=$(( $LOOPS / $IPMAX ))
-LOOPS=$(( $LOOPS + 1 ))
-echo "
-decl IPLEN 2;
-decl FRAG 2;
-decl LAN 2;
-get len LEN;
-match ip;
-	get skb-ifindex IDX;
-	match ip-mf;
-		set map FRAG 4 4;
-		continue;
-	match ip-df;
-                set ip-frag 0;
-	set map FRAG %FRAG %FRAG;
-	set map FRAG 3 %FRAG;
-        set ip-frag 0;
-        #If we are here, then we have an IP packet without the DF bit set
-        match val LEN gt $MAXL;
-		save-packet BACKUP_BUF %LEN;
-                set val IPLEN %LEN;
-                calc sub IPLEN 34;
-                set len $MAXL;
-                set ip-len $IPTOTL;"
-OFF=34
-IPOFF=0
-echo $LOOPS > frag.debug
-#UNROLL LOOP STARTS HERE
-#for I in 1 2 3 4
-for I in $( seq 1 $LOOPS )
-do
-	FRAG=$(( $IPOFF / 8 ))
-	FRAG_MF=$(( $FRAG + 8192 ))
-	echo "OFF: $OFF IP_OFF: $IPOFF FRAG: $FRAG" >> frag.debug
-	OFF=$(( $OFF + $IPMAX ))
-	IPOFF=$(( $IPOFF + $IPMAX ))
-echo "
-			set ip-frag $FRAG_MF;
-                        clone %IDX;
-                        calc sub IPLEN $IPMAX;
-                        calc sub LEN $IPMAX;
-			load-packet BACKUP_BUF $IPMAX $OFF 34;
-			set map FRAG %IPLEN %IPLEN;
-			match val IPLEN lt $IPMAX;
-				set map FRAG %IPLEN 1;
-				goto FRAG_DONE;
-                        end-match;
-			match val LEN lt $IPMAX;
-				set map FRAG %IPLEN 2;
-				goto FRAG_DONE;
-			end-match;
-			"
-#UNROLLED LOOP ENDS HERE
-done
-echo "
-		label FRAG_DONE;
-		set len %LEN;
-		set ip-frag $FRAG;
-		calc bswap IPLEN;
-		set ip-len %IPLEN;
-		clone %IDX;
-		drop;
-        end-match;
-end-match;
-"
-}
-
-function fragment() {
-MAX=$1
-MAXL=$(( 14 + $MAX ))
-IPMAX=$(( $MAX - 20 ))
-echo "
-decl IPLEN 2;
-decl L2 2;
-decl L3 2;
-decl L4 2;
-decl FRAG 2;
-get len LEN;
-get skb-ifindex IDX;
-save-packet BACKUP_BUF %LEN;
-load-packet BACKUP_BUF %LEN;
-match ip;
-	get ip-frag FRAG;
-	calc bswap FRAG;
-	#Match packets with DF bit set
-	calc and FRAG 64;
-	#Clear DF bit
-	match val FRAG gt 0;
-		set ip-frag 0;
-		#Send back up the stack
-		reclassify;
-	#If we are here, then we have an IP packet without the DF bit set
-	match val LEN gt $MAX;
-		set val IPLEN %LEN;
-		calc sub IPLEN 34;
-		set len $MAXL;
-		set ip-len $MAX;
-		set val L3 0;
-		set val L2 34;
-		set val L4 34;
-		calc add L4 $MAX;
-		set-reg-loop 5000;
-		start-loop;
-			dec-reg-loop $MAX;	
-			set val FRAG %L3;
-			calc div FRAG 8;
-			match val IPLEN gt $MAX;
-				calc add FRAG 8192;
-			end-match;
-			calc bswap FRAG;
-			set ip-frag %FRAG;
-			clone %IDX egress;
-			#Math for next packet;
-			match val IPLEN le $MAX;
-				goto FRAG_DONE;
-			end-match;
-
-			calc add L3 $IPMAX;
-			calc add L2 $IPMAX;
-			calc sub IPLEN $IPMAX;
-			calc sub LEN $IPMAX;
-			set val L4 %L2;
-			calc add L4 $IPMAX;
-			match val L4 gt %LEN;
-				goto FRAG_DONE;
-			end-match;
-			calc add L4 34;
-			match val L4 gt 9000;
-				goto FRAG_DONE;
-			end-match;
-			match val IPLEN gt %LEN;
-				goto FRAG_DONE;
-			end-match;
-			match val L2 gt %LEN;
-				goto FRAG_DONE;
-			end-match;
-			match val IPLEN ge $IPMAX;
-				set ip-tos 192;
-				load-packet BACKUP_BUF $IPMAX %L2 34;
-			end-match;
-			#match val L4 le 9000;	
-			#	load-packet BACKUP_BUF $MAX %L2 34;
-			#end-match;
-			match val IPLEN lt $IPMAX;
-				#load-packet BACKUP_BUF %IPLEN %L2 34;
-				set len %LEN;
-				calc bswap IPLEN;
-				set ip-len %IPLEN;
-				calc bswap IPLEN;
-			end-match;
-		loop-reg;
-		label FRAG_DONE;
-	end-match;
-end-match;
-"
 }
 
 function mpls_out_nh()  {
@@ -527,41 +337,6 @@ match val %FIB_RESULT eq 0;
         redirect %FIB_IFINDEX egress" | tr -d '\n' | tr -d '\t'
 }
 
-function mpls_in()  {
-LABEL=$1
-IFACE=$2
-echo "
-        match mpls;
-        match mpls-label $LABEL;
-        #decl DATA 8;
-        get bytes 18 8 DMAC;
-        get bytes 24 8 SMAC;
-        get bytes 30 2 ETHP;
-        calc bswap %DMAC;
-        calc bswap %SMAC;
-        calc bswap %ETHP;
-        #get len LEN;
-        #decap-mpls;
-        #set eth-proto 0x0800;
-        #set bytes 14 1 0x45;
-        #del-head-bytes 18;
-        #set eth-proto 0x8847;
-        #set bytes 14 1 0xff;
-        #del-bytes 0 18;
-	del-l2-bytes 18;
-        set src-mac %SMAC;
-        set dst-mac %DMAC;
-        set eth-proto %ETHP;
-        #recalc-*-csum doesn't work right now - throws verifier errors
-        #match udp;
-        #recalc-udp-csum;
-        #end-match;
-        #match tcp;
-        #recalc-tcp-csum;
-        #end-match;
-        redirect $IFACE egress" | tr -d '\n' | tr -d '\t'
-}
-
 function mpls_in_slow()  {
 LABEL=$1
 IFACE=$2
@@ -573,48 +348,55 @@ echo "
         redirect $IFACE egress" | tr -d '\n' | tr -d '\t'
 }
 
-function mpls_in_1() {
-IFACE=$1
-echo "
-	match skb-mark 100;
-	del-head-bytes 18;
-	set eth-proto 0x8847;
-	redirect $IFACE egress
-	" | tr -d '\n' | tr -d '\t' 
-}
-
-#ip netns exec H1 ./bpf_compiler -v $COPTS -i ce1 -d egress -p 100 -m /var/run/bpf/H1 "$(fragment_unrolled 200 9000)" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
-#ip netns exec CE1 ./bpf_compiler -v $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "$(fragment_unrolled 200 9000)" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
-ip netns exec CE1 ./bpf_compiler $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "ip-frag 110 3000" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
+ip netns exec CE1 ./bpf_compiler $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "ip-frag $FRAG_SIZE 3000" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
+ip netns exec CE2 ./bpf_compiler $COPTS -i h2 -d ingress -p 10 -m /var/run/bpf/CE2 "ip-frag $FRAG_SIZE 3000" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
 #exit 1
 ip netns exec CE1 ./bpf_compiler $COPTS -i h1  -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_out_nh 10.0.0.6 16 1 255 19)" && test_pass CE1-pw0-out-install || test_fail CE1-pw0-out-install
 ip netns exec CE2 ./bpf_compiler $COPTS -i h2  -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_out_nh 10.0.0.2 18 1 255 20)" && test_pass CE2-pw0-out-install || test_fail CE2-pw0-out-install
 #ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d egress -p 10 "get len LEN; match val LEN gt 300; drop"
 #ip netns exec CE1 ./bpf_compiler $COPTS -i h1 -d ingress -p 50 "get len LEN; match val LEN gt 250; drop"
-#ip netns exec CE2 ./bpf_compiler $COPTS -i h2 -d egress -p 50 "match ip-mf; match ip-frag-off 0; drop"
-#ip netns exec CE1 ./bpf_compiler $COPTS -i h1 -d ingress -p 70 "match ip-mf; drop"
-#ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
-#ip netns exec CE2 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
 ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_in_slow 18 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
-#ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 101 "$(mpls_in_1 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
 ip netns exec CE2 ./bpf_compiler $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_in_slow 16 h2)" && test_pass CE2-pw0-in-install || test_fail CE2-pw0-in-install
-ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 -m /var/run/bpf/CE1 "get mpls-label MPLS; set map MPLS %MPLS %MPLS"
+#ip netns exec CE1 ./bpf_compiler $COPTS -i pe1 -d ingress -p 10 -m /var/run/bpf/CE1 "get mpls-label MPLS; set map MPLS %MPLS %MPLS"
 
 #timeout 5 ip netns exec PE1 tcpdump -levnpi ce2 -XX &> out1.txt &
 #timeout 3 ip netns exec CE1 tcpdump -levnpi pe1 -XX &
 #timeout 5 ip netns exec CE1 tcpdump -levnpi pe1 -Q out -XX &
-#timeout 5 ip netns exec CE2 tcpdump -levnpi pe1 -XX &
+#timeout 3 ip netns exec CE2 tcpdump -levnpi pe1 -XX &
 #timeout 5 ip netns exec CE1 tcpdump -levnpi h1 -XX &> out4.txt &
 #timeout 5 ip netns exec CE1 tcpdump -levnpi h1 -XX icmp &> out.ce1.txt &
 #timeout 5 ip netns exec CE2 tcpdump -levnpi h2 -XX &
 #timeout 3 ip netns exec H1 tcpdump -levnpi ce1 -XX icmp &> out.h1.txt &
 #timeout 5 ip netns exec H1 tcpdump -levnpi ce1 -Q out &
-#timeout 5 ip netns exec H1 tcpdump -levnpi ce1 &
+#timeout 3 ip netns exec H1 tcpdump -levnpi ce1 -XX &
 #timeout 3 ip netns exec H2 tcpdump -levnpi ce2 -XX icmp &
 sleep 0.5s
 
-timeout 3 ip netns exec H1 ping -c1 -s 1600 -i 0.1 192.168.0.2 &>/dev/null && test_pass MPLS-pw || test_fail MPLS-pw
+PING_PROC_NUM=1000
+PING_COUNT=100
+PING_SIZE=1600
 
+PPIDS=()
+
+for I in $( seq 1 $PING_PROC_NUM )
+do
+#timeout 15 ip netns exec H1 ping -c $PING_COUNT -s $PING_SIZE -i 0.01 192.168.0.2 &>/dev/null && test_pass IP-Frag-$I || test_fail IP-Frag-$I & 
+timeout 15 ip netns exec H1 ping -c $PING_COUNT -s $PING_SIZE -i 0.01 -W 2 192.168.0.2 &>/dev/null & 
+PPIDS+=($!)
+done
+
+PASS=1
+for PINGPID in "${PPIDS[@]}"
+do
+	wait "$PINGPID" 
+	RET=$?
+	if [ $RET -ne 0 ]
+	then
+		PASS=0
+		test_fail "IP-Frag-$PINGPID"
+	fi
+done 
+[ $PASS -eq 1 ] && test_pass "IP-Frag" || test_fail "IP-Frag"
 
 #cat out*.txt
 #rm -f out*.txt
@@ -675,10 +457,10 @@ then
 	#ip netns exec H1 netstat -s -t | sed 's/^/  /g'
 	#echo "TCP stats H2:"
 	#ip netns exec H2 netstat -s -t | sed 's/^/  /g'
-#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r PKTS_OVR
-#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r PKTS_IN
-#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r PKTS_OUT
-ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r MPLS
+	#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r PKTS_OVR
+	#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r PKTS_IN
+	#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r PKTS_OUT
+	#ip netns exec CE1 ./bpf_compiler $COPTS -m /var/run/bpf/CE1 -r MPLS
 
 	#echo "TC filter CE1"
 	#ip netns exec CE1 tc -s -d filter show dev pe1 ingress | sed 's/^/  /g'

@@ -164,6 +164,7 @@
 #define BPF_LOG_BUF_SIZE (1 << 26) // 256KB log buffer
 
 #define MAX_LOOPS 64
+#define BUFFER_ENTRIES 10000
 
 void compile_set_var(const char *dst_var, const char *src_val);
 
@@ -4145,10 +4146,12 @@ int bpf_map_get_next_key_user(int fd, const void *key, void *next_key) {
  */
 int create_bpf_buffer_map(const char *name, int cpu) {
     union bpf_attr attr = {
-        .map_type    = cpu?BPF_MAP_TYPE_PERCPU_ARRAY:BPF_MAP_TYPE_LRU_HASH,
-        .key_size    = cpu?4:12,      // 32-bit key (We will just use Index 0)
+        //.map_type    = cpu?BPF_MAP_TYPE_PERCPU_ARRAY:BPF_MAP_TYPE_LRU_HASH,
+        .map_type    = cpu?BPF_MAP_TYPE_PERCPU_ARRAY:BPF_MAP_TYPE_ARRAY,
+        //.key_size    = cpu?4:8,      // 32-bit key (We will just use Index 0)
+        .key_size    = 4,      // 32-bit key (We will just use Index 0)
         .value_size  = 18000,   // MTU-sized payload buffer
-        .max_entries = cpu?1:10000,      // We only need 1 buffer per CPU core
+        .max_entries = cpu?1:BUFFER_ENTRIES,      // We only need 1 buffer per CPU core
     };
     strcpy(attr.map_name, name);
     int fd = bpf_syscall(BPF_MAP_CREATE, &attr, sizeof(attr));
@@ -4190,36 +4193,59 @@ int get_or_create_buffer_map(const char *name, int per_cpu, int exonerr) {
  */
 void compile_save_packet(int map_fd, const char *key, const char *len_arg, const char *src_off_arg, const char *dst_off_arg) {
     //store packet length into REG8
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len)));
+    //emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    //emit(BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len)));
     //emit(BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_1, offsetof(struct __sk_buff, len)));
 
     // 1. Setup Key (Index 0) on stack
     if (key) {
-	if (key[0] == '%') {
-            int v_off = get_var_offset(key);
-            emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, v_off));
-	} else
-            //emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, 0, atoi(key)));
-            emit(BPF_MOV64_IMM(BPF_REG_2, atoi(key)));
-
-        //emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, 0, key));
+	// 1. Setup 64-bit KEY on the local scratch stack (R10 - 8)
+        if (key[0] == '%') {
+            int k_off = get_var_offset(key); 
+            int k_sz = get_var_size(key); 
+            if (k_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, k_off));
+            else if (k_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, k_off));
+            else if (k_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, k_off));
+            else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, k_off));
+	    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_MOD|BPF_K, .dst_reg=BPF_REG_1, .imm=BUFFER_ENTRIES}));
+            emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -4));
+        } else {        
+            uint64_t k_imm = strtoull(key, NULL, 0);
+            //emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -8, (uint32_t)(k_imm & 0xFFFFFFFF)));
+            emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, (uint32_t)(k_imm % BUFFER_ENTRIES)));
+        } 
     } else {
+        //emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -8, 0));
+        //emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0));
         //emit(BPF_MOV64_IMM(BPF_REG_2, 0));
-        emit(BPF_ST_MEM(BPF_W, BPF_REG_2, -4, 0));
-        emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
+        emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0));
     }
     
     // 2. Lookup Map Pointer
     emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .off = 0, .imm = map_fd}));
     emit(((struct bpf_insn){.code = 0x00, .dst_reg = 0,         .src_reg = 0, .off = 0, .imm = 0}));
-    
+
+
+    // 4. Set R2 = R10 - 8 (Pointer to Key)
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    //if (key)
+        emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
+    //else
+    //if (!key) 
+    //    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
+    //emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
+
+    emit(BPF_MOV64_IMM(BPF_REG_4, 0));
+
     //emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
     emit(BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
     
     // Safety abort if map lookup fails
     add_safety_jump();
     emit(((struct bpf_insn){.code = BPF_JMP|BPF_JEQ|BPF_K, .dst_reg = BPF_REG_0, .imm = 0}));
+
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len)));
 
     // 4. Resolve SRC offset (from packet) into R2
     if (src_off_arg && src_off_arg[0] == '%') {
@@ -4590,23 +4616,45 @@ void compile_save_packet(int map_fd, const char *key, const char *len_arg, const
  * Emits bytecode to overwrite the packet using 'len' bytes from the Per-CPU Buffer Map.
  * Syntax: load-packet <MAP_NAME> <len> [src_off] [dst_off]
  */
-void compile_load_packet(int map_fd, const char *len_arg, const char *src_off_arg, const char *dst_off_arg) {
-    //store packet length into REG7
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1, offsetof(struct __sk_buff, len)));
+void compile_load_packet(int map_fd, const char *key, const char *len_arg, const char *src_off_arg, const char *dst_off_arg) {
     // 1. Setup Key (Index 0) on stack
-    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0));
+    if (key) {
+        // 1. Setup 64-bit KEY on the local scratch stack (R10 - 8)
+        if (key[0] == '%') {
+            int k_off = get_var_offset(key);
+            int k_sz = get_var_size(key);
+            if (k_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, k_off));
+            else if (k_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, k_off));
+            else if (k_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, k_off));
+            else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, k_off));
+	    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_MOD|BPF_K, .dst_reg=BPF_REG_1, .imm=BUFFER_ENTRIES}));
+            emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, -8));
+        } else {
+	    uint64_t k_imm = strtoull(key, NULL, 0);
+            //emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -8, (uint32_t)(k_imm & 0xFFFFFFFF)));
+            emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, (uint32_t)(k_imm % BUFFER_ENTRIES)));
+        }
+    } else {
+        emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -8, 0));
+        emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0));
+    }
     
     // 2. Lookup Map Pointer
     emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .off = 0, .imm = map_fd}));
     emit(((struct bpf_insn){.code = 0x00, .dst_reg = 0,         .src_reg = 0, .off = 0, .imm = 0}));
     
     emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
-    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
+    //if (key)
+    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -8}));
+    //if (!key)
+    //    emit(((struct bpf_insn){.code = BPF_ALU64|BPF_ADD|BPF_K, .dst_reg = BPF_REG_2, .imm = -4}));
     emit(BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
     
     add_safety_jump();
     emit(((struct bpf_insn){.code = BPF_JMP|BPF_JEQ|BPF_K, .dst_reg = BPF_REG_0, .imm = 0}));
+
+    //emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    //emit(BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1, offsetof(struct __sk_buff, len)));
 
     // 5. Resolve DST offset (into packet) into R2
     if (dst_off_arg && dst_off_arg[0] == '%') {
@@ -4771,7 +4819,7 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
 	//printf("IPMAX: %u OFFSET: %u\n",ip_max,packet_offset);
 	snprintf(len_str1,sizeof(len_str1),"%hu",ip_max);
 	snprintf(len_str2,sizeof(len_str2),"%hu",packet_offset);
-	compile_load_packet(map_fd, len_str1, len_str2, "34");
+	compile_load_packet(map_fd, NULL, len_str1, len_str2, "34");
 	//match val __IPLEN__ lt ip_max
     	compile_match_var("__IPLEN__", "le", len_str1);
 	//goto FRAG_DONE;
@@ -4836,8 +4884,8 @@ void compile_delete_bytes_buffered(int offset, int dlen) {
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, len_off));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_K, .dst_reg=BPF_REG_1, .imm=dlen}));
     emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, len_off));
-    compile_save_packet(map_fd, 0,"%__LEN__", len_str2, len_str1);
-    compile_load_packet(map_fd, "%__LEN__", "0", "0");
+    compile_save_packet(map_fd, NULL,"%__LEN__", len_str2, len_str1);
+    compile_load_packet(map_fd, NULL,"%__LEN__", "0", "0");
     compile_set_length("%__LEN__");
 }
 
@@ -5627,7 +5675,7 @@ int main(int argc, char **argv) {
 	} else if (strcmp(op, "save-packet-keyed") == 0 && t > 3) {
             // Syntax: save-packet <MAP_NAME> <len> [src_off] [dst_off]
             int map_fd = get_or_create_buffer_map(a1,0,1);
-            char *src_off = t > 4 ? tok[5] : NULL;
+            char *src_off = t > 4 ? tok[4] : NULL;
             char *dst_off = t > 5 ? tok[5] : NULL;
             compile_save_packet(map_fd, a2, tok[3], src_off, dst_off);
         } else if (strcmp(op, "load-packet") == 0 && t > 2) {
@@ -5635,7 +5683,12 @@ int main(int argc, char **argv) {
             int map_fd = get_or_create_buffer_map(a1,1,1);
             char *src_off = t > 3 ? tok[3] : NULL;
             char *dst_off = t > 4 ? tok[4] : NULL;
-            compile_load_packet(map_fd, tok[2], src_off, dst_off);
+            compile_load_packet(map_fd, NULL, tok[2], src_off, dst_off);
+        } else if (strcmp(op, "load-packet-keyed") == 0 && t > 3) {
+            int map_fd = get_or_create_buffer_map(a1,0,1);
+            char *src_off = t > 4 ? tok[4] : NULL;
+            char *dst_off = t > 5 ? tok[5] : NULL;
+            compile_load_packet(map_fd, tok[2], tok[3], src_off, dst_off);
 	} else if (strcmp(op, "copy-pkt-to-map") == 0 && t > 4) {
             // Syntax: copy-pkt-to-map <MAP_NAME> <pkt_offset> <size | %VAR_SIZE> <%VAR_MAP_OFFSET>
             int map_fd = get_or_create_buffer_map(tok[1],1,1);
