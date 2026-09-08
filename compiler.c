@@ -4381,6 +4381,8 @@ void help(const char *arg0) {
 	"redirect <iface> [ingress|egress]"	,"send packet to specified interface, optionally specifying ingress or egress, assumes 'end-match'",
 	"redirect-neigh <iface>"		,"send packet to specified interface and apply next-hop layer-2 fields, assumes 'end-match'",
 	"clone <iface> [ingress|egress]"	,"clone and send packet to specified interface, optionally specifying ingress or egress",
+	"ip-frag <size> <input-mtu-max>"	,"fragment IP packets into <size> payload packets up to <input-mtu-max>",
+	"ip-defrag"				,"reassemble fragmented IP packets into a single packet",
 	"fib-lookup [OPTS] <ip-address>"	,"perform FIB lookup on IP address, populate FIB_SMAC, FIB_DMAC, FIB_IFINDEX and FIB_IP_DST variables",
 	"  src <ip-address>"			,"set source IP address for FIB lookup - if source based routing is needed",
 	"  iface <iface>"			,"set source IP interface for FIB lookup - if source based routing is needed",
