@@ -344,7 +344,7 @@ echo "
 	match mpls;
 	match mpls-label $LABEL;
 	del-bytes 0 18;
-	$( defrag 3000 );
+	ip-defrag;
         redirect $IFACE egress" | tr -d '\n' | tr -d '\t'
 }
 
@@ -415,7 +415,7 @@ then
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
 fi
 
-if [ 1 -eq 0 ]
+if [ 1 -eq 1 ]
 then
 	ip netns exec H2 $IPERF -s &>/dev/null & P1=$!
 	ip netns exec H1 $IPERF -s &>/dev/null & P2=$!

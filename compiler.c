@@ -167,6 +167,7 @@
 #define BUFFER_ENTRIES 10000
 
 void compile_set_var(const char *dst_var, const char *src_val);
+int process_cmd_list(char *instr, const char *dir);
 
 /* --- Map Tracking (Symbol Table) --- */
 #define MAX_MAPS 16
@@ -5238,53 +5239,29 @@ void help(const char *arg0) {
     }
 }
 
-/* --- Main CLI & Tokenizer --- */
-int main(int argc, char **argv) {
-    int pri = 0;
-    char *iface = NULL, *dir = "ingress", *instr = NULL; int clean = 0;
-    char *filename = NULL;
-    char *read_map = NULL;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i],"-i")==0) iface = argv[++i];
-        else if (strcmp(argv[i],"-d")==0) dir = argv[++i];
-        else if (strcmp(argv[i],"-c")==0) clean = 1;
-        else if (strcmp(argv[i],"-p")==0) pri = atoi(argv[++i]);
-        else if (strcmp(argv[i],"-v")==0) verbose_mode = 1;
-        else if (strcmp(argv[i],"-m")==0) strcpy(bpf_map_dir,argv[++i]);
-	else if (strcmp(argv[i],"-r")==0) read_map = argv[++i];
-	else if (strcmp(argv[i],"-f")==0) filename = argv[++i];
-	else if (strcmp(argv[i],"-h")==0) { help(argv[0]); return 0; }
-        else instr = argv[i];
-    }
-    if (read_map) {
-        dump_map_contents(read_map, bpf_map_dir);
-        return 0;
-    }
-    if(strcmp(dir, "ingress") && strcmp(dir, "egress")) {
-	clean = 0;
-        instr = NULL;
-    }
-    if (clean) return detach_bpf_tc(iface) < 0 ? 1 : 0;
-    if (filename) {
-        instr = read_instructions_from_file(filename);
-    }
-    if (!instr) { printf("Usage: %s -i <iface> [-d ingress|egress] \"<cmds>\"\n", argv[0]); return 1; }
+void compile_ip_defrag(const char *dir) {
+    char instr[] = "match ip;decl IPFRAG 2;decl NEWLEN 2;decl TLEN 4;decl IPID 4;decl L1 4;decl L2 4;get ip-frag IPFRAG;calc and IPFRAG 0x1FFF;get ip-len IPLEN;get ip-ident IPID;match val IPFRAG gt 0;set val L1 0;calc add L1 %IPLEN;set val NEWLEN 0;calc add NEWLEN %IPFRAG;calc lsh NEWLEN 3;calc add NEWLEN %IPLEN;calc lsh IPFRAG 3;calc add IPFRAG 34;decl TEST 2;set val TEST 300;set val L2 %IPFRAG;save-packet-keyed DEFRAG_BUF %IPID 34;save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2;calc sub L1 20;save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2;set map DEFRAG %IPFRAG %NEWLEN;end-match;match ip-mf;match ip-frag-off 0;get len LEN;save-packet-keyed DEFRAG_BUF %IPID %LEN;end-match;drop;match val IPFRAG gt 0;set val TLEN %NEWLEN;calc add TLEN 34;set len %TLEN;calc add NEWLEN 20;load-packet-keyed DEFRAG_BUF %IPID %NEWLEN 14 14;set ip-len %NEWLEN;set ip-frag 0;end-match;end-match;";
+    process_cmd_list(instr, dir);
+}
 
-    emit(BPF_MOV64_REG(BPF_REG_6, BPF_REG_1)); 
+int process_cmd(char *cmd, const char *dir) {
 
-    char *save_c, *save_w, *cmd = strtok_r(instr, ";", &save_c);
-    while (cmd) {
+	char *save_w ;
+
         char *tok[16];
 	int t = 0;
 	while (*cmd == '\n' || *cmd == '\r' || *cmd == ' ' || *cmd == '\t') {
 		++cmd;
 	}
+	if (cmd[0] == '#' || strlen(cmd)==0)
+		return 0;
         char *w = strtok_r(cmd, " ", &save_w);
         while (w && t < 16) { 
 		tok[t++] = w; 
 		w = strtok_r(NULL, " ", &save_w); 
 	}
-        if (t == 0) { cmd = strtok_r(NULL, ";", &save_c); continue; }
+        if (t == 0)
+	    return 0;
         
         char *op = tok[0]; 
 	char *a1 = t>1 ? tok[1] : NULL; 
@@ -5298,10 +5275,6 @@ int main(int argc, char **argv) {
 	            printf("\n");
         }
 		
-        if (strlen(op) == 0 || op[0] == '#') {
-	    cmd = strtok_r(NULL, ";", &save_c);
-	    continue;
-	}
 	if (strcmp(op, "get") == 0 && t > 2) {
             char *f = a1; char *var = a2;
             if (strcmp(f,"bytes")==0 && t > 3) compile_get_raw_bytes(atoi(tok[2]), atoi(tok[3]), tok[4]);
@@ -5355,12 +5328,14 @@ int main(int argc, char **argv) {
                     compile_get_skb_field(offsetof(struct __sk_buff, cb[cb_index]), 0,0,tok[3]);
                 } else {
                     fprintf(stderr, "Error: skb-cb index must be between 0 and 4\n");
-                    exit(1);
+		    return 1;
+                    //exit(1);
                 }
 	    }
 	    else {
                  printf("Invalid get instruction %s\n",f);
-                 exit(2);
+		 return 1;
+                 //exit(2);
             }
         }
         else if (strcmp(op, "set") == 0 && t > 2) {
@@ -5412,13 +5387,14 @@ int main(int argc, char **argv) {
                     compile_set_skb_field(offsetof(struct __sk_buff, cb[cb_index]), tok[3]);
                 } else {
                     fprintf(stderr, "Error: skb-cb index must be between 0 and 4\n");
-                    exit(1);
+		    return 1;
+                    //exit(1);
                 }
             }
-
 	    else {
                  printf("Invalid set instruction %s\n",f);
-                 exit(2);
+		 return 1;
+                 //exit(2);
             }
 	}
         else if (strcmp(op, "match") == 0 && t == 2) {
@@ -5483,7 +5459,8 @@ int main(int argc, char **argv) {
 		compile_match_skb_field(offsetof(struct __sk_buff, vlan_proto), htons(ETH_P_8021AD), 0xFFFFFFFF, NULL);
             } else {
                  printf("Invalid match instruction %s\n",f);
-                 exit(2);
+		 return 1;
+                 //exit(2);
             }
 	} 
 	else if (strcmp(op, "match") == 0 && t > 2) {
@@ -5538,7 +5515,8 @@ int main(int argc, char **argv) {
                     compile_match_skb_field(offsetof(struct __sk_buff, cb[cb_index]), expected_val, 0xFFFFFFFF, nested_mv);
                 } else {
                     fprintf(stderr, "Error: skb-cb index must be between 0 and 4\n");
-                    exit(1);
+		    return 1;
+                    //exit(1);
                 }
             }
 	    else if (strcmp(a1, "tcp-flags") == 0) {
@@ -5567,7 +5545,8 @@ int main(int argc, char **argv) {
             }
 	    else {
                  printf("Invalid match instruction %s\n",f);
-                 exit(2);
+		 return 1;
+                 //exit(2);
             }
         }
 	else if (strcmp(op, "calc") == 0 && t > 2) {
@@ -5588,7 +5567,8 @@ int main(int argc, char **argv) {
             else if (strcmp(f,"bswap")==0) compile_math_bswap(a2, a3 ? atoi(a3) : get_var_size(a2)*8);
 	    else {
                  printf("Invalid math instruction %s\n",f);
-                 exit(2);
+		 return 1;
+                 //exit(2);
             }
         }
 	else if (strcmp(op, "decl") == 0 && t > 2) compile_decl_var(tok[1], atoi(tok[2]));
@@ -5661,6 +5641,7 @@ int main(int argc, char **argv) {
         else if (strcmp(op, "redirect-neigh")==0) compile_redirect_neigh(a1);
         else if (strcmp(op, "clone")==0) compile_clone(a1, a2?a2:dir);
         else if (strcmp(op, "ip-frag")==0) compile_ip_frag(atoi(a1), atoi(a2), a3?a3:dir);
+        else if (strcmp(op, "ip-defrag")==0) compile_ip_defrag(dir);
         else if (strcmp(op, "debug-log")==0) compile_debug_log(a1);
         else if (strcmp(op, "buffer-map")==0 && t > 1) {
             get_or_create_buffer_map(a1,1,1);
@@ -5695,11 +5676,60 @@ int main(int argc, char **argv) {
             compile_copy_pkt_to_map(map_fd, atoi(tok[2]), tok[3], tok[4]);
         } else {
              printf("Invalid instruction %s\n",op);
-	     exit(2);
+	     //exit(2);
+	     return 1;
 	}
+	return 0;
+}
 
+int process_cmd_list(char *instr, const char *dir) {
+    char *save_c, *cmd = strtok_r(instr, ";", &save_c);
+    while (cmd) {
+        //Process cmd in tokenizer
+        if(process_cmd(cmd, dir)) {
+                return 1;
+	}
         cmd = strtok_r(NULL, ";", &save_c);
     }
+    return 0;
+}
+
+/* --- Main CLI & Tokenizer --- */
+int main(int argc, char **argv) {
+    int pri = 0;
+    char *iface = NULL, *dir = "ingress", *instr = NULL; int clean = 0;
+    char *filename = NULL;
+    char *read_map = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i],"-i")==0) iface = argv[++i];
+        else if (strcmp(argv[i],"-d")==0) dir = argv[++i];
+        else if (strcmp(argv[i],"-c")==0) clean = 1;
+        else if (strcmp(argv[i],"-p")==0) pri = atoi(argv[++i]);
+        else if (strcmp(argv[i],"-v")==0) verbose_mode = 1;
+        else if (strcmp(argv[i],"-m")==0) strcpy(bpf_map_dir,argv[++i]);
+        else if (strcmp(argv[i],"-r")==0) read_map = argv[++i];
+        else if (strcmp(argv[i],"-f")==0) filename = argv[++i];
+        else if (strcmp(argv[i],"-h")==0) { help(argv[0]); return 0; }
+        else instr = argv[i];
+    }
+    if (read_map) {
+        dump_map_contents(read_map, bpf_map_dir);
+        return 0;
+    }
+    if(strcmp(dir, "ingress") && strcmp(dir, "egress")) {
+        clean = 0;
+        instr = NULL;
+    }
+    if (clean) return detach_bpf_tc(iface) < 0 ? 1 : 0;
+    if (filename) {
+        instr = read_instructions_from_file(filename);
+    }
+    if (!instr) { printf("Usage: %s -i <iface> [-d ingress|egress] \"<cmds>\"\n", argv[0]); return 1; }
+
+    emit(BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
+
+    if(process_cmd_list(instr, dir))
+	    exit(1);
 
     // --- RESOLVE FORWARD GOTOS ---
     for (int i = 0; i < num_unresolved_gotos; i++) {
@@ -5735,28 +5765,27 @@ int main(int argc, char **argv) {
             }
         }
     }
-
     if (need_epilogue) {
         int final_epilogue_idx = prog_idx;
         for (int i = 0; i < num_jumps; i++) prog[jump_patch_indices[i]].off = final_epilogue_idx - jump_patch_indices[i] - 1;
         for (int i = 0; i < num_safety_jumps; i++) prog[safety_jump_indices[i]].off = final_epilogue_idx - safety_jump_indices[i] - 1;
-	if (verbose_mode) {
-	    printf("[%d] Default continue\n",prog_idx);
-	}
-        //emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_OK)); 
-        emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_PIPE)); 
+        if (verbose_mode) {
+            printf("[%d] Default continue\n",prog_idx);
+        }
+        //emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_OK));
+        emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_PIPE));
         emit(BPF_EXIT_INSN());
     }
 
     if (iface) {
         //union bpf_attr a = {.prog_type=BPF_PROG_TYPE_SCHED_CLS, .insns=(unsigned long)prog, .insn_cnt=prog_idx, .license=(unsigned long)"GPL"};
         //int fd = syscall(__NR_bpf, BPF_PROG_LOAD, &a, sizeof(a));
-	int fd = load_bpf_prog_mem();
-        if (fd < 0 || attach_bpf_tc(fd, iface, dir, pri) < 0) { 
-			perror("Load/Attach failed"); 
-			return 1; 
-	}
-	if (verbose_mode)
+        int fd = load_bpf_prog_mem();
+        if (fd < 0 || attach_bpf_tc(fd, iface, dir, pri) < 0) {
+                        perror("Load/Attach failed");
+                        return 1;
+        }
+        if (verbose_mode)
             printf("Attached %d instructions to %s\n", prog_idx, iface);
     } else {
         FILE *f = fopen("output.bpf", "wb");
@@ -5765,3 +5794,4 @@ int main(int argc, char **argv) {
     }
     return 0;
 }
+
