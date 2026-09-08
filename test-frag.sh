@@ -239,58 +239,6 @@ match val %FIB_RESULT eq 0;
 	redirect %FIB_IFINDEX egress" | tr -d '\n' | tr -d '\t'
 }
 
-function defrag() {
-MAX=$1
-echo "
-match ip;
-	decl IPFRAG 2;
-	decl NEWLEN 2;
-	decl TLEN 4;
-	decl IPID 4;
-	decl L1 4;
-	decl L2 4;
-	get ip-frag IPFRAG;
-	calc and IPFRAG 0x1FFF;
-	get ip-len IPLEN;
-	get ip-ident IPID;
-	match val IPFRAG gt 0;
-		set val L1 0;
-		calc add L1 %IPLEN;
-		set val NEWLEN 0;
-		calc add NEWLEN %IPFRAG;
-		calc lsh NEWLEN 3;
-		calc add NEWLEN %IPLEN;
-		calc lsh IPFRAG 3;
-		calc add IPFRAG 34;
-		decl TEST 2;
-		set val TEST 300;
-		save-packet-keyed DEFRAG_BUF %IPID 34;
-		save-packet-keyed DEFRAG_BUF %IPID %L1 34 %IPFRAG;
-		calc sub L1 20;
-		save-packet-keyed DEFRAG_BUF %IPID %L1 34 %IPFRAG;
-		set map DEFRAG %IPFRAG %NEWLEN;
-	end-match;
-	match ip-mf;
-		match ip-frag-off 0;
-			get len LEN;
-			save-packet-keyed DEFRAG_BUF %IPID %LEN;
-		end-match;
-		drop;
-	#end-match;
-	match val IPFRAG gt 0;
-		set val TLEN %NEWLEN;
-		calc add TLEN 34;
-		set len %TLEN;
-		calc add NEWLEN 20;
-		load-packet-keyed DEFRAG_BUF %IPID %NEWLEN 14 14;
-		set ip-tos 192;
-		set ip-len %NEWLEN;
-		set ip-frag 0;
-	end-match;
-end-match;
-" #>/dev/null
-}
-
 function mpls_out_nh()  {
 TC=0
 NH=$1
