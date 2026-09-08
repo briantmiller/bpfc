@@ -58,14 +58,18 @@ Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val |
 * **L4:** `tcp-src`, `tcp-dst`, `udp-src`, `udp-dst`
 * **ARP:** `arp-htype`, `arp-ptype`, `arp-hlen`, `arp-plen`, `arp-oper`, `arp-sha`, `arp-tha`, `arp-spa`, `arp-tpa`
 * **MPLS:** `mpls-label`, `mpls-bos`
-* **GRE:** `gre-key`
+* **GRE:** `gre-key`, `gre-proto`
 * **Generic:** `bytes <offset> <length>`
 
 ### Context Metadata (`__sk_buff`)
+* `len` - Packet length (`u32`).
+* `protocol` - Protocol stored in sk_buff.
+* `skb-ifindex` - Interface number associated with sk_buff.
+* `skb-ingress` - Ingress interface number associated with sk_buff.
 * `skb-mark` - Netfilter/iptables firewall mark (`u32`).
 * `skb-hash` - RPS flow hash (`u32`).
 * `skb-cb <0-4>` - 20-byte control buffer array (5x `u32` slots) for passing state across tail-calls.
-* `queue` - Hardware TX queue mapping (`set` only).
+* `queue` - Hardware TX queue mapping.
 
 ### ALU Math Engine (`calc`)
 Performs mathematically-safe eBPF operations on standard 32/64-bit variables.
@@ -91,7 +95,7 @@ Allows persistent data storage across packets and network interfaces.
 ### Structural Manipulation & Checksums
 * `add-bytes <offset> <len>` / `del-bytes <offset> <len>` - Inserts `<len>` number of bytes at `<offset>` and shifts packet tail down/up.
 * `add-head-bytes <len>` - Adds bytes to head of packet.
-* `add-l2-bytes <len>` / `del-l2-bytes <len>` - Shifts memory exactly at Offset 14.
+* `add-l2-bytes <len>` / `del-l2-bytes <len>` - Shifts memory exactly at Offset 14. Possibly not working depending on kernel version.
 * `recalc-tcp-csum`, `recalc-udp-csum`, `recalc-icmp-csum` - Stack-safe L4 recalculations via `bpf_csum_diff`.
 
 ### Diagnostics
@@ -143,3 +147,157 @@ Route UDP 5060 (VoIP) out a fast link, and GRE tunnel everything else via the ro
     continue"
 ```
 
+### 4. MPLS pseudowires
+Encapsulate all packets on an interface eth1 within MPLS pseudowire of label 16 and next-hop label of 20 and send to 10.0.0.6.
+```bash
+./bpf_compiler -i eth1 -d ingress "decl MPLS1 4; \
+decl MPLS2 4; \
+fib-lookup 10.0.0.6; \ 
+match val %FIB_RESULT eq 0; \
+        add-head-bytes 22; \
+        #Next-hop label \
+        set val MPLS1 20; \
+        calc lsh MPLS1 3; \
+	#MPLS TC \
+        calc or MPLS1 0; \
+        calc lsh MPLS1 1; \
+        #Bottom of stack is zero on next-hop label \
+        calc or MPLS1 0; \
+        calc lsh MPLS1 8; \
+        #TTL \
+        calc or MPLS1 225; \
+        calc bswap MPLS1; \
+	#MPLS lable 16 \
+        set val MPLS2 16; \
+        calc lsh MPLS2 3; \
+	#MPLS TC \
+        calc or MPLS2 0; \
+        calc lsh MPLS2 1; \
+        #MPLS bottom of stack \
+        calc or MPLS2 1; \
+        calc lsh MPLS2 8; \
+        #TTL \
+        calc or MPLS2 225; \
+        calc bswap MPLS2; \
+        set bytes 14 4 %MPLS1; \
+        set bytes 18 4 %MPLS2; \
+        set eth-proto 0x8847; \
+        set dst-mac %FIB_DMAC; \
+        set src-mac %FIB_SMAC; \
+        redirect %FIB_IFINDEX egress"
+```
+
+Decapsulate pseudowire packets and send to interface eth2 - assume next-hop label `20` has been stripped off by PE router. 
+```bash
+./bpf_compiler -i eth0 -d ingress "match mpls; \
+        match mpls-label 16; \
+        del-bytes 0 18; \
+        redirect eth2 egress"
+```
+
+If control-words are desired, change `add-head-bytes 22` to `add-head-bytes 26` and `del-bytes 0 18` to `del-bytes 0 22` to account for the 4-byte control word.
+
+Note: The above MPLS encapsulation is not compatible with TCP Generic Receive Offload (GRO) or TCP Segmentation Offload (TSO). This is due to the behavior of combining multiple TCP segments into a single sk_buff and then processing that single sk_buff for all segments.  When this occurs, the large chunk of segments is encapsulated into the single MPLS packet often resulting in a packet larger than the interface MTU.  To overcome this, disable GRO and TSO on the interface using `ethtool -K eth1 tso off gro off`.
+
+### 5. Network Address Translation (NAT)
+
+
+Outgoing:
+* Create a `FLOW_KEY` variable using layer-3 and layer-4 information that is unique to flow and store the source IP address.
+* Change the packet source IP address to the WAN facing IP address. 
+
+Incoming:
+* Lookup the original source IP address using the same `FLOW_KEY` fields, but reverse source & destination where appropriate.
+* Change the packet destination IP address to the original source IP address referenced by `FLOW_KEY`
+
+This implementation uses the normal Linux routing FIB, so there is no need to do FIB lookups or redirection in eBPF.
+
+NAT ICMP traffic on eth0
+```bash
+#Store ICMP "echo request" flow information into map and change source IP to address of eth0
+bpf_compiler -i eth0 -d egress -p 100 "\
+match icmp; \
+	match icmp-type 8; \
+		decl FLOW_KEY 8; \
+		get ip-src IP_SRC; \
+		get ip-dst FLOW_KEY; \
+		calc bswap FLOW_KEY; \
+		get bytes 38 2 ICMP_IDENT; \
+		calc or FLOW_KEY %ICMP_IDENT; \
+		set map ICMP_NAT %FLOW_KEY %IP_SRC; \
+		set ip-src 10.0.0.30"
+
+#Change the IP destination of ICMP "echo reply" packets received on eth0 to NAT'ed address
+bpf_compiler -i eth0 -d ingress -p 100 "\
+match icmp; \
+	match icmp-type 0; \
+		decl FLOW_KEY 8; \
+		get bytes 38 2 ICMP_IDENT; \
+		get ip-src FLOW_KEY; \
+		calc bswap FLOW_KEY; \
+		calc or FLOW_KEY %ICMP_IDENT; \
+		get map ICMP_NAT %FLOW_KEY IP_DST; \
+		set ip-dst %IP_DST"
+```
+
+NAT TCP traffic on eth0
+```bash
+#Match new TCP flows and create entry for flow in map
+bpf_compiler -i eth0 -d egress -p 160 "\
+match tcp; \
+	match tcp-flags SYN; \
+		decl FLOW_KEY 8; \
+		decl TCP_SRC 4; \
+		get ip-dst FLOW_KEY; \
+		calc bswap FLOW_KEY; \
+		get ip-src IP_SRC; \
+		get tcp-src TCP_SRC; \
+		calc lsh TCP_SRC 16; \
+		get tcp-dst TCP_DST; \
+		calc or FLOW_KEY %TCP_SRC; \
+		calc or FLOW_KEY %TCP_DST; \
+		set map TCP_NAT %FLOW_KEY %IP_SRC"
+#Change source IP to IP address of eth0
+bpf_compiler -i eth0 -d egress -p 164 'match tcp; set ip-src 10.0.0.30'
+
+#Change the IP destination of TCP packets received on eth0 to NAT'ed address
+bpf_compiler -i eth0 -d ingress -p 160 "\
+match tcp; \
+	decl FLOW_KEY 8; \
+	decl TCP_DST 4; \
+	get tcp-dst TCP_DST; \
+	get ip-src FLOW_KEY; \
+	calc bswap FLOW_KEY; \
+	calc lsh TCP_DST 16; \
+	get tcp-src TCP_SRC; \
+	calc or FLOW_KEY %TCP_DST; \
+	calc or FLOW_KEY %TCP_SRC; \
+	get map TCP_NAT %FLOW_KEY IP_DST; \
+	set ip-dst %IP_DST"
+```
+
+NAT UDP traffic on eth0
+```bash
+#Store UDP flow information into map and change source IP to address of eth0
+bpf_compiler -i eth0 -d egress -p 117 "\
+match udp; \
+	decl FLOW_KEY 8; \
+	get ip-dst FLOW_KEY; \
+	get ip-src IP_SRC; \
+	get udp-src UDP_SRC; \
+	calc bswap FLOW_KEY; \
+	calc or FLOW_KEY %UDP_SRC; \
+	set map UDP_NAT %FLOW_KEY %IP_SRC; \
+	set ip-src 10.0.0.30"
+
+#Change the IP destination of UDP packets received on eth0 to NAT'ed address
+bpf_compiler -i eth0 -d ingress -p 117 "\
+match udp; \
+	decl FLOW_KEY 8; \
+	get ip-src FLOW_KEY; \
+	get udp-dst UDP_DST; \
+	calc bswap FLOW_KEY; \
+	calc or FLOW_KEY %UDP_DST; \
+	get map UDP_NAT %FLOW_KEY IP_DST; \
+	set ip-dst %IP_DST"
+```
