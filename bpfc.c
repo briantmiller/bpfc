@@ -4544,8 +4544,8 @@ int process_cmd(char *cmd, const char *dir) {
             else if (strcmp(f,"ip-frag")==0) compile_get_field(20,2,var);
             else if (strcmp(f,"ip-proto")==0) compile_get_field(23,1,var);
             else if (strcmp(f,"ip-ident")==0) compile_get_field(18,2,var);
-            else if (strcmp(f,"gre-proto")==0) compile_get_gre_key(var);
-            else if (strcmp(f,"gre-key")==0) compile_get_gre_proto(var);
+            else if (strcmp(f,"gre-key")==0) compile_get_gre_key(var);
+            else if (strcmp(f,"gre-proto")==0) compile_get_gre_proto(var);
             else if (strcmp(f,"eth-proto")==0) compile_get_field(12,2,var);
             else if (strcmp(f,"dst-mac")==0) compile_get_field(0,6,var);
             else if (strcmp(f,"src-mac")==0) compile_get_field(6,6,var);
