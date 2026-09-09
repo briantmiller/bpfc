@@ -62,7 +62,9 @@
 
 #define BPF_FUNC_map_lookup_elem 1
 #define BPF_FUNC_map_update_elem 2
+#define BPF_FUNC_ktime_get_ns    5
 #define BPF_FUNC_trace_printk    6
+#define BPF_FUNC_get_prandom_u32 7
 #define BPF_FUNC_skb_store_bytes 9
 #define BPF_FUNC_l3_csum_replace 10
 #define BPF_FUNC_l4_csum_replace 11
@@ -226,6 +228,21 @@ struct {
     int insn_idx; // The prog_idx where the BPF_JA instruction was emitted
 } unresolved_gotos[MAX_UNRESOLVED_GOTOS];
 int num_unresolved_gotos = 0;
+
+void reset() {
+    prog_idx = 0;
+    num_labels = 0;
+    num_unresolved_gotos = 0;
+    is_xdp = 0;
+    num_safety_jumps = 0;
+    num_blocks = 0;
+    num_jumps = 0;
+    num_maps = 0;
+    target_tc_protocol = ETH_P_ALL;
+    num_loop_starts = 0;
+    num_vars = 0;
+    next_var_offset = -( MAX_VARS * 8);
+}
 
 void emit(struct bpf_insn insn) {
         if (prog_idx < MAX_INSNS)
@@ -705,6 +722,18 @@ void compile_math_bswap(const char *var, int bits) {
     else if (d_sz==2) emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, d_off));
     else if (d_sz==4) emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, d_off));
     else emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, d_off));
+}
+
+void compile_get_time(const char *var) {
+    int d_off = allocate_var(var, 8);
+    emit(BPF_CALL_FUNC(BPF_FUNC_ktime_get_ns));
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, d_off));
+}
+
+void compile_get_random(const char *var) {
+    int d_off = allocate_var(var, 4);
+    emit(BPF_CALL_FUNC(BPF_FUNC_get_prandom_u32));
+    emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, d_off));
 }
 
 void compile_vlan_offset() {
@@ -4610,8 +4639,8 @@ int process_cmd(char *cmd, const char *dir) {
             else if (strcmp(f,"ip6-tclass")==0) compile_get_bitfield(14, 4, 20, 0xFF, var);
             else if (strcmp(f,"ip6-flow")==0) compile_get_bitfield(14, 4, 0, 0xFFFFF, var);
 	    else if (strcmp(f,"map") == 0 && t > 4) compile_get_map(get_or_create_map(tok[2]), tok[3], tok[4]);
-	    //TODO: Add time functions from here: https://docs.ebpf.io/linux/helper-function/bpf_ktime_get_boot_ns/ 
-	    //TODO: Add support for getting a random number
+	    else if (strcmp(f,"time") == 0) compile_get_time(var);
+	    else if (strcmp(f,"random") == 0) compile_get_random(var);
 	    else if (strcmp(f,"len") == 0) compile_get_skb_field(offsetof(struct __sk_buff, len), 0,0,var);
 	    else if (strcmp(f,"data") == 0) compile_get_skb_field(offsetof(struct __sk_buff, data), 0,0,var);
 	    else if (strcmp(f,"protocol") == 0) compile_get_skb_field(offsetof(struct __sk_buff, protocol), 0,0,var);
@@ -4981,10 +5010,15 @@ int process_cmd(char *cmd, const char *dir) {
 int process_cmd_list(char *instr, const char *dir) {
     char *save_c, *cmd = strtok_r(instr, ";", &save_c);
     while (cmd) {
-        //Process cmd in tokenizer
-        if(process_cmd(cmd, dir)) {
-                return 1;
-	}
+	while (*cmd == '\n' || *cmd == '\r' || *cmd == ' ' || *cmd == '\t') {
+                ++cmd;
+		if (strlen(cmd) == 0)
+			break;
+        }
+        if (strlen(cmd)!=0 && cmd[0] != '#') 
+            if(process_cmd(cmd, dir)) {
+                    return 1;
+	    }
         cmd = strtok_r(NULL, ";", &save_c);
     }
     return 0;
