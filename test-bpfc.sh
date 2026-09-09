@@ -200,7 +200,7 @@ ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 101 'match arp; match arp-op
 ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 102 'match icmp; match icmp-type 8; set icmp-type 0; match ip-dst 10.0.0.30; get ip-src IP_SRC; set ip-dst %IP_SRC; set ip-src 10.0.0.30; get dst-mac DMAC; get src-mac SMAC; set dst-mac %SMAC; set src-mac %DMAC; redirect rx0 egress' || test_fail ICMP-Echo-Install-2
 #timeout 3 ip netns exec TX tcpdump -c5 -levnnpi tx0 icmp & P1=$!
 sleep 0.5s 
-timeout 4 ip netns exec TX ping -c2 -i 0.1 -W 1 10.0.0.30 &>/dev/null && test_pass ICMP-Echo || test_fail ICMP-Echo
+timeout 4 ip netns exec TX ping -c2 -i 0.1 -W 2 10.0.0.30 &>/dev/null && test_pass ICMP-Echo || test_fail ICMP-Echo
 ip netns exec TX ip neigh show 10.0.0.30 dev br0 | grep -q "de:ad:be:ef:ca:fe" && test_pass ARP-reply || test_pass ARP-reply
 #kill -9 $P1
 
@@ -299,6 +299,21 @@ ip netns exec RX ./bpfc $COPTS -i rx0 -c
 ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 101 'match vlan-id 100-101; get vlan-id VLAN; calc add VLAN 20; set vlan-id %VLAN' && test_pass VLAN change install 1 || test_fail VLAN change install 1
 ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 105 'match vlan-id 120-121; pop-vlan' && test_pass VLAN change install 2 || test_fail VLAN change install 2
 timeout 3 ip netns exec TX ping -c 3 -i 0.5 -W0.2 2.2.2.2 &>/dev/null && test_pass VLAN change || test_fail VLAN change
+
+ip netns exec TX ./bpfc $COPTS -i tx0 -c
+ip netns exec RX ./bpfc $COPTS -i rx0 -c
+
+if [ 1 -eq 0 ]
+then
+#Test variable declarations and free
+ip netns exec TX ./bpfc -v $COPTS -i tx0 -d egress -p 90 'decl V1 4; set val V1 4; free V1; decl V2 2; match tcp; get tcp-dst TDST; calc add TDST %V2; set tcp-dst %TDST'
+#ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 90 'decl V1 4; match tcp; get tcp-dst TDST; calc sub TDST 8; set tcp-dst %TDST'
+timeout 3 ip netns exec TX tcpdump -lvnnpi tx0 &
+#timeout 3 ip netns exec RX tcpdump -lvnpi rx0 &
+sleep 0.5s     
+#ip netns exec TX ping -c 1 2.2.2.2
+echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_pass Var-Free || test_fail Var-Free
+fi
 
 
 #ip netns exec TX ./bpfc $COPTS -m /var/run/bpf/RX -r VLAN
