@@ -4368,6 +4368,7 @@ void help(const char *arg0) {
     };
     char *cmds[] = {
 	"decl <VAR> <1|2|4|8>"			,"declare variable VAR of specified length",
+	"free <VAR>"				,"free var from stack - make space available",
 	"set <field> <INT|0x00|%VAR>"		,"set specified field to integer, hex value or value stored in variable VAR",
 	"get <field> <VAR>"			,"get specified field and store into VAR",
 	"match <field> <INT|0x00|%VAR>"		,"conditional, check if field equals value or variable, if so continue execution",
