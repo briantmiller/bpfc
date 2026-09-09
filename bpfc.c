@@ -368,7 +368,7 @@ int allocate_var(const char *name, int size) {
     return vars[num_vars++].stack_off = next_var_offset;
 }
 
-void free_var(const char *name) {
+void compile_free_var(const char *name) {
     for (int i = 0; i < num_vars; i++) {
         if (strcmp(vars[i].name, name) == 0) {
 	    vars[i].free = 1;	
@@ -4534,7 +4534,7 @@ void compile_ip_defrag(const char *dir) {
     char *vars_to_free[] = {"L2","L1","IPID","TLEN","NEWLEN","IPFRAG"};
     int v_num = sizeof(vars_to_free) / sizeof(vars_to_free[0]);
     for (int v=0;v<v_num;v++) {
-    	free_var(vars_to_free[v]);
+    	compile_free_var(vars_to_free[v]);
     }
 }
 
@@ -4866,6 +4866,7 @@ int process_cmd(char *cmd, const char *dir) {
             }
         }
 	else if (strcmp(op, "decl") == 0 && t > 2) compile_decl_var(tok[1], atoi(tok[2]));
+	else if (strcmp(op, "free") == 0 && t > 1) compile_free_var(tok[1]);
 	else if (strcmp(op, "push-eth")==0 && t>2) compile_push_eth(a1, a2);
         else if (strcmp(op, "pop-eth")==0) compile_pop_eth();
         else if (strcmp(op, "push-vlan")==0) compile_push_vlan(a1, t>2?a2:NULL);
