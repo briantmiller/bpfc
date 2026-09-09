@@ -1,6 +1,5 @@
 #!/bin/bash
 
-FRAG_SIZE=1100
 
 if [ $(whoami) != "root" ]
 then
@@ -292,12 +291,13 @@ echo "
 	match mpls;
 	match mpls-label $LABEL;
 	del-bytes 0 18;
-	ip-defrag;
         redirect $IFACE egress" | tr -d '\n' | tr -d '\t'
 }
 
-ip netns exec CE1 ./bpfc $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "ip-frag $FRAG_SIZE 3000" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
-ip netns exec CE2 ./bpfc $COPTS -i h2 -d ingress -p 10 -m /var/run/bpf/CE2 "ip-frag $FRAG_SIZE 3000" && test_pass Fragment-install || (test_fail Fragment-install ; exit 1)
+FRAG_SIZE=1000
+
+#ip netns exec CE1 ./bpfc $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "ip-frag $FRAG_SIZE 3000" && test_pass CE1-frag-install || (test_fail CE1-frag-install ; exit 1)
+#ip netns exec CE2 ./bpfc $COPTS -i h2 -d ingress -p 10 -m /var/run/bpf/CE2 "ip-frag $FRAG_SIZE 3000" && test_pass CE2-frag-install || (test_fail CE2-frag-install ; exit 1)
 #exit 1
 ip netns exec CE1 ./bpfc $COPTS -i h1  -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_out_nh 10.0.0.6 16 1 255 19)" && test_pass CE1-pw0-out-install || test_fail CE1-pw0-out-install
 ip netns exec CE2 ./bpfc $COPTS -i h2  -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_out_nh 10.0.0.2 18 1 255 20)" && test_pass CE2-pw0-out-install || test_fail CE2-pw0-out-install
@@ -305,6 +305,9 @@ ip netns exec CE2 ./bpfc $COPTS -i h2  -d ingress -p 100 -m /var/run/bpf/CE2 "$(
 #ip netns exec CE1 ./bpfc $COPTS -i h1 -d ingress -p 50 "get len LEN; match val LEN gt 250; drop"
 ip netns exec CE1 ./bpfc $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_in_slow 18 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
 ip netns exec CE2 ./bpfc $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_in_slow 16 h2)" && test_pass CE2-pw0-in-install || test_fail CE2-pw0-in-install
+
+ip netns exec CE1 ./bpfc $COPTS -i h1 -d egress -p 100 -m /var/run/bpf/CE1 "ip-defrag" && test_pass CE1-defrag-install || test_fail CE1-defrag-install
+ip netns exec CE2 ./bpfc $COPTS -i h2 -d egress -p 100 -m /var/run/bpf/CE2 "ip-defrag" && test_pass CE2-defrag-install || test_fail CE2-defrag-install
 #ip netns exec CE1 ./bpfc $COPTS -i pe1 -d ingress -p 10 -m /var/run/bpf/CE1 "get mpls-label MPLS; set map MPLS %MPLS %MPLS"
 
 #timeout 5 ip netns exec PE1 tcpdump -levnpi ce2 -XX &> out1.txt &
@@ -322,9 +325,20 @@ sleep 0.5s
 
 PING_PROC_NUM=1000
 PING_COUNT=100
-PING_SIZE=1600
+PING_SIZE=2950
+
+for FRAG_SIZE in 1450 1000 500 200
+do
+
+MAX=$(( $FRAG_SIZE + 50 ))
+
+
+ip netns exec CE1 ./bpfc $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "ip-frag $FRAG_SIZE 3000" && test_pass CE1-frag-$FRAG_SIZE-install || (test_fail CE1-frag-$FRAG_SIZE-install ; exit 1)
+ip netns exec CE2 ./bpfc $COPTS -i h2 -d ingress -p 10 -m /var/run/bpf/CE2 "ip-frag $FRAG_SIZE 3000" && test_pass CE2-frag-$FRAG_SIZE-install || (test_fail CE2-frag-$FRAG_SIZE-install ; exit 1)
 
 PPIDS=()
+
+#timeout 5 ip netns exec PE1 tcpdump -c 1 -lvnpi ce1 "greater $MAX" &>/dev/null && test_fail "Pkt-mon-$FRAG_SIZE" || test_pass "Pkt-mon-$FRAG_SIZE"
 
 for I in $( seq 1 $PING_PROC_NUM )
 do
@@ -344,8 +358,8 @@ do
 		test_fail "IP-Frag-$PINGPID"
 	fi
 done 
-[ $PASS -eq 1 ] && test_pass "IP-Frag" || test_fail "IP-Frag"
-
+[ $PASS -eq 1 ] && test_pass "IP-Frag-size-$FRAG_SIZE" || test_fail "IP-Frag-size-$FRAG_SIZE"
+done
 #cat out*.txt
 #rm -f out*.txt
 
