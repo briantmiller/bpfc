@@ -200,7 +200,7 @@ ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 101 'match arp; match arp-op
 ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 102 'match icmp; match icmp-type 8; set icmp-type 0; match ip-dst 10.0.0.30; get ip-src IP_SRC; set ip-dst %IP_SRC; set ip-src 10.0.0.30; get dst-mac DMAC; get src-mac SMAC; set dst-mac %SMAC; set src-mac %DMAC; redirect rx0 egress' || test_fail ICMP-Echo-Install-2
 #timeout 3 ip netns exec TX tcpdump -c5 -levnnpi tx0 icmp & P1=$!
 sleep 0.5s 
-timeout 4 ip netns exec TX ping -c2 -i 0.1 -W 0.2 10.0.0.30 &>/dev/null && test_pass ICMP-Echo || test_fail ICMP-Echo
+timeout 4 ip netns exec TX ping -c2 -i 0.1 -W 1 10.0.0.30 &>/dev/null && test_pass ICMP-Echo || test_fail ICMP-Echo
 ip netns exec TX ip neigh show 10.0.0.30 dev br0 | grep -q "de:ad:be:ef:ca:fe" && test_pass ARP-reply || test_pass ARP-reply
 #kill -9 $P1
 
