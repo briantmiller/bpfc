@@ -37,6 +37,11 @@ sudo ./bpfc -i <interface> -c
 
 Instructions are strictly **semicolon-separated**. Variables (denoted by `%`) are dynamically allocated on the 512-byte eBPF stack and natively converted to Host Byte Order for mathematical operations.
 
+### Variables
+* `decl <VAR> <size>` - Create a new variable of `<size>` bytes (1,2,4 or 8).
+* `set val <VAR> <%VAR | int>` - Set variable to integer value or value from another variable
+* `free <VAR>` - Free `VAR` from the stack, making space available for later variables.  
+
 ### Branching & Control Flow
 * `match <field> <value>` - Opens a conditional block. If the packet field does not match the value, execution jumps past the block.
 * `match val %VAR <op> <val | %VAR>` - Compares variables logically (`lt`, `gt`, `le`, `ge`, `eq`, `ne`).
