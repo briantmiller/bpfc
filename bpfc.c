@@ -375,6 +375,10 @@ void compile_free_var(const char *name) {
             if (vars[i].stack_off == next_var_offset) {
                 next_var_offset += 8;
 		--num_vars;
+		while (num_vars > 1 && vars[num_vars].free) {
+                	next_var_offset += 8;
+			--num_vars;
+		}
 	    }
 	    break;
         }
