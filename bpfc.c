@@ -191,6 +191,7 @@ int prog_idx = 0;
 struct { char name[32];
     int stack_off;
     int size;
+    int free;
     } vars[MAX_VARS];
 int num_vars = 0;
 //int next_var_offset = -256;
@@ -343,14 +344,41 @@ int allocate_var(const char *name, int size) {
         if (strcmp(vars[i].name, name) == 0) {
             return vars[i].stack_off;
         }
+	//Check if we have a free slot on the stack
+	if (vars[i].free) {
+	    vars[i].free = 0;
+	    strncpy(vars[i].name, name, 31);
+            vars[i].size = size;
+    	    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, next_var_offset, 0));
+    	    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, next_var_offset, 0));
+	    return vars[i].stack_off;
+	}
     }
 
     // 2. Not found, allocate new 8-byte aligned space
-    next_var_offset -= ((size + 7) & ~7);
-    next_var_offset &= ~7;
+    // BTM: Not sure why we ever did this, just allocate 8 bytes
+    //next_var_offset -= ((size + 7) & ~7);
+    //next_var_offset &= ~7;
+    next_var_offset -= 8;
     strncpy(vars[num_vars].name, name, 31);
     vars[num_vars].size = size;
+    vars[num_vars].free = 0;
+    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, next_var_offset, 0));
+    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, next_var_offset, 0));
     return vars[num_vars++].stack_off = next_var_offset;
+}
+
+void free_var(const char *name) {
+    for (int i = 0; i < num_vars; i++) {
+        if (strcmp(vars[i].name, name) == 0) {
+	    vars[i].free = 1;	
+            if (vars[i].stack_off == next_var_offset) {
+                next_var_offset += 8;
+		--num_vars;
+	    }
+	    break;
+        }
+    }  
 }
 
 
@@ -1679,6 +1707,7 @@ void compile_set_ipv6_bitfield(int is_tclass, uint32_t val, const char *var) {
  * to securely handle MAC variable chunking without triggering verifier misalignment errors.
  */
 void compile_push_eth(const char *dst, const char *src) {
+    //TODO: Fix this to use the add_bytes and don't mess with the next_var_offset
     // 1. Allocate a strictly aligned 32-byte scratch block on the stack.
     next_var_offset &= ~7; 
     int scratch_base = next_var_offset - 32;
@@ -1932,6 +1961,7 @@ void compile_recalculate_icmp_csum(void) {
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
 
     // 2. Allocate and ZERO a 128-byte buffer on the eBPF stack
+    // TODO: use maps to calculate the checksum and don't mess with next_var_offset
     int buf_off = next_var_offset - 128;
     next_var_offset = (buf_off - 7) & ~7;
     buf_off = next_var_offset;
@@ -2270,6 +2300,7 @@ void compile_insert_bytes(int offset, int ilen) {
     // R9 = dst (starts at 0)
     emit(BPF_MOV64_IMM(BPF_REG_9, 0));
 
+    //TODO: Don't mess with next_var_offset, calculate scratch a better way
     // Save Context (R6) to stack
     int ctx_spill = next_var_offset - 8;
     next_var_offset = ctx_spill;
@@ -2568,7 +2599,8 @@ void compile_add_l2_bytes(int len) {
     // The space previously occupied by the original MAC header is now a gap of 
     // uninitialized kernel memory. We must zero it out to prevent data leaks.
     // Because the L3 payload didn't move, the gap is located exactly at offset 14!
-    
+   
+    //TODO: Don't mess with next_var_offset, build scratch without affecting it 
     int aligned_len = (len + 7) & ~7;
     int stack_off = next_var_offset - aligned_len;
     if (stack_off < -512) {
@@ -4496,8 +4528,14 @@ void help(const char *arg0) {
 }
 
 void compile_ip_defrag(const char *dir) {
-    char instr[] = "match ip;decl IPFRAG 2;decl NEWLEN 2;decl TLEN 4;decl IPID 4;decl L1 4;decl L2 4;get ip-frag IPFRAG;calc and IPFRAG 0x1FFF;get ip-len IPLEN;get ip-ident IPID;match val IPFRAG gt 0;set val L1 0;calc add L1 %IPLEN;set val NEWLEN 0;calc add NEWLEN %IPFRAG;calc lsh NEWLEN 3;calc add NEWLEN %IPLEN;calc lsh IPFRAG 3;calc add IPFRAG 34;decl TEST 2;set val TEST 300;set val L2 %IPFRAG;save-packet-keyed DEFRAG_BUF %IPID 34;save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2;calc sub L1 20;save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2;set map DEFRAG %IPFRAG %NEWLEN;end-match;match ip-mf;match ip-frag-off 0;get len LEN;save-packet-keyed DEFRAG_BUF %IPID %LEN;end-match;drop;match val IPFRAG gt 0;set val TLEN %NEWLEN;calc add TLEN 34;set len %TLEN;calc add NEWLEN 20;load-packet-keyed DEFRAG_BUF %IPID %NEWLEN 14 14;set ip-len %NEWLEN;set ip-frag 0;end-match;end-match;";
+    char instr[] = "match ip;decl IPFRAG 2;decl NEWLEN 2;decl TLEN 4;decl IPID 4;decl L1 4;decl L2 4;get ip-frag IPFRAG;calc and IPFRAG 0x1FFF;get ip-len IPLEN;get ip-ident IPID;match val IPFRAG gt 0;set val L1 0;calc add L1 %IPLEN;set val NEWLEN 0;calc add NEWLEN %IPFRAG;calc lsh NEWLEN 3;calc add NEWLEN %IPLEN;calc lsh IPFRAG 3;calc add IPFRAG 34;set val L2 %IPFRAG;save-packet-keyed DEFRAG_BUF %IPID 34;save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2;calc sub L1 20;save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2;set map DEFRAG %IPFRAG %NEWLEN;end-match;match ip-mf;match ip-frag-off 0;get len LEN;save-packet-keyed DEFRAG_BUF %IPID %LEN;end-match;drop;match val IPFRAG gt 0;set val TLEN %NEWLEN;calc add TLEN 34;set len %TLEN;calc add NEWLEN 20;load-packet-keyed DEFRAG_BUF %IPID %NEWLEN 14 14;set ip-len %NEWLEN;set ip-frag 0;end-match;end-match;";
     process_cmd_list(instr, dir);
+    //free variables in revers order they were declared
+    char *vars_to_free[] = {"L2","L1","IPID","TLEN","NEWLEN","IPFRAG"};
+    int v_num = sizeof(vars_to_free) / sizeof(vars_to_free[0]);
+    for (int v=0;v<v_num;v++) {
+    	free_var(vars_to_free[v]);
+    }
 }
 
 int process_cmd(char *cmd, const char *dir) {
