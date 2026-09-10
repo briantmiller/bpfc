@@ -244,24 +244,9 @@ NH_LABEL=$5
 echo "decl FIB_DMAC 8; 
 decl MPLS1 4;
 decl MPLS2 4;
-#	get len LEN;
-#match val LEN gt 1414;
-#        get map PKTS_OVR %LEN TOT;
-#        calc add TOT 1;
-#        set map PKTS_OVR %LEN %TOT;
-#end-match;
-
 fib-lookup $NH; 
 match val %FIB_RESULT eq 0;
-        #set skb-hash 0;
-	#add-bytes 0 22;
 	add-head-bytes 22;
-	#get len LEN;
-        #match val LEN gt 1436;
-        #get map PKTS_OUT %LEN TOT;
-        #calc add TOT 1;
-        #set map PKTS_OUT %LEN %TOT;
-        #end-match;
 	set val MPLS1 $NH_LABEL;
         calc lsh MPLS1 3;
         calc or MPLS1 $TC;
@@ -281,7 +266,6 @@ match val %FIB_RESULT eq 0;
 	set bytes 14 4 %MPLS1;
         set bytes 18 4 %MPLS2; 
         set eth-proto 0x8847; 
-	#set skb-proto 0x8847;
         set dst-mac %FIB_DMAC; 
         set src-mac %FIB_SMAC;
         redirect %FIB_IFINDEX egress" | tr -d '\n' | tr -d '\t'
@@ -293,70 +277,33 @@ IFACE=$2
 echo "
         match mpls;
         match mpls-label $LABEL;
-        #decl DATA 8;
         get bytes 18 8 DMAC;
         get bytes 24 8 SMAC;
         get bytes 30 2 ETHP;
         calc bswap %DMAC;
         calc bswap %SMAC;
         calc bswap %ETHP;
-        #get len LEN;
-        #decap-mpls;
-        #set eth-proto 0x0800;
-        #set bytes 14 1 0x45;
-        #del-head-bytes 18;
-        #set eth-proto 0x8847;
-        #set bytes 14 1 0xff;
-        #del-bytes 0 18;
 	del-l2-bytes 18;
         set src-mac %SMAC;
         set dst-mac %DMAC;
         set eth-proto %ETHP;
-        #recalc-*-csum doesn't work right now - throws verifier errors
-        #match udp;
-        #recalc-udp-csum;
-        #end-match;
-        #match tcp;
-        #recalc-tcp-csum;
-        #end-match;
         redirect $IFACE egress" | tr -d '\n' | tr -d '\t'
 }
 
-function mpls_in_slow()  {
+function mpls_in()  {
 LABEL=$1
 IFACE=$2
 echo "
 	match mpls;
 	match mpls-label $LABEL;
-	#get len LEN;
-	#match val LEN gt 1432;
-	#get map PKTS_IN %LEN TOT;
-	#calc add TOT 1;
-	#set map PKTS_IN %LEN %TOT;
-	#end-match;
 	del-bytes 0 18;
-	#get eth-proto ETHP;
-	#set skb-proto %ETHP;
         redirect $IFACE egress" | tr -d '\n' | tr -d '\t'
-}
-
-function mpls_in_1() {
-IFACE=$1
-echo "
-	match skb-mark 100;
-	del-head-bytes 18;
-	set eth-proto 0x8847;
-	redirect $IFACE egress
-	" | tr -d '\n' | tr -d '\t' 
 }
 
 ip netns exec CE1 ./bpfc $COPTS -i h1  -d ingress -p 100 "$(mpls_out_nh 10.0.0.6 16 1 255 19)" && test_pass CE1-pw0-out-install || test_fail CE1-pw0-out-install
 ip netns exec CE2 ./bpfc $COPTS -i h2  -d ingress -p 100 "$(mpls_out_nh 10.0.0.2 18 1 255 20)" && test_pass CE2-pw0-out-install || test_fail CE2-pw0-out-install
-#ip netns exec CE1 ./bpfc $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
-#ip netns exec CE2 ./bpfc $COPTS -i pe1 -d ingress -p 10 "match arp; accept"
-ip netns exec CE1 ./bpfc $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_in_slow 18 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
-#ip netns exec CE1 ./bpfc $COPTS -i pe1 -d ingress -p 101 "$(mpls_in_1 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
-ip netns exec CE2 ./bpfc $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_in_slow 16 h2)" && test_pass CE2-pw0-in-install || test_fail CE2-pw0-in-install
+ip netns exec CE1 ./bpfc $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_in 18 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
+ip netns exec CE2 ./bpfc $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_in 16 h2)" && test_pass CE2-pw0-in-install || test_fail CE2-pw0-in-install
 
 
 #timeout 5 ip netns exec PE1 tcpdump -levnpi ce2 -XX &> out1.txt &
