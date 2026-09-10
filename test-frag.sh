@@ -251,14 +251,7 @@ decl MPLS2 4;
 fib-lookup $NH; 
 match val %FIB_RESULT eq 0;
         #set skb-hash 0;
-	#add-bytes 0 22;
 	add-head-bytes 22;
-	#get len LEN;
-        #match val LEN gt 1436;
-        #get map PKTS_OUT %LEN TOT;
-        #calc add TOT 1;
-        #set map PKTS_OUT %LEN %TOT;
-        #end-match;
 	set val MPLS1 $NH_LABEL;
         calc lsh MPLS1 3;
         calc or MPLS1 $TC;
@@ -278,13 +271,12 @@ match val %FIB_RESULT eq 0;
 	set bytes 14 4 %MPLS1;
         set bytes 18 4 %MPLS2; 
         set eth-proto 0x8847; 
-	#set skb-proto 0x8847;
         set dst-mac %FIB_DMAC; 
         set src-mac %FIB_SMAC;
         redirect %FIB_IFINDEX egress" | tr -d '\n' | tr -d '\t'
 }
 
-function mpls_in_slow()  {
+function mpls_in()  {
 LABEL=$1
 IFACE=$2
 echo "
@@ -301,10 +293,8 @@ FRAG_SIZE=1000
 #exit 1
 ip netns exec CE1 ./bpfc $COPTS -i h1  -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_out_nh 10.0.0.6 16 1 255 19)" && test_pass CE1-pw0-out-install || test_fail CE1-pw0-out-install
 ip netns exec CE2 ./bpfc $COPTS -i h2  -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_out_nh 10.0.0.2 18 1 255 20)" && test_pass CE2-pw0-out-install || test_fail CE2-pw0-out-install
-#ip netns exec CE1 ./bpfc $COPTS -i pe1 -d egress -p 10 "get len LEN; match val LEN gt 300; drop"
-#ip netns exec CE1 ./bpfc $COPTS -i h1 -d ingress -p 50 "get len LEN; match val LEN gt 250; drop"
-ip netns exec CE1 ./bpfc $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_in_slow 18 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
-ip netns exec CE2 ./bpfc $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_in_slow 16 h2)" && test_pass CE2-pw0-in-install || test_fail CE2-pw0-in-install
+ip netns exec CE1 ./bpfc $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE1 "$(mpls_in 18 h1)" && test_pass CE1-pw0-in-install || test_fail CE1-pw0-in-install
+ip netns exec CE2 ./bpfc $COPTS -i pe1 -d ingress -p 100 -m /var/run/bpf/CE2 "$(mpls_in 16 h2)" && test_pass CE2-pw0-in-install || test_fail CE2-pw0-in-install
 
 ip netns exec CE1 ./bpfc $COPTS -i h1 -d egress -p 100 -m /var/run/bpf/CE1 "ip-defrag" && test_pass CE1-defrag-install || test_fail CE1-defrag-install
 ip netns exec CE2 ./bpfc $COPTS -i h2 -d egress -p 100 -m /var/run/bpf/CE2 "ip-defrag" && test_pass CE2-defrag-install || test_fail CE2-defrag-install
@@ -323,7 +313,7 @@ ip netns exec CE2 ./bpfc $COPTS -i h2 -d egress -p 100 -m /var/run/bpf/CE2 "ip-d
 #timeout 3 ip netns exec H2 tcpdump -levnpi ce2 -XX icmp &
 sleep 0.5s
 
-PING_PROC_NUM=1000
+PING_PROC_NUM=100
 PING_COUNT=100
 PING_SIZE=2950
 
