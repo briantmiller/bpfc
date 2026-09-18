@@ -136,8 +136,8 @@ sleep 0.5s
 #ip netns exec RTR  ./bpf_compiler $COPT -i host1 -d ingress -p 101 'match icmp; decl IP_SRC 4; get ip-src IP_SRC; set-reg-loop 5; start-loop; dec-reg-loop; calc sub IP_SRC 1; loop-reg; set ip-src %IP_SRC'
 ip netns exec RTR  ./bpfc $COPT -i host1 -d ingress -p 101 -m /var/run/bpf/RTR 'match icmp; decl LOOP 4; set val LOOP 4; decl IP_SRC 4; get ip-src IP_SRC; set-reg-loop 8; start-loop; dec-reg-loop 1; calc sub IP_SRC 1; calc sub LOOP 1; match val LOOP lt 3; set-reg-loop 0; end-match; loop-reg; set ip-src %IP_SRC; set map LOOP 0xFF %LOOP'
 
-timeout 3 ip netns exec HOST1 ping -c 3 192.168.0.1
-ip netns exec RTR ./bpfc $COPTS -m /var/run/bpf/RTR -r LOOP
+timeout 3 ip netns exec HOST1 ping -c 3 192.168.0.1 &>/dev/null
+ip netns exec RTR ./bpfc $COPTS -m /var/run/bpf/RTR -r LOOP | grep 0x00000000000000ff | grep -q "0x0000000000000002" && test_pass Loop || test_fail Loop 
 
 #Test bed cleanup
 { kill -9 $TCP_PID && wait $TCP_PID; } &>/dev/null 
