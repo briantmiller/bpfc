@@ -96,9 +96,22 @@ DEC_TIME="${DEC_TIME::-9}"
 [ $START -le $DEC_TIME ] && test_pass Time-1 || test_fail Time-1
 [ $STOP  -ge $DEC_TIME ] && test_pass Time-2 || test_fail Time-2
 
-timeout 5 ip netns exec H1 ping -c 20 -i 0.001 -W 1 10.0.0.2 &>/dev/null
+timeout 5 ip netns exec H1 ping -c 30 -i 0.001 -W 1 10.0.0.2 &>/dev/null
 #ip netns exec H1 ./bpfc -m /var/run/bpf/H1 -r RAND | grep "^\[0000\]" | cut -f 6 -d ' '
-ip netns exec H1 ./bpfc -m /var/run/bpf/H1 -r RAND
+#This is a poor test for randomness, but sufficient for our usecase
+RAND=$(ip netns exec H1 ./bpfc -m /var/run/bpf/H1 -r RAND | grep Value | cut -f 3 -d : | sed 's/ 0x00000000//g' | tr -d '\n')
+PASS=1
+for N in 0 1 2 3 4 5 6 7 8 9 a b c d e f
+do
+	#echo -n $N: 
+	NUM=$(echo $RAND | tr -cd "$N" | wc -c)
+	if [ $NUM -lt 4 ]
+	then
+		test_fail Random-$N
+		PASS=0
+	fi
+done
+[ $PASS -eq 1 ] && test_pass Random
 
 #Cleanup
 for N in H1 H2
