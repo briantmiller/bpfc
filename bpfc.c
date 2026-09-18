@@ -4137,6 +4137,10 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
     }
     //label FRAG_DONE
     compile_label("__IP_FRAG_DONE__");
+    //calc add __LEN__ 20
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, len_off));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_1, .imm=20}));
+    emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, len_off));
     //set len $__LEN__
     compile_set_length("%__LEN__");
     //get ip-frag __IP_FRAG__
