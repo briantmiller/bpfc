@@ -163,7 +163,7 @@ ip netns exec CE2 sysctl -w net.mpls.conf.pe1.input=1 &>/dev/null
 ip -f mpls -n PE1 route add 19 via inet 10.0.0.6 dev ce2
 ip -f mpls -n PE1 route add 20 via inet 10.0.0.2 dev ce1
 
-ip -f mpls -n PE1 route show
+#ip -f mpls -n PE1 route show
 
 ip netns exec H1 iptables -t mangle -A POSTROUTING -p tcp -m tcp -j CHECKSUM --checksum-fill
 ip netns exec H2 iptables -t mangle -A POSTROUTING -p tcp -m tcp -j CHECKSUM --checksum-fill
@@ -333,7 +333,7 @@ then
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
 fi
 
-if [ 1 -eq 1 ]
+if [ 1 -eq 0 ]
 then
 	ip netns exec H2 $IPERF -s &>/dev/null & P1=$!
 	ip netns exec H1 $IPERF -s &>/dev/null & P2=$!
