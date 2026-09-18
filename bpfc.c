@@ -4416,6 +4416,8 @@ void help(const char *arg0) {
 	"  ip6"					,"match packets with Ethernet proto of 0x86dd",
 	"  arp"					,"match packets with Ethernet proto of 0x0806",
 	"  mpls"				,"match packets with Ethernet proto of 0x8847",
+	"  ip-df"				,"match IPv4 packets with DF-bit set",
+	"  ip-ndf"				,"match IPv4 packets without DF-bit set",
 	"  icmp"				,"match IPv4 packets with IP proto of 1",
 	"  igmp"				,"match IPv4 packets with IP proto of 2",
 	"  tcp"					,"match IPv4 packets with IP proto of 6",
