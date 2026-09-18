@@ -4779,6 +4779,10 @@ int process_cmd(char *cmd, const char *dir) {
                 start_match_block();
                 compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
                 compile_match_core(20,1,0x40,0x40,NULL);
+            } else if (strcmp(f,"ip-ndf")==0) {
+                start_match_block();
+                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                compile_match_core(20,1,0x00,0x40,NULL);
             } else if (strcmp(f,"ip-mf")==0) {
                 start_match_block();
                 compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
