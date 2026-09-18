@@ -1,8 +1,8 @@
-# Programmable eBPF Network Fabric Compiler
+# Programmable eBPF Network Fabric Compiler & Dataplane
 
-A standalone, LLVM/Clang-independent eBPF assembler and direct network fabric loader written in pure C. This tool parses a custom, semicolon-separated instruction set to generate raw eBPF bytecode, securely load it into the Linux kernel, and bind it to network interfaces via raw Netlink TC `clsact` queuing disciplines.
+A standalone, LLVM/Clang-independent eBPF assembler and dataplane written in pure C with zero library dependencies. This tool parses a custom, semicolon-separated instruction set to generate raw eBPF bytecode, load/verify into the kernel, and bind it to network interfaces via raw Netlink TC `clsact` queuing disciplines.
 
-Built for Red Team operations, SD-WAN edge routing, and high-performance network programming, it supports dynamic variables, stateful map sharing, nested branching logic, and on-the-fly L2-L4 encapsulation.
+Designed to be a deployable eBPF dataplane and networking swiss army knife.  Useful for Red Team operations, SD-WAN edge routing, and high-performance network programming, it supports dynamic variables, stateful map sharing, nested branching logic, and on-the-fly L2-L4 encapsulation.
 
 ---
 
@@ -313,3 +313,19 @@ match udp; \
 	get map UDP_NAT %FLOW_KEY IP_DST; \
 	set ip-dst %IP_DST"
 ```
+
+### 6. IP Fragementation and Reassembly
+
+Segment oversized IPv4 packets into several packets of max size, even those with the DF-bit set. Optionally re-assemble the segments into the original packet, for instances where the application does not support reassembly.  
+
+```bash
+#Segment packets up to 9000 bytes into 1400 byte segments when received on eth0
+bpfc -i eth0 -d ingress -p 100 "ip-frag 1400 9000;"
+
+#Re-assmble fragmented packets when sending to eth0
+bpfc -i eth0 -d egress -p 100 "ip-defrag"
+```
+
+Note: The `ip-frag <size> <max>` and `ip-defrag` commands will automatically install matching criteria for IPv4 packets, but will ignore the DF bit by design. If it is desired to not fragment packets with the DF-bit set, use `match ip-ndf` before `ip-frag` to only match packets without the DF-bit set.
+
+When performing an `ip-defrag` the maximum reassembled size is limited by the interface MTU. When forwarding, it is recommended to attach the `ip-frag` to ingress and `ip-defrag` to egress.  When operating as the end host, do the opposite with `ip-frag` on the egress and `ip-defrag` on the ingress.   
