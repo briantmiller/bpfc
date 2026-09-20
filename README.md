@@ -121,22 +121,7 @@ Allows persistent data storage across packets and network interfaces.
 
 ## Advanced Examples
 
-### 1. Stateful Firewall & Port Translation (DNAT)
-Intercept TCP traffic, enforce a connection rate limit via Maps, and dynamically translate the destination port.
-```bash
-./bpfc -i eth0 -p 10 "match tcp; \
-    get ip-src SRC; \
-    get map DDOS_BLOCK %SRC COUNT; \
-    match val %COUNT gt 5000; debug-log BLOCKED; drop; end-match; \
-    calc add COUNT 1; set map DDOS_BLOCK %SRC %COUNT; \
-    match tcp-dst 80; \
-        set tcp-dst 8080; \
-        redirect-neigh eth1; \
-    end-match; \
-    continue"
-```
-
-### 2. ARP Spoofing / Reflection
+### 1. ARP Spoofing / Reflection
 Intercept an ARP Request, flip it to a Reply, dynamically swap addresses, and reflect it out the same interface.
 ```bash
 ./bpfc -i eth0 -p 5 -d ingress "match arp; match arp-oper 1; \
@@ -147,7 +132,7 @@ Intercept an ARP Request, flip it to a Reply, dynamically swap addresses, and re
     redirect-egress eth0"
 ```
 
-### 3. SD-WAN Policy Routing (FIB Lookup + GRE)
+### 2. SD-WAN Policy Routing (FIB Lookup + GRE)
 Route UDP 5060 (VoIP) out a fast link, and GRE tunnel everything else via the routing table.
 ```bash
 ./bpfc -i eth0 -d ingress "match ip; \
@@ -163,7 +148,7 @@ Route UDP 5060 (VoIP) out a fast link, and GRE tunnel everything else via the ro
     continue"
 ```
 
-### 4. MPLS pseudowires
+### 3. MPLS pseudowires
 Encapsulate all packets on an interface eth1 within MPLS pseudowire of label 16 and next-hop label of 20 and send to 10.0.0.6.
 ```bash
 ./bpfc -i eth1 -d ingress "decl MPLS1 4; \
@@ -215,7 +200,7 @@ If control-words are desired, change `add-head-bytes 22` to `add-head-bytes 26` 
 
 Note: The above MPLS encapsulation is not compatible with TCP Generic Receive Offload (GRO) or TCP Segmentation Offload (TSO). This is due to the behavior of combining multiple TCP segments into a single sk_buff and then processing that single sk_buff for all segments.  When this occurs, the large chunk of segments is encapsulated into the single MPLS packet often resulting in a packet larger than the interface MTU.  To overcome this, disable GRO and TSO on the interface using `ethtool -K eth1 tso off gro off`.
 
-### 5. Network Address Translation (NAT)
+### 4. Network Address Translation (NAT)
 
 
 Outgoing:
@@ -318,7 +303,7 @@ match udp; \
 	set ip-dst %IP_DST"
 ```
 
-### 6. IP Fragementation and Reassembly
+### 5. IP Fragementation and Reassembly
 
 Segment oversized IPv4 packets into several packets of max size, even those with the DF-bit set. Optionally re-assemble the segments into the original packet, for instances where the application does not support reassembly.  
 
