@@ -316,6 +316,17 @@ echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_
 fi
 
 
+ip netns exec TX ./bpfc $COPTS -i tx0 -c
+ip netns exec TX ./bpfc $COPTS -i host1 -c
+ip netns exec RX ./bpfc $COPTS -i rx0 -c
+
+#ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 10 'get ip-tos TOS; if TOS eq 192; set ip-tos 0; else; set ip-tos 8; end-if; match ip-tos 0; drop;'
+#TODO: Fix else after a terminal 
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 10 'get ip-tos TOS; if val TOS eq 192; set ip-tos 0; else; set ip-tos 8; end-if; match ip-tos 0; drop; end-match;'
+
+timeout 4 ip netns exec TX ping -c2 -i 0.1 -W 2 10.0.0.2 &>/dev/null && test_pass If-Else-1 || test_fail If-Else-1
+timeout 4 ip netns exec TX ping -c2 -i 0.1 -W 2 -Q 192 10.0.0.2 &>/dev/null && test_fail If-Else-2 || test_pass If-Else-2
+
 #ip netns exec TX ./bpfc $COPTS -m /var/run/bpf/RX -r VLAN
 #ip netns exec TX ./bpfc $COPTS -m /var/run/bpf/RX -r OFF14
 #kill -9 $P1

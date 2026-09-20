@@ -43,12 +43,15 @@ Instructions are strictly **semicolon-separated**. Variables (denoted by `%`) ar
 * `free <VAR>` - Free `VAR` from the stack, making space available for later variables.  
 
 ### Branching & Control Flow
-* `match <field> <value>` - Opens a conditional block. If the packet field does not match the value, execution jumps past the block.
-* `match val %VAR <op> <val | %VAR>` - Compares variables logically (`lt`, `gt`, `le`, `ge`, `eq`, `ne`).
-* `end-match` - Closes the most recent conditional `match` block.
-* `continue` - Terminal. Closes most recent match block, exits eBPF, and tells kernel to evaluate the next TC rule.
-* `drop` - Terminal. Closes most recent match block, exits eBPF, and silently drops the packet.
-* `reclassify` - Terminal. Closes most recent match block. Restarts TC evaluation from rule 0.
+* `match|if <field> <value>` - Opens a conditional block. If the packet field does not match the value, execution jumps past the block.
+* `match|if val %VAR <op> <val | %VAR>` - Compares variables logically (`lt`, `gt`, `le`, `ge`, `eq`, `ne`).
+* `else` - Inverse of match/if criteria.
+* `end-match|end-if` - Closes the most recent conditional `match` block.
+* `continue` - Terminal. Exits eBPF, and tells kernel to evaluate the next TC rule.
+* `drop` - Terminal. Exits eBPF, and silently drops the packet.
+* `reclassify` - Terminal. Restarts TC evaluation from rule 0.
+
+Note - Terminal commands must be last command in program or be followed by 'end-match', 'else' or 'end-if'.
 
 ### Protocol Shorthands
 Quick boolean filters for specific L2/L3 types. Use as standalone matches (e.g., `match tcp;`).
@@ -94,7 +97,8 @@ Allows persistent data storage across packets and network interfaces.
 
 ### Routing & Forwarding
 * `fib-lookup [direct|output] [tbid] [skip-neigh] [src] [mark]` - Queries kernel routing tables. Populates `%FIB_RESULT`, `%FIB_SMAC`, `%FIB_DMAC`, `%FIB_IP_DST`, `%FIB_IP6_DST`, `%FIB_IFINDEX`.
-* `redirect <ifname | %VAR>`, `redirect-egress`, `redirect-neigh`, `clone-redirect` - Terminal forwarding actions.
+* `redirect <ifname | %VAR> [egress|ingress]`, `redirect-neigh` - Terminal forwarding actions. If direction is not specified, will use same direction as attached mode.
+* `clone <ifname | %VAR> [egress|ingress]` - Clone packet to specified interface. If direction is not specified, will use the same direction as attached mode.
 * `encap-gre ip-src <ip> ip-dst <ip> key <val>` / `decap-gre`
 * `encap-mpls <label> <bos>` / `decap-mpls`
 * `push-vlan <vid> [pcp]` / `pop-vlan`
