@@ -225,16 +225,6 @@ struct {
 } labels[MAX_LABELS];
 int num_labels = 0;
 
-struct if_frame {
-    int false_jump_idx;   /* conditional jump to else/end-if */
-    int end_jump_idx;     /* unconditional jump over else; -1 if no else */
-    int match_depth;      /* active match-block depth when 'if' opened */
-    int has_else;
-};
-
-struct if_frame if_frames[MAX_IFS];
-int num_ifs = 0;
-
 #define MAX_UNRESOLVED_GOTOS 128
 struct {
     char target_name[32];
@@ -254,7 +244,6 @@ void reset() {
     target_tc_protocol = ETH_P_ALL;
     num_loop_starts = 0;
     num_vars = 0;
-    num_ifs = 0;
     next_var_offset = -( MAX_VARS * 8);
 }
 
@@ -303,7 +292,6 @@ int load_bpf_prog_mem() {
 /* Helper to print indentation based on active block depth */
 void print_indent() {
     for (int i = 0; i < num_blocks; i++) printf("    ");
-    for (int i = 0; i < num_ifs; i++) printf("    ");
 }
 
 /* Maps a variable name to an explicit offset on the stack without allocating new space */
@@ -432,138 +420,6 @@ int emit_var_compare_false_jump(const char *var1_name,
 }
 
 
-
-void compile_if(const char *lhs, const char *op, const char *rhs)
-{
-    if (num_ifs >= MAX_IFS) {
-        fprintf(stderr, "Error: Maximum nested if depth exceeded.\n");
-        exit(1);
-    }
-
-    /*
-     * Save the active match depth.  Any match opened inside this if branch
-     * must be closed before else/end-if.
-     */
-    struct if_frame *frame = &if_frames[num_ifs++];
-
-    frame->match_depth = num_blocks;
-    frame->has_else = 0;
-    frame->end_jump_idx = -1;
-
-    /*
-     * Emit:
-     *   if condition is false -> jump to ELSE or END-IF
-     */
-    frame->false_jump_idx = emit_var_compare_false_jump(lhs, op, rhs);
-
-    if (verbose_mode) {
-        print_indent();
-        printf("--> IF %s %s %s (false-jump at %d)\n",
-               lhs, op, rhs, frame->false_jump_idx);
-    }
-}
-
-void compile_else_old(void)
-{
-    if (num_ifs <= 0) {
-        fprintf(stderr, "Error: 'else' found without a preceding 'if'.\n");
-        exit(1);
-    }
-
-    struct if_frame *frame = &if_frames[num_ifs - 1];
-
-    if (frame->has_else) {
-        fprintf(stderr, "Error: Duplicate 'else' for current if block.\n");
-        exit(1);
-    }
-
-    /*
-     * Matches opened within the true branch must be closed before else.
-     * This prevents ambiguous jump ownership.
-     */
-    if (num_blocks != frame->match_depth) {
-        fprintf(stderr,
-                "Error: Unclosed match block before 'else'. "
-                "Close nested match blocks with 'end-match'.\n");
-        exit(1);
-    }
-
-    /*
-     * True path skips the false branch:
-     *
-     *   [true branch]
-     *   JA end-if
-     * else:
-     *   [false branch]
-     */
-    frame->end_jump_idx = prog_idx;
-    emit(((struct bpf_insn) {
-        .code = BPF_JMP | BPF_JA,
-        .dst_reg = 0,
-        .src_reg = 0,
-        .off = 0,
-        .imm = 0
-    }));
-
-    /*
-     * The original failed-condition jump now targets the first instruction
-     * of the else branch, which is immediately after the JA above.
-     */
-    prog[frame->false_jump_idx].off =
-        prog_idx - frame->false_jump_idx - 1;
-
-    frame->has_else = 1;
-
-    if (verbose_mode) {
-        print_indent();
-        printf("--> ELSE (false-jump %d -> %d; end-jump at %d)\n",
-               frame->false_jump_idx,
-               prog[frame->false_jump_idx].off,
-               frame->end_jump_idx);
-    }
-}
-
-void compile_end_if(void)
-{
-    if (num_ifs <= 0) {
-        fprintf(stderr, "Error: 'end-if' found without a preceding 'if'.\n");
-        exit(1);
-    }
-
-    struct if_frame *frame = &if_frames[num_ifs - 1];
-
-    /*
-     * Require nested match blocks within this if/else body to be closed.
-     */
-    if (num_blocks != frame->match_depth) {
-        fprintf(stderr,
-                "Error: Unclosed match block before 'end-if'. "
-                "Close nested match blocks with 'end-match'.\n");
-        exit(1);
-    }
-
-    if (frame->has_else) {
-        /*
-         * Patch true-path JA to instruction immediately after false branch.
-         */
-        prog[frame->end_jump_idx].off =
-            prog_idx - frame->end_jump_idx - 1;
-    } else {
-        /*
-         * No else: false condition skips true branch and resumes here.
-         */
-        prog[frame->false_jump_idx].off =
-            prog_idx - frame->false_jump_idx - 1;
-    }
-
-    if (verbose_mode) {
-        print_indent();
-        printf("--> END-IF\n");
-    }
-
-    num_ifs--;
-}
-
 void start_match_block(void) {
     if (num_blocks < MAX_BLOCKS) block_jump_counts[num_blocks++] = 0;
 }
@@ -621,25 +477,6 @@ void resolve_local_block(void) {
     } else {
         // If we are at the root level (no active blocks), resolve any remaining global jumps
         resolve_pending_jumps();
-    }
-}
-
-/*
- * A terminal action should only auto-close a match block opened within
- * the active if/else branch.  It must not close a match block that was
- * already active before the current if began.
- */
-void resolve_terminal_block(void)
-{
-    if (num_ifs == 0) {
-        resolve_local_block();
-        return;
-    }
-
-    int protected_depth = if_frames[num_ifs - 1].match_depth;
-
-    if (num_blocks > protected_depth) {
-        resolve_local_block();
     }
 }
 
@@ -776,7 +613,6 @@ void compile_drop_packet(void) {
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
     //resolve_local_block();
-    //resolve_terminal_block();
 }
 	
 void compile_continue_packet(void) { 
@@ -784,7 +620,6 @@ void compile_continue_packet(void) {
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
     //resolve_local_block();
-    //resolve_terminal_block();
 }
 
 void compile_accept_packet(void) {
@@ -792,7 +627,6 @@ void compile_accept_packet(void) {
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
     //resolve_local_block();
-    //resolve_terminal_block();
 }
 	
 void compile_reclassify(void) { 
@@ -800,7 +634,6 @@ void compile_reclassify(void) {
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
     //resolve_local_block();
-    //resolve_terminal_block();
 }
 
 /*
@@ -5406,11 +5239,6 @@ int main(int argc, char **argv) {
 
     if(process_cmd_list(instr, dir))
 	    exit(1);
-
-    if (num_ifs != 0) {
-	    fprintf(stderr,"Fatal Compile Error: %d unclosed if block(s); missing 'end-if'.\n",num_ifs);
-	    return 1;
-    }
 
     // --- RESOLVE FORWARD GOTOS ---
     for (int i = 0; i < num_unresolved_gotos; i++) {
