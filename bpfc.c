@@ -167,6 +167,9 @@
 
 #define MAX_LOOPS 64
 #define BUFFER_ENTRIES 10000
+#define MAX_IFS 128
+
+int last_cmd_terminal = 0;
 
 void compile_set_var(const char *dst_var, const char *src_val);
 int process_cmd_list(char *instr, const char *dir);
@@ -222,6 +225,16 @@ struct {
 } labels[MAX_LABELS];
 int num_labels = 0;
 
+struct if_frame {
+    int false_jump_idx;   /* conditional jump to else/end-if */
+    int end_jump_idx;     /* unconditional jump over else; -1 if no else */
+    int match_depth;      /* active match-block depth when 'if' opened */
+    int has_else;
+};
+
+struct if_frame if_frames[MAX_IFS];
+int num_ifs = 0;
+
 #define MAX_UNRESOLVED_GOTOS 128
 struct {
     char target_name[32];
@@ -241,6 +254,7 @@ void reset() {
     target_tc_protocol = ETH_P_ALL;
     num_loop_starts = 0;
     num_vars = 0;
+    num_ifs = 0;
     next_var_offset = -( MAX_VARS * 8);
 }
 
@@ -289,6 +303,265 @@ int load_bpf_prog_mem() {
 /* Helper to print indentation based on active block depth */
 void print_indent() {
     for (int i = 0; i < num_blocks; i++) printf("    ");
+    for (int i = 0; i < num_ifs; i++) printf("    ");
+}
+
+/* Maps a variable name to an explicit offset on the stack without allocating new space */
+void define_var_at_offset(const char *name, int size, int stack_off) {
+    for (int i = 0; i < num_vars; i++) {
+        if (strcmp(vars[i].name, name) == 0) {
+            vars[i].stack_off = stack_off;
+            vars[i].size = size;
+            return;
+        }
+    }
+    strncpy(vars[num_vars].name, name, 31);
+    vars[num_vars].size = size;
+    vars[num_vars].stack_off = stack_off;
+    num_vars++;
+}
+    
+int get_var_offset(const char *name) {
+    if (name[0] == '%') name++;
+    for (int i = 0; i < num_vars; i++)
+        if (strcmp(vars[i].name, name) == 0)
+                        return vars[i].stack_off;
+                fprintf(stderr, "Error: Undefined variable '%s'\n", name);
+    exit(1);
+}       
+            
+int get_var_size(const char *name) {
+    if (name[0] == '%') name++;
+    for (int i = 0; i < num_vars; i++)
+        if (strcmp(vars[i].name, name) == 0)
+                        return vars[i].size;
+    return 4;
+} 
+
+/*
+ * Emit a conditional comparison that jumps when the condition is FALSE.
+ *
+ * Syntax model:
+ *   if <VAR1> <lt|gt|le|ge|eq|ne> <VAR2|integer>
+ *
+ * Returns the index of the emitted conditional jump.  The caller must
+ * later patch prog[returned_index].off.
+ */
+int emit_var_compare_false_jump(const char *var1_name,
+                                const char *op,
+                                const char *var2_or_val)
+{
+    int v1_off = get_var_offset(var1_name);
+    int v1_sz  = get_var_size(var1_name);
+
+    /* Load left-hand value into R1. */
+    if (v1_sz == 1)
+        emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, v1_off));
+    else if (v1_sz == 2)
+        emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, v1_off));
+    else if (v1_sz == 4)
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v1_off));
+    else
+        emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, v1_off));
+
+    /*
+     * Inverse comparison: jump when the requested condition fails.
+     *
+     * if A lt B  -> jump when A >= B
+     * if A eq B  -> jump when A != B
+     */
+    int false_jmp_opcode = -1;
+
+    if (strcmp(op, "lt") == 0)
+        false_jmp_opcode = BPF_JGE;
+    else if (strcmp(op, "gt") == 0)
+        false_jmp_opcode = BPF_JLE;
+    else if (strcmp(op, "le") == 0)
+        false_jmp_opcode = BPF_JGT;
+    else if (strcmp(op, "ge") == 0)
+        false_jmp_opcode = BPF_JLT;
+    else if (strcmp(op, "eq") == 0)
+        false_jmp_opcode = BPF_JNE;
+    else if (strcmp(op, "ne") == 0)
+        false_jmp_opcode = BPF_JEQ;
+    else {
+        fprintf(stderr, "Error: Unknown if operator '%s'\n", op);
+        exit(1);
+    }
+
+    /*
+     * Match the existing match-val behavior:
+     * use 32-bit jumps for variables <= 32 bits and 64-bit jumps otherwise.
+     */
+    int jmp_class = (v1_sz <= 4) ? BPF_JMP32 : BPF_JMP;
+    int jump_idx = prog_idx;
+
+    if (var2_or_val[0] == '%') {
+        int v2_off = get_var_offset(var2_or_val);
+        int v2_sz  = get_var_size(var2_or_val);
+
+        if (v2_sz == 1)
+            emit(BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_10, v2_off));
+        else if (v2_sz == 2)
+            emit(BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_10, v2_off));
+        else if (v2_sz == 4)
+            emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v2_off));
+        else
+            emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, v2_off));
+
+        emit(((struct bpf_insn) {
+            .code = jmp_class | false_jmp_opcode | BPF_X,
+            .dst_reg = BPF_REG_1,
+            .src_reg = BPF_REG_2,
+            .off = 0,
+            .imm = 0
+        }));
+    } else {
+        unsigned long imm = strtoul(var2_or_val, NULL, 0);
+
+        emit(((struct bpf_insn) {
+            .code = jmp_class | false_jmp_opcode | BPF_K,
+            .dst_reg = BPF_REG_1,
+            .src_reg = 0,
+            .off = 0,
+            .imm = (int)imm
+        }));
+    }
+
+    return jump_idx;
+}
+
+
+
+void compile_if(const char *lhs, const char *op, const char *rhs)
+{
+    if (num_ifs >= MAX_IFS) {
+        fprintf(stderr, "Error: Maximum nested if depth exceeded.\n");
+        exit(1);
+    }
+
+    /*
+     * Save the active match depth.  Any match opened inside this if branch
+     * must be closed before else/end-if.
+     */
+    struct if_frame *frame = &if_frames[num_ifs++];
+
+    frame->match_depth = num_blocks;
+    frame->has_else = 0;
+    frame->end_jump_idx = -1;
+
+    /*
+     * Emit:
+     *   if condition is false -> jump to ELSE or END-IF
+     */
+    frame->false_jump_idx = emit_var_compare_false_jump(lhs, op, rhs);
+
+    if (verbose_mode) {
+        print_indent();
+        printf("--> IF %s %s %s (false-jump at %d)\n",
+               lhs, op, rhs, frame->false_jump_idx);
+    }
+}
+
+void compile_else_old(void)
+{
+    if (num_ifs <= 0) {
+        fprintf(stderr, "Error: 'else' found without a preceding 'if'.\n");
+        exit(1);
+    }
+
+    struct if_frame *frame = &if_frames[num_ifs - 1];
+
+    if (frame->has_else) {
+        fprintf(stderr, "Error: Duplicate 'else' for current if block.\n");
+        exit(1);
+    }
+
+    /*
+     * Matches opened within the true branch must be closed before else.
+     * This prevents ambiguous jump ownership.
+     */
+    if (num_blocks != frame->match_depth) {
+        fprintf(stderr,
+                "Error: Unclosed match block before 'else'. "
+                "Close nested match blocks with 'end-match'.\n");
+        exit(1);
+    }
+
+    /*
+     * True path skips the false branch:
+     *
+     *   [true branch]
+     *   JA end-if
+     * else:
+     *   [false branch]
+     */
+    frame->end_jump_idx = prog_idx;
+    emit(((struct bpf_insn) {
+        .code = BPF_JMP | BPF_JA,
+        .dst_reg = 0,
+        .src_reg = 0,
+        .off = 0,
+        .imm = 0
+    }));
+
+    /*
+     * The original failed-condition jump now targets the first instruction
+     * of the else branch, which is immediately after the JA above.
+     */
+    prog[frame->false_jump_idx].off =
+        prog_idx - frame->false_jump_idx - 1;
+
+    frame->has_else = 1;
+
+    if (verbose_mode) {
+        print_indent();
+        printf("--> ELSE (false-jump %d -> %d; end-jump at %d)\n",
+               frame->false_jump_idx,
+               prog[frame->false_jump_idx].off,
+               frame->end_jump_idx);
+    }
+}
+
+void compile_end_if(void)
+{
+    if (num_ifs <= 0) {
+        fprintf(stderr, "Error: 'end-if' found without a preceding 'if'.\n");
+        exit(1);
+    }
+
+    struct if_frame *frame = &if_frames[num_ifs - 1];
+
+    /*
+     * Require nested match blocks within this if/else body to be closed.
+     */
+    if (num_blocks != frame->match_depth) {
+        fprintf(stderr,
+                "Error: Unclosed match block before 'end-if'. "
+                "Close nested match blocks with 'end-match'.\n");
+        exit(1);
+    }
+
+    if (frame->has_else) {
+        /*
+         * Patch true-path JA to instruction immediately after false branch.
+         */
+        prog[frame->end_jump_idx].off =
+            prog_idx - frame->end_jump_idx - 1;
+    } else {
+        /*
+         * No else: false condition skips true branch and resumes here.
+         */
+        prog[frame->false_jump_idx].off =
+            prog_idx - frame->false_jump_idx - 1;
+    }
+
+    if (verbose_mode) {
+        print_indent();
+        printf("--> END-IF\n");
+    }
+
+    num_ifs--;
 }
 
 void start_match_block(void) {
@@ -352,6 +625,25 @@ void resolve_local_block(void) {
 }
 
 /*
+ * A terminal action should only auto-close a match block opened within
+ * the active if/else branch.  It must not close a match block that was
+ * already active before the current if began.
+ */
+void resolve_terminal_block(void)
+{
+    if (num_ifs == 0) {
+        resolve_local_block();
+        return;
+    }
+
+    int protected_depth = if_frames[num_ifs - 1].match_depth;
+
+    if (num_blocks > protected_depth) {
+        resolve_local_block();
+    }
+}
+
+/*
  * Allocates space on the eBPF stack for a new variable.
  * If the variable already exists, returns its existing offset without altering size.
  */
@@ -400,39 +692,6 @@ void compile_free_var(const char *name) {
 	    break;
         }
     }  
-}
-
-
-/* Maps a variable name to an explicit offset on the stack without allocating new space */
-void define_var_at_offset(const char *name, int size, int stack_off) {
-    for (int i = 0; i < num_vars; i++) {
-        if (strcmp(vars[i].name, name) == 0) {
-            vars[i].stack_off = stack_off;
-            vars[i].size = size;
-            return;
-        }
-    }
-    strncpy(vars[num_vars].name, name, 31);
-    vars[num_vars].size = size;
-    vars[num_vars].stack_off = stack_off;
-    num_vars++;
-}
-
-int get_var_offset(const char *name) {
-    if (name[0] == '%') name++;
-    for (int i = 0; i < num_vars; i++) 
-        if (strcmp(vars[i].name, name) == 0) 
-			return vars[i].stack_off;
-		fprintf(stderr, "Error: Undefined variable '%s'\n", name);
-    exit(1);
-}
-
-int get_var_size(const char *name) {
-    if (name[0] == '%') name++;
-    for (int i = 0; i < num_vars; i++) 
-        if (strcmp(vars[i].name, name) == 0) 
-			return vars[i].size;
-    return 4;
 }
 
 /* --- Utilities --- */
@@ -515,25 +774,33 @@ void parse_port_range(char *v, uint16_t *min_p, uint16_t *max_p) {
 void compile_drop_packet(void) { 
     emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_SHOT));
     emit(BPF_EXIT_INSN());
-    resolve_local_block();
+    last_cmd_terminal = 1;
+    //resolve_local_block();
+    //resolve_terminal_block();
 }
 	
 void compile_continue_packet(void) { 
     emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_PIPE));
     emit(BPF_EXIT_INSN());
-    resolve_local_block();
+    last_cmd_terminal = 1;
+    //resolve_local_block();
+    //resolve_terminal_block();
 }
 
 void compile_accept_packet(void) {
     emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_OK));
     emit(BPF_EXIT_INSN());
-    resolve_local_block();
+    last_cmd_terminal = 1;
+    //resolve_local_block();
+    //resolve_terminal_block();
 }
 	
 void compile_reclassify(void) { 
     emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_RECLASSIFY));
     emit(BPF_EXIT_INSN());
-    resolve_local_block();
+    last_cmd_terminal = 1;
+    //resolve_local_block();
+    //resolve_terminal_block();
 }
 
 /*
@@ -554,7 +821,8 @@ void compile_redirect_core(const char *iface_arg, int flags) {
     emit(BPF_MOV64_IMM(BPF_REG_2, flags));
     emit(BPF_CALL_FUNC(BPF_FUNC_redirect));
     emit(BPF_EXIT_INSN());
-    resolve_local_block();
+    last_cmd_terminal = 1;
+    //resolve_local_block();
 }
 
 /*
@@ -579,7 +847,8 @@ void compile_redirect_neigh(const char *iface_arg) {
     emit(BPF_CALL_FUNC(BPF_FUNC_redirect_neigh));
 
     emit(BPF_EXIT_INSN());
-    resolve_local_block();
+    last_cmd_terminal = 1;
+    //resolve_local_block();
 }
 
 
@@ -601,7 +870,8 @@ void compile_redirect(const char *iface_arg, const char *d) {
     emit(BPF_MOV64_IMM(BPF_REG_2, f));
     emit(BPF_CALL_FUNC(BPF_FUNC_redirect));
     emit(BPF_EXIT_INSN());
-    resolve_local_block();
+    last_cmd_terminal = 1;
+    //resolve_local_block();
 }
 
 void compile_clone(const char *iface_arg, const char *d) {
@@ -644,6 +914,36 @@ void compile_end_match(void) {
             if (num_jumps > 0) {
                 int j_idx = jump_patch_indices[--num_jumps];
                 prog[j_idx].off = prog_idx - j_idx - 1;
+		if (verbose_mode) {
+                    print_indent();
+		    printf("--> END-MATCH jump from %d to %d\n",j_idx, prog_idx);
+		}
+            }
+        }
+    }
+}
+
+void compile_else(void) {
+    if (num_blocks > 0) {
+        int goto_idx = prog_idx;
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA, .dst_reg = 0, .src_reg = 0, .off = 0, .imm = 0}));
+
+        int jumps = block_jump_counts[num_blocks-1];
+
+        if (verbose_mode) {
+            print_indent();
+            printf("--> ELSE (Resolving %d jumps from Block %d)\n", jumps, num_blocks);
+        }
+
+        for (int i = 0; i < jumps; i++) {
+            if (num_jumps > 0) {
+                int j_idx = jump_patch_indices[num_jumps-1];
+                jump_patch_indices[num_jumps-1] = goto_idx;
+                prog[j_idx].off = prog_idx - j_idx - 1;
+		if (verbose_mode) {
+            	    print_indent();
+		    printf("--> ELSE jump from %d to %d\n", j_idx, prog_idx);
+		}
             }
         }
     }
@@ -4076,6 +4376,7 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
     compile_match_core(20,1,0x20,0x20,NULL);
     //continue, which closes 'match ip-mf'
     compile_continue_packet();
+    compile_end_match();
     //get len __LEN__
     compile_get_skb_field(offsetof(struct __sk_buff, len), 0,0,"__LEN__");
     //match val __LEN__ gt IP_MAX_TLEN
@@ -4159,6 +4460,7 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
     compile_clone("%__IDX__", dir);
     //drop
     compile_drop_packet();
+    compile_end_match();
     // drop naturally ends the 'match val __LEN__ gt IP_MAX_TLEN' 
     // end 'match ip'
     compile_end_match();
@@ -4408,6 +4710,9 @@ void help(const char *arg0) {
 	"free <VAR>"				,"free var from stack - make space available",
 	"set <field> <INT|0x00|%VAR>"		,"set specified field to integer, hex value or value stored in variable VAR",
 	"get <field> <VAR>"			,"get specified field and store into VAR",
+	"if <VAR> <op> <VAL|%VAR>"		,"conditional branch; operators: lt gt le ge eq ne",
+	"else"					,"begin false branch of the current if block",
+	"end-if"				,"close the current if or if/else block",
 	"match <field> <INT|0x00|%VAR>"		,"conditional, check if field equals value or variable, if so continue execution",
 	"match <shorthand>"			,"match Ethernet and optionally IP protocol",
 	"  vlan"				,"match packets encapsulated in 802.1q VLAN",
@@ -4447,12 +4752,6 @@ void help(const char *arg0) {
 	"set-reg-loop <INT|0x00|%VAR>"		,"set loop register value to integer, hex or VAR value",
 	"dec-reg-loop"				,"decrement loop register value",
 	"loop-reg"				,"loop back to start of loop if loop register is not zero",
-	"continue"				,"continue processing packet, assumes 'end-match' for most recent match block",
-	"accept"				,"accept packet without continuing down processing chain, assumes 'end-match'",
-	"reclassify"				,"restart packet processing from top chain, assumes 'end-match'",
-	"redirect <iface> [ingress|egress]"	,"send packet to specified interface, optionally specifying ingress or egress, assumes 'end-match'",
-	"redirect-neigh <iface>"		,"send packet to specified interface and apply next-hop layer-2 fields, assumes 'end-match'",
-	"clone <iface> [ingress|egress]"	,"clone and send packet to specified interface, optionally specifying ingress or egress",
 	"ip-frag <size> <input-mtu-max>"	,"fragment IP packets into <size> payload packets up to <input-mtu-max>",
 	"ip-defrag"				,"reassemble fragmented IP packets into a single packet",
 	"save-packet <len> <src> <dst>"		,"save packet data of length into a per-CPU map, optionally specify src and/or dst offset variables supported",
@@ -4463,6 +4762,14 @@ void help(const char *arg0) {
 	"  src <ip-address>"			,"set source IP address for FIB lookup - if source based routing is needed",
 	"  iface <iface>"			,"set source IP interface for FIB lookup - if source based routing is needed",
 	"  output"				,"perform FIB lookup as an output route (sourced locally)",
+	"clone <iface> [ingress|egress]"	,"clone and send packet to specified interface, optionally specifying ingress or egress",
+	"Terminal Commands"			,"These commands stop further processing and must be the last command or followed by 'end-if' 'end-match' or 'else'",
+	"  continue"				,"continue processing packet - terminal command",
+	"  accept"				,"accept packet without continuing down processing chain - terminal command",
+	"  drop"				,"drop packet without continuing down processing chain - terminal command",
+	"  reclassify"				,"restart packet processing from top chain - terminal command",
+	"  redirect <iface> [ingress|egress]"	,"send packet to specified interface, optionally specifying ingress or egress - terminal command",
+	"  redirect-neigh <iface>"		,"send packet to specified interface and apply next-hop layer-2 fields - terminal command",
 
     };
     char *l2_fields[] = {
@@ -4531,7 +4838,7 @@ void help(const char *arg0) {
     printf("\nCOMMANDS:\n");
     int cmd_num = sizeof(cmds) / sizeof(cmds[0]);
     for (int i=0; i< cmd_num; i+=2) {
-	printf("   %-34s %s\n",cmds[i], cmds[i+1]);
+	printf("   %-36s %s\n",cmds[i], cmds[i+1]);
     }
 
     printf("\nFIELDS:\n");
@@ -4568,7 +4875,7 @@ void help(const char *arg0) {
 }
 
 void compile_ip_defrag(const char *dir) {
-    char instr[] = "match ip;decl IPFRAG 2;decl NEWLEN 2;decl TLEN 4;decl IPID 4;decl L1 4;decl L2 4;get ip-frag IPFRAG;calc and IPFRAG 0x1FFF;get ip-len IPLEN;get ip-ident IPID;match val IPFRAG gt 0;set val L1 0;calc add L1 %IPLEN;set val NEWLEN 0;calc add NEWLEN %IPFRAG;calc lsh NEWLEN 3;calc add NEWLEN %IPLEN;calc lsh IPFRAG 3;calc add IPFRAG 34;set val L2 %IPFRAG;save-packet-keyed DEFRAG_BUF %IPID 34;save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2;calc sub L1 20;save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2;set map DEFRAG %IPFRAG %NEWLEN;end-match;match ip-mf;match ip-frag-off 0;get len LEN;save-packet-keyed DEFRAG_BUF %IPID %LEN;end-match;drop;match val IPFRAG gt 0;set val TLEN %NEWLEN;calc add TLEN 34;set len %TLEN;calc add NEWLEN 20;load-packet-keyed DEFRAG_BUF %IPID %NEWLEN 14 14;set ip-len %NEWLEN;set ip-frag 0;end-match;end-match;";
+    char instr[] = "match ip;decl IPFRAG 2;decl NEWLEN 2;decl TLEN 4;decl IPID 4;decl L1 4;decl L2 4;get ip-frag IPFRAG;calc and IPFRAG 0x1FFF;get ip-len IPLEN;get ip-ident IPID;match val IPFRAG gt 0;set val L1 0;calc add L1 %IPLEN;set val NEWLEN 0;calc add NEWLEN %IPFRAG;calc lsh NEWLEN 3;calc add NEWLEN %IPLEN;calc lsh IPFRAG 3;calc add IPFRAG 34;set val L2 %IPFRAG;save-packet-keyed DEFRAG_BUF %IPID 34;save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2;calc sub L1 20;save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2;set map DEFRAG %IPFRAG %NEWLEN;end-match;match ip-mf;match ip-frag-off 0;get len LEN;save-packet-keyed DEFRAG_BUF %IPID %LEN;end-match;drop;end-match;match val IPFRAG gt 0;set val TLEN %NEWLEN;calc add TLEN 34;set len %TLEN;calc add NEWLEN 20;load-packet-keyed DEFRAG_BUF %IPID %NEWLEN 14 14;set ip-len %NEWLEN;set ip-frag 0;end-match;end-match;";
     process_cmd_list(instr, dir);
     //free variables in revers order they were declared
     char *vars_to_free[] = {"L2","L1","IPID","TLEN","NEWLEN","IPFRAG"};
@@ -4608,7 +4915,36 @@ int process_cmd(char *cmd, const char *dir) {
             for (int k = 1; k < t; k++) printf(" %s", tok[k]);
 	            printf("\n");
         }
-		
+
+	if (strcmp(op, "drop")==0){ compile_drop_packet(); return 0; }
+        else if (strcmp(op, "continue")==0){ compile_continue_packet(); return 0; }
+        else if (strcmp(op, "accept")==0){ compile_accept_packet(); return 0; }
+        else if (strcmp(op, "reclassify")==0){ compile_reclassify(); return 0; }
+        else if (strcmp(op, "redirect")==0){ compile_redirect(a1, a2?a2:dir); return 0; }
+        else if (strcmp(op, "redirect-neigh")==0){ compile_redirect_neigh(a1); return 0; }
+	
+	if (strcmp(op, "label") == 0 && t > 1){ compile_label(a1); last_cmd_terminal=0; return 0; }
+        else if (strcmp(op, "end-match")==0){ compile_end_match(); last_cmd_terminal=0; return 0; }
+        else if (strcmp(op, "end-if")==0){ compile_end_match(); last_cmd_terminal=0; return 0; }
+	else if (strcmp(op, "else") == 0) {
+                if (t != 1) {
+                        fprintf(stderr, "Usage: else\n");
+                        return 1;
+                }
+		if (last_cmd_terminal)
+			compile_end_match();
+		else
+	                compile_else();
+		last_cmd_terminal=0;
+		return 0;
+        }
+
+	if (last_cmd_terminal) {
+		printf("error with cmd '%s', last command was terminal, must have end-if, end-match or else\n",op);
+		return 1;
+	}
+	last_cmd_terminal = 0;
+
 	if (strcmp(op, "get") == 0 && t > 2) {
             char *f = a1; char *var = a2;
             if (strcmp(f,"bytes")==0 && t > 3) compile_get_raw_bytes(atoi(tok[2]), atoi(tok[3]), tok[4]);
@@ -4731,7 +5067,7 @@ int process_cmd(char *cmd, const char *dir) {
                  //exit(2);
             }
 	}
-        else if (strcmp(op, "match") == 0 && t == 2) {
+        else if ((strcmp(op, "if") == 0 || strcmp(op, "match")) == 0 && t == 2) {
             char *f = a1; 
 	    if (strcmp(f,"ip")==0) { start_match_block(); compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL); }
             else if (strcmp(f,"ip6")==0) { start_match_block(); compile_match_core(12,2,htons(0x86DD),0xFFFFFFFF,NULL); }
@@ -4801,7 +5137,7 @@ int process_cmd(char *cmd, const char *dir) {
                  //exit(2);
             }
 	} 
-	else if (strcmp(op, "match") == 0 && t > 2) {
+	else if ((strcmp(op, "if") == 0 || strcmp(op, "match") == 0) && t > 2) {
             char *f = a1; char *val = a2; char *mv = (val[0]=='%') ? val : NULL;
             if (strcmp(f,"src-mac")==0) compile_match_mac(6, val);
             else if (strcmp(f,"dst-mac")==0) compile_match_mac(0, val);
@@ -4881,10 +5217,15 @@ int process_cmd(char *cmd, const char *dir) {
                 // Syntax: match val %VAR1 <op> <VAR2_OR_VAL>
                 compile_match_var(tok[2], tok[3], tok[4]);
             }
-	    else {
-                 printf("Invalid match instruction %s\n",f);
-		 return 1;
-                 //exit(2);
+	    else if (t > 3) {
+                if (strcmp(tok[2],"gt") && strcmp(tok[2],"ge") && strcmp(tok[2],"lt") && strcmp(tok[2],"le") && strcmp(tok[2],"eq") && strcmp(tok[2],"ne")) {
+                    printf("Invalid match val operation %s\n",tok[3]);
+		    exit(2);
+		}
+                compile_match_var(f, tok[2], tok[3]);
+	    } else {
+                printf("Invalid match instruction %s\n",f);
+		return 1;
             }
         }
 	else if (strcmp(op, "calc") == 0 && t > 2) {
@@ -4969,15 +5310,10 @@ int process_cmd(char *cmd, const char *dir) {
         else if (strcmp(op, "set-reg-loop") == 0 && t > 1) compile_set_reg_loop(a1);
         else if (strcmp(op, "dec-reg-loop") == 0 && t > 1) compile_dec_reg_loop(a1);
         else if (strcmp(op, "loop-reg") == 0) compile_loop_reg();
-        else if (strcmp(op, "label") == 0 && t > 1) compile_label(a1);
         else if (strcmp(op, "goto") == 0 && t > 1) compile_goto(a1);
-        else if (strcmp(op, "drop")==0) compile_drop_packet();
-        else if (strcmp(op, "continue")==0) compile_continue_packet();
-        else if (strcmp(op, "accept")==0) compile_accept_packet();
-        else if (strcmp(op, "reclassify")==0) compile_reclassify();
+        else if (strcmp(op, "label") == 0 && t > 1) compile_label(a1);
         else if (strcmp(op, "end-match")==0) compile_end_match();
-        else if (strcmp(op, "redirect")==0) compile_redirect(a1, a2?a2:dir);
-        else if (strcmp(op, "redirect-neigh")==0) compile_redirect_neigh(a1);
+        else if (strcmp(op, "end-if")==0) compile_end_match();
         else if (strcmp(op, "clone")==0) compile_clone(a1, a2?a2:dir);
         else if (strcmp(op, "ip-frag")==0) compile_ip_frag(atoi(a1), atoi(a2), a3?a3:dir);
         else if (strcmp(op, "ip-defrag")==0) compile_ip_defrag(dir);
@@ -5070,6 +5406,11 @@ int main(int argc, char **argv) {
 
     if(process_cmd_list(instr, dir))
 	    exit(1);
+
+    if (num_ifs != 0) {
+	    fprintf(stderr,"Fatal Compile Error: %d unclosed if block(s); missing 'end-if'.\n",num_ifs);
+	    return 1;
+    }
 
     // --- RESOLVE FORWARD GOTOS ---
     for (int i = 0; i < num_unresolved_gotos; i++) {
