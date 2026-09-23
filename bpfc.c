@@ -4288,7 +4288,12 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
     //calc bswap __IPLEN__
     //compile_math_bswap("__IPLEN__", 16);
     //set ip-len %__IPLEN__
+    //calc add __IPLEN__ 20
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, iplen_off));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_1, .imm=20}));
+    emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, iplen_off));
     compile_set_ip_field16(16, 0 ,"%__IPLEN__");
+    //compile_set_ip_field8(15, 192, NULL);
     //clone %__IDX__
     compile_clone("%__IDX__", dir);
     //drop
@@ -4708,7 +4713,51 @@ void help(const char *arg0) {
 }
 
 void compile_ip_defrag(const char *dir) {
-    char instr[] = "match ip;decl IPFRAG 2;decl NEWLEN 2;decl TLEN 4;decl IPID 4;decl L1 4;decl L2 4;get ip-frag IPFRAG;calc and IPFRAG 0x1FFF;get ip-len IPLEN;get ip-ident IPID;match val IPFRAG gt 0;set val L1 0;calc add L1 %IPLEN;set val NEWLEN 0;calc add NEWLEN %IPFRAG;calc lsh NEWLEN 3;calc add NEWLEN %IPLEN;calc lsh IPFRAG 3;calc add IPFRAG 34;set val L2 %IPFRAG;save-packet-keyed DEFRAG_BUF %IPID 34;save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2;calc sub L1 20;save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2;set map DEFRAG %IPFRAG %NEWLEN;end-match;match ip-mf;match ip-frag-off 0;get len LEN;save-packet-keyed DEFRAG_BUF %IPID %LEN;end-match;drop;end-match;match val IPFRAG gt 0;set val TLEN %NEWLEN;calc add TLEN 34;set len %TLEN;calc add NEWLEN 20;load-packet-keyed DEFRAG_BUF %IPID %NEWLEN 14 14;set ip-len %NEWLEN;set ip-frag 0;end-match;end-match;";
+    char instr[] = 
+	"match ip;"
+		"decl IPFRAG 2"
+		"decl NEWLEN 2"
+		"decl TLEN 4"
+		"decl IPID 4"
+		"decl L1 4"
+		"decl L2 4"
+		"get ip-frag IPFRAG"
+		"calc and IPFRAG 0x1FFF"
+		"get ip-len IPLEN"
+		"get ip-ident IPID"
+		"match val IPFRAG gt 0"
+			"set val L1 0"
+			"calc add L1 %IPLEN"
+			"set val NEWLEN 0"
+			"calc add NEWLEN %IPFRAG"
+			"calc lsh NEWLEN 3"
+			"calc add NEWLEN %IPLEN"
+			"calc lsh IPFRAG 3"
+			"calc add IPFRAG 34"
+			"set val L2 %IPFRAG"
+			"save-packet-keyed DEFRAG_BUF %IPID 34"
+			"save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2"
+			"calc sub L1 20"
+			"save-packet-keyed DEFRAG_BUF %IPID %L1 34 %L2"
+			"set map DEFRAG %IPFRAG %NEWLEN"
+		"end-match"
+		"match ip-mf"
+			"match ip-frag-off 0"
+				"get len LEN"
+				"save-packet-keyed DEFRAG_BUF %IPID %LEN"
+			"end-match"
+			"drop"
+		"end-match"
+		"match val IPFRAG gt 0"
+			"set val TLEN %NEWLEN"
+			"calc add TLEN 34"
+			"set len %TLEN"
+			"calc add NEWLEN 0"
+			"load-packet-keyed DEFRAG_BUF %IPID %NEWLEN 14 14"
+			"set ip-len %NEWLEN"
+			"set ip-frag 0"
+		"end-match"
+	"end-match";
     process_cmd_list(instr, dir);
     //free variables in revers order they were declared
     char *vars_to_free[] = {"L2","L1","IPID","TLEN","NEWLEN","IPFRAG"};
