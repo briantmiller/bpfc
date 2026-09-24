@@ -184,8 +184,18 @@ ip netns exec R1 ping -c 4 -i 0.1 -W 0.2 10.0.0.6 &>/dev/null && test_pass R1-R2
 ip netns exec H1 ping -c 4 -i 0.1 -W 0.2 192.168.2.2 &>/dev/null && test_pass H1-H2 || test_fail H1-H2 & P4=$!
 wait $P1 $P2 $P3 $P4
 
-if [ 1 -eq 1 ]
-then
+
+PROCNUM=10
+IPERF_OPTS="-m -P $PROCNUM -i 5 -t 5 -e -y C"
+$IPERF --help 2>&1 | grep -q "\--sum-only" && IPERF_OPTS="$IPERF_OPTS --sum-only"
+
+timeout 15 ip netns exec H1 $IPERF -s &>/dev/null & P1=$!
+timeout 15 ip netns exec H2 $IPERF -s &>/dev/null & P2=$!
+sleep 0.5s
+h1h2bps_nobpf=$(ip netns exec H1 $IPERF $IPERF_OPTS -M 1450 -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+h2h1bps_nobpf=$(ip netns exec H2 $IPERF $IPERF_OPTS -M 1450 -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+
+#{ kill -9 $P1 $P2 && wait $P1 $P2 } &>/dev/null
 
 ip netns exec R1 ./bpfc $COPTS -i h1 -d egress -p 100 -m /var/run/bpf/R1 "ip-defrag" && test_pass R1-defrag-install || test_fail R1-defrag-install
 ip netns exec R2 ./bpfc $COPTS -i h2 -d egress -p 100 -m /var/run/bpf/R2 "ip-defrag" && test_pass R2-defrag-install || test_fail R2-defrag-install
@@ -260,17 +270,13 @@ FRAG_SIZE=1450
 	ip netns exec R2 ./bpfc $COPTS -i h2 -d ingress -p 10 -m /var/run/bpf/R2 "ip-frag $FRAG_SIZE 3000" && test_pass R2-frag-$FRAG_SIZE-install || (test_fail R2-frag-$FRAG_SIZE-install ; exit 1)
 
 
-PROCNUM=10
-IDX=$(ip -n R1 link show dev h1 | head -n1 | cut -f 1 -d :)
-IPERF_OPTS="-m -P $PROCNUM -i 5 -t 5 -e -y C"
-$IPERF --help 2>&1 | grep -q "\--sum-only" && IPERF_OPTS="$IPERF_OPTS --sum-only"
-
 if [ 1 -eq 1 ]
 then
-	ip netns exec R1 $IPERF -s &>/dev/null & P1=$!
-	ip netns exec R2 $IPERF -s &>/dev/null & P2=$!
-	ip netns exec H1 $IPERF -s &>/dev/null & P3=$!
-	ip netns exec H2 $IPERF -s &>/dev/null & P4=$!
+	ip netns exec H1 $IPERF -s &>/dev/null & P1=$!
+	ip netns exec H2 $IPERF -s &>/dev/null & P2=$!
+	#ip netns exec H1 $IPERF $IPERF_OPTS -M 1450 -c 192.168.2.2 | sed 's/^/  /g'
+	#r1r2bps=$(ip netns exec H1 $IPERF $IPERF_OPTS -M 1450 -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+	#r2r1bps=$(ip netns exec H2 $IPERF $IPERF_OPTS -M 1450 -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 	(for MSS in $(timeout 15 ip netns exec R2 tcpdump -c $PROCNUM -lvnpi h2 'tcp[tcpflags] & (tcp-syn) != 0' 2>/dev/null | grep mss | grep -oP 'mss\s+\K[0-9]+' | tr '\n' ' ')
 	do
 		[ $MSS -lt 2900 ] && test_fail TCP-MSS-$MSS
@@ -278,9 +284,9 @@ then
 	done ; [ $MSS -gt 2900 ] && test_pass TCP-MSS-$MSS ) &
 	sleep 0.5s
 	#TCP R1->R2
-	r1r2bps=$(ip netns exec R1 $IPERF $IPERF_OPTS -c 10.0.0.6 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+	#r1r2bps=$(ip netns exec R1 $IPERF $IPERF_OPTS -c 10.0.0.6 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 	#TCP R2->R1
-	r2r1bps=$(ip netns exec R2 $IPERF $IPERF_OPTS -c 10.0.0.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+	#r2r1bps=$(ip netns exec R2 $IPERF $IPERF_OPTS -c 10.0.0.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 	#TCP H1->H2
 	h1h2bps=$(ip netns exec H1 $IPERF $IPERF_OPTS -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 	#TCP H2->H1
@@ -294,12 +300,15 @@ then
 	h2h1bps=$(ip netns exec H2 $IPERF $IPERF_OPTS -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 
 
-	loss1=$(( 100 * $h1h2bps / $r1r2bps ))
-	loss2=$(( 100 * $h2h1bps / $r2r1bps ))
+	loss1=$(( 100 * $h1h2bps / $h1h2bps_nobpf ))
+	loss2=$(( 100 * $h2h1bps / $h2h1bps_nobpf ))
+	echo Loss-1 $loss1%
+	echo Loss-2 $loss2%
 	[ $loss1 -ge 10 ] && test_pass Frag-efficiency-1 || test_fail Frag-efficiency-1
 	[ $loss2 -ge 10 ] && test_pass Frag-efficiency-2 || test_fail Frag-efficiency-2
 
-	{ kill -9 $P1 $P2 $P3 $P4 && wait $P1 $P2 $P3 $P4; } &>/dev/null
+	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
+	#{ kill -9 $P1 $P2 $P3 $P4 && wait $P1 $P2 $P3 $P4; } &>/dev/null
 	#echo "Interface stats H1:"
 	#ip netns exec H1 netstat -i | sed 's/^/  /g'
 	#echo "Interface stats H2:"
@@ -350,8 +359,6 @@ then
 	echo "UDP H2->H1"
 	ip netns exec H2 $IPERF -u -P 10 -i 5 -t 20 -c 192.168.1.2 -b 50g | sed 's/^/  /g' | grep SUM
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
-fi
-
 fi
 
 wait &>/dev/null
