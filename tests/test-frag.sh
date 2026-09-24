@@ -104,12 +104,13 @@ ip -n H2 link set r2 mtu 3000
 
 ip netns exec H1 ethtool -K r1 tso off gro off
 ip netns exec H2 ethtool -K r2 tso off gro off
-ip netns exec R1 ethtool -K h1 tso off gro off
-ip netns exec R2 ethtool -K h2 tso off gro off
+ip netns exec R1 ethtool -K h1 tso off gro off #tx off rx off
+ip netns exec R2 ethtool -K h2 tso off gro off #tx off rx off
 ip netns exec R3 ethtool -K r1 tso off gro off
 ip netns exec R3 ethtool -K r2 tso off gro off
 ip netns exec R1 ethtool -K r3 tso off gro off
 ip netns exec R2 ethtool -K r3 tso off gro off
+
 
 #ip -n H1 link set r1 qlen 10000
 #ip -n H2 link set r2 qlen 10000
@@ -163,6 +164,8 @@ ip -6 -n R3 addr flush dev r2
 
 ip netns exec H1 iptables -t mangle -A POSTROUTING -p tcp -m tcp -j CHECKSUM --checksum-fill
 ip netns exec H2 iptables -t mangle -A POSTROUTING -p tcp -m tcp -j CHECKSUM --checksum-fill
+#ip netns exec H1 iptables -t mangle -A PREROUTING -p tcp -m tcp -j CHECKSUM --checksum-fill
+#ip netns exec H2 iptables -t mangle -A PREROUTING -p tcp -m tcp -j CHECKSUM --checksum-fill
 
 if [ $DEBUG -eq 1 ]
 then
@@ -185,7 +188,10 @@ if [ 1 -eq 1 ]
 then
 
 ip netns exec R1 ./bpfc $COPTS -i h1 -d egress -p 100 -m /var/run/bpf/R1 "ip-defrag" && test_pass R1-defrag-install || test_fail R1-defrag-install
-#ip netns exec R2 ./bpfc $COPTS -i h2 -d egress -p 100 -m /var/run/bpf/R2 "ip-defrag" && test_pass R2-defrag-install || test_fail R2-defrag-install
+ip netns exec R2 ./bpfc $COPTS -i h2 -d egress -p 100 -m /var/run/bpf/R2 "ip-defrag" && test_pass R2-defrag-install || test_fail R2-defrag-install
+
+ip netns exec H1 ./bpfc $COPTS -i r1 -d ingress -p 10 "match ip-mf; drop; end-match"
+ip netns exec H2 ./bpfc $COPTS -i r2 -d ingress -p 10 "match ip-mf; drop; end-match"
 
 /bin/rm -f out*.txt
 #timeout 5 ip netns exec R3 tcpdump -levnpi r2 -XX &> out1.txt &
@@ -206,7 +212,8 @@ FRAG_SIZE=1100
 ip netns exec R1 ./bpfc $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/R1 "ip-frag $FRAG_SIZE 3000" && test_pass R1-frag-$FRAG_SIZE-install || (test_fail R1-frag-$FRAG_SIZE-install ; exit 1)
 ip netns exec R2 ./bpfc $COPTS -i h2 -d ingress -p 10 -m /var/run/bpf/R2 "ip-frag $FRAG_SIZE 3000" && test_pass R2-frag-$FRAG_SIZE-install || (test_fail R2-frag-$FRAG_SIZE-install ; exit 1)
 
-#ip netns exec H1 ping -c 3 -s 2050 -i 0.1 -W 1 192.168.2.2
+#ip netns exec H1 ping -c 1 -s 2050 -i 0.1 -W 1 192.168.2.2
+#ip netns exec H2 ping -c 1 -s 2050 -i 0.1 -W 1 192.168.1.2
 
 PING_PROC_NUM=100
 PING_COUNT=100
@@ -249,34 +256,34 @@ done
 #timeout 10 ip netns exec H1 tcpdump -levnpi r1 -XX &
 
 FRAG_SIZE=1450
-        ip netns exec R1 ./bpfc $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/R1 "ip-frag $FRAG_SIZE 3000" && test_pass R1-frag-$FRAG_SIZE-install || (test_fail R1-frag-$FRAG_SIZE-install ; exit 1)
-        ip netns exec R2 ./bpfc $COPTS -i h2 -d ingress -p 10 -m /var/run/bpf/R2 "ip-frag $FRAG_SIZE 3000" && test_pass R2-frag-$FRAG_SIZE-install || (test_fail R2-frag-$FRAG_SIZE-install ; exit 1)
+	ip netns exec R1 ./bpfc $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/R1 "ip-frag $FRAG_SIZE 3000" && test_pass R1-frag-$FRAG_SIZE-install || (test_fail R1-frag-$FRAG_SIZE-install ; exit 1)
+	ip netns exec R2 ./bpfc $COPTS -i h2 -d ingress -p 10 -m /var/run/bpf/R2 "ip-frag $FRAG_SIZE 3000" && test_pass R2-frag-$FRAG_SIZE-install || (test_fail R2-frag-$FRAG_SIZE-install ; exit 1)
 
 
-if [ 1 -eq 0 ]
-then
-	ip netns exec R1 $IPERF -s &>/dev/null & P1=$!
-        ip netns exec R2 $IPERF -s &>/dev/null & P2=$!
-	sleep 1
-        echo "TCP R1->R2"
-        ip netns exec R1 $IPERF -P 10 -i 5 -t 20 -c 10.0.0.6 | sed 's/^/  /g'
-        echo "TCP R2->R1"
-        ip netns exec R2 $IPERF -P 10 -i 5 -t 20 -c 10.0.0.2 | sed 's/^/  /g'
-	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
-fi
+PROCNUM=10
+IDX=$(ip -n R1 link show dev h1 | head -n1 | cut -f 1 -d :)
+IPERF_OPTS="-m -P $PROCNUM -i 5 -t 5 -e -y C"
+$IPERF --help 2>&1 | grep -q "\--sum-only" && IPERF_OPTS="$IPERF_OPTS --sum-only"
 
 if [ 1 -eq 1 ]
 then
-	PROCNUM=10
-	ip netns exec H2 $IPERF -s &>/dev/null & P1=$!
-	ip netns exec H1 $IPERF -s &>/dev/null & P2=$!
-	IDX=$(ip -n R1 link show dev h1 | head -n1 | cut -f 1 -d :)
-	#timeout 45 ip netns exec R1 perf trace -e skb:kfree_skb --filter "skb_drop_reason(skb, $IDX)" &> R1-h1-perf.log & P3=$!
-	#ip netns exec H2 iperf3 -s & P1=$!
-	#echo "start" | timeout 40 dropwatch -l kas &> dropwatch.log & P3=$!
-	IPERF_OPTS="-m -P $PROCNUM -i 5 -t 5"
-	$IPERF --help 2>&1 | grep -q "\--sum-only" && IPERF_OPTS="$IPERF_OPTS --sum-only"
-	#timeout 2 ip netns exec R2 tcpdump -c 10 -levnpi h2 -XX tcp -Q out greater 600 &
+	ip netns exec R1 $IPERF -s &>/dev/null & P1=$!
+	ip netns exec R2 $IPERF -s &>/dev/null & P2=$!
+	ip netns exec H1 $IPERF -s &>/dev/null & P3=$!
+	ip netns exec H2 $IPERF -s &>/dev/null & P4=$!
+	(for MSS in $(timeout 15 ip netns exec R2 tcpdump -c $PROCNUM -lvnpi h2 'tcp[tcpflags] & (tcp-syn) != 0' 2>/dev/null | grep mss | grep -oP 'mss\s+\K[0-9]+' | tr '\n' ' ')
+	do
+		[ $MSS -lt 2900 ] && test_fail TCP-MSS-$MSS
+		export MSS=$MSS
+	done ; [ $MSS -gt 2900 ] && test_pass TCP-MSS-$MSS ) &
+	sleep 0.5s
+	#TCP R1->R2
+	r1r2bps=$(ip netns exec R1 $IPERF $IPERF_OPTS -c 10.0.0.6 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+	#TCP R2->R1
+	r2r1bps=$(ip netns exec R2 $IPERF $IPERF_OPTS -c 10.0.0.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+	#TCP H1->H2
+	h1h2bps=$(ip netns exec H1 $IPERF $IPERF_OPTS -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+	#TCP H2->H1
 	(for MSS in $(timeout 5 ip netns exec R2 tcpdump -c $PROCNUM -lvnpi h2 'tcp[tcpflags] & (tcp-syn) != 0' 2>/dev/null | grep mss | grep -oP 'mss\s+\K[0-9]+' | tr '\n' ' ')
 
 	do
@@ -284,28 +291,24 @@ then
 		export MSS=$MSS
 	done ; [ $MSS -gt 2900 ] && test_pass TCP-MSS-$MSS ) &
 	sleep 0.5s
-	echo "TCP H1->H2"
-	ip netns exec H1 $IPERF $IPERF_OPTS -c 192.168.2.2 | sed 's/^/  /g' | grep SUM | tail -n 1
-	echo "TCP H2->H1"
-	(for MSS in $(timeout 5 ip netns exec R2 tcpdump -c $PROCNUM -lvnpi h2 'tcp[tcpflags] & (tcp-syn) != 0' 2>/dev/null | grep mss | grep -oP 'mss\s+\K[0-9]+' | tr '\n' ' ')
+	h2h1bps=$(ip netns exec H2 $IPERF $IPERF_OPTS -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 
-        do
-                [ $MSS -lt 2900 ] && test_fail TCP-MSS-$MSS
-                export MSS=$MSS
-        done ; [ $MSS -gt 2900 ] && test_pass TCP-MSS-$MSS ) &
-	sleep 0.5s
-	ip netns exec H2 $IPERF $IPERF_OPTS -c 192.168.1.2 | sed 's/^/  /g' | grep SUM | tail -n 1
-	#wait $P3
-	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
+
+	loss1=$(( 100 * $h1h2bps / $r1r2bps ))
+	loss2=$(( 100 * $h2h1bps / $r2r1bps ))
+	[ $loss1 -ge 10 ] && test_pass Frag-efficiency-1 || test_fail Frag-efficiency-1
+	[ $loss2 -ge 10 ] && test_pass Frag-efficiency-2 || test_fail Frag-efficiency-2
+
+	{ kill -9 $P1 $P2 $P3 $P4 && wait $P1 $P2 $P3 $P4; } &>/dev/null
 	#echo "Interface stats H1:"
-        #ip netns exec H1 netstat -i | sed 's/^/  /g'
-        #echo "Interface stats H2:"
-        #ip netns exec H2 netstat -i | sed 's/^/  /g'
+	#ip netns exec H1 netstat -i | sed 's/^/  /g'
+	#echo "Interface stats H2:"
+	#ip netns exec H2 netstat -i | sed 's/^/  /g'
 
 	#echo "Interface stats R1:"
-        #ip netns exec R1 netstat -i | sed 's/^/  /g'
-        #echo "Interface stats R2:"
-        #ip netns exec R2 netstat -i | sed 's/^/  /g'
+	#ip netns exec R1 netstat -i | sed 's/^/  /g'
+	#echo "Interface stats R2:"
+	#ip netns exec R2 netstat -i | sed 's/^/  /g'
 
 	#echo "R1"
 	#ip -s -d -n R1 link show dev r3
@@ -355,7 +358,7 @@ wait &>/dev/null
 #ip netns exec R2 ./bpfc $COPTS -m /var/run/bpf/R2 -r DEFRAG
 for C in H1 H2 H3 R1 R2 R3
 do      
-        umount /var/run/bpf/$C &>/dev/null
+	umount /var/run/bpf/$C &>/dev/null
 done
 ip netns del H1
 ip netns del H2
