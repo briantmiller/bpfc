@@ -302,8 +302,9 @@ then
 
 	loss1=$(( 100 * $h1h2bps / $h1h2bps_nobpf ))
 	loss2=$(( 100 * $h2h1bps / $h2h1bps_nobpf ))
-	echo Loss-1 $loss1%
-	echo Loss-2 $loss2%
+
+	echo H1-H2 Throughput $(echo $h1h2bps | numfmt --to=si)bps, Efficiency $loss1%
+	echo H2-H1 Throughput $(echo $h2h1bps | numfmt --to=si)bps, Efficiency $loss2%
 	[ $loss1 -ge 10 ] && test_pass Frag-efficiency-1 || test_fail Frag-efficiency-1
 	[ $loss2 -ge 10 ] && test_pass Frag-efficiency-2 || test_fail Frag-efficiency-2
 
