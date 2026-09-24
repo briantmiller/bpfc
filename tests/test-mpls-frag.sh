@@ -345,10 +345,10 @@ do
 	if [ $RET -ne 0 ]
 	then
 		PASS=0
-		test_fail "IP-Frag-$PINGPID"
+		test_fail "MPLS-IP-Frag-$PINGPID"
 	fi
 done 
-[ $PASS -eq 1 ] && test_pass "IP-Frag-size-$FRAG_SIZE" || test_fail "IP-Frag-size-$FRAG_SIZE"
+[ $PASS -eq 1 ] && test_pass "MPLS-IP-Frag-size-$FRAG_SIZE" || test_fail "MPLS-IP-Frag-size-$FRAG_SIZE"
 done
 #cat out*.txt
 #rm -f out*.txt
@@ -377,9 +377,9 @@ then
 	#echo "start" | timeout 40 dropwatch -l kas &> dropwatch.log & P3=$!
 	sleep 1
 	echo "TCP H1->H2"
-	ip netns exec H1 $IPERF -P 10 -i 5 -t 20 -c 192.168.0.2 | sed 's/^/  /g'
+	ip netns exec H1 $IPERF -m -P 10 -i 5 -t 20 -c 192.168.0.2 | sed 's/^/  /g'
 	echo "TCP H2->H1"
-	ip netns exec H2 $IPERF -P 10 -i 5 -t 20 -c 192.168.0.1 | sed 's/^/  /g'
+	ip netns exec H2 $IPERF -m -P 10 -i 5 -t 20 -c 192.168.0.1 | sed 's/^/  /g'
 	#wait $P3
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
 	#echo "Interface stats H1:"
