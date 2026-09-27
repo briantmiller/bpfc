@@ -7,6 +7,8 @@ then
 	exit 1
 fi
 
+sysctl net.ipv4.ip_forward=1 &>/dev/null
+
 DEBUG=0
 declare -a TESTS
 #TESTS=()
@@ -282,13 +284,14 @@ then
 		[ $MSS -lt 2900 ] && test_fail TCP-MSS-$MSS
 		export MSS=$MSS
 	done ; [ $MSS -gt 2900 ] && test_pass TCP-MSS-$MSS ) &
-	sleep 0.5s
+	sleep 0.5
 	#TCP R1->R2
 	#r1r2bps=$(ip netns exec R1 $IPERF $IPERF_OPTS -c 10.0.0.6 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 	#TCP R2->R1
 	#r2r1bps=$(ip netns exec R2 $IPERF $IPERF_OPTS -c 10.0.0.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 	#TCP H1->H2
 	h1h2bps=$(ip netns exec H1 $IPERF $IPERF_OPTS -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+	sleep 3
 	#TCP H2->H1
 	(for MSS in $(timeout 5 ip netns exec R2 tcpdump -c $PROCNUM -lvnpi h2 'tcp[tcpflags] & (tcp-syn) != 0' 2>/dev/null | grep mss | grep -oP 'mss\s+\K[0-9]+' | tr '\n' ' ')
 

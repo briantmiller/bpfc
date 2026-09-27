@@ -7,6 +7,9 @@ then
 	exit 1
 fi
 
+sysctl net.ipv4.ip_forward=1 &>/dev/null
+lsmod | grep -q mpls-router || modprobe mpls-router
+
 DEBUG=0
 declare -a TESTS
 #TESTS=()
