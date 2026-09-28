@@ -188,7 +188,7 @@ wait $P1 $P2 $P3 $P4
 
 
 PROCNUM=10
-IPERF_OPTS="-m -P $PROCNUM -i 5 -t 5 -e -y C"
+IPERF_OPTS="-m -P $PROCNUM -i 5 -t 5 -y C"
 $IPERF --help 2>&1 | grep -q "\--sum-only" && IPERF_OPTS="$IPERF_OPTS --sum-only"
 
 timeout 15 ip netns exec H1 $IPERF -s &>/dev/null & P1=$!
