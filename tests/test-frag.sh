@@ -279,6 +279,7 @@ then
 	#ip netns exec H1 $IPERF $IPERF_OPTS -M 1450 -c 192.168.2.2 | sed 's/^/  /g'
 	#r1r2bps=$(ip netns exec H1 $IPERF $IPERF_OPTS -M 1450 -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 	#r2r1bps=$(ip netns exec H2 $IPERF $IPERF_OPTS -M 1450 -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+	MSS=0
 	(for MSS in $(timeout 15 ip netns exec R2 tcpdump -c $PROCNUM -lvnpi h2 'tcp[tcpflags] & (tcp-syn) != 0' 2>/dev/null | grep mss | grep -oP 'mss\s+\K[0-9]+' | tr '\n' ' ')
 	do
 		[ $MSS -lt 2900 ] && test_fail TCP-MSS-$MSS
@@ -293,6 +294,7 @@ then
 	h1h2bps=$(ip netns exec H1 $IPERF $IPERF_OPTS -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 	sleep 3
 	#TCP H2->H1
+	MSS=0
 	(for MSS in $(timeout 5 ip netns exec R2 tcpdump -c $PROCNUM -lvnpi h2 'tcp[tcpflags] & (tcp-syn) != 0' 2>/dev/null | grep mss | grep -oP 'mss\s+\K[0-9]+' | tr '\n' ' ')
 
 	do
@@ -303,6 +305,8 @@ then
 	h2h1bps=$(ip netns exec H2 $IPERF $IPERF_OPTS -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 
 
+	if [[ $h1h2bps =~ ^[0-9]+$ ]] && [[ $h2h1bps =~ ^[0-9]+$ ]] && [[ $h1h2bps_nobpf =~ ^[0-9]+$ ]] && [[ $h2h1bps_nobpf =~ ^[0-9]+$ ]]; then
+
 	loss1=$(( 100 * $h1h2bps / $h1h2bps_nobpf ))
 	loss2=$(( 100 * $h2h1bps / $h2h1bps_nobpf ))
 
@@ -310,6 +314,11 @@ then
 	echo H2-H1 Throughput $(echo $h2h1bps | numfmt --to=si)bps, Efficiency $loss2%
 	[ $loss1 -ge 10 ] && test_pass Frag-efficiency-1 || test_fail Frag-efficiency-1
 	[ $loss2 -ge 10 ] && test_pass Frag-efficiency-2 || test_fail Frag-efficiency-2
+
+	else
+		test_fail Frag-efficiency-1
+		test_fail Frag-efficiency-2
+	fi
 
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
 	#{ kill -9 $P1 $P2 $P3 $P4 && wait $P1 $P2 $P3 $P4; } &>/dev/null
