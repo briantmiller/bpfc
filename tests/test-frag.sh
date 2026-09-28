@@ -194,8 +194,8 @@ $IPERF --help 2>&1 | grep -q "\--sum-only" && IPERF_OPTS="$IPERF_OPTS --sum-only
 timeout 15 ip netns exec H1 $IPERF -s &>/dev/null & P1=$!
 timeout 15 ip netns exec H2 $IPERF -s &>/dev/null & P2=$!
 sleep 0.5s
-h1h2bps_nobpf=$(ip netns exec H1 $IPERF $IPERF_OPTS -M 1450 -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
-h2h1bps_nobpf=$(ip netns exec H2 $IPERF $IPERF_OPTS -M 1450 -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+h1h2bps_nobpf=$(ip netns exec H1 $IPERF $IPERF_OPTS -M 1450 -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev)
+h2h1bps_nobpf=$(ip netns exec H2 $IPERF $IPERF_OPTS -M 1450 -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev)
 
 #{ kill -9 $P1 $P2 && wait $P1 $P2 } &>/dev/null
 
@@ -291,7 +291,7 @@ then
 	#TCP R2->R1
 	#r2r1bps=$(ip netns exec R2 $IPERF $IPERF_OPTS -c 10.0.0.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 	#TCP H1->H2
-	h1h2bps=$(ip netns exec H1 $IPERF $IPERF_OPTS -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+	h1h2bps=$(ip netns exec H1 $IPERF $IPERF_OPTS -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev)
 	sleep 3
 	#TCP H2->H1
 	MSS=0
@@ -302,7 +302,7 @@ then
 		export MSS=$MSS
 	done ; [ $MSS -gt 2900 ] && test_pass TCP-MSS-$MSS ) &
 	sleep 0.5s
-	h2h1bps=$(ip netns exec H2 $IPERF $IPERF_OPTS -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
+	h2h1bps=$(ip netns exec H2 $IPERF $IPERF_OPTS -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev)
 
 
 	if [[ $h1h2bps =~ ^[0-9]+$ ]] && [[ $h2h1bps =~ ^[0-9]+$ ]] && [[ $h1h2bps_nobpf =~ ^[0-9]+$ ]] && [[ $h2h1bps_nobpf =~ ^[0-9]+$ ]]; then
