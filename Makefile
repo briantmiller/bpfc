@@ -1,15 +1,23 @@
-VERSION   ?= 0.1.0
+VERSION   ?= 0.1.1
 RELEASE   ?= 1
 
 CC        ?= gcc
 CFLAGS    ?= -O2 -g
 WARN       = -Wall -Wextra
 LDFLAGS   ?=
+# STATIC=1 links the binaries statically, so they run regardless of the
+# libc in the image (minimal or distroless containers). Kept separate from
+# LDFLAGS because rpmbuild passes LDFLAGS on the command line.
+STATIC    ?= 0
+ifeq ($(STATIC),1)
+STATIC_LDFLAGS = -static
+endif
 
 PREFIX    ?= /usr
 SBINDIR   ?= $(PREFIX)/sbin
 MANDIR    ?= $(PREFIX)/share/man
 DOCDIR    ?= $(PREFIX)/share/doc/bpfc
+CONTAINER_DOCDIR ?= $(PREFIX)/share/doc/bpfc-container
 SYSCONFDIR ?= /etc
 UNITDIR   ?= $(PREFIX)/lib/systemd/system
 DESTDIR   ?=
@@ -34,13 +42,13 @@ TARBALL    = bpfc-$(VERSION).tar.gz
 all: $(TARGET) $(DAEMON) $(CTL)
 
 $(TARGET): bpfc.c
-	$(CC) $(CFLAGS) $(WARN) $(LDFLAGS) -o $@ bpfc.c
+	$(CC) $(CFLAGS) $(WARN) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfc.c
 
 $(DAEMON): bpfcd/bpfcd.c $(COMMON_SRC) $(COMMON_HDR)
-	$(CC) $(CFLAGS) $(DAEMON_CFLAGS) $(LDFLAGS) -o $@ bpfcd/bpfcd.c $(COMMON_SRC)
+	$(CC) $(CFLAGS) $(DAEMON_CFLAGS) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfcd/bpfcd.c $(COMMON_SRC)
 
 $(CTL): bpfcd/bpfcctl.c $(COMMON_SRC) $(COMMON_HDR)
-	$(CC) $(CFLAGS) $(DAEMON_CFLAGS) $(LDFLAGS) -o $@ bpfcd/bpfcctl.c $(COMMON_SRC)
+	$(CC) $(CFLAGS) $(DAEMON_CFLAGS) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfcd/bpfcctl.c $(COMMON_SRC)
 
 install: all
 	install -D -m 0755 $(TARGET) $(DESTDIR)$(SBINDIR)/bpfc
@@ -58,6 +66,9 @@ install: all
 	install -m 0644 dist/examples/interfaces.d/eth0/ingress/*.bpfc $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/ingress/
 	install -m 0644 dist/examples/interfaces.d/eth0/egress/*.bpfc $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/egress/
 	install -m 0644 README.md $(DESTDIR)$(DOCDIR)/README.md
+	install -D -m 0755 dist/container/bpfcd-entrypoint $(DESTDIR)$(SBINDIR)/bpfcd-entrypoint
+	install -D -m 0644 dist/container/README.md $(DESTDIR)$(CONTAINER_DOCDIR)/README.md
+	install -D -m 0644 dist/container/Containerfile $(DESTDIR)$(CONTAINER_DOCDIR)/Containerfile
 
 dist: $(TARBALL)
 
@@ -84,7 +95,8 @@ srpm: $(TARBALL)
 
 # Integration test for bpfcd/bpfcctl (needs root; creates and deletes veth pairs).
 check: all
-	sh tests/test-bpfcd.sh
+	bash tests/test-bpfcd.sh
+	bash tests/test-container.sh
 
 clean:
 	rm -f $(TARGET) $(DAEMON) $(CTL) output.bpf $(TARBALL)

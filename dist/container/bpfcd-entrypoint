@@ -1,0 +1,136 @@
+#!/bin/sh
+# bpfcd-entrypoint - start bpfcd as the main process of a container (no systemd).
+#
+#   ENTRYPOINT ["/usr/sbin/bpfcd-entrypoint"]
+#
+#   (no arguments)        check the container's privileges, prepare bpffs, then
+#                         exec bpfcd in the foreground as PID 1
+#   -<option> ...         the same, passing the options to bpfcd (e.g. --debug)
+#   bpfcd [options]       the same
+#   <any other command>   run that command instead (bpfcctl status, sh, ...)
+#
+# Settings: /etc/bpfc/bpfc.conf if mounted, overridden by BPFCD_<SETTING>
+# variables, e.g. -e BPFCD_ON_EXTERNAL_CHANGE=log. See bpfcd(8), section
+# CONTAINERS. Set BPFCD_SKIP_CHECKS=1 to skip the privilege checks.
+#
+# POSIX sh only: runs under bash, dash or busybox ash. Uses /proc, sed, tr and
+# tail (coreutils or busybox); `mount` only if bpffs has to be mounted.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+set -eu
+
+BPFCD=${BPFCD_BIN:-/usr/sbin/bpfcd}
+CONF=/etc/bpfc/bpfc.conf
+
+log() { printf 'bpfcd-entrypoint: %s\n' "$*" >&2; }
+die() { log "error: $*"; exit 1; }
+
+# ---- what to run -----------------------------------------------------------
+case "${1:-}" in
+	"" | -*) ;;
+	bpfcd) shift ;;
+	*) exec "$@" ;;
+esac
+
+for a in "$@"; do
+	case "$a" in
+	-b | --background) die "do not pass $a: in a container bpfcd must stay in the foreground" ;;
+	-c | --config) CONF_NEXT=1; continue ;;
+	esac
+	if [ "${CONF_NEXT:-0}" = 1 ]; then CONF=$a; CONF_NEXT=0; fi
+done
+
+# Value of a bpfc.conf setting: environment first, then the file, then $2.
+setting() {
+	_env=$(printf 'BPFCD_%s' "$1" | tr '[:lower:]' '[:upper:]')
+	eval "_val=\${$_env-}"
+	if [ -n "$_val" ]; then printf '%s\n' "$_val"; return; fi
+	if [ -r "$CONF" ]; then
+		_val=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\([^#]*\).*/\1/p" "$CONF" | tail -n 1)
+		_val=$(printf '%s' "$_val" | sed 's/[[:space:]]*$//')
+		if [ -n "$_val" ]; then printf '%s\n' "$_val"; return; fi
+	fi
+	printf '%s\n' "$2"
+}
+
+# ---- privileges ------------------------------------------------------------
+# Capability numbers from linux/capability.h.
+CAP_NET_ADMIN=12
+CAP_SYS_ADMIN=21
+CAP_PERFMON=38
+CAP_BPF=39
+
+cap_eff=
+uid=
+while read -r key val _; do
+	case "$key" in
+	Uid:) uid=$val ;;
+	CapEff:) cap_eff=$val ;;
+	esac
+done < /proc/self/status
+
+has_cap() { [ $(( (0x$cap_eff >> $1) & 1 )) -eq 1 ]; }
+
+if [ "${BPFCD_SKIP_CHECKS:-0}" != 1 ]; then
+	[ "$uid" = 0 ] || die "bpfcd must run as root inside the container (uid is $uid)"
+	[ -n "$cap_eff" ] || die "cannot read capabilities from /proc/self/status; is /proc mounted?"
+	has_cap $CAP_NET_ADMIN ||
+		die "missing CAP_NET_ADMIN, needed to attach TC filters (add --cap-add NET_ADMIN, or --privileged)"
+	has_cap $CAP_BPF || has_cap $CAP_SYS_ADMIN ||
+		die "missing CAP_BPF (or CAP_SYS_ADMIN), needed to load programs (add --cap-add BPF, or --privileged)"
+	has_cap $CAP_PERFMON || has_cap $CAP_SYS_ADMIN ||
+		log "warning: no CAP_PERFMON or CAP_SYS_ADMIN; programs using debug-log will be rejected"
+	has_cap $CAP_SYS_ADMIN ||
+		log "note: no CAP_SYS_ADMIN; 'bpfcctl show --bytecode' and program tags in 'bpfcctl status -a' will be unavailable"
+fi
+
+# ---- bpffs for pinned maps -------------------------------------------------
+# Prints the bpffs mount point that contains $1, if any.
+bpffs_for() {
+	_best=
+	while read -r _ _ _ _ mp rest; do
+		case "$rest" in *" - bpf "*) ;; *) continue ;; esac
+		case "$1/" in "$mp"/*) [ ${#mp} -gt ${#_best} ] && _best=$mp ;; esac
+	done < /proc/self/mountinfo
+	[ -n "$_best" ] && printf '%s\n' "$_best"
+}
+
+map_dir=$(setting map_dir /sys/fs/bpf)
+if mp=$(bpffs_for "$map_dir"); then
+	[ -d "$map_dir" ] || mkdir -p "$map_dir" || die "cannot create map directory $map_dir"
+	log "pinned maps go to $map_dir (bpffs at $mp)"
+else
+	mounted=0
+	if [ "$map_dir" = /sys/fs/bpf ] && command -v mount >/dev/null 2>&1; then
+		if mount -t bpf bpf /sys/fs/bpf 2>/dev/null; then mounted=1; fi
+	fi
+	if [ $mounted = 1 ]; then
+		log "warning: mounted a private bpffs at /sys/fs/bpf; pinned maps (NAT state, counters)"
+		log "warning: are lost when the container stops. Mount the host's: -v /sys/fs/bpf:/sys/fs/bpf"
+	else
+		log "warning: $map_dir is not on a bpffs mount; programs that use maps will fail to install."
+		log "warning: Mount the host's bpffs: -v /sys/fs/bpf:/sys/fs/bpf"
+	fi
+fi
+
+# ---- memlock ---------------------------------------------------------------
+# Kernels before 5.11 charge BPF memory to RLIMIT_MEMLOCK (the systemd unit
+# sets LimitMEMLOCK=infinity). Newer kernels use memory cgroups instead.
+# ulimit -l is not POSIX but bash, dash and busybox all have it; skip if absent.
+# shellcheck disable=SC3045
+if cur=$(ulimit -l 2>/dev/null) && [ "$cur" != unlimited ]; then
+	# shellcheck disable=SC3045
+	ulimit -l unlimited 2>/dev/null ||
+		log "note: could not raise the memlock limit ($cur KiB); kernels before 5.11 may refuse large programs (use --ulimit memlock=-1)"
+fi
+
+# ---- start -----------------------------------------------------------------
+config_dir=$(setting config_dir /etc/bpfc/interfaces.d)
+if [ ! -d "$config_dir" ]; then
+	log "warning: $config_dir does not exist; mount your programs there (-v ./interfaces.d:$config_dir:ro)"
+fi
+
+# exec: bpfcd becomes PID 1, receives podman/docker stop and kill signals
+# directly, and reaps orphaned processes.
+exec "$BPFCD" "$@"

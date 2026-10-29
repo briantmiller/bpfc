@@ -3,6 +3,10 @@
 # Fallbacks so the spec also builds where systemd-rpm-macros is unavailable.
 %{!?_unitdir: %global _unitdir /usr/lib/systemd/system}
 
+# rpmbuild --with static: statically linked binaries that run in any image,
+# whatever its libc (used for builds made outside RHEL).
+%bcond_with static
+
 Name:           bpfc
 Version:        @VERSION@
 Release:        @RELEASE@%{?dist}
@@ -16,7 +20,12 @@ BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  kernel-headers
 BuildRequires:  systemd-rpm-macros
-%{?systemd_requires}
+%if %{with static}
+BuildRequires:  glibc-static
+%endif
+# Ordering only, not a dependency: the package installs and runs without
+# systemd (containers); the unit file is simply unused there.
+%{?systemd_ordering}
 
 %description
 bpfc compiles a small packet matching and rewriting language straight to
@@ -28,16 +37,29 @@ them at boot and when interfaces appear, applies changes on reload with an
 atomic replace, and reinstalls or reports programs removed by other tools.
 bpfcctl shows what is installed and from which file.
 
+%package container
+Summary:        Entrypoint for running bpfcd in a container without systemd
+BuildArch:      noarch
+Requires:       %{name} = %{version}-%{release}
+
+%description container
+bpfcd-entrypoint starts bpfcd as a container's main process (PID 1), with
+no systemd. It checks the container's capabilities, prepares bpffs for
+pinned maps and execs bpfcd in the foreground. Includes an example
+Containerfile and run instructions.
+
 %prep
 %autosetup
 
 %build
-%make_build VERSION=%{version} CFLAGS="%{optflags}" LDFLAGS="%{?build_ldflags}"
+%make_build VERSION=%{version} CFLAGS="%{optflags}" LDFLAGS="%{?build_ldflags}" \
+    STATIC=%{?with_static:1}%{!?with_static:0}
 
 %install
 %make_install VERSION=%{version} \
     PREFIX=%{_prefix} SBINDIR=%{_sbindir} MANDIR=%{_mandir} \
-    DOCDIR=%{_docdir}/%{name} UNITDIR=%{_unitdir} SYSCONFDIR=%{_sysconfdir}
+    DOCDIR=%{_docdir}/%{name} CONTAINER_DOCDIR=%{_docdir}/%{name}-container \
+    UNITDIR=%{_unitdir} SYSCONFDIR=%{_sysconfdir}
 
 %post
 %{?systemd_post:%systemd_post bpfcd.service}
@@ -64,8 +86,20 @@ bpfcctl shows what is installed and from which file.
 %config(noreplace) %{_sysconfdir}/bpfc/bpfc.conf
 %dir %{_sysconfdir}/bpfc/interfaces.d
 
+%files container
+%{_sbindir}/bpfcd-entrypoint
+%{_docdir}/%{name}-container/
+
 %changelog
-* Wed Oct 28 2026 bpfc maintainers <brun064@gmail.com> - @VERSION@-@RELEASE@
+* Thu Oct 29 2026 bpfc maintainers <brun064@gmail.com> - @VERSION@-@RELEASE@
+- Add bpfc-container subpackage with bpfcd-entrypoint for systemd-free containers
+- Drop the hard dependency on systemd (ordering only)
+- bpfcd: BPFCD_* environment overrides, reaps orphans as PID 1, blocks
+  stop signals from the first instruction
+- bpfcctl: correct daemon status when run as a non-root user
+- Optional static build (rpmbuild --with static)
+
+* Wed Oct 28 2026 bpfc maintainers <brun064@gmail.com> - 0.1.0-1
 - Add bpfcd daemon, bpfcctl status tool and systemd unit
 - bpfc: atomic replace, per-priority delete (-D), program naming (-n),
   id/tag reporting (-I), netlink error checking, comment handling in -f files

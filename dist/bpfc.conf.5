@@ -62,6 +62,16 @@ The bpfc binary. Must be absolute.
 .TP
 .BI state_dir " = " /run/bpfc
 Where the state file, PID file and failure logs live.
+.SH ENVIRONMENT
+Each setting can be overridden by an environment variable named
+.B BPFCD_
+followed by the setting in capitals, for example
+.B BPFCD_REMOVE_ON_STOP=yes
+or
+.BR BPFCD_STATE_DIR=/var/lib/bpfc .
+Variables take precedence over the file and are validated the same way.
+This is mainly for containers; see
+.BR bpfcd (8).
 .SH SEE ALSO
 .BR bpfcd (8),
 .BR bpfcctl (8),

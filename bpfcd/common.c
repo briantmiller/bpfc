@@ -162,6 +162,40 @@ static int parse_int(const char *v, int lo, int hi, int *out) {
     return 0;
 }
 
+/* Settings that can be given in bpfc.conf and, upper-cased with a BPFCD_ prefix, in the environment. */
+static const char *const config_keys[] = {
+    "bpfc_path", "config_dir", "state_dir", "map_dir", "on_external_change",
+    "remove_on_stop", "reinstall_limit", "compile_timeout", "log_level", NULL};
+
+/* Applies one setting. Returns 0, -1 for an unknown key, -2 for an invalid value. */
+static int config_set(struct config *c, const char *k, const char *v) {
+    if (!strcmp(k, "bpfc_path")) snprintf(c->bpfc_path, sizeof(c->bpfc_path), "%s", v);
+    else if (!strcmp(k, "config_dir")) snprintf(c->config_dir, sizeof(c->config_dir), "%s", v);
+    else if (!strcmp(k, "state_dir")) snprintf(c->state_dir, sizeof(c->state_dir), "%s", v);
+    else if (!strcmp(k, "map_dir")) snprintf(c->map_dir, sizeof(c->map_dir), "%s", v);
+    else if (!strcmp(k, "on_external_change")) {
+        if (!strcmp(v, "reinstall")) c->on_external_change = EXT_REINSTALL;
+        else if (!strcmp(v, "log")) c->on_external_change = EXT_LOG;
+        else return -2;
+    } else if (!strcmp(k, "remove_on_stop")) { if (parse_bool(v, &c->remove_on_stop) < 0) return -2; }
+    else if (!strcmp(k, "reinstall_limit")) { if (parse_int(v, 0, 1000, &c->reinstall_limit) < 0) return -2; }
+    else if (!strcmp(k, "compile_timeout")) { if (parse_int(v, 1, 3600, &c->compile_timeout) < 0) return -2; }
+    else if (!strcmp(k, "log_level")) {
+        int l = log_level_parse(v);
+        if (l < 0) return -2;
+        c->log_level = l;
+    } else return -1;
+    return 0;
+}
+
+static int config_check(const struct config *c, const char *src, char *err, size_t errlen) {
+    if (c->bpfc_path[0] != '/') {
+        snprintf(err, errlen, "%s: bpfc_path must be an absolute path", src);
+        return -1;
+    }
+    return 0;
+}
+
 int config_load(const char *path, struct config *c, char *err, size_t errlen) {
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -184,36 +218,36 @@ int config_load(const char *path, struct config *c, char *err, size_t errlen) {
         }
         *eq = '\0';
         char *k = trim(s), *v = trim(eq + 1);
-        int bad = 0;
-        if (!strcmp(k, "bpfc_path")) snprintf(c->bpfc_path, sizeof(c->bpfc_path), "%s", v);
-        else if (!strcmp(k, "config_dir")) snprintf(c->config_dir, sizeof(c->config_dir), "%s", v);
-        else if (!strcmp(k, "state_dir")) snprintf(c->state_dir, sizeof(c->state_dir), "%s", v);
-        else if (!strcmp(k, "map_dir")) snprintf(c->map_dir, sizeof(c->map_dir), "%s", v);
-        else if (!strcmp(k, "on_external_change")) {
-            if (!strcmp(v, "reinstall")) c->on_external_change = EXT_REINSTALL;
-            else if (!strcmp(v, "log")) c->on_external_change = EXT_LOG;
-            else bad = 1;
-        } else if (!strcmp(k, "remove_on_stop")) bad = parse_bool(v, &c->remove_on_stop) < 0;
-        else if (!strcmp(k, "reinstall_limit")) bad = parse_int(v, 0, 1000, &c->reinstall_limit) < 0;
-        else if (!strcmp(k, "compile_timeout")) bad = parse_int(v, 1, 3600, &c->compile_timeout) < 0;
-        else if (!strcmp(k, "log_level")) {
-            int l = log_level_parse(v);
-            if (l < 0) bad = 1; else c->log_level = l;
-        } else {
+        int r = config_set(c, k, v);
+        if (r == -1) {
             snprintf(err, errlen, "%s:%d: unknown setting '%s'", path, lineno, k);
             rc = -1; break;
         }
-        if (bad) {
+        if (r == -2) {
             snprintf(err, errlen, "%s:%d: invalid value '%s' for %s", path, lineno, v, k);
             rc = -1; break;
         }
     }
     fclose(f);
-    if (rc == 0 && c->bpfc_path[0] != '/') {
-        snprintf(err, errlen, "%s: bpfc_path must be an absolute path", path);
-        rc = -1;
-    }
+    if (rc == 0) rc = config_check(c, path, err, errlen);
     return rc;
+}
+
+int config_apply_env(struct config *c, char *err, size_t errlen) {
+    for (int i = 0; config_keys[i]; i++) {
+        char name[64] = "BPFCD_";
+        size_t n = strlen(name);
+        for (const char *p = config_keys[i]; *p && n + 1 < sizeof(name); p++)
+            name[n++] = (char)toupper((unsigned char)*p);
+        name[n] = '\0';
+        const char *v = getenv(name);
+        if (!v) continue;
+        if (config_set(c, config_keys[i], v) < 0) {
+            snprintf(err, errlen, "environment: invalid value '%s' for %s", v, name);
+            return -1;
+        }
+    }
+    return config_check(c, "environment", err, errlen);
 }
 
 /* ======================= SHA-256 (FIPS 180-4) ======================= */
