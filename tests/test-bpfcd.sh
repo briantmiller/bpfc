@@ -107,6 +107,12 @@ check "error log saved"                        test -s "$T/run/errors/$A.egress.
 check "leading-zero file name ignored"         eval '! grep -q "prio=10 path=[^ ]*/010.bpfc" $T/run/state'
 check "filter carries bpfcd name"              eval 'tc filter show dev $A ingress | grep -q "bpfcd:$A/ingress/10"'
 check "bpfcctl status exits 2 (a failure)"     eval '$BPFCCTL -s $T/run status >/dev/null; [ $? -eq 2 ]'
+# Non-root users must see a root-owned daemon as running (kill(pid, 0) gives EPERM, not ESRCH).
+if id nobody >/dev/null 2>&1; then
+	chmod 755 "$T"
+	install -m 0755 "$BPFCCTL" "$T/bpfcctl"
+	check "non-root status sees daemon running"  eval 'su -s /bin/sh nobody -c "$T/bpfcctl -s $T/run status" >/dev/null 2>&1; [ $? -eq 2 ]'
+fi
 
 echo "interface events"
 ip link add $B type veth peer name ${B}p
