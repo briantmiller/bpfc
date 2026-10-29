@@ -54,7 +54,10 @@ static const char *short_path(const char *path, const char *config_dir) {
 
 /* Is the pid alive and actually bpfcd (not a recycled pid)? */
 static int daemon_alive(int pid) {
-    if (pid <= 0 || kill(pid, 0) < 0) return 0;
+    if (pid <= 0) return 0;
+    /* Signal 0 only probes. EPERM means the process exists but belongs to
+     * another user (bpfcd runs as root), so only ESRCH means it is gone. */
+    if (kill(pid, 0) < 0 && errno != EPERM) return 0;
     char p[64], comm[64] = "";
     snprintf(p, sizeof(p), "/proc/%d/comm", pid);
     FILE *f = fopen(p, "r");
@@ -491,7 +494,10 @@ static int cmd_reload(int wait) {
     free(slots);
     slots = NULL;
     if (kill(pid, SIGHUP) < 0) {
-        fprintf(stderr, "Cannot signal bpfcd (pid %d): %s\n", pid, strerror(errno));
+        if (errno == EPERM)
+            fprintf(stderr, "Reloading bpfcd requires root: run 'sudo bpfcctl reload' or 'sudo systemctl reload bpfcd'\n");
+        else
+            fprintf(stderr, "Cannot signal bpfcd (pid %d): %s\n", pid, strerror(errno));
         return 1;
     }
     if (!wait) { printf("Sent SIGHUP to bpfcd (pid %d)\n", pid); return 0; }
