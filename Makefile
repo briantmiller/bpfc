@@ -1,5 +1,5 @@
 VERSION   ?= 0.1.1
-RELEASE   ?= 1
+RELEASE   ?= 2
 
 CC        ?= gcc
 CFLAGS    ?= -O2 -g

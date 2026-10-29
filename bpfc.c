@@ -173,6 +173,7 @@ int last_cmd_terminal = 0;
 
 void compile_set_var(const char *dst_var, const char *src_val);
 int process_cmd_list(char *instr, const char *dir);
+void emit_drop_if_r0_error(void);
 
 /* --- Map Tracking (Symbol Table) --- */
 #define MAX_MAPS 16
@@ -508,6 +509,11 @@ int allocate_var(const char *name, int size) {
     // BTM: Not sure why we ever did this, just allocate 8 bytes
     //next_var_offset -= ((size + 7) & ~7);
     //next_var_offset &= ~7;
+    if (num_vars >= MAX_VARS) {
+        fprintf(stderr, "Error: too many variables (limit %d, including any the compiler adds for "
+                        "del-bytes, ip-frag and similar instructions)\n", MAX_VARS);
+        exit(1);
+    }
     next_var_offset -= 8;
     strncpy(vars[num_vars].name, name, 31);
     vars[num_vars].size = size;
@@ -2969,6 +2975,17 @@ void compile_add_head_bytes(const char *len_arg) {
     prog[z_end1].off = prog_idx - z_end1 - 1;
 }
 
+/*
+ * After bytes have been moved, a failed resize (the kernel refuses to shrink
+ * a packet below its link/network header) would pass on a packet whose
+ * contents no longer match its length. Drop it instead.
+ */
+void emit_drop_if_r0_error(void) {
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_0, .imm=0, .off=2}));
+    emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_SHOT));
+    emit(BPF_EXIT_INSN());
+}
+
 void compile_set_length(const char *len_arg) {
     if (len_arg[0] == '%') {
         int v_off = get_var_offset(len_arg);
@@ -2995,72 +3012,70 @@ void compile_set_length(const char *len_arg) {
  * dynamic memory zero-out defense mechanisms.
  */
 void compile_delete_bytes(int offset, int dlen) {
+    /*
+     * Register use: R6 holds skb->len while copying (the context pointer is
+     * spilled to the stack and restored afterwards), R8 = source offset,
+     * R9 = destination offset, R0 = scratch for bound checks. R7 is left
+     * alone: it is the counter of set-reg-loop/loop-reg loops, and
+     * clobbering it made del-bytes inside such a loop fail verification.
+     */
+    if (offset < 0 || dlen <= 0 || offset + dlen > 9000) {
+        fprintf(stderr, "Error: del-bytes needs an offset >= 0 and a length > 0 that end within 9000 bytes\n");
+        exit(1);
+    }
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV64_IMM(BPF_REG_2, 0));
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_pull_data));
 
-    //emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    //emit(BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1, offsetof(struct __sk_buff, data_end)));
-    //emit(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_1, offsetof(struct __sk_buff, data)));
-    //emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_X, .dst_reg=BPF_REG_7, .src_reg=BPF_REG_3}));
-
-    //TODO: Figure out how to not use REG_7 for deletes, since it may be used for legacy loops
-
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1, offsetof(struct __sk_buff, len)));
+    int ctx_spill = next_var_offset - 8;
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_6, ctx_spill));
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_6, BPF_REG_6, offsetof(struct __sk_buff, len)));
 
     add_safety_jump();
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_7, .imm=9000}));
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_6, .imm=9000}));
 
     emit(BPF_MOV64_IMM(BPF_REG_8, offset + dlen));
     emit(BPF_MOV64_IMM(BPF_REG_9, offset));
 
-    //add_safety_jump();
-    //emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGE|BPF_X, .dst_reg=BPF_REG_8, .src_reg=BPF_REG_7}));
+    // Packet ends before offset+dlen: leave it unchanged. (Previously the
+    // copy was skipped but the tail was still cut by dlen, deleting bytes
+    // in front of the requested offset.)
+    int too_short = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_8, .src_reg=BPF_REG_6}));
 
-    int ctx_spill = next_var_offset - 8;
-    //next_var_offset = ctx_spill;
-    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_6, ctx_spill));
-
-    // Allocate as much as possible for the scratch buffer
+    // Largest scratch buffer that fits below the spilled context pointer.
     int chunk_size = 64;
-    if (504 + next_var_offset >= 256)
+    if (512 + ctx_spill >= 256)
 	    chunk_size = 256;
-    else if (504 + next_var_offset >= 128)
+    else if (512 + ctx_spill >= 128)
 	    chunk_size = 128;
-    //next_var_offset &= ~7;
-    //int scratch = next_var_offset - chunk_size - 8;
-    int scratch = ctx_spill - chunk_size - 8;
-    if (scratch < -512) { fprintf(stderr, "Error: Stack exhausted.\n"); exit(1); }
-    //next_var_offset = scratch;
+    int buf = ctx_spill - chunk_size;           // buffer = [buf, ctx_spill)
+    if (buf < -512) { fprintf(stderr, "Error: Stack exhausted.\n"); exit(1); }
 
     int max_iter = (9000 / chunk_size);
 
-    // --- C-COMPILER chunk_size-BYTE FIXED SHIFT ---
+    // --- chunk_size-byte fixed copies, front to back ---
     for (int i = 0; i < max_iter; i++) {
         // If (R8 + chunk_size > skb->len), skip this block
-        emit(BPF_MOV64_REG(BPF_REG_6, BPF_REG_8));
-        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_6, chunk_size));
-
+        emit(BPF_MOV64_REG(BPF_REG_0, BPF_REG_8));
+        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_0, chunk_size));
         int skip_chunk = prog_idx;
-        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_6, .src_reg=BPF_REG_7}));
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_0, .src_reg=BPF_REG_6}));
 
-        // Load EXACTLY 128 bytes
         emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, ctx_spill));
         emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_8));
         emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=scratch + 8}));
+        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=buf}));
         emit(BPF_MOV64_IMM(BPF_REG_4, chunk_size));
         emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
 
         add_safety_jump();
         emit(((struct bpf_insn){.code=BPF_JMP|BPF_JSLT|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
 
-        // Store EXACTLY chunk_size bytes
         emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, ctx_spill));
         emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_9));
         emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=scratch + 8}));
+        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=buf}));
         emit(BPF_MOV64_IMM(BPF_REG_4, chunk_size));
         emit(BPF_MOV64_IMM(BPF_REG_5, 0));
         emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
@@ -3071,23 +3086,21 @@ void compile_delete_bytes(int offset, int dlen) {
         prog[skip_chunk].off = prog_idx - skip_chunk - 1;
     }
 
-    // --- REMAINDER CASCADE (Fixed Lengths dividing by 2) ---
+    // --- remainder: chunk/2, chunk/4, ... 1 bytes, each at most once ---
     int r_size = chunk_size;
     while(r_size > 1) {
         r_size = r_size / 2;
 
-        // If (R8 + r_size > skb->len), skip this block
-        emit(BPF_MOV64_REG(BPF_REG_6, BPF_REG_8));
-        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_6, r_size));
-
+        emit(BPF_MOV64_REG(BPF_REG_0, BPF_REG_8));
+        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_0, r_size));
         int skip_r = prog_idx;
-        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_6, .src_reg=BPF_REG_7}));
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_0, .src_reg=BPF_REG_6}));
 
         emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, ctx_spill));
         emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_8));
         emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=scratch + 8}));
-        emit(BPF_MOV64_IMM(BPF_REG_4, r_size)); // HARDCODED
+        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=buf}));
+        emit(BPF_MOV64_IMM(BPF_REG_4, r_size));
         emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
 
         add_safety_jump();
@@ -3096,8 +3109,8 @@ void compile_delete_bytes(int offset, int dlen) {
         emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, ctx_spill));
         emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_9));
         emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=scratch + 8}));
-        emit(BPF_MOV64_IMM(BPF_REG_4, r_size)); // HARDCODED
+        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=buf}));
+        emit(BPF_MOV64_IMM(BPF_REG_4, r_size));
         emit(BPF_MOV64_IMM(BPF_REG_5, 0));
         emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
 
@@ -3107,22 +3120,18 @@ void compile_delete_bytes(int offset, int dlen) {
         prog[skip_r].off = prog_idx - skip_r - 1;
     }
 
-    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_10, ctx_spill));
-
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_7));
+    // Shrink the packet by dlen.
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_6));
     emit(BPF_ALU64_IMM(BPF_SUB, BPF_REG_2, dlen));
-    
-    //emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    //emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_1, offsetof(struct __sk_buff, data_end)));
-    //emit(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_1, offsetof(struct __sk_buff, data)));
-    //emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_X, .dst_reg=BPF_REG_2, .src_reg=BPF_REG_3}));
-
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_10, ctx_spill));
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV64_IMM(BPF_REG_3, 0));
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_change_tail));
+    emit_drop_if_r0_error();
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JA, .off=1}));
 
-    //add_safety_jump();
-    //emit(((struct bpf_insn){.code=BPF_JMP|BPF_JSLT|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+    prog[too_short].off = prog_idx - too_short - 1;
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_10, ctx_spill));
 }
 
 /*
@@ -4308,40 +4317,59 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
 }
 
 void compile_delete_bytes_buffered(int offset, int dlen) {
+    if (offset < 0 || dlen <= 0 || offset + dlen > 9000) {
+        fprintf(stderr, "Error: del-bytes needs an offset >= 0 and a length > 0 that end within 9000 bytes\n");
+        exit(1);
+    }
     int map_fd = get_or_create_buffer_map("__DEL_B_BUF__",1,0);
     if (map_fd < 0) {
-	//printf("Using unrolled loop for del-bytes\n");
         compile_delete_bytes(offset,dlen);
-	return;
+        return;
     }
-    //printf("Using save/load-packet for del-bytes\n");
-    char len_str1[5];
-    char len_str2[5];
+    /*
+     * Copy the tail that follows the deleted range into the per-CPU buffer,
+     * write it back at 'offset', then shrink the packet by dlen. The head
+     * (bytes before 'offset') is never touched.
+     *
+     * The previous version saved (len - dlen) bytes starting at offset+dlen,
+     * which runs past the end of the packet whenever offset > 0. The helper
+     * then failed and zero-filled the buffer, so everything after 'offset'
+     * came out as zeros.
+     */
+    char tail_src[12], dst[12];
+    snprintf(tail_src, sizeof(tail_src), "%d", offset + dlen);
+    snprintf(dst, sizeof(dst), "%d", offset);
 
     int len_off = allocate_var("__LEN__", 4);
     compile_get_skb_field(offsetof(struct __sk_buff, len), 0, 0, "__LEN__");
-    //compile_save_packet(map_fd, "%__LEN__", NULL, NULL);
 
-    if (offset) {
-        snprintf(len_str1,sizeof(len_str1),"%hu",offset);
-	//Copy head of packet up to offset
-	compile_save_packet(map_fd,0,len_str1,"0","0");
-        //snprintf(len_str2,sizeof(len_str2),"%hu",offset+dlen);
-        //compile_save_packet(map_fd, len_str1, len_str2, len_str1);
-	//map, length, src_off, dst_off
-    } else
-        snprintf(len_str1,sizeof(len_str1),"0");
-    snprintf(len_str2,sizeof(len_str2),"%hu",offset+dlen);
-    //Copy packet starting at offset len_str2 and write to destination offset len_str1
-    
+    // __LEN__ = len - (offset + dlen), the tail length. A packet that ends
+    // before offset+dlen is left unchanged.
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, len_off));
+    int too_short = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLT|BPF_K, .dst_reg=BPF_REG_1, .imm=offset + dlen}));
+    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_K, .dst_reg=BPF_REG_1, .imm=offset + dlen}));
+    emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, len_off));
 
-    //calc sub LEN $IPMAX;
-    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, len_off));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_SUB|BPF_K, .dst_reg=BPF_REG_1, .imm=dlen}));
-    emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, len_off));
-    compile_save_packet(map_fd, NULL,"%__LEN__", len_str2, len_str1);
-    compile_load_packet(map_fd, NULL,"%__LEN__", "0", "0");
+    // Nothing follows the deleted range: just truncate.
+    int no_tail = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=0}));
+
+    compile_save_packet(map_fd, NULL, "%__LEN__", tail_src, "0");
+    // Unlike the unrolled path, save-packet does not stop on a helper error;
+    // a failed read must not be written back.
+    emit_drop_if_r0_error();
+    compile_load_packet(map_fd, NULL, "%__LEN__", "0", dst);
+
+    prog[no_tail].off = prog_idx - no_tail - 1;
+    // New length = offset + tail.
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, len_off));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, offset));
+    emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, len_off));
     compile_set_length("%__LEN__");
+    emit_drop_if_r0_error();
+
+    prog[too_short].off = prog_idx - too_short - 1;
 }
 
 /*

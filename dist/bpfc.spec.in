@@ -91,7 +91,17 @@ Containerfile and run instructions.
 %{_docdir}/%{name}-container/
 
 %changelog
-* Thu Oct 29 2026 bpfc maintainers <brun064@gmail.com> - @VERSION@-@RELEASE@
+* Thu Oct 29 2026 bpfc maintainers <brun064@gmail.com> - 0.1.1-3
+- bpfc del-bytes: the default (buffered) path zero-filled the packet after
+  the offset whenever the offset was above 0; it now copies only the tail
+- bpfc del-bytes: a packet shorter than offset+length is left unchanged
+  (the unrolled path used to cut the tail, deleting bytes before the offset)
+- bpfc del-bytes: no longer overwrites the set-reg-loop counter (R7)
+- bpfc del-bytes: drops the packet if the kernel refuses the new length
+  instead of passing on shifted bytes at the old length
+- bpfc: more than 16 variables is an error instead of a crash
+
+* Thu Oct 29 2026 bpfc maintainers <brun064@gmail.com> - 0.1.1-2
 - Add bpfc-container subpackage with bpfcd-entrypoint for systemd-free containers
 - Drop the hard dependency on systemd (ordering only)
 - bpfcd: BPFCD_* environment overrides, reaps orphans as PID 1, blocks
