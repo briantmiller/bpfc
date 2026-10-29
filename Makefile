@@ -4,6 +4,9 @@ RELEASE   ?= 2
 CC        ?= gcc
 CFLAGS    ?= -O2 -g
 WARN       = -Wall -Wextra
+# bpf_prog_info.verified_insns (kernel headers 5.16+, backported to RHEL 9)
+FEATURES  := $(shell printf '#include <linux/bpf.h>\nint x = sizeof(((struct bpf_prog_info *)0)->verified_insns);\n' | \
+               $(CC) -x c -c -o /dev/null - 2>/dev/null && echo -DBPFC_HAVE_VERIFIED_INSNS)
 LDFLAGS   ?=
 # STATIC=1 links the binaries statically, so they run regardless of the
 # libc in the image (minimal or distroless containers). Kept separate from
@@ -31,18 +34,18 @@ DAEMON_CFLAGS = $(WARN) -Wno-format-truncation -DBPFC_VERSION='"$(VERSION)"'
 
 # Everything that goes into the source tarball used by `make rpm`.
 DIST_FILES = Makefile LICENSE README.md bpfc.8 bpfc.c test.sh tests \
-             bpfcd/*.c bpfcd/*.h dist
+             bpfcd/*.c bpfcd/*.h dist dataplane
 
 RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
 TARBALL    = bpfc-$(VERSION).tar.gz
 
-.PHONY: all clean install dist rpm srpm check
+.PHONY: check-dataplane all clean install dist rpm srpm check
 
 all: $(TARGET) $(DAEMON) $(CTL)
 
 $(TARGET): bpfc.c
-	$(CC) $(CFLAGS) $(WARN) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfc.c
+	$(CC) $(CFLAGS) $(WARN) $(FEATURES) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfc.c
 
 $(DAEMON): bpfcd/bpfcd.c $(COMMON_SRC) $(COMMON_HDR)
 	$(CC) $(CFLAGS) $(DAEMON_CFLAGS) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfcd/bpfcd.c $(COMMON_SRC)
@@ -97,6 +100,9 @@ srpm: $(TARBALL)
 check: all
 	bash tests/test-bpfcd.sh
 	bash tests/test-container.sh
+
+check-dataplane: $(TARGET)
+	bash tests/test-dataplane.sh
 
 clean:
 	rm -f $(TARGET) $(DAEMON) $(CTL) output.bpf $(TARBALL)

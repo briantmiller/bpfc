@@ -34,6 +34,7 @@ sudo ./bpfc -i <interface> -c
 | `-n <name>` | Name the TC filter and the kernel program (shown by `tc filter show` and `bpftool prog`). |
 | `-I` | Print a `BPFC_INFO id=... tag=...` line after attaching. |
 | `-r <map>` | Dump the contents of a pinned map. |
+| `-w <map> <key> <value>` | Write a 64-bit value into a pinned map (e.g. runtime settings). |
 | `-v` | Verbose mode. Prints a trace of jump offset calculations and block resolutions. |
 
 ---
@@ -64,6 +65,24 @@ bpfcctl show eth0 ingress 100 --bytecode
 See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)`. Build an RPM (RHEL 9/10) with `make rpm`; run the daemon's integration and container tests with `make check` (root).
 
 **Containers (no systemd):** the `bpfc-container` package adds `/usr/sbin/bpfcd-entrypoint`, which runs bpfcd as the container's PID 1. Neither package requires systemd, and settings can be passed as `BPFCD_*` environment variables. See [dist/container/README.md](dist/container/README.md) for an example Containerfile and run options. `make rpm RPMBUILD_OPTS="--with static"` builds statically linked binaries for images without a matching libc.
+
+---
+
+## Dataplane: FEC, ARQ, in-band telemetry and bandwidth probing
+
+`dataplane/bpfc-dataplane-gen` generates bpfc programs for a point-to-point Layer-2 link (both ends run them): every IPv4 packet gets an 8-byte shim (EtherType 0x88B5) with a sequence number and timestamp. The receiver measures loss, reordering, duplicates, jitter and queueing delay (no clock synchronisation needed) and reports back once a second. When loss crosses a threshold the sender adds XOR parity (forward error correction), scaled to the loss, and turns it off again after a cool-down; lost packets are also retransmitted from a short buffer (ARQ), and packet-pair probes estimate the link capacity. Each interface has its own maps.
+
+The two scripts are plain bash and are not part of the RPM; copy them to e.g. `/usr/local/sbin`.
+
+```bash
+bpfc-dataplane-gen -i eth0                 # writes /etc/bpfc/interfaces.d/eth0/{egress,ingress}/*.bpfc
+bpfc-dataplane-gen -i eth0 --setup-hints   # MTU / offload settings for the link
+systemctl reload bpfcd
+bpfc-dataplane-status                      # link quality and what FEC/ARQ are doing, per interface
+bpfc-dataplane-status set eth0 fec-threshold 2
+```
+
+See [dataplane/DESIGN.md](dataplane/DESIGN.md) for the wire format, the algorithms and the limits; `make check-dataplane` (root) runs its end-to-end tests.
 
 ---
 
@@ -110,7 +129,8 @@ Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val |
 * `skb-ingress` - Ingress interface number associated with sk_buff.
 * `skb-mark` - Netfilter/iptables firewall mark (`u32`).
 * `skb-hash` - RPS flow hash (`u32`).
-* `skb-cb <0-4>` - 20-byte control buffer array (5x `u32` slots) for passing state across tail-calls.
+* `skb-cb <0-4>` - 20-byte control buffer array (5x `u32` slots) for passing state across tail-calls and to the next TC priority.
+* `cpu` - (`get` only) number of the CPU running the program.
 * `queue` - Hardware TX queue mapping.
 
 ### ALU Math Engine (`calc`)
@@ -119,6 +139,7 @@ Performs mathematically-safe eBPF operations on standard 32/64-bit variables.
 * Operators: `add`, `sub`, `mul`, `div`, `or`, `and`, `lsh`, `rsh`, `mod`, `xor`
 * `calc not <VAR>` - Unary bitwise inversion.
 * `calc bswap <VAR> <bits>` - Flips byte order (16, 32, or 64 bits).
+* `calc hton <VAR> [bits]` / `calc ntoh <VAR> [bits]` - Host/network byte order. `get bytes` returns host order; `set bytes` with a variable writes it as stored, so convert first.
 
 ### eBPF Maps (State Tracking)
 Allows persistent data storage across packets and network interfaces.
@@ -128,6 +149,10 @@ Allows persistent data storage across packets and network interfaces.
 * `save-packet-keyed <MAP_NAME> <key | %VAR> <len | %VAR> [src-offset | %VAR [dst-offset | %VAR]]` - Save packet data of specified length into a global map into key number specified, allowing for storing packet contents for later recovery.
 * `load-packet <MAP_NAME> <len | %VAR> [src-offset | %VAR [dst-offset | %VAR]]` - Load data of specified length from per-CPU map into packet.
 * `load-packet-keyed <MAP_NAME> <key | %VAR> <len | %VAR> [src-offset | %VAR [dst-offset | %VAR]]` - Load data of specified length from keyed map into packet.
+* `buffer-map <MAP_NAME> [size]` / `shared-buffer-map <MAP_NAME> [entries [size]]` - Declare a buffer map with smaller values (default 18000 bytes, 10000 shared entries) before using it. Lengths are capped at size/2.
+* `calc-map <add|or|and|xor|xchg> <MAP_NAME> <key | %VAR> <val | %VAR> [OLD_VAR]` - Atomic update of a 64-bit map value (created as 0); `OLD_VAR` receives the previous value. Safe when several CPUs update the same key, unlike `get map` + `set map`.
+* `xor-packet <MAP_NAME> <len> [src [dst]]` / `xor-packet-keyed <MAP_NAME> <key> <len> [src [dst]]` - XOR packet bytes into a buffer (atomically; dst is a multiple of 8). Building block for XOR parity / FEC.
+* `zero-buffer <MAP_NAME> <len> [dst]` / `zero-buffer-keyed <MAP_NAME> <key> <len> [dst]` - Zero part of a buffer.
 
 ### Routing & Forwarding
 * `fib-lookup [direct|output] [tbid] [skip-neigh] [src] [mark]` - Queries kernel routing tables. Populates `%FIB_RESULT`, `%FIB_SMAC`, `%FIB_DMAC`, `%FIB_IP_DST`, `%FIB_IP6_DST`, `%FIB_IFINDEX`.
@@ -144,7 +169,10 @@ Allows persistent data storage across packets and network interfaces.
 * `add-head-bytes <len>` - Adds bytes to head of packet.
 * `del-bytes <offset> <len>` - Delete bytes at specific offset. Will attempt to use buffer maps if available, then revert to unrolled loop if necessary.
 * `add-l2-bytes <len>` / `del-l2-bytes <len>` - Shifts memory exactly at Offset 14. Possibly not working depending on kernel version.
-* `recalc-tcp-csum`, `recalc-udp-csum`, `recalc-icmp-csum` - Stack-safe L4 recalculations via `bpf_csum_diff`.
+* `insert-l2 <len> [ethertype]` - Insert `len` zero bytes after the Ethernet header (IPv4/IPv6 packets) and optionally set the EtherType. Headers behind it keep their place in memory, so checksum offload keeps working.
+* `strip-l2 <len> <ethertype>` - Remove `len` bytes (multiple of 4) after the Ethernet header and set the EtherType, for any protocol (`bpf_skb_adjust_room` refuses non-IP packets). No payload copy; the stack sees the new protocol directly.
+* `recalc-tcp-csum [l3 [max]]`, `recalc-udp-csum [l3 [max]]`, `recalc-icmp-csum` - L4 checksum recomputed from scratch via `bpf_csum_diff`: any IHL, length from the IP header, packets up to `max` bytes (default 9000). On egress, locally sent TCP/UDP packets usually still have checksum offload pending (the kernel or NIC completes the checksum after the program), so recalculate on ingress or for forwarded packets.
+* `calc-csum <tcp|udp> <VAR> [l3 [max]]` - Compute the correct TCP/UDP checksum into `VAR` (host order) without changing the packet.
 * `ip-frag <len> <max-input-mtu>` - Fragment IP payloads into `<len>` size fragments up to `<max-input-mtu>` input size.  
 * `ip-defrag` - Reassemble fragmented IP packets back into a single packet. 
 
