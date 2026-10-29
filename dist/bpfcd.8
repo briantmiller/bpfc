@@ -124,6 +124,39 @@ without touching the kernel.
 .TP
 .BR \-V ", " \-\-version
 Print the version.
+.SH CONTAINERS
+The
+.B bpfc-container
+package provides
+.BR bpfcd-entrypoint ,
+a container entrypoint that checks the container's root user and
+capabilities (\fBCAP_NET_ADMIN\fR, and \fBCAP_BPF\fR or \fBCAP_SYS_ADMIN\fR),
+makes sure the map directory is on a bpffs mount (mounting a private one
+at \fI/sys/fs/bpf\fR if it has to), raises the memlock limit, and then
+replaces itself with
+.B bpfcd
+in the foreground. bpfcd then runs as PID 1: it receives the runtime's stop
+and kill signals directly and reaps orphaned processes. Other commands given
+to the entrypoint, such as
+.BR "bpfcctl status" ,
+run in place of the daemon. See
+.I /usr/share/doc/bpfc-container/README.md
+for run options and an example Containerfile.
+.SH ENVIRONMENT
+.TP
+.BI BPFCD_ SETTING
+Any setting from
+.BR bpfc.conf (5),
+named in capitals (for example
+.BR BPFCD_ON_EXTERNAL_CHANGE=log ),
+overrides the file. Read again on reload.
+.BR bpfcctl (8)
+reads the same variables.
+.TP
+.B NOTIFY_SOCKET
+When set (by systemd, or by podman with
+.BR \-\-sdnotify=container ),
+bpfcd reports readiness and status through it.
 .SH SIGNALS
 .TP
 .B SIGHUP

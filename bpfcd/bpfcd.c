@@ -870,7 +870,8 @@ static int reload_config_file(void) {
     struct config nc;
     config_defaults(&nc);
     char err[512] = "";
-    if (config_load(conf_path, &nc, err, sizeof(err)) < 0) {
+    if (config_load(conf_path, &nc, err, sizeof(err)) < 0 ||
+        config_apply_env(&nc, err, sizeof(err)) < 0) {
         logmsg(LOG_LVL_ERR, "%s; keeping the previous settings", err);
         return -1;
     }
@@ -918,6 +919,21 @@ int main(int argc, char **argv) {
         {"config", required_argument, 0, 'c'}, {"background", no_argument, 0, 'b'},
         {"debug", no_argument, 0, 'D'}, {"test", no_argument, 0, 't'},
         {"version", no_argument, 0, 'V'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
+    /*
+     * Block the signals bpfcd reads through its signalfd before anything else,
+     * so a SIGTERM that arrives during start-up is handled as a clean stop
+     * rather than killing the process. As PID 1 in a container, bpfcd also
+     * takes SIGCHLD to reap orphaned processes re-parented to it.
+     */
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGHUP);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGINT);
+    int is_init = getpid() == 1;
+    if (is_init) sigaddset(&mask, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &mask, NULL);
+
     int o;
     while ((o = getopt_long(argc, argv, "c:bDtVh", longopts, NULL)) != -1) {
         switch (o) {
@@ -934,7 +950,8 @@ int main(int argc, char **argv) {
     log_init("bpfcd", LOG_TO_STDERR, LOG_LVL_INFO);
     config_defaults(&cfg);
     char err[512] = "";
-    if (config_load(conf_path, &cfg, err, sizeof(err)) < 0) {
+    if (config_load(conf_path, &cfg, err, sizeof(err)) < 0 ||
+        config_apply_env(&cfg, err, sizeof(err)) < 0) {
         logmsg(LOG_LVL_ERR, "%s", err);
         return 1;
     }
@@ -960,12 +977,6 @@ int main(int argc, char **argv) {
     }
     write_pidfile();
 
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGHUP);
-    sigaddset(&mask, SIGTERM);
-    sigaddset(&mask, SIGINT);
-    sigprocmask(SIG_BLOCK, &mask, NULL);
     signal(SIGPIPE, SIG_IGN);
     sigfd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
     tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
@@ -982,8 +993,9 @@ int main(int argc, char **argv) {
     dinfo.started = time(NULL);
     snprintf(dinfo.version, sizeof(dinfo.version), "%s", BPFC_VERSION);
 
-    logmsg(LOG_LVL_INFO, "bpfcd %s starting; programs from %s, external changes: %s",
-           BPFC_VERSION, cfg.config_dir, cfg.on_external_change == EXT_LOG ? "log" : "reinstall");
+    logmsg(LOG_LVL_INFO, "bpfcd %s starting%s; programs from %s, external changes: %s",
+           BPFC_VERSION, is_init ? " as PID 1" : "", cfg.config_dir,
+           cfg.on_external_change == EXT_LOG ? "log" : "reinstall");
     scan_dir();
     adopt_previous_state();
     apply(0);
@@ -1011,7 +1023,12 @@ int main(int argc, char **argv) {
         if (pfd[0].revents & POLLIN) {
             struct signalfd_siginfo si;
             while (read(sigfd, &si, sizeof(si)) == sizeof(si)) {
-                if (si.ssi_signo == SIGHUP) {
+                if (si.ssi_signo == SIGCHLD) {
+                    /* Only orphans can be waiting here: bpfc runs are reaped by run_capture()
+                     * before it returns, and nothing else is forked from the main loop. */
+                    while (waitpid(-1, NULL, WNOHANG) > 0)
+                        ;
+                } else if (si.ssi_signo == SIGHUP) {
                     logmsg(LOG_LVL_INFO, "SIGHUP: reloading %s and %s", conf_path, cfg.config_dir);
                     sd_notify_msg("STATUS=reloading");
                     reload_config_file();

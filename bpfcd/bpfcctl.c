@@ -580,6 +580,9 @@ int main(int argc, char **argv) {
     char err[512] = "";
     if (config_load(conf_path, &cfg, err, sizeof(err)) < 0)
         fprintf(stderr, "warning: %s (using defaults)\n", err);
+    /* Same BPFCD_* overrides as bpfcd, so `podman exec` finds a relocated state_dir. */
+    if (config_apply_env(&cfg, err, sizeof(err)) < 0)
+        fprintf(stderr, "warning: %s\n", err);
 
     const char *cmd = optind < argc ? argv[optind++] : "status";
     int rest = argc - optind;

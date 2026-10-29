@@ -1,0 +1,28 @@
+# Example image for running bpfcd without systemd.
+#
+#   cp ~/rpmbuild/RPMS/*/bpfc-*.rpm .      # bpfc and bpfc-container RPMs
+#   podman build -t bpfcd -f Containerfile .
+#
+# Run it as described in README.md next to this file
+# (/usr/share/doc/bpfc-container/README.md when installed).
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal
+
+# rpm -i is enough: the packages need only /bin/sh and, for a dynamically
+# linked build, glibc, which ubi-minimal already has. Neither package pulls
+# in systemd.
+COPY bpfc-*.rpm /tmp/rpms/
+RUN rpm -i /tmp/rpms/bpfc-*.rpm && rm -rf /tmp/rpms
+
+# Programs: mount yours at /etc/bpfc/interfaces.d (read-only is fine).
+# State: keep /run/bpfc on a volume so a restarted container adopts the
+# programs that are still attached and removes those whose files are gone.
+VOLUME ["/run/bpfc"]
+
+# Exit 3 means bpfcd is not running; exit 2 (a program needs attention) is
+# reported by `bpfcctl status`, not treated as unhealthy.
+# (HEALTHCHECK needs `podman build --format docker`; OCI images ignore it.)
+HEALTHCHECK --interval=30s --timeout=5s CMD bpfcctl status >/dev/null; [ $? -ne 3 ]
+
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/sbin/bpfcd-entrypoint"]

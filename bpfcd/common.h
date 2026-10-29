@@ -71,6 +71,12 @@ void config_defaults(struct config *c);
  * error (defaults apply). Returns 0, or -1 with a message in err.
  */
 int config_load(const char *path, struct config *c, char *err, size_t errlen);
+/*
+ * Overrides settings from BPFCD_<SETTING> environment variables (for example
+ * BPFCD_ON_EXTERNAL_CHANGE=log), so containers can configure bpfcd without a
+ * config file. Applied after config_load(). Returns 0, or -1 with a message.
+ */
+int config_apply_env(struct config *c, char *err, size_t errlen);
 
 /* ---------------- hashing ---------------- */
 
