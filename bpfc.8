@@ -7,12 +7,29 @@ bpfc \- Pure C eBPF bytecode compiler and direct network fabric loader
 .IR interface ]
 .RB [ \-d
 .IR direction ]
-.I "<instructions>"
+.RB [ \-p
+.IR priority ]
+.RB [ \-n
+.IR name ]
+.RB [ \-I ]
+.RB [ \-m
+.IR map_dir ]
+.RB [ \-v ]
+.RI { "<instructions>" " | " \-f " file" }
 .PP
 .B bpfc
 .RB \-i
 .IR interface
 .RB \-c
+.PP
+.B bpfc
+.RB \-i
+.IR interface
+.RB [ \-d
+.IR direction ]
+.B \-p
+.I priority
+.B \-D
 .SH DESCRIPTION
 .B bpfc
 is a standalone, LLVM/Clang-independent eBPF assembler and loader. It parses a 
@@ -32,7 +49,36 @@ Specifies the target network interface (e.g., eth0) to attach the compiled eBPF 
 Specifies the hook direction for the eBPF filter. Valid options are \fBingress\fR (default) and \fBegress\fR.
 .TP
 .B \-c
-Cleanup mode. Atomically detaches all eBPF programs from the specified interface by removing the \fBclsact\fR qdisc. Must be used with \fB\-i\fR.
+Cleanup mode. Atomically detaches all eBPF programs from the specified interface, in both directions, by removing the \fBclsact\fR qdisc. Must be used with \fB\-i\fR.
+.TP
+.BI \-p " priority"
+TC filter priority, 1\-65535; lower priorities run first. If a program from bpfc is already attached at this priority and direction, it is replaced atomically, so traffic is never left unfiltered. If the priority holds a filter that cannot be swapped atomically (another protocol or classifier), bpfc warns and removes it before attaching. Priority 0 (the default) lets the kernel pick a free priority.
+.TP
+.B \-D
+Delete only the filter at \fB\-p\fR \fIpriority\fR on \fB\-d\fR \fIdirection\fR, leaving other priorities and the other direction in place. Succeeds if nothing is attached there.
+.TP
+.BI \-n " name"
+Name the TC filter \fIname\fR (shown by \fBtc filter show\fR) and the kernel program after the part of \fIname\fR following its last \(oq:\(cq, limited to its last 15 characters of [A\-Za\-z0\-9_.] (other characters become \(oq_\(cq; shown by \fBbpftool prog\fR).
+.TP
+.B \-I
+After attaching, print one line describing the program:
+.EX
+BPFC_INFO id=<id> tag=<tag> insns=<n> iface=<if> dir=<dir> prio=<p> proto=<0xNNNN> name=<name>
+.EE
+.TP
+.BI \-f " file"
+Read instructions from \fIfile\fR (\fB\-\fR for standard input). Line breaks act as spaces, and a \fB#\fR at the start of an instruction begins a comment that ends at the end of the line.
+.TP
+.BI \-m " map_dir"
+Directory for pinned maps (default \fI/sys/fs/bpf\fR).
+.TP
+.BI \-r " map"
+Print the contents of a pinned map and exit.
+.TP
+.B \-v
+Verbose compiler output.
+.SH EXIT STATUS
+0 on success. 1 if the program cannot be compiled, is rejected by the kernel verifier, or cannot be attached or detached; the kernel's reason is printed. Earlier versions could report success when attaching failed.
 .SH INSTRUCTION SYNTAX
 Instructions are provided as a single string argument, separated by semicolons. 
 .SS Matching Rules
@@ -117,6 +163,8 @@ Remove the eBPF program from eth0 and clean up the TC hook:
 .SH NOTES
 eBPF strict stack size limitations apply. Arbitrary byte injection (\fBadd-bytes\fR) is constrained to 256 bytes per instruction to satisfy kernel verifier bounds.
 .SH SEE ALSO
+.BR bpfcd (8),
+.BR bpfcctl (8),
 .BR tc (8),
 .BR bpf (2),
 .BR ip (8)

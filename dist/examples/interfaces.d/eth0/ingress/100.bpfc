@@ -1,0 +1,8 @@
+# Example: drop inbound telnet on eth0.
+# Copy the eth0 directory to /etc/bpfc/interfaces.d/<your interface>/ and run
+#   systemctl reload bpfcd
+# One instruction per line or several per line; ';' separates instructions and
+# '#' starts a comment that runs to the end of the line.
+match tcp;
+  match tcp-dst 23;
+    drop

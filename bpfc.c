@@ -181,6 +181,7 @@ struct { char name[32]; int fd; } maps[MAX_MAPS];
 int num_maps = 0;
 
 char bpf_map_dir[255] = BPF_FS_DIR;
+extern char bpf_prog_name[16];
 uint16_t target_tc_protocol = ETH_P_ALL;
 
 int loop_start_indices[MAX_LOOPS];
@@ -277,6 +278,8 @@ int load_bpf_prog_mem() {
         .log_size  = BPF_LOG_BUF_SIZE,
         .log_level = 2, // 1 = errors only, 2 = full instruction trace
     };
+    // Program name set with -n; makes the program identifiable in bpftool/bpfcctl.
+    memcpy(attr.prog_name, bpf_prog_name, sizeof(attr.prog_name));
 
     int fd = bpf_syscall(BPF_PROG_LOAD, &attr, sizeof(attr));
 
@@ -4392,87 +4395,347 @@ void dump_map_contents(const char *map_name, const char *map_dir) {
 }
 
 /* --- Netlink Loaders --- */
-int attach_bpf_tc(int fd, const char *iface, const char *dir, int pri) {
-    int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-    if(s<0) return -1;
-    int idx = get_ifindex(iface);
-    if(!idx){close(s);
-    return -1;}
+
+#ifndef SOL_NETLINK
+#define SOL_NETLINK 270
+#endif
+#ifndef NETLINK_EXT_ACK
+#define NETLINK_EXT_ACK 11
+#endif
+#ifndef NLM_F_ACK_TLVS
+#define NLM_F_ACK_TLVS 0x200
+#endif
+#ifndef NLM_F_CAPPED
+#define NLM_F_CAPPED 0x100
+#endif
+#ifndef TCA_BPF_ID
+#define TCA_BPF_ID 11
+#endif
+#ifndef BPF_OBJ_GET_INFO_BY_FD
+#define BPF_OBJ_GET_INFO_BY_FD 15
+#endif
+
+/* Program/filter naming requested with -n (see set_prog_name()). */
+char bpf_prog_name[16] = {0};
+char tc_filter_name[256] = {0};
+
+/* Last netlink error message reported by the kernel (extended ACK), if any. */
+static char nl_last_errmsg[256];
+
+static int nl_open(void) {
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (s < 0) return -1;
+    int one = 1;
+    /* Ask for human readable error strings; harmless if unsupported. */
+    setsockopt(s, SOL_NETLINK, NETLINK_EXT_ACK, &one, sizeof(one));
     struct sockaddr_nl sa = {.nl_family = AF_NETLINK};
-    char b[8192]={0};
-    
-    struct nlmsghdr *n = (struct nlmsghdr*)b;
-    n->nlmsg_len=NLMSG_LENGTH(sizeof(struct tcmsg));
-    n->nlmsg_flags=NLM_F_REQUEST|NLM_F_EXCL|NLM_F_CREATE;
-    n->nlmsg_type=RTM_NEWQDISC;
-    struct tcmsg *t = (struct tcmsg*)NLMSG_DATA(n);
-    t->tcm_family=AF_UNSPEC;
-    t->tcm_ifindex=idx;
-    t->tcm_handle=TC_H_MAKE(TC_H_CLSACT,0);
-    t->tcm_parent=TC_H_CLSACT;
-    struct rtattr *r = (struct rtattr*)((char*)n + NLMSG_ALIGN(n->nlmsg_len));
-    r->rta_type=TCA_KIND;
-    r->rta_len=RTA_LENGTH(7);
-    memcpy(RTA_DATA(r),"clsact",7);
-    n->nlmsg_len=NLMSG_ALIGN(n->nlmsg_len)+RTA_ALIGN(r->rta_len);
-    sendto(s,n,n->nlmsg_len,0,(struct sockaddr*)&sa,sizeof(sa));
+    if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(s); return -1; }
+    return s;
+}
 
-    memset(b,0,sizeof(b));
-    n=(struct nlmsghdr*)b;
-    n->nlmsg_len=NLMSG_LENGTH(sizeof(struct tcmsg));
-    n->nlmsg_flags=NLM_F_REQUEST|NLM_F_EXCL|NLM_F_CREATE;
-    n->nlmsg_type=RTM_NEWTFILTER;
-    t=(struct tcmsg*)NLMSG_DATA(n);
-    t->tcm_family=AF_UNSPEC;
-    t->tcm_ifindex=idx;
-    t->tcm_handle=1;
-    t->tcm_info=TC_H_MAKE(pri << 16,htons(target_tc_protocol));
-    t->tcm_parent = strcmp(dir,"egress")==0 ? TC_H_MAKE(TC_H_CLSACT,TC_H_MIN_EGRESS) : TC_H_MAKE(TC_H_CLSACT,TC_H_MIN_INGRESS);
+static void nl_addattr(struct nlmsghdr *n, int type, const void *data, int len) {
+    struct rtattr *r = (struct rtattr *)((char *)n + NLMSG_ALIGN(n->nlmsg_len));
+    r->rta_type = type;
+    r->rta_len = RTA_LENGTH(len);
+    if (len) memcpy(RTA_DATA(r), data, len);
+    n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(r->rta_len);
+}
 
-    r=(struct rtattr*)((char*)n + NLMSG_ALIGN(n->nlmsg_len));
-    r->rta_type=TCA_KIND;
-    r->rta_len=RTA_LENGTH(4);
-    memcpy(RTA_DATA(r),"bpf",4);
-    n->nlmsg_len=NLMSG_ALIGN(n->nlmsg_len)+RTA_ALIGN(r->rta_len);
-    struct rtattr *tail=(struct rtattr*)((char*)n + NLMSG_ALIGN(n->nlmsg_len));
-    tail->rta_type=TCA_OPTIONS;
-    tail->rta_len=RTA_LENGTH(0);
-    n->nlmsg_len=NLMSG_ALIGN(n->nlmsg_len)+RTA_ALIGN(tail->rta_len);
-    r=(struct rtattr*)((char*)n + NLMSG_ALIGN(n->nlmsg_len));
-    r->rta_type=TCA_BPF_FD;
-    r->rta_len=RTA_LENGTH(4);
-    memcpy(RTA_DATA(r),&fd,4);
-    n->nlmsg_len=NLMSG_ALIGN(n->nlmsg_len)+RTA_ALIGN(r->rta_len);
-    r=(struct rtattr*)((char*)n + NLMSG_ALIGN(n->nlmsg_len));
-    r->rta_type=TCA_BPF_FLAGS;
-    r->rta_len=RTA_LENGTH(4);
-    uint32_t fl=TCA_BPF_FLAG_ACT_DIRECT;
-    memcpy(RTA_DATA(r),&fl,4);
-    n->nlmsg_len=NLMSG_ALIGN(n->nlmsg_len)+RTA_ALIGN(r->rta_len);
-    tail->rta_len = (char*)n + NLMSG_ALIGN(n->nlmsg_len) - (char*)tail;
-    
-    if(sendto(s,n,n->nlmsg_len,0,(struct sockaddr*)&sa,sizeof(sa))<0) {close(s);
-    return -1;}
+static struct rtattr *nl_nest_start(struct nlmsghdr *n, int type) {
+    struct rtattr *nest = (struct rtattr *)((char *)n + NLMSG_ALIGN(n->nlmsg_len));
+    nl_addattr(n, type, NULL, 0);
+    return nest;
+}
+
+static void nl_nest_end(struct nlmsghdr *n, struct rtattr *nest) {
+    nest->rta_len = (char *)n + NLMSG_ALIGN(n->nlmsg_len) - (char *)nest;
+}
+
+/*
+ * Sends a request with NLM_F_ACK and waits for the kernel's answer.
+ * Returns 0 on success or a negative errno. Unlike the original loader
+ * this never reports success for a request the kernel rejected.
+ */
+static int nl_transact(int s, struct nlmsghdr *n) {
+    static uint32_t seq = 0;
+    struct sockaddr_nl sa = {.nl_family = AF_NETLINK};
+    n->nlmsg_flags |= NLM_F_ACK;
+    n->nlmsg_seq = ++seq + (uint32_t)getpid();
+    nl_last_errmsg[0] = '\0';
+    if (sendto(s, n, n->nlmsg_len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0)
+        return -errno;
+
+    char buf[16384];
+    for (;;) {
+        ssize_t len = recv(s, buf, sizeof(buf), 0);
+        if (len < 0) {
+            if (errno == EINTR) continue;
+            return -errno;
+        }
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (unsigned)len);
+             h = NLMSG_NEXT(h, len)) {
+            if (h->nlmsg_seq != n->nlmsg_seq) continue;
+            if (h->nlmsg_type != NLMSG_ERROR) continue;
+            struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(h);
+            if (e->error && (h->nlmsg_flags & NLM_F_ACK_TLVS)) {
+                /* Walk extended ACK TLVs looking for NLMSGERR_ATTR_MSG (1). */
+                size_t off = sizeof(*e);
+                if (!(h->nlmsg_flags & NLM_F_CAPPED))
+                    off += e->msg.nlmsg_len - NLMSG_HDRLEN;
+                int alen = (int)h->nlmsg_len - NLMSG_HDRLEN - (int)off;
+                struct rtattr *a = (struct rtattr *)((char *)e + off);
+                for (; alen > 0 && RTA_OK(a, alen); a = RTA_NEXT(a, alen)) {
+                    if (a->rta_type == 1) {
+                        snprintf(nl_last_errmsg, sizeof(nl_last_errmsg), "%s", (char *)RTA_DATA(a));
+                        break;
+                    }
+                }
+            }
+            return e->error;
+        }
+    }
+}
+
+static void nl_report(const char *what, int err) {
+    if (nl_last_errmsg[0])
+        fprintf(stderr, "Error: %s: %s (%s)\n", what, strerror(-err), nl_last_errmsg);
+    else
+        fprintf(stderr, "Error: %s: %s\n", what, strerror(-err));
+}
+
+static uint32_t tc_parent_for(const char *dir) {
+    return strcmp(dir, "egress") == 0 ? TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS)
+                                      : TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_INGRESS);
+}
+
+/* Creates the clsact qdisc if it does not exist yet. */
+static int ensure_clsact(int s, int idx) {
+    char b[512] = {0};
+    struct nlmsghdr *n = (struct nlmsghdr *)b;
+    n->nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg));
+    n->nlmsg_flags = NLM_F_REQUEST | NLM_F_EXCL | NLM_F_CREATE;
+    n->nlmsg_type = RTM_NEWQDISC;
+    struct tcmsg *t = (struct tcmsg *)NLMSG_DATA(n);
+    t->tcm_family = AF_UNSPEC;
+    t->tcm_ifindex = idx;
+    t->tcm_handle = TC_H_MAKE(TC_H_CLSACT, 0);
+    t->tcm_parent = TC_H_CLSACT;
+    nl_addattr(n, TCA_KIND, "clsact", 7);
+    int err = nl_transact(s, n);
+    if (err == -EEXIST) return 0;
+    if (err) nl_report("creating clsact qdisc", err);
+    return err;
+}
+
+/*
+ * Describes what currently occupies a priority on a clsact hook.
+ * found: a filter chain exists at that priority.
+ * compatible: it can be atomically replaced by our filter, i.e. it is a
+ *   bpf classifier with the same protocol and only handle 1 in use.
+ */
+struct prio_probe { int found; int compatible; uint16_t proto; };
+
+static int probe_priority(int s, int idx, uint32_t parent, int pri, uint16_t want_proto,
+                          struct prio_probe *out) {
+    memset(out, 0, sizeof(*out));
+    out->compatible = 1;
+    char b[512] = {0};
+    struct nlmsghdr *n = (struct nlmsghdr *)b;
+    n->nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg));
+    n->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    n->nlmsg_type = RTM_GETTFILTER;
+    n->nlmsg_seq = (uint32_t)getpid() ^ 0x5a5a;
+    struct tcmsg *t = (struct tcmsg *)NLMSG_DATA(n);
+    t->tcm_family = AF_UNSPEC;
+    t->tcm_ifindex = idx;
+    t->tcm_parent = parent;
+    struct sockaddr_nl sa = {.nl_family = AF_NETLINK};
+    if (sendto(s, n, n->nlmsg_len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) return -errno;
+
+    char buf[32768];
+    for (;;) {
+        ssize_t len = recv(s, buf, sizeof(buf), 0);
+        if (len < 0) {
+            if (errno == EINTR) continue;
+            return -errno;
+        }
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (unsigned)len);
+             h = NLMSG_NEXT(h, len)) {
+            if (h->nlmsg_type == NLMSG_DONE) return 0;
+            if (h->nlmsg_type == NLMSG_ERROR) {
+                int e = ((struct nlmsgerr *)NLMSG_DATA(h))->error;
+                /* No qdisc yet means nothing is installed. */
+                return (e == -EINVAL || e == -ENOENT) ? 0 : e;
+            }
+            if (h->nlmsg_type != RTM_NEWTFILTER) continue;
+            struct tcmsg *tm = (struct tcmsg *)NLMSG_DATA(h);
+            if ((int)(TC_H_MAJ(tm->tcm_info) >> 16) != pri) continue;
+            out->found = 1;
+            out->proto = ntohs(TC_H_MIN(tm->tcm_info));
+            if (out->proto != want_proto) out->compatible = 0;
+            int alen = h->nlmsg_len - NLMSG_LENGTH(sizeof(*tm));
+            for (struct rtattr *a = (struct rtattr *)((char *)tm + NLMSG_ALIGN(sizeof(*tm)));
+                 RTA_OK(a, alen); a = RTA_NEXT(a, alen)) {
+                if (a->rta_type == TCA_KIND && strcmp((char *)RTA_DATA(a), "bpf") != 0)
+                    out->compatible = 0;
+            }
+            /* The chain header entry has handle 0; any other handle than 1 blocks replace. */
+            if (tm->tcm_handle != 0 && tm->tcm_handle != 1) out->compatible = 0;
+        }
+    }
+}
+
+static int delete_priority(int s, int idx, uint32_t parent, int pri) {
+    char b[512] = {0};
+    struct nlmsghdr *n = (struct nlmsghdr *)b;
+    n->nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg));
+    n->nlmsg_flags = NLM_F_REQUEST;
+    n->nlmsg_type = RTM_DELTFILTER;
+    struct tcmsg *t = (struct tcmsg *)NLMSG_DATA(n);
+    t->tcm_family = AF_UNSPEC;
+    t->tcm_ifindex = idx;
+    t->tcm_parent = parent;
+    /* Protocol 0 + handle 0 removes the whole filter chain at this priority. */
+    t->tcm_info = TC_H_MAKE((uint32_t)pri << 16, 0);
+    return nl_transact(s, n);
+}
+
+int attach_bpf_tc(int fd, const char *iface, const char *dir, int pri) {
+    int idx = get_ifindex(iface);
+    if (!idx) return -1;
+    int s = nl_open();
+    if (s < 0) { perror("netlink socket"); return -1; }
+    if (ensure_clsact(s, idx)) { close(s); return -1; }
+
+    uint32_t parent = tc_parent_for(dir);
+    int flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL;
+
+    if (pri > 0) {
+        struct prio_probe pp;
+        int err = probe_priority(s, idx, parent, pri, target_tc_protocol, &pp);
+        if (err) { nl_report("reading existing filters", err); close(s); return -1; }
+        if (pp.found && pp.compatible) {
+            /* Atomic in-place swap: traffic is never left unfiltered. */
+            flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE;
+        } else if (pp.found) {
+            /* Protocol or classifier differs; the kernel cannot swap these atomically. */
+            fprintf(stderr, "Warning: priority %d on %s %s holds an incompatible filter "
+                            "(protocol 0x%04x); replacing it non-atomically\n",
+                    pri, iface, dir, pp.proto);
+            err = delete_priority(s, idx, parent, pri);
+            if (err && err != -ENOENT) { nl_report("removing old filter", err); close(s); return -1; }
+        }
+    }
+
+    char b[8192] = {0};
+    struct nlmsghdr *n = (struct nlmsghdr *)b;
+    n->nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg));
+    n->nlmsg_flags = flags;
+    n->nlmsg_type = RTM_NEWTFILTER;
+    struct tcmsg *t = (struct tcmsg *)NLMSG_DATA(n);
+    t->tcm_family = AF_UNSPEC;
+    t->tcm_ifindex = idx;
+    t->tcm_handle = 1;
+    t->tcm_info = TC_H_MAKE((uint32_t)pri << 16, htons(target_tc_protocol));
+    t->tcm_parent = parent;
+    nl_addattr(n, TCA_KIND, "bpf", 4);
+    struct rtattr *opts = nl_nest_start(n, TCA_OPTIONS);
+    nl_addattr(n, TCA_BPF_FD, &fd, 4);
+    if (tc_filter_name[0])
+        nl_addattr(n, TCA_BPF_NAME, tc_filter_name, strlen(tc_filter_name) + 1);
+    uint32_t fl = TCA_BPF_FLAG_ACT_DIRECT;
+    nl_addattr(n, TCA_BPF_FLAGS, &fl, 4);
+    nl_nest_end(n, opts);
+
+    int err = nl_transact(s, n);
     close(s);
+    if (err) {
+        nl_report("attaching filter", err);
+        return -1;
+    }
+    return 0;
+}
+
+/* Removes the filter at one priority of one direction, leaving everything else intact. */
+int detach_bpf_prio(const char *iface, const char *dir, int pri) {
+    int idx = get_ifindex(iface);
+    if (!idx) return -1;
+    int s = nl_open();
+    if (s < 0) { perror("netlink socket"); return -1; }
+    int err = delete_priority(s, idx, tc_parent_for(dir), pri);
+    close(s);
+    if (err == -ENOENT || err == -EINVAL) {
+        /* Nothing installed at that priority (or no clsact qdisc): already in the wanted state. */
+        if (verbose_mode) fprintf(stderr, "No filter at %s %s priority %d\n", iface, dir, pri);
+        return 0;
+    }
+    if (err) { nl_report("deleting filter", err); return -1; }
     return 0;
 }
 
 int detach_bpf_tc(const char *iface) {
-    int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     int idx = get_ifindex(iface);
-    if(!idx) return -1;
-    char b[1024]={0};
-    struct nlmsghdr *n=(struct nlmsghdr*)b;
-    struct tcmsg *t=(struct tcmsg*)NLMSG_DATA(n);
-    n->nlmsg_len=NLMSG_LENGTH(sizeof(struct tcmsg));
-    n->nlmsg_flags=NLM_F_REQUEST;
-    n->nlmsg_type=RTM_DELQDISC;
-    t->tcm_ifindex=idx;
-    t->tcm_handle=TC_H_MAKE(TC_H_CLSACT,0);
-    t->tcm_parent=TC_H_CLSACT;
-    sendto(s,n,n->nlmsg_len,0,(struct sockaddr*)&(struct sockaddr_nl){.nl_family=AF_NETLINK},12);
+    if (!idx) return -1;
+    int s = nl_open();
+    if (s < 0) { perror("netlink socket"); return -1; }
+    char b[1024] = {0};
+    struct nlmsghdr *n = (struct nlmsghdr *)b;
+    struct tcmsg *t = (struct tcmsg *)NLMSG_DATA(n);
+    n->nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg));
+    n->nlmsg_flags = NLM_F_REQUEST;
+    n->nlmsg_type = RTM_DELQDISC;
+    t->tcm_ifindex = idx;
+    t->tcm_handle = TC_H_MAKE(TC_H_CLSACT, 0);
+    t->tcm_parent = TC_H_CLSACT;
+    int err = nl_transact(s, n);
     close(s);
+    if (err && err != -ENOENT && err != -EINVAL) { nl_report("deleting clsact qdisc", err); return -1; }
     return 0;
+}
+
+/*
+ * Applies -n <name>. The TC filter keeps the full name (shown by `tc filter show`
+ * and bpfcctl); the kernel program name is limited to 15 characters of
+ * [A-Za-z0-9_.], so other characters become '_' and the tail is kept, since the
+ * end of a name such as "eth0_i_10" is the part that tells programs apart.
+ */
+void set_prog_name(const char *name) {
+    snprintf(tc_filter_name, sizeof(tc_filter_name), "%s", name);
+    /* A "prefix:" (e.g. "bpfcd:") is kept in the filter name only. */
+    const char *colon = strrchr(name, ':');
+    if (colon && colon[1]) name = colon + 1;
+    size_t len = strlen(name);
+    const char *src = len > 15 ? name + (len - 15) : name;
+    size_t i = 0;
+    for (; *src && i < 15; src++) {
+        char c = *src;
+        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                 c == '_' || c == '.';
+        if (!ok) c = '_';
+        if (i == 0 && c == '_') continue; /* no leading separators: "bpfcd:x" -> "x" */
+        bpf_prog_name[i++] = c;
+    }
+    bpf_prog_name[i] = '\0';
+}
+
+/* Prints a machine-readable line describing the loaded program (-I). */
+void print_prog_info(int fd, const char *iface, const char *dir, int pri) {
+    struct bpf_prog_info info;
+    memset(&info, 0, sizeof(info));
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.info.bpf_fd = fd;
+    attr.info.info_len = sizeof(info);
+    attr.info.info = (unsigned long)&info;
+    if (bpf_syscall(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr)) < 0) {
+        fprintf(stderr, "Warning: could not read program info: %s\n", strerror(errno));
+        return;
+    }
+    printf("BPFC_INFO id=%u tag=", info.id);
+    for (int i = 0; i < 8; i++) printf("%02x", info.tag[i]);
+    printf(" insns=%d iface=%s dir=%s prio=%d proto=0x%04x name=%s\n", prog_idx,
+           iface, dir, pri, target_tc_protocol, bpf_prog_name[0] ? bpf_prog_name : "-");
+    fflush(stdout);
 }
 
 /*
@@ -4501,6 +4764,8 @@ char* read_instructions_from_file(const char *filename) {
 
     size_t len = 0;
     int c;
+    // True while only whitespace has been seen since the start of a line or the last ';'.
+    int at_cmd_start = 1;
     while ((c = fgetc(f)) != EOF) {
         // Expand buffer if needed
         if (len + 2 >= buf_size) {
@@ -4511,17 +4776,30 @@ char* read_instructions_from_file(const char *filename) {
                 exit(1);
             }
         }
-        
-        // Strip newlines and carriage returns
-        if (c == '\n' || c == '\r') {
-            continue;
+
+        // A '#' that starts a command is a comment running to the end of the line.
+        // Newlines used to be deleted outright, which let a comment swallow the
+        // next line's command (e.g. "# note\nmatch tcp; drop" compiled to "drop").
+        if (c == '#' && at_cmd_start) {
+            while ((c = fgetc(f)) != EOF && c != '\n')
+                ;
+            if (c == EOF) break;
         }
-        
+
+        // Newlines act as whitespace so tokens on adjacent lines never merge.
+        if (c == '\n' || c == '\r') {
+            at_cmd_start = 1;
+            c = ' ';
+        }
+
         // Convert tabs to spaces for the tokenizer
         if (c == '\t') {
             c = ' ';
         }
-        
+
+        if (c == ';') at_cmd_start = 1;
+        else if (c != ' ') at_cmd_start = 0;
+
         buffer[len++] = (char)c;
     }
     
@@ -4537,7 +4815,10 @@ void help(const char *arg0) {
         "-i <interface>"	,"attach program to specific interface",
         "-d ingress|egress"	,"direction to attach, default ingress",
         "-c"			,"clear all attached program on interface",
-        "-p <priority>"		,"attachment priority, lower first",
+        "-D"			,"delete only the program at -p <priority> on -d <direction>",
+        "-p <priority>"		,"attachment priority, lower first; an existing program at this priority is replaced atomically",
+        "-n <name>"		,"name the program (kernel name: last 15 chars of [A-Za-z0-9_.]) and TC filter (full name)",
+        "-I"			,"print a BPFC_INFO line with the program id and tag after attaching",
         "-m <dir>"		,"specify directory for BPF maps",
         "-r <map>"		,"dump contents of specified map",
         "-f <file>"		,"read command instructions from file, - for STDIN",
@@ -5255,13 +5536,25 @@ int main(int argc, char **argv) {
     char *iface = NULL, *dir = "ingress", *instr = NULL; int clean = 0;
     char *filename = NULL;
     char *read_map = NULL;
+    int delete_prio = 0, show_info = 0;
     for (int i = 1; i < argc; i++) {
+        /* Options that take a value must not run past the end of argv. */
+        int needs_arg = !strcmp(argv[i],"-i") || !strcmp(argv[i],"-d") || !strcmp(argv[i],"-p") ||
+                        !strcmp(argv[i],"-m") || !strcmp(argv[i],"-r") || !strcmp(argv[i],"-f") ||
+                        !strcmp(argv[i],"-n");
+        if (needs_arg && i + 1 >= argc) {
+            fprintf(stderr, "Error: option %s requires an argument\n", argv[i]);
+            return 1;
+        }
         if (strcmp(argv[i],"-i")==0) iface = argv[++i];
         else if (strcmp(argv[i],"-d")==0) dir = argv[++i];
         else if (strcmp(argv[i],"-c")==0) clean = 1;
+        else if (strcmp(argv[i],"-D")==0) delete_prio = 1;
+        else if (strcmp(argv[i],"-I")==0) show_info = 1;
+        else if (strcmp(argv[i],"-n")==0) set_prog_name(argv[++i]);
         else if (strcmp(argv[i],"-p")==0) pri = atoi(argv[++i]);
         else if (strcmp(argv[i],"-v")==0) verbose_mode = 1;
-        else if (strcmp(argv[i],"-m")==0) strcpy(bpf_map_dir,argv[++i]);
+        else if (strcmp(argv[i],"-m")==0) snprintf(bpf_map_dir, sizeof(bpf_map_dir), "%s", argv[++i]);
         else if (strcmp(argv[i],"-r")==0) read_map = argv[++i];
         else if (strcmp(argv[i],"-f")==0) filename = argv[++i];
         else if (strcmp(argv[i],"-h")==0 || strcmp(argv[i],"--help")==0) { help(argv[0]); return 0; }
@@ -5272,10 +5565,25 @@ int main(int argc, char **argv) {
         return 0;
     }
     if(strcmp(dir, "ingress") && strcmp(dir, "egress")) {
-        clean = 0;
-        instr = NULL;
+        fprintf(stderr, "Error: direction must be 'ingress' or 'egress', not '%s'\n", dir);
+        return 1;
+    }
+    if (pri < 0 || pri > 65535) {
+        fprintf(stderr, "Error: priority must be between 0 and 65535\n");
+        return 1;
+    }
+    if ((clean || delete_prio) && !iface) {
+        fprintf(stderr, "Error: -c and -D require -i <interface>\n");
+        return 1;
     }
     if (clean) return detach_bpf_tc(iface) < 0 ? 1 : 0;
+    if (delete_prio) {
+        if (pri <= 0) {
+            fprintf(stderr, "Error: -D requires -p <priority> (1-65535)\n");
+            return 1;
+        }
+        return detach_bpf_prio(iface, dir, pri) < 0 ? 1 : 0;
+    }
     if (filename) {
         instr = read_instructions_from_file(filename);
     }
@@ -5336,10 +5644,16 @@ int main(int argc, char **argv) {
         //union bpf_attr a = {.prog_type=BPF_PROG_TYPE_SCHED_CLS, .insns=(unsigned long)prog, .insn_cnt=prog_idx, .license=(unsigned long)"GPL"};
         //int fd = syscall(__NR_bpf, BPF_PROG_LOAD, &a, sizeof(a));
         int fd = load_bpf_prog_mem();
-        if (fd < 0 || attach_bpf_tc(fd, iface, dir, pri) < 0) {
-                        perror("Load/Attach failed");
-                        return 1;
+        if (fd < 0) {
+            fprintf(stderr, "Error: kernel rejected program: %s\n", strerror(errno));
+            return 1;
         }
+        if (attach_bpf_tc(fd, iface, dir, pri) < 0) {
+            fprintf(stderr, "Error: failed to attach program to %s %s priority %d\n", iface, dir, pri);
+            return 1;
+        }
+        if (show_info)
+            print_prog_info(fd, iface, dir, pri);
         if (verbose_mode)
             printf("Attached %d instructions to %s\n", prog_idx, iface);
     } else {

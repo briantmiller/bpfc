@@ -1,1 +1,6 @@
 bpfc
+bpfcd/bpfcd
+bpfcd/bpfcctl
+output.bpf
+rpmbuild/
+bpfc-*.tar.gz

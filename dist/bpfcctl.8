@@ -1,0 +1,140 @@
+.TH BPFCCTL 8 "October 2026" "bpfc" "System Administration"
+.SH NAME
+bpfcctl \- show and inspect programs managed by bpfcd
+.SH SYNOPSIS
+.B bpfcctl
+.RI [ options ]
+.RB [ status
+.RB [ \-a ]
+.RB [ \-l ]]
+.br
+.B bpfcctl
+.RI [ options ]
+.B show
+.I iface direction priority
+.RB [ \-\-bytecode ]
+.br
+.B bpfcctl
+.RI [ options ]
+.B reload
+.RB [ \-\-no\-wait ]
+.SH DESCRIPTION
+.B bpfcctl
+reads the state
+.BR bpfcd (8)
+keeps in
+.I /run/bpfc
+and checks it against the kernel.
+.SH COMMANDS
+.TP
+.B status
+The default. One line per program file: interface, direction, priority,
+status, kernel program id and tag, a kernel check, and the file. Errors are
+printed under the line they belong to. Statuses are:
+.RS
+.TP 22
+.B installed
+Attached and current.
+.TP
+.B pending-iface
+The interface does not exist; installed when it appears.
+.TP
+.B failed
+bpfc or the verifier rejected the file, or attaching failed. The priority is
+empty.
+.TP
+.B removed-externally
+Removed by something else while
+.B on_external_change
+is
+.BR log .
+.TP
+.B replaced-externally
+Replaced by something else while
+.B on_external_change
+is
+.BR log .
+.TP
+.B reinstall-limit
+Kept being removed or replaced; bpfcd stopped reinstalling it until the next
+reload.
+.RE
+.IP
+The KERNEL column is
+.B ok
+when the kernel has exactly the recorded program at that priority,
+.B MISSING
+or
+.B DIFFERS
+when it does not (bpfcd normally corrects or records this within a moment),
+and
+.B occupied
+when a non-installed slot's priority holds some other filter. A file changed
+or deleted since the last reload is marked
+.BR "reload pending" .
+.RS
+.TP
+.BR \-a ", " \-\-all
+Also list TC filters on any interface that bpfcd does not manage.
+.TP
+.BR \-l ", " \-\-long
+Add install time, instruction count, hash and ifindex.
+.RE
+.TP
+.BI show " iface direction priority"
+Also accepted as
+.IR iface / direction / priority .
+Prints the record, the source file with line numbers and, for a failed
+program, the saved bpfc output including the verifier log.
+.RS
+.TP
+.BR \-b ", " \-\-bytecode
+Also print the program's bytecode as the kernel holds it (after verifier
+rewrites), with helper calls named when
+.I /proc/kallsyms
+is readable. Requires root.
+.RE
+.TP
+.B reload
+Send SIGHUP to bpfcd, wait for the rescan to finish and summarize the
+result, listing failed programs.
+.RS
+.TP
+.BR \-n ", " \-\-no\-wait
+Only send the signal.
+.RE
+.SH OPTIONS
+.TP
+.BI \-c ", " \-\-config " file"
+.I bpfc.conf
+to take
+.B state_dir
+from (default
+.IR /etc/bpfc/bpfc.conf ).
+.TP
+.BI \-s ", " \-\-state\-dir " dir"
+State directory, overriding the configuration.
+.TP
+.BR \-\-color= { auto , always , never }
+Colored output; auto colors terminals unless
+.B NO_COLOR
+is set.
+.SH EXIT STATUS
+.B status
+exits 0 when every program is installed or waiting for its interface and the
+kernel agrees, 2 when some program needs attention, and 3 when bpfcd is not
+running.
+.B reload
+exits 2 when some program failed.
+Other errors exit 1.
+.SH EXAMPLES
+.EX
+# bpfcctl
+# bpfcctl status \-a
+# bpfcctl show eth0 ingress 100 \-\-bytecode
+# bpfcctl reload
+.EE
+.SH SEE ALSO
+.BR bpfcd (8),
+.BR bpfc.conf (5),
+.BR bpfc (8)

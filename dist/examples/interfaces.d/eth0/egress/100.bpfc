@@ -1,0 +1,4 @@
+# Example: mark outbound SIP (UDP 5060) as Expedited Forwarding (DSCP 46 = TOS 184).
+match udp;
+  match udp-dst 5060;
+    set ip-tos 184

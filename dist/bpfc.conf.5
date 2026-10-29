@@ -1,0 +1,68 @@
+.TH BPFC.CONF 5 "October 2026" "bpfc" "File Formats"
+.SH NAME
+bpfc.conf \- bpfcd configuration
+.SH DESCRIPTION
+.I /etc/bpfc/bpfc.conf
+holds
+.IB key " = " value
+lines;
+.B #
+starts a comment. Unknown keys or invalid values are errors: bpfcd refuses to
+start, and on reload keeps its previous settings. Changes apply on reload,
+except
+.BR state_dir ,
+which needs a restart.
+.SH SETTINGS
+.TP
+.BI config_dir " = " /etc/bpfc/interfaces.d
+Directory holding
+.IB interface / direction / priority .bpfc
+program files.
+.TP
+.BR on_external_change " = " reinstall | log
+What to do when a program bpfcd installed is removed or replaced by anything
+else.
+.B reinstall
+(default) puts bpfcd's program back and logs a warning.
+.B log
+logs a warning and marks the program
+.B removed-externally
+or
+.B replaced-externally
+in
+.BR bpfcctl (8)
+until the next reload.
+.TP
+.BI reinstall_limit " = " 5
+Automatic reinstalls allowed per program per minute. When exceeded, bpfcd
+logs an error and leaves the program alone (status
+.BR reinstall-limit )
+until the next reload, so it never fights another tool indefinitely. 0 means
+unlimited.
+.TP
+.BR remove_on_stop " = " no | yes
+Detach all managed programs when bpfcd stops. By default programs stay
+attached across restarts and upgrades.
+.TP
+.BI map_dir " = "
+Directory for pinned eBPF maps, passed to bpfc as
+.BR \-m .
+Empty means bpfc's default,
+.IR /sys/fs/bpf .
+.TP
+.BI compile_timeout " = " 30
+Seconds one bpfc run may take before it is killed and treated as a failure.
+.TP
+.BR log_level " = " error | warning | info | debug
+Default
+.BR info .
+.TP
+.BI bpfc_path " = " /usr/sbin/bpfc
+The bpfc binary. Must be absolute.
+.TP
+.BI state_dir " = " /run/bpfc
+Where the state file, PID file and failure logs live.
+.SH SEE ALSO
+.BR bpfcd (8),
+.BR bpfcctl (8),
+.BR bpfc (8)
