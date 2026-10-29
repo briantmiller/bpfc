@@ -27,6 +27,7 @@ COPTS=""
 [ $DEBUG -eq 1 ] && COPTS=" -v "
 
 
+MS_PER_NS=1000000
 # Color Definitions
 RED='\e[31m'
 GREEN='\e[32m'
@@ -58,6 +59,12 @@ function test_fail()
 {
 	echo -e "$@ ${RED}FAIL${NC}"
 }
+
+for N in R1 R2 R3 H1 H2
+do
+	ip netns del $N &>/dev/null
+	rm -Rf /var/run/bpf/$N &>/dev/null
+done
 
 #Setup network
 ulimit -l unlimited
@@ -188,15 +195,16 @@ wait $P1 $P2 $P3 $P4
 
 
 PROCNUM=10
-IPERF_OPTS="-m -P $PROCNUM -i 5 -t 5 -y C"
+TEST_TIME=10
+IPERF_OPTS="-P $PROCNUM -i $TEST_TIME -t $TEST_TIME -y C"
 $IPERF --help 2>&1 | grep -q "\--sum-only" && IPERF_OPTS="$IPERF_OPTS --sum-only"
 
 ip netns exec H1 $IPERF -s &>/dev/null & P1=$!
 ip netns exec H2 $IPERF -s &>/dev/null & P2=$!
 sleep 0.5s
-ip netns exec H2 $IPERF $IPERF_OPTS -M 1450 -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev
-h1h2bps_nobpf=$(ip netns exec H1 $IPERF $IPERF_OPTS -M 1450 -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev)
-h2h1bps_nobpf=$(ip netns exec H2 $IPERF $IPERF_OPTS -M 1450 -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev)
+#ip netns exec H2 $IPERF $IPERF_OPTS -M 1450 -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev
+h1h2bps_nobpf=$(ip netns exec H1 $IPERF $IPERF_OPTS -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev)
+h2h1bps_nobpf=$(ip netns exec H2 $IPERF $IPERF_OPTS -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev)
 
 #{ kill -9 $P1 $P2 && wait $P1 $P2 } &>/dev/null
 
@@ -218,8 +226,87 @@ h2h1bps_nobpf=$(ip netns exec H2 $IPERF $IPERF_OPTS -M 1450 -c 192.168.1.2 | sed
 #timeout 2 ip netns exec R2 tcpdump -c 2 -levnpi h2 -XX icmp &> out3.txt & P3=$!
 sleep 0.5s
 
-BPS=100000
-ip netns exec R1 ./bpfc $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/R1 "match tcp; get len LEN; calc mul LEN 8; get map BPS 0 BPS; calc add BPS %LEN; set map BPS 0 %BPS" && test_pass R1-throttle-$BPS-install || (test_fail R1-throttle-$BPS-install ; exit 1)
+function throttle() {
+	METER=$1
+	RATE=$2
+	TIME=$3
+	[ "$TIME" == "" ] && TIME=500
+	MS_PER_NS=1000000
+	TIME=$(( $TIME * $MS_PER_NS ))
+	echo "\
+decl TIME1 8;\
+decl BPS 8;
+get time TIME;\
+get map TIME $METER MTIME;\
+get map BPS $METER BYTES;\
+set val BPS %BYTES;
+set val TIME1 %TIME;\
+calc sub TIME %MTIME;\
+set val MTIME %TIME;\
+match val MTIME gt $TIME;\
+	set map BPS $METER 0;\
+	set map TIME $METER %TIME1;\
+	continue;\
+end-match;\
+calc div MTIME 1000;\
+calc div MTIME 1000;\
+get len LEN;\
+calc add BPS %LEN;\
+calc mul BPS 8000;\
+match val MTIME gt 0;\
+calc div BPS %MTIME;\
+match val BPS gt $RATE;\
+drop;\
+end-match;\
+calc add BYTES %LEN;\
+set map BPS $METER %BYTES;\
+end-match;\
+	"
+}
+
+function shape() {
+        METER=$1
+        RATE=$2
+	MS_INT=1000
+	TIME=$(( $MS_INT * 1000 ))
+	DIV=$(( 8000 / $MS_INT ))
+	BYTES=$(( $RATE / $DIV ))
+	echo "$BYTES $TIME" > .bytes
+        echo "\
+get map BYTES $METER BYTES;\
+match val BYTES eq 0;\
+	decl TIME1 8;\
+	get time TIME;\
+	get map TIME $METER MTIME;\
+	set val TIME1 %TIME;\
+	calc sub TIME %MTIME;\
+	calc div TIME 1000;\
+	match val TIME ge $TIME;\
+		set map BYTES $METER $BYTES;\
+		set map TIME $METER %TIME1;\
+	else;\
+		#continue;\
+		drop;\
+	end-match;\
+end-match;\
+get len LEN;\
+match val BYTES gt LEN;\
+	calc sub BYTES %LEN;\
+	set map BYTES $METER %BYTES;\
+else;\
+	set map BYTES $METER 0;\
+end-match;\
+        "
+}
+
+BPS=2000000
+INTERVAL=500
+#ip netns exec R1 ./bpfc $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/R1 "match tcp; $(throttle 1 $BPS $INTERVAL); end-match;" && test_pass R1-throttle-$BPS-install || (test_fail R1-throttle-$BPS-install ; exit 1)
+ip netns exec R1 ./bpfc $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/R1 "match tcp; $(shape 1 $BPS); end-match;" && test_pass R1-throttle-$BPS-install || (test_fail R1-throttle-$BPS-install ; exit 1)
+
+cat .bytes
+rm -f .bytes
+
 #ip netns exec R2 ./bpfc $COPTS -i h2 -d ingress -p 10 -m /var/run/bpf/R2 "ip-frag $FRAG_SIZE 3000" && test_pass R2-frag-$FRAG_SIZE-install || (test_fail R2-frag-$FRAG_SIZE-install ; exit 1)
 
 #ip netns exec H1 ping -c 1 -s 2050 -i 0.1 -W 1 192.168.2.2
@@ -237,10 +324,11 @@ then
 	#TCP R2->R1
 	#r2r1bps=$(ip netns exec R2 $IPERF $IPERF_OPTS -c 10.0.0.2 | sed 's/^/  /g' | tail -n 1 | cut -f 10 -d ,)
 	#TCP H1->H2
-	h1h2bps=$(ip netns exec H1 $IPERF $IPERF_OPTS -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev)
+	#ip netns exec H1 $IPERF $IPERF_OPTS -c 192.168.2.2
+	h1h2bps=$(timeout $TEST_TIME ip netns exec H1 $IPERF $IPERF_OPTS -c 192.168.2.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev)
 	#TCP H2->H1
 	sleep 1s
-	h2h1bps=$(ip netns exec H2 $IPERF $IPERF_OPTS -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev)
+	h2h1bps=$(timeout $TEST_TIME ip netns exec H2 $IPERF $IPERF_OPTS -c 192.168.1.2 | sed 's/^/  /g' | tail -n 1 | rev | cut -f 1 -d , | rev)
 
 
 	if [[ $h1h2bps =~ ^[0-9]+$ ]] && [[ $h2h1bps =~ ^[0-9]+$ ]] && [[ $h1h2bps_nobpf =~ ^[0-9]+$ ]] && [[ $h2h1bps_nobpf =~ ^[0-9]+$ ]]; then
@@ -248,14 +336,15 @@ then
 	loss1=$(( 100 * $h1h2bps / $h1h2bps_nobpf ))
 	loss2=$(( 100 * $h2h1bps / $h2h1bps_nobpf ))
 
-	echo H1-H2 Throughput $(echo $h1h2bps | numfmt --to=si)bps, Efficiency $loss1%
-	echo H2-H1 Throughput $(echo $h2h1bps | numfmt --to=si)bps, Efficiency $loss2%
-	[ $loss1 -ge 10 ] && test_pass Frag-efficiency-1 || test_fail Frag-efficiency-1
-	[ $loss2 -ge 10 ] && test_pass Frag-efficiency-2 || test_fail Frag-efficiency-2
+	echo H1-H2 Throttled $(echo $h1h2bps | numfmt --to=si)bps, Un-Throttled $(echo $h1h2bps_nobpf | numfmt --to=si)
+	echo H2-H1 Throttled $(echo $h2h1bps | numfmt --to=si)bps, Un-Throttled $(echo $h2h1bps_nobpf | numfmt --to=si)
+	[ $loss1 -ge 10 ] && test_pass Throttle-1 || test_fail Throttle-1
+	[ $loss2 -ge 10 ] && test_pass Throttle-2 || test_fail Throttle-2
 
 	else
-		test_fail Frag-efficiency-1
-		test_fail Frag-efficiency-2
+		echo "h1h2:$h1h2bps, h2h1:$h2h1bps, h1h2_orig:$h1h2bps_nobpf, h2h1_orig:$h2h1bps_nobpf"
+		test_fail Throttle-exec-1
+		test_fail Throggle-exec-2
 	fi
 
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
@@ -275,7 +364,7 @@ then
 fi
 
 wait &>/dev/null
-ip netns exec R1 ./bpfc $COPTS -m /var/run/bpf/R1 -r BPS
+#ip netns exec R1 ./bpfc $COPTS -m /var/run/bpf/R1 -r BPS
 for C in H1 H2 H3 R1 R2 R3
 do      
 	umount /var/run/bpf/$C &>/dev/null
