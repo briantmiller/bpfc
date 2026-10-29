@@ -1,0 +1,71 @@
+# Generated into rpmbuild/SPECS/bpfc.spec by `make rpm`; @VERSION@/@RELEASE@ come from the Makefile.
+
+# Fallbacks so the spec also builds where systemd-rpm-macros is unavailable.
+%{!?_unitdir: %global _unitdir /usr/lib/systemd/system}
+
+Name:           bpfc
+Version:        @VERSION@
+Release:        @RELEASE@%{?dist}
+Summary:        eBPF compiler for TC packet programs, with a daemon to keep them attached
+
+License:        GPL-3.0-or-later
+URL:            https://github.com/briantmiller/bpfc
+Source0:        %{name}-%{version}.tar.gz
+
+BuildRequires:  gcc
+BuildRequires:  make
+BuildRequires:  kernel-headers
+BuildRequires:  systemd-rpm-macros
+%{?systemd_requires}
+
+%description
+bpfc compiles a small packet matching and rewriting language straight to
+eBPF bytecode (no LLVM/Clang) and attaches it to a network interface's TC
+ingress or egress hook.
+
+bpfcd keeps the programs in /etc/bpfc/interfaces.d attached: it installs
+them at boot and when interfaces appear, applies changes on reload with an
+atomic replace, and reinstalls or reports programs removed by other tools.
+bpfcctl shows what is installed and from which file.
+
+%prep
+%autosetup
+
+%build
+%make_build VERSION=%{version} CFLAGS="%{optflags}" LDFLAGS="%{?build_ldflags}"
+
+%install
+%make_install VERSION=%{version} \
+    PREFIX=%{_prefix} SBINDIR=%{_sbindir} MANDIR=%{_mandir} \
+    DOCDIR=%{_docdir}/%{name} UNITDIR=%{_unitdir} SYSCONFDIR=%{_sysconfdir}
+
+%post
+%{?systemd_post:%systemd_post bpfcd.service}
+
+%preun
+%{?systemd_preun:%systemd_preun bpfcd.service}
+
+%postun
+# Restart on upgrade: running programs are adopted, not reinstalled.
+%{?systemd_postun_with_restart:%systemd_postun_with_restart bpfcd.service}
+
+%files
+%license LICENSE
+%{_docdir}/%{name}/
+%{_sbindir}/bpfc
+%{_sbindir}/bpfcd
+%{_sbindir}/bpfcctl
+%{_mandir}/man8/bpfc.8*
+%{_mandir}/man8/bpfcd.8*
+%{_mandir}/man8/bpfcctl.8*
+%{_mandir}/man5/bpfc.conf.5*
+%{_unitdir}/bpfcd.service
+%dir %{_sysconfdir}/bpfc
+%config(noreplace) %{_sysconfdir}/bpfc/bpfc.conf
+%dir %{_sysconfdir}/bpfc/interfaces.d
+
+%changelog
+* Wed Oct 28 2026 bpfc maintainers <brun064@gmail.com> - @VERSION@-@RELEASE@
+- Add bpfcd daemon, bpfcctl status tool and systemd unit
+- bpfc: atomic replace, per-priority delete (-D), program naming (-n),
+  id/tag reporting (-I), netlink error checking, comment handling in -f files

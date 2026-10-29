@@ -1,0 +1,34 @@
+[Unit]
+Description=bpfc eBPF program manager
+Documentation=man:bpfcd(8) man:bpfcctl(8) man:bpfc.conf(5) man:bpfc(8)
+# Attach programs before interfaces are configured, as packet filters usually are.
+Wants=network-pre.target
+Before=network-pre.target
+After=local-fs.target
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/bpfcd
+# `bpfcctl reload` does the same but waits and reports failures.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+# /run/bpfc holds the state file bpfcctl reads. It is preserved across
+# restarts so a restarted bpfcd adopts the programs that are still attached
+# instead of reinstalling them.
+RuntimeDirectory=bpfc
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+# Pre-5.11 kernels charge BPF maps and programs to RLIMIT_MEMLOCK.
+LimitMEMLOCK=infinity
+
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
+
+[Install]
+WantedBy=multi-user.target

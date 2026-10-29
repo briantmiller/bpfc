@@ -1,0 +1,157 @@
+.TH BPFCD 8 "October 2026" "bpfc" "System Administration"
+.SH NAME
+bpfcd \- keep bpfc programs attached to network interfaces
+.SH SYNOPSIS
+.B bpfcd
+.RB [ \-c
+.IR config ]
+.RB [ \-b ]
+.RB [ \-D ]
+.RB [ \-t ]
+.SH DESCRIPTION
+.B bpfcd
+compiles the program files under
+.I /etc/bpfc/interfaces.d
+with
+.BR bpfc (8)
+and keeps them attached to the TC ingress and egress hooks of the matching
+interfaces. It is normally started by systemd as
+.BR bpfcd.service .
+.SS File layout
+.EX
+/etc/bpfc/interfaces.d/<interface>/ingress/<priority>.bpfc
+/etc/bpfc/interfaces.d/<interface>/egress/<priority>.bpfc
+.EE
+.PP
+The priority is 1\-65535 without leading zeros; lower priorities run first.
+Each file holds bpfc instructions separated by \(oq;\(cq. A \(oq#\(cq at the start of
+an instruction begins a comment that ends at the end of the line. Files that
+do not follow this naming are ignored with a warning; world-writable files are
+refused, since a program can drop or redirect any traffic.
+.SS Start-up
+Every file is compiled and attached. If the previous run's state is still in
+.I /run/bpfc
+and the kernel still has exactly that program at that priority from a file
+with the same SHA-256, the program is adopted rather than reinstalled, so a
+restart does not disturb traffic. Programs whose files were deleted while
+.B bpfcd
+was stopped are detached.
+.SS Reload (SIGHUP)
+.B systemctl reload bpfcd
+(or
+.BR "bpfcctl reload" ,
+which waits for the result) rereads
+.I bpfc.conf
+and rescans the directory:
+.IP \(bu 2
+A file is hashed only if its modification time changed, and reinstalled only
+if the hash differs too. Touching a file therefore does not reinstall it.
+.IP \(bu
+A changed program replaces the old one atomically at the same priority, so
+packets are never left unfiltered during the swap. (If the filter at that
+priority has a different protocol or classifier, the kernel cannot swap them
+atomically and bpfc removes the old one first.)
+.IP \(bu
+A deleted file's program is detached; other priorities and the other
+direction are untouched.
+.IP \(bu
+Programs in any non-installed state (failed, changed externally, reinstall
+limit) are retried. This is how to retry after fixing something outside the
+file itself, such as a missing redirect target.
+.SS Failures
+If bpfc cannot compile a file, the kernel verifier rejects it, or attaching
+fails, the priority is left
+.B empty
+\(em an older version of the program is never left running in its place. The
+slot shows as
+.B failed
+in
+.BR bpfcctl (8)
+and the full bpfc output (including the verifier log) is kept in
+.IR /run/bpfc/errors/ ,
+shown by
+.BR "bpfcctl show" .
+.SS Interfaces
+A netlink monitor watches interfaces. When a configured interface appears
+(or is deleted and created again), its programs are installed. When it is
+removed, its programs are marked
+.B pending-iface
+until it returns. If a managed interface is renamed, the programs are removed
+from it, because the configuration is keyed by name.
+.SS External changes
+The monitor also watches TC filters on managed interfaces. If a program
+.B bpfcd
+installed is removed or replaced by anything else (for example
+.BR tc ,
+a manual
+.B bpfc
+run, or deleting the clsact qdisc), the
+.B on_external_change
+setting decides whether it is reinstalled or only logged; see
+.BR bpfc.conf (5).
+Filters at priorities that have no file are never touched. A filter at a
+priority that does have a file is replaced, with a warning.
+.SS Identification
+Each filter is named
+.BI bpfcd: iface / direction / priority
+(visible in
+.BR "tc filter show" ),
+and each program gets the kernel name
+.IB iface _ direction _ priority
+(its last 15 characters, visible in
+.BR "bpftool prog" ).
+The program id and tag bpfc reported are recorded in
+.I /run/bpfc/state
+next to the file path and hash.
+.SH OPTIONS
+.TP
+.BI \-c ", " \-\-config " file"
+Configuration file (default
+.IR /etc/bpfc/bpfc.conf ).
+.TP
+.BR \-b ", " \-\-background
+Detach and log to syslog, for systems without systemd. Without it,
+.B bpfcd
+stays in the foreground and logs to stderr (with journal priorities when run
+by systemd).
+.TP
+.BR \-D ", " \-\-debug
+Log debug messages.
+.TP
+.BR \-t ", " \-\-test
+Check the configuration file and list the programs that would be installed,
+without touching the kernel.
+.TP
+.BR \-V ", " \-\-version
+Print the version.
+.SH SIGNALS
+.TP
+.B SIGHUP
+Reload, as described above.
+.TP
+.BR SIGTERM ", " SIGINT
+Stop. Programs stay attached unless
+.B remove_on_stop
+is set.
+.SH FILES
+.TP
+.I /etc/bpfc/bpfc.conf
+Settings.
+.TP
+.I /etc/bpfc/interfaces.d/
+Program files.
+.TP
+.I /run/bpfc/state
+Current state, read by
+.BR bpfcctl (8).
+.TP
+.I /run/bpfc/errors/
+bpfc output of failed programs.
+.TP
+.I /run/bpfc/bpfcd.pid
+PID file, locked while bpfcd runs.
+.SH SEE ALSO
+.BR bpfcctl (8),
+.BR bpfc.conf (5),
+.BR bpfc (8),
+.BR tc (8)

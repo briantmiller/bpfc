@@ -26,10 +26,42 @@ sudo ./bpfc -i <interface> -c
 | :--- | :--- |
 | `-i <iface>` | Target network interface (e.g., `eth0`). If omitted, compiles to `output.bpf` locally. |
 | `-d <dir>` | Hook direction: `ingress` (default) or `egress`. |
-| `-p <prio>` | TC filter execution priority (e.g., `1`). Allows multiple stacked programs to execute sequentially. |
+| `-p <prio>` | TC filter execution priority (e.g., `1`). Allows multiple stacked programs to execute sequentially. Re-running with the same priority replaces the program atomically. |
 | `-m <dir>` | Path to store pinned eBPF maps (e.g., `/sys/fs/bpf/my_ns/`). Crucial for network namespaces. |
+| `-f <file>` | Read instructions from a file (`-` for stdin). `#` comments run to the end of the line. |
 | `-c` | Cleanup mode. Atomically deletes the `clsact` qdisc, detaching all filters from the interface. |
+| `-D` | Delete only the program at `-p <prio>` on `-d <dir>`. |
+| `-n <name>` | Name the TC filter and the kernel program (shown by `tc filter show` and `bpftool prog`). |
+| `-I` | Print a `BPFC_INFO id=... tag=...` line after attaching. |
+| `-r <map>` | Dump the contents of a pinned map. |
 | `-v` | Verbose mode. Prints a trace of jump offset calculations and block resolutions. |
+
+---
+
+## bpfcd: managing programs from files
+
+`bpfcd` keeps programs from `/etc/bpfc/interfaces.d` attached, so they survive reboots and interface re-creation:
+
+```
+/etc/bpfc/interfaces.d/<interface>/ingress/<priority>.bpfc
+/etc/bpfc/interfaces.d/<interface>/egress/<priority>.bpfc
+```
+
+```bash
+mkdir -p /etc/bpfc/interfaces.d/eth0/ingress
+printf 'match tcp;\n  match tcp-dst 23;\n    drop\n' > /etc/bpfc/interfaces.d/eth0/ingress/100.bpfc
+systemctl enable --now bpfcd
+bpfcctl                      # what is installed, from which file, and whether the kernel agrees
+bpfcctl show eth0 ingress 100 --bytecode
+```
+
+* **Reload** (`systemctl reload bpfcd` or `bpfcctl reload`): new and changed files are installed (atomic replace at the same priority), deleted files are detached. A file is only re-hashed when its mtime changes and only reinstalled when its SHA-256 differs.
+* **Failures**: if a file does not compile or the verifier rejects it, its priority is left empty rather than running the old version; `bpfcctl show` prints the verifier log.
+* **Interfaces**: programs are installed when a configured interface appears and re-installed when it is re-created.
+* **External changes**: if something else removes or replaces a managed program, bpfcd reinstalls it or only logs it, per `on_external_change` in `/etc/bpfc/bpfc.conf`.
+* **Tracking**: each program's id and tag are recorded with its file path and hash in `/run/bpfc/state`; filters are named `bpfcd:<iface>/<dir>/<prio>`.
+
+See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)`. Build an RPM (RHEL 9/10) with `make rpm`; run the daemon's integration test with `make check` (root).
 
 ---
 
