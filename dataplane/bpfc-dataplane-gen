@@ -1,0 +1,2283 @@
+#!/bin/bash
+# bpfc-dataplane-gen - generate the FEC / INT / ARQ / probing dataplane for
+# one interface as bpfc programs for /etc/bpfc/interfaces.d.
+#
+# Every interface gets its own maps (named <prefix>_tx, _rx, ...), so several
+# interfaces run independently. The default prefix is "dp" + 8 base32
+# characters of the interface name's SHA-256: any valid interface name gives
+# a map name the kernel accepts in full (15 characters at most). Both ends of a point-to-point link run the
+# same programs; each end is the sender for its own direction.
+#
+# Settings come from built-in defaults, then a profile (--profile, which may
+# inherit from others), then the command line. --link-rate and --rtt size the
+# retransmit ring, the duplicate window and the FEC receive slots.
+#
+# See DESIGN.md for the wire format and how the pieces fit together.
+
+set -e
+VERSION=3
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+PROFILE_DIRS=(/etc/bpfc/dataplane/profiles.d /usr/share/bpfc/dataplane/profiles "$SELF_DIR/profiles")
+SAVE_DIR=/etc/bpfc/dataplane/profiles.d
+NAK_MAX=32          # sequences one NAK can ask for
+
+die()  { echo "Error: $*" >&2; exit 1; }
+warn() { [ -n "$SHOW" ] || echo "Warning: $*" >&2; WARNINGS+=("$*"); }
+WARNINGS=()
+
+# ---------------------------------------------------------------- settings
+# key | kind | class | default | help
+#   kind:  rate, dur:<default unit>, int:<min>:<max>, auto-int:<min>:<max>,
+#          pct, enum:<a>,<b>..., arqfec
+#   class: sizing / structural (needs regenerating), runtime (also changeable
+#          with "bpfc-dataplane-status set")
+SETTINGS='link-rate|rate|sizing||link rate, e.g. 20m, 1g (sizes the buffers below)
+rtt|dur:ms|sizing||round-trip time, e.g. 30ms, 800ms (sizes the buffers below)
+sizing-packet-bytes|int:64:9000|sizing|1000|average packet size assumed when sizing
+arq-depth|auto-int:1:16384|structural|auto|packets kept for retransmission (auto: rate x RTT x 1.5, else 10)
+arq-with-fec|arqfec|runtime|3|ARQ while FEC is on: keep, off, N packets or a time like 200ms
+dup-window|auto-int:1024:16384|structural|auto|duplicate window in packets (auto: rate x (2 RTT + 100 ms), else 1024)
+fec-slots|auto-int:16:64|structural|auto|FEC blocks the receiver tracks at once (auto: 4 per CPU, 16-64)
+fec-threshold|pct|runtime|1|loss that turns FEC on, percent
+fec-cooldown|dur:s|runtime|10s|loss must stay below the threshold this long before FEC turns off
+fec-k|int:1:15|runtime|8|parity ratio 1:N when the link looks congested, or with fec-mode on
+fec-k-min|int:1:15|runtime|2|smallest N when scaling with loss
+fec-k-max|int:1:15|runtime|15|largest N when scaling with loss
+fec-floor|int:0:15|runtime|0|in auto mode never less than 1 parity per N packets (0: FEC turns off)
+fec-timeout|dur:ms|runtime|50ms|send parity for a partly filled block after this long
+fec-mode|enum:auto,on,off|runtime|auto|auto, on or off
+report-interval|dur:ms|runtime|1000ms|loss window and report interval
+probe-interval|dur:s|runtime|10s|packet-pair probe interval
+probe-backoff|int:1:1000|runtime|6|multiply the probe interval by N while FEC is on
+probe-min-bytes|int:64:1500|runtime|600|only probe with packets of at least N bytes
+congestion-pct|int:1:100|runtime|85|utilisation above which loss counts as congestion (FEC not scaled up)
+congestion-delay|dur:ms|runtime|20ms|queueing delay above which loss counts as congestion'
+
+declare -A KIND CLASS DEF HELP VAL SRC CLI
+KEYS=()
+while IFS='|' read -r k kind class def help; do
+    KEYS+=("$k"); KIND[$k]=$kind; CLASS[$k]=$class; DEF[$k]=$def; HELP[$k]=$help
+done <<< "$SETTINGS"
+is_key() { [ -n "${KIND[$1]+x}" ]; }
+
+usage() {
+cat <<EOF
+Usage: $(basename "$0") -i <interface> [--profile NAME] [settings...]
+       $(basename "$0") --list-profiles
+       $(basename "$0") --show-profile NAME [settings...]
+       $(basename "$0") --save-profile NAME [--profile BASE] [--description TEXT] [settings...] [-i IF]
+
+Writes <outdir>/<interface>/egress/*.bpfc and ingress/*.bpfc.
+
+  -i, --interface IF       interface to generate for
+  -o, --outdir DIR         default /etc/bpfc/interfaces.d (use - for stdout)
+  -P, --prefix NAME        map name prefix (1-10 of A-Z a-z 0-9 _ .), default
+                           dp + 8 characters hashed from the interface name
+  -m, --map-dir DIR        pinned maps, for --remove-maps (default /sys/fs/bpf)
+      --map-prefix         print the map prefix for -i (and --prefix) and exit
+      --remove-maps        delete the interface's pinned maps from --map-dir
+                           (also those of generator v2, dp_<interface>_*);
+                           remove its programs first
+  -b, --priority N         first TC priority, default 100 (uses N..N+30)
+  -p, --profile NAME       start from a profile (see --list-profiles)
+      --profile-dir DIR    also look for profiles in DIR (searched first)
+      --list-profiles      list the available profiles
+      --show-profile NAME  print every effective setting, where it comes from,
+                           and the sizes derived from --link-rate / --rtt
+      --save-profile NAME  save --profile and the settings given on the
+                           command line as a new profile (in $SAVE_DIR,
+                           or --profile-dir)
+      --description TEXT   description for --save-profile
+      --setup-hints        print the ip/ethtool commands for the interface
+
+Settings (--name value or --name=value; the same names are used in profiles):
+EOF
+    local k
+    for k in "${KEYS[@]}"; do
+        printf "  --%-22s %s%s\n" "$k" "${HELP[$k]}" "$( [ -n "${DEF[$k]}" ] && echo " [${DEF[$k]}]")"
+    done
+cat <<EOF
+Durations take us, ms, s or m (a bare number is in the unit shown by the
+default); rates take k, m or g (bits per second).
+
+The interface must carry 1514-byte frames (MTU 1500) while IP uses 1492:
+set "mtu lock 1492" on the routes through it. Turn off TSO/GSO/GRO on it
+and set gso_max_segs 1; see --setup-hints.
+EOF
+}
+
+# ---------------------------------------------------------------- units
+
+# rate -> bits per second
+parse_rate() {
+    local v=${1,,}
+    v=${v%/s}; v=${v%bps}; v=${v%bit}; v=${v%b}
+    [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)([kmg]?)$ ]] || return 1
+    awk -v n="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[3]}" \
+        'BEGIN{m = (u=="k")?1e3:(u=="m")?1e6:(u=="g")?1e9:1; printf "%.0f\n", n*m}'
+}
+# duration <value> <default unit> -> milliseconds (at least 1 if non-zero)
+parse_dur() {
+    local v=${1,,}
+    [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)(us|ms|s|m)?$ ]] || return 1
+    local u=${BASH_REMATCH[3]:-$2}
+    awk -v n="${BASH_REMATCH[1]}" -v u="$u" \
+        'BEGIN{f = (u=="us")?0.001:(u=="ms")?1:(u=="s")?1000:60000; x = n*f; if (x > 0 && x < 1) x = 1; printf "%.0f\n", x}'
+}
+pow2_up() { local n=$1 p=1; while [ $p -lt "$n" ]; do p=$((p * 2)); done; echo $p; }
+human_rate() {
+    awk -v b="$1" 'BEGIN{ if (b >= 1e9) printf "%.3g Gbit/s", b/1e9; else if (b >= 1e6) printf "%.3g Mbit/s", b/1e6;
+                         else if (b >= 1e3) printf "%.3g kbit/s", b/1e3; else printf "%d bit/s", b }'
+}
+
+# check_value <key> <value>: exit with a message if invalid
+check_value() {
+    local k=$1 v=$2 where="$k = $2 (from ${SRC[$1]:-command line})"
+    local kind=${KIND[$k]} lo hi
+    case "$kind" in
+        rate) [ -z "$v" ] || parse_rate "$v" >/dev/null || die "$where: not a rate (e.g. 20m, 1g)" ;;
+        dur:*) [ -z "$v" ] || parse_dur "$v" "${kind#dur:}" >/dev/null || die "$where: not a duration (e.g. 50ms, 10s)" ;;
+        int:*|auto-int:*)
+            IFS=: read -r _ lo hi <<< "$kind"
+            [[ "$kind" == auto-int:* && "$v" == auto ]] && return 0
+            [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge "$lo" ] && [ "$v" -le "$hi" ] ||
+                die "$where: must be $( [[ "$kind" == auto-* ]] && echo "auto or ")$lo-$hi" ;;
+        pct) [[ "${v%\%}" =~ ^[0-9]+(\.[0-9]{1,2})?$ ]] || die "$where: must be a percentage like 1 or 0.5" ;;
+        enum:*) [[ ",${kind#enum:}," == *",$v,"* ]] || die "$where: must be one of ${kind#enum:}" ;;
+        arqfec) [[ "$v" =~ ^(keep|off|[1-9][0-9]*|[0-9]+(\.[0-9]+)?(us|ms|s))$ ]] || die "$where: must be keep, off, a number or a time" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- profiles
+
+find_profile() {    # name -> path of the first match
+    local d
+    for d in "${PROFILE_DIRS[@]}"; do
+        [ -r "$d/$1.profile" ] && { echo "$d/$1.profile"; return 0; }
+    done
+    return 1
+}
+
+declare -A PDESC
+PROFILE_CHAIN=()
+# load_profile <name> <depth>: parents first, then this profile's settings
+load_profile() {
+    local name=$1 depth=${2:-0} path n line key val parent=""
+    [[ "$name" =~ ^[A-Za-z0-9_.-]{1,40}$ ]] || die "invalid profile name '$name'"
+    [ "$depth" -le 8 ] || die "profile inheritance deeper than 8 levels (loop?) at '$name'"
+    local p; for p in "${PROFILE_CHAIN[@]}"; do
+        if [ "$p" = "$name" ]; then
+            local chain; chain=$(printf "%s -> " "${PROFILE_CHAIN[@]}")
+            die "profile inheritance loop: $chain$name"
+        fi
+    done
+    path=$(find_profile "$name") || die "profile '$name' not found (looked in ${PROFILE_DIRS[*]})"
+    local -a keys=() vals=()
+    n=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        line=$(sed -e 's/\(^\|[[:space:]]\)#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<< "$line")
+        [ -z "$line" ] && continue
+        [[ "$line" =~ ^([a-z0-9-]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || die "$path:$n: expected 'name = value'"
+        key=${BASH_REMATCH[1]}; val=${BASH_REMATCH[2]}
+        case "$key" in
+            inherit) parent=$val ;;
+            description) PDESC[$name]=$val ;;
+            *) is_key "$key" || die "$path:$n: unknown setting '$key'"
+               keys+=("$key"); vals+=("$val") ;;
+        esac
+    done < "$path"
+    [ -n "$parent" ] && { PROFILE_CHAIN+=("$name"); load_profile "$parent" $((depth + 1)); unset 'PROFILE_CHAIN[-1]'; }
+    local i
+    for i in "${!keys[@]}"; do VAL[${keys[$i]}]=${vals[$i]}; SRC[${keys[$i]}]="profile $name"; done
+    RESOLVED_CHAIN+=("$name")
+}
+RESOLVED_CHAIN=()
+
+list_profiles() {
+    local d f name seen=" "
+    printf "%-14s %-52s %s\n" PROFILE DESCRIPTION FILE
+    for d in "${PROFILE_DIRS[@]}"; do
+        for f in "$d"/*.profile; do
+            [ -r "$f" ] || continue
+            name=$(basename "$f" .profile)
+            local desc
+            desc=$(sed -n -e 's/\(^\|[[:space:]]\)#.*$//' -e 's/^[[:space:]]*description[[:space:]]*=[[:space:]]*//p' "$f" | head -1)
+            if [[ "$seen" == *" $name "* ]]; then
+                printf "%-14s %-52s %s (hidden by the one above)\n" "$name" "${desc:0:52}" "$f"
+            else
+                printf "%-14s %-52s %s\n" "$name" "${desc:0:52}" "$f"
+                seen+="$name "
+            fi
+        done
+    done
+}
+
+# ---------------------------------------------------------------- command line
+
+IFACE=""; OUTDIR=/etc/bpfc/interfaces.d; PREFIX=""; PRIO=100; MAP_DIR=/sys/fs/bpf
+PRINT_PREFIX=0; REMOVE_MAPS=0
+PROFILE=""; SHOW=""; SAVE=""; DESCRIPTION=""; LIST=0; HINTS=0
+while [ $# -gt 0 ]; do
+    arg=$1; val=""; has_eq=0
+    if [[ "$arg" == --*=* ]]; then val=${arg#*=}; arg=${arg%%=*}; has_eq=1; fi
+    need() { if [ $has_eq -eq 1 ]; then return; fi; [ $# -ge 2 ] || die "$arg needs a value"; val=$2; SHIFT=1; }
+    SHIFT=0
+    case "$arg" in
+        -i|--interface) need "$@"; IFACE=$val ;;
+        -o|--outdir) need "$@"; OUTDIR=$val ;;
+        -P|--prefix) need "$@"; PREFIX=$val ;;
+        -m|--map-dir) need "$@"; MAP_DIR=$val ;;
+        --map-prefix) PRINT_PREFIX=1 ;;
+        --remove-maps) REMOVE_MAPS=1 ;;
+        -b|--priority) need "$@"; PRIO=$val ;;
+        -p|--profile) need "$@"; PROFILE=$val ;;
+        --profile-dir) need "$@"; PROFILE_DIRS=("$val" "${PROFILE_DIRS[@]}"); SAVE_DIR=$val ;;
+        --list-profiles) LIST=1 ;;
+        --show-profile) need "$@"; SHOW=$val ;;
+        --save-profile) need "$@"; SAVE=$val ;;
+        --description) need "$@"; DESCRIPTION=$val ;;
+        --setup-hints) HINTS=1 ;;
+        -h|--help) usage; exit 0 ;;
+        --*) is_key "${arg#--}" || { echo "Unknown option: $arg" >&2; usage >&2; exit 2; }
+             need "$@"; CLI[${arg#--}]=$val ;;
+        *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
+    esac
+    shift $((1 + SHIFT))
+done
+
+if [ $LIST -eq 1 ]; then list_profiles; exit 0; fi
+
+# ---------------------------------------------------------------- names
+
+# Interface names as the kernel accepts them: 1-15 bytes, not "." or "..",
+# no "/", ":" or whitespace, no "%" (the kernel takes it as a "%d" name
+# template); control characters are refused too.
+valid_ifname() {
+    local n=$1 len
+    len=$(LC_ALL=C; echo ${#n})
+    [ "$len" -ge 1 ] && [ "$len" -le 15 ] || return 1
+    [ "$n" != . ] && [ "$n" != .. ] || return 1
+    [[ "$n" =~ [[:space:][:cntrl:]/:%] ]] && return 1
+    return 0
+}
+# map_id <name>: "dp" + 8 base32 characters (a-z 2-7) of SHA-256(name), 40 bits
+map_id() {
+    local h n a=abcdefghijklmnopqrstuvwxyz234567 out="" i
+    h=$(printf '%s' "$1" | sha256sum); n=$((16#${h:0:10}))
+    for i in 1 2 3 4 5 6 7 8; do out=${a:$((n & 31)):1}$out; n=$((n >> 5)); done
+    echo "dp$out"
+}
+# pct_encode <s>: the interface name in comments and key=value lines
+pct_encode() {
+    local LC_ALL=C s=$1 out="" c i
+    for ((i = 0; i < ${#s}; i++)); do
+        c=${s:i:1}
+        if [[ "$c" =~ ^[A-Za-z0-9_.@+-]$ ]]; then out+=$c; else out+=$(printf '%%%02X' "'$c"); fi
+    done
+    echo "$out"
+}
+MAP_SUFFIXES=(tx rx pcpu cfg arq atag ftx frx fsl dup)
+
+if [ -n "$IFACE" ]; then
+    valid_ifname "$IFACE" || die "invalid interface name '$IFACE' (1-15 bytes, no '/', ':', '%' or whitespace)"
+    [ -n "$PREFIX" ] || PREFIX=$(map_id "$IFACE")
+    [[ "$PREFIX" =~ ^[A-Za-z0-9_.]{1,10}$ ]] || die "invalid prefix '$PREFIX' (1-10 of A-Z a-z 0-9 _ .)"
+fi
+if [ $PRINT_PREFIX -eq 1 ]; then
+    [ -n "$IFACE" ] || die "--map-prefix needs -i <interface>"
+    echo "$PREFIX"; exit 0
+fi
+if [ $REMOVE_MAPS -eq 1 ]; then
+    [ -n "$IFACE" ] || die "--remove-maps needs -i <interface>"
+    removed=0
+    for p in "$PREFIX" "dp_$IFACE"; do
+        for sfx in "${MAP_SUFFIXES[@]}"; do
+            f="$MAP_DIR/${p}_$sfx"
+            if [ -e "$f" ]; then rm -f -- "$f" && echo "removed $f" && removed=$((removed + 1)); fi
+        done
+    done
+    [ $removed -gt 0 ] || echo "no maps for $IFACE in $MAP_DIR"
+    exit 0
+fi
+
+if [ $HINTS -eq 1 ]; then
+    [ -n "$IFACE" ] || die "--setup-hints needs -i <interface>"
+    IFQ=$(printf %q "$IFACE")
+cat <<EOF
+# Frames grow by 8 bytes: keep the link MTU at 1500 and use 1492 for IP.
+ip link set dev $IFQ mtu 1500
+# For every route through $IFQ (example for the connected subnet):
+#   ip route change <subnet> dev $IFQ ... mtu lock 1492
+# One TCP segment per packet, so every packet can be protected:
+ip link set dev $IFQ gso_max_segs 1
+ethtool -K $IFQ tso off gso off gro off
+# Packets forwarded into $IFQ from other interfaces must not be GRO-merged
+# (merged packets are sent unprotected): ethtool -K <lan-if> gro off
+EOF
+    exit 0
+fi
+
+# ---------------------------------------------------------------- resolve
+
+for k in "${KEYS[@]}"; do VAL[$k]=${DEF[$k]}; SRC[$k]=default; done
+[ -n "$SHOW" ] && [ -z "$PROFILE" ] && PROFILE=$SHOW
+[ -n "$PROFILE" ] && load_profile "$PROFILE"
+for k in "${!CLI[@]}"; do VAL[$k]=${CLI[$k]}; SRC[$k]="command line"; done
+for k in "${KEYS[@]}"; do check_value "$k" "${VAL[$k]}"; done
+
+RATE_BPS=""; RTT_MS=""
+[ -n "${VAL[link-rate]}" ] && RATE_BPS=$(parse_rate "${VAL[link-rate]}")
+[ -n "${VAL[rtt]}" ] && RTT_MS=$(parse_dur "${VAL[rtt]}" ms)
+[ -n "$RATE_BPS" ] && { [ "$RATE_BPS" -ge 1000 ] || die "link-rate below 1 kbit/s"; }
+[ -n "$RTT_MS" ] && { [ "$RTT_MS" -ge 1 ] && [ "$RTT_MS" -le 30000 ] || die "rtt must be 1 ms - 30 s"; }
+SIZING=${VAL[sizing-packet-bytes]}
+SIZED=0; PPS=0
+if [ -n "$RATE_BPS" ] && [ -n "$RTT_MS" ]; then
+    SIZED=1
+    PPS=$(( RATE_BPS / 8 / SIZING )); [ $PPS -ge 1 ] || PPS=1
+elif [ -n "$RATE_BPS$RTT_MS" ]; then
+    warn "link-rate and rtt are only used together; buffers keep their default sizes"
+fi
+
+ceil_div() { echo $(( ($1 + $2 - 1) / $2 )); }
+
+# ARQ ring: everything sent during one RTT, with 50 % margin
+if [ "${VAL[arq-depth]}" = auto ]; then
+    if [ $SIZED -eq 1 ]; then
+        need=$(ceil_div $((PPS * RTT_MS * 3)) 2000)
+        ARQ_DEPTH=$need
+        [ $ARQ_DEPTH -ge 10 ] || ARQ_DEPTH=10
+        if [ $ARQ_DEPTH -gt 16384 ]; then
+            warn "rate x RTT needs an ARQ ring of $need packets; capped at 16384 (retransmission covers $((16384 * 1000 / PPS)) ms)"
+            ARQ_DEPTH=16384
+        fi
+    else
+        ARQ_DEPTH=10
+    fi
+else
+    ARQ_DEPTH=${VAL[arq-depth]}
+fi
+
+# Duplicate window: two RTTs (a retransmission can arrive that late) + 100 ms
+if [ "${VAL[dup-window]}" = auto ]; then
+    if [ $SIZED -eq 1 ]; then
+        need=$(( PPS * (2 * RTT_MS + 100) / 1000 ))
+        DUP_WORDS=$(pow2_up "$(ceil_div "$need" 64)")
+        [ $DUP_WORDS -ge 16 ] || DUP_WORDS=16
+        if [ $DUP_WORDS -gt 256 ]; then
+            warn "rate x RTT needs a duplicate window of $need packets; capped at 16384 (16-bit sequence numbers)"
+            DUP_WORDS=256
+        fi
+    else
+        DUP_WORDS=16
+    fi
+else
+    DUP_WORDS=$(pow2_up "$(ceil_div "${VAL[dup-window]}" 64)")
+    [ $DUP_WORDS -le 256 ] || DUP_WORDS=256
+fi
+DUP_OLD=$(( (DUP_WORDS - 1) * 64 ))
+
+# FEC receive slots: blocks open at the same time - about one per sending
+# CPU, with room for parity that arrives a little late
+if [ "${VAL[fec-slots]}" = auto ]; then
+    cpus=$(nproc 2>/dev/null || echo 4)
+    FEC_SLOTS=$(pow2_up $((cpus * 4)))
+    [ $FEC_SLOTS -ge 16 ] || FEC_SLOTS=16
+    [ $FEC_SLOTS -le 64 ] || FEC_SLOTS=64
+else
+    FEC_SLOTS=$(pow2_up "${VAL[fec-slots]}")
+    [ $FEC_SLOTS -le 64 ] || FEC_SLOTS=64
+fi
+
+# 16-bit sequence numbers: retransmissions and late duplicates must arrive
+# within the 16384 packets the receiver can still place. Longer outages
+# are counted as a resync rather than loss.
+SEQ_MS=""
+if [ $SIZED -eq 1 ]; then
+    SEQ_MS=$(( 16384 * 1000 / PPS ))
+    span=$(( PPS * (2 * RTT_MS + 100) / 1000 ))
+    [ $span -le 16384 ] || warn "16-bit sequence numbers cover only $SEQ_MS ms at this rate, less than 2 x RTT + 100 ms: late retransmissions and duplicates are miscounted (a larger shim class is needed)"
+fi
+
+# Settings in the units the programs use
+FEC_PCT=${VAL[fec-threshold]%\%}
+FEC_BP=$(awk -v p="$FEC_PCT" 'BEGIN{printf "%d", p*100 + 0.5}')
+[ "$FEC_BP" -ge 1 ] && [ "$FEC_BP" -le 10000 ] || die "fec-threshold must be between 0.01 and 100"
+COOLDOWN_MS=$(parse_dur "${VAL[fec-cooldown]}" s)
+FEC_TIMEOUT=$(parse_dur "${VAL[fec-timeout]}" ms)
+REPORT_MS=$(parse_dur "${VAL[report-interval]}" ms)
+PROBE_MS=$(parse_dur "${VAL[probe-interval]}" s)
+CONG_DELAY_MS=$(parse_dur "${VAL[congestion-delay]}" ms)
+FEC_K=${VAL[fec-k]}; FEC_KMIN=${VAL[fec-k-min]}; FEC_KMAX=${VAL[fec-k-max]}; FEC_FLOOR=${VAL[fec-floor]}
+PROBE_BACKOFF=${VAL[probe-backoff]}; PROBE_MIN=${VAL[probe-min-bytes]}; CONG_PCT=${VAL[congestion-pct]}
+case "${VAL[fec-mode]}" in auto) FEC_FORCE=0 ;; off) FEC_FORCE=1 ;; on) FEC_FORCE=2 ;; esac
+[ "$FEC_KMIN" -le "$FEC_KMAX" ] || die "fec-k-min ($FEC_KMIN) is larger than fec-k-max ($FEC_KMAX)"
+[ "$COOLDOWN_MS" -ge 1 ] && [ "$COOLDOWN_MS" -le 3600000 ] || die "fec-cooldown must be 1 ms - 1 h"
+[ "$FEC_TIMEOUT" -ge 1 ] && [ "$FEC_TIMEOUT" -le 2000 ] || die "fec-timeout must be 1-2000 ms"
+[ "$REPORT_MS" -ge 100 ] && [ "$REPORT_MS" -le 60000 ] || die "report-interval must be 100 ms - 60 s"
+[ "$PROBE_MS" -ge 1000 ] && [ "$PROBE_MS" -le 86400000 ] || die "probe-interval must be 1 s - 1 day"
+[ "$CONG_DELAY_MS" -ge 1 ] && [ "$CONG_DELAY_MS" -le 10000 ] || die "congestion-delay must be 1 ms - 10 s"
+case "${VAL[arq-with-fec]}" in
+    keep) ARQ_MODE=1; ARQ_FEC_DEPTH=$ARQ_DEPTH ;;
+    off)  ARQ_MODE=2; ARQ_FEC_DEPTH=0 ;;
+    *[a-z]*)
+        [ $SIZED -eq 1 ] || die "arq-with-fec = ${VAL[arq-with-fec]}: a time needs link-rate and rtt"
+        t=$(parse_dur "${VAL[arq-with-fec]}" ms)
+        ARQ_MODE=3; ARQ_FEC_DEPTH=$(ceil_div $((PPS * t)) 1000)
+        [ $ARQ_FEC_DEPTH -ge 1 ] || ARQ_FEC_DEPTH=1 ;;
+    *)    ARQ_MODE=3; ARQ_FEC_DEPTH=${VAL[arq-with-fec]} ;;
+esac
+[ "$ARQ_FEC_DEPTH" -le "$ARQ_DEPTH" ] || ARQ_FEC_DEPTH=$ARQ_DEPTH
+MEM_KB=$(( (ARQ_DEPTH * 1504 + FEC_SLOTS * 1504 + ARQ_DEPTH * 8 + FEC_SLOTS * 32 + DUP_WORDS * 8) / 1024 ))
+
+# ---------------------------------------------------------------- show / save
+
+show_settings() {
+    local k v
+    echo "# Effective settings$( [ ${#RESOLVED_CHAIN[@]} -gt 0 ] && echo " (profile: ${RESOLVED_CHAIN[*]})" )"
+    [ -n "$PROFILE" ] && [ -n "${PDESC[$PROFILE]}" ] && echo "# ${PDESC[$PROFILE]}"
+    for k in "${KEYS[@]}"; do
+        v=${VAL[$k]}; [ -n "$v" ] || v="-"
+        printf "%-20s = %-10s # %-22s %s\n" "$k" "$v" "${SRC[$k]}" \
+            "$( [ "${CLASS[$k]}" = runtime ] && echo "[runtime]" || echo "[regenerate]")"
+    done
+    echo "#"
+    if [ $SIZED -eq 1 ]; then
+        echo "# Sized for $(human_rate "$RATE_BPS"), RTT $RTT_MS ms: about $PPS packets/s of $SIZING bytes"
+    else
+        echo "# Not sized (no link-rate and rtt): default buffer sizes"
+    fi
+    echo "#   ARQ ring        $ARQ_DEPTH packets$( [ "$ARQ_MODE" = 3 ] && echo ", last $ARQ_FEC_DEPTH while FEC is on")"
+    echo "#   duplicate window $((DUP_WORDS * 64)) packets"
+    echo "#   FEC slots       $FEC_SLOTS"
+    [ -n "$SEQ_MS" ] && echo "#   sequence space  $SEQ_MS ms (outages longer than this count as a resync, not loss)"
+    echo "#   map memory      about $MEM_KB KiB per interface"
+    local w; for w in "${WARNINGS[@]}"; do echo "#   warning: $w"; done
+}
+
+if [ -n "$SHOW" ]; then show_settings; exit 0; fi
+
+if [ -n "$SAVE" ]; then
+    [[ "$SAVE" =~ ^[A-Za-z0-9_.-]{1,40}$ ]] || die "invalid profile name '$SAVE'"
+    [ -n "$PROFILE" ] || [ ${#CLI[@]} -gt 0 ] || die "nothing to save: give --profile and/or settings"
+    [ "$SAVE" != "$PROFILE" ] || die "--save-profile $SAVE would inherit from itself; choose another name"
+    mkdir -p "$SAVE_DIR" || die "cannot create $SAVE_DIR"
+    f="$SAVE_DIR/$SAVE.profile"
+    {
+        echo "# Saved by bpfc-dataplane-gen on $(date '+%Y-%m-%d %H:%M')"
+        echo "description = ${DESCRIPTION:-${PROFILE:+based on $PROFILE}}"
+        [ -n "$PROFILE" ] && echo "inherit = $PROFILE"
+        for k in "${KEYS[@]}"; do if [ -n "${CLI[$k]+x}" ]; then echo "$k = ${CLI[$k]}"; fi; done
+    } > "$f.tmp" && mv "$f.tmp" "$f" || die "cannot write $f"
+    echo "saved profile $SAVE to $f"
+    [ -n "$IFACE" ] || exit 0
+    PROFILE=$SAVE; RESOLVED_CHAIN+=("$SAVE")
+fi
+
+[ -n "$IFACE" ] || { usage >&2; exit 2; }
+IFACE_ENC=$(pct_encode "$IFACE")
+# Two interfaces must not share a prefix (a hash collision, or the same
+# --prefix twice): check the other interfaces generated into OUTDIR.
+if [ "$OUTDIR" != "-" ] && [ -z "$SHOW" ]; then
+    for f in "$OUTDIR"/*/egress/*.bpfc; do
+        [ -r "$f" ] || continue
+        other=${f#"$OUTDIR"/}; other=${other%%/*}
+        [ "$other" = "$IFACE" ] && continue
+        p=$(sed -n 's/^# dataplane: .* prefix=\([^ ]*\).*/\1/p' "$f" | head -1)
+        [ "$p" = "$PREFIX" ] && die "map prefix $PREFIX is already used by $other (in $OUTDIR); choose one with --prefix"
+    done
+fi
+[[ "$PRIO" =~ ^[0-9]+$ ]] && [ "$PRIO" -ge 1 ] && [ "$PRIO" -le 65000 ] || die "--priority must be 1-65000"
+
+# Maps (pinned under bpfcd's map_dir):
+TX=${PREFIX}_tx      # sender state, settings in force, what the peer reports
+RX=${PREFIX}_rx      # receiver state
+PC=${PREFIX}_pcpu    # per-CPU FEC block state, key cpu*2 (+1 = block start time)
+CFG=${PREFIX}_cfg    # runtime overrides (bpfc -w); 0 or missing = generated default
+ARQ=${PREFIX}_arq    # retransmit ring: shim + IP packet per slot
+ATAG=${PREFIX}_atag  # retransmit ring tags: seq << 16 | length (array)
+ACC=${PREFIX}_ftx    # per-CPU parity accumulator
+FRX=${PREFIX}_frx    # receive-side block accumulators
+FSL=${PREFIX}_fsl    # receive-side block state: slot*4 + 0 block+1, 1 members, 2 seq-xor (array)
+DUP=${PREFIX}_dup    # duplicate bitmap, 64 sequences per word (array)
+
+P_EGRESS=$PRIO
+P_FEC=$((PRIO + 10))
+P_CTRL=$PRIO
+P_PARITY=$((PRIO + 10))
+P_DATA=$((PRIO + 20))
+P_DELIVER=$((PRIO + 30))
+
+emit() {   # emit <dir> <prio> <name>; reads the program on stdin
+    local dir="$1" prio="$2" name="$3"
+    if [ "$OUTDIR" = "-" ]; then
+        echo "### $IFACE_ENC/$dir/$prio.bpfc ($name)"; cat; echo
+    else
+        mkdir -p "$OUTDIR/$IFACE/$dir"
+        cat > "$OUTDIR/$IFACE/$dir/$prio.bpfc.tmp"
+        mv "$OUTDIR/$IFACE/$dir/$prio.bpfc.tmp" "$OUTDIR/$IFACE/$dir/$prio.bpfc"
+        echo "wrote $OUTDIR/$IFACE/$dir/$prio.bpfc ($name)"
+    fi
+}
+
+PNAME=${PROFILE:-none}
+SETTINGS_LINE=""
+for k in "${KEYS[@]}"; do [ -n "${VAL[$k]}" ] && SETTINGS_LINE+=" $k=${VAL[$k]}"; done
+HEADER="# Generated by bpfc-dataplane-gen v$VERSION for $IFACE_ENC (profile $PNAME) - regenerate, do not edit.
+# dataplane: version=$VERSION iface=$IFACE_ENC prefix=$PREFIX profile=$PNAME link_rate=${RATE_BPS:-0} rtt_ms=${RTT_MS:-0} sizing_bytes=$SIZING arq_depth=$ARQ_DEPTH dup_words=$DUP_WORDS fec_slots=$FEC_SLOTS nak_max=$NAK_MAX arq_mode=$ARQ_MODE arq_fec_depth=$ARQ_FEC_DEPTH fec_bp=$FEC_BP cooldown_ms=$COOLDOWN_MS k=$FEC_K kmin=$FEC_KMIN kmax=$FEC_KMAX floor=$FEC_FLOOR timeout_ms=$FEC_TIMEOUT fec_mode=$FEC_FORCE report_ms=$REPORT_MS probe_ms=$PROBE_MS backoff=$PROBE_BACKOFF probe_min=$PROBE_MIN cong_pct=$CONG_PCT cong_delay_ms=$CONG_DELAY_MS
+# maps: $TX $RX $PC $CFG $ARQ $ATAG $ACC $FRX $FSL $DUP
+# settings:$SETTINGS_LINE"
+
+########################################################################
+# Egress, first: encapsulate every IPv4 packet (sequence number, timestamp)
+# and keep a copy for ARQ.
+########################################################################
+emit egress $P_EGRESS "encapsulate" <<EOF
+$HEADER
+#
+# Shim (8 bytes after the Ethernet header, EtherType 0x88B5), big-endian:
+#   type:3 flags:5 | k:4 idx:4 | seq:16 | block:8 | ts:24 (4 us units)
+# flags: 0x10 FEC member, 0x08 probe 1, 0x04 probe 2, 0x02 FEC on,
+#        0x01 sequence restarted (first 1024 packets)
+shared-buffer-map $ARQ $ARQ_DEPTH 1504;
+array-map $ATAG $ARQ_DEPTH;
+
+# Our own frames (clones re-entering egress, NAK, report, retransmission)
+# pass; clear the hand-over mark so the FEC program leaves them alone.
+match eth-proto 0x88B5;
+  set skb-cb 0 0;
+  continue;
+end-match;
+match ip;
+
+# Packets that do not fit (GSO, or IP longer than 1492) go out unprotected.
+get len FLEN;
+if FLEN gt 1506;
+  calc-map add $TX 4 1;
+  set skb-cb 0 0;
+  continue;
+end-if;
+free FLEN;
+
+get ip-len IPL2;
+decl IPL 8;
+set val IPL %IPL2;
+free IPL2;
+calc-map add $TX 1 1 SEQ;
+calc-map add $TX 2 1;
+calc-map add $TX 3 %IPL;
+get time NOW;
+get map $TX 6 FK;
+# Start-up: the controller only runs when the peer's first report arrives,
+# so apply "fec-mode on" and the FEC floor from the first packet.
+if FK eq 0;
+  if SEQ lt 64;
+    decl FM 8;
+    get map $CFG 14 FM;
+    if FM eq 0;
+      set val FM $FEC_FORCE;
+    end-if;
+    if FM eq 2;
+      get map $CFG 3 FK;
+      if FK eq 0;
+        set val FK $FEC_K;
+      end-if;
+    end-if;
+    if FM ne 1;
+      if FK eq 0;
+        get map $CFG 16 FM;
+        if FM eq 0;
+          set val FM $FEC_FLOOR;
+        end-if;
+        if FM gt 0;
+          if FM le 15;
+            set val FK %FM;
+          end-if;
+        end-if;
+      end-if;
+    end-if;
+    free FM;
+    if FK gt 15;
+      set val FK 15;
+    end-if;
+    if FK gt 0;
+      set map $TX 6 %FK;
+      calc-map add $TX 8 1;
+      set map $TX 22 %NOW;
+    end-if;
+  end-if;
+end-if;
+
+decl W 8;
+set val W 1;
+calc lsh W 61;
+decl T 8;
+if FK gt 0;
+  # FEC on: flag 0x02 and the ratio in use (k), on every packet
+  set val T 0x02;
+  calc lsh T 56;
+  calc or W %T;
+  set val T %FK;
+  calc and T 0xF;
+  calc lsh T 52;
+  calc or W %T;
+end-if;
+set val T %SEQ;
+calc and T 0xFFFF;
+calc lsh T 32;
+calc or W %T;
+# 0x01: this sequence just started (map created), lets the peer resync
+if SEQ lt 1024;
+  set val T 0x01;
+  calc lsh T 56;
+  calc or W %T;
+end-if;
+set val T %NOW;
+calc div T 4000;
+calc and T 0xFFFFFF;
+calc or W %T;
+free NOW;
+insert-l2 8 0x88B5;
+set val T %W;
+calc hton T 64;
+set bytes 14 8 %T;
+free W;
+
+# ARQ: keep shim + packet; tag = seq << 16 | stored length.
+decl SAVE 8;
+set val SAVE 1;
+if FK gt 0;
+  get map $CFG 8 MODE;
+  if MODE eq 0;
+    set val MODE $ARQ_MODE;
+  end-if;
+  if MODE eq 2;
+    set val SAVE 0;
+  end-if;
+  free MODE;
+end-if;
+if SAVE eq 1;
+  set val T %SEQ;
+  calc mod T $ARQ_DEPTH;
+  decl SLEN 8;
+  set val SLEN %IPL;
+  calc add SLEN 8;
+  save-packet-keyed $ARQ %T %SLEN 14 0;
+  set val SAVE %SEQ;
+  calc lsh SAVE 16;
+  calc or SAVE %SLEN;
+  set map $ATAG %T %SAVE;
+  free SLEN;
+end-if;
+free SAVE;
+
+# Hand over to the FEC program: cb[0] = 0xDA7B0000, cb[1] = seq.
+set val T 0xDA7B;
+calc lsh T 16;
+set skb-cb 0 %T;
+set skb-cb 1 %SEQ;
+continue;
+EOF
+
+########################################################################
+# Egress, second: fold the packet into this CPU's FEC block, send parity
+# when the block is full or old, send packet-pair probes.
+########################################################################
+emit egress $P_FEC "fec" <<EOF
+$HEADER
+buffer-map $ACC 1504;
+match eth-proto 0x88B5;
+get skb-cb 0 C0;
+calc rsh C0 16;
+if C0 ne 0xDA7B;
+  continue;
+end-if;
+free C0;
+set skb-cb 0 0;
+get skb-cb 1 SQ;
+get time NOW;
+get map $TX 6 FK;
+get bytes 24 2 IPL;
+get bytes 31 1 PROTO;
+
+# FEC members: IHL 5 (fixed checksum offsets below) and not SCTP (its CRC
+# may still be filled in by the NIC).
+decl EL 8;
+get bytes 22 1 VIHL;
+if VIHL eq 0x45;
+  set val EL 1;
+end-if;
+free VIHL;
+if PROTO eq 132;
+  set val EL 0;
+end-if;
+
+# Per-CPU block state: open:1 | k:4 (bits 59-56) | idx:4 (55-52) | block:8 (51-44)
+#   | length-or:12 (43-32) | seq-xor:16 (31-16)
+get cpu CPU;
+decl PK 8;
+set val PK %CPU;
+free CPU;
+calc mul PK 2;
+get map $PC %PK ST;
+# ACT: 1 = member of a block, 2 = this packet closes the block, 4 = flush the
+# open block (timed out or FEC turned off) with this packet as the carrier.
+decl ACT 8;
+decl T 8;
+set val T %ST;
+calc rsh T 63;
+if T eq 1;
+  if FK eq 0;
+    set val ACT 4;
+  end-if;
+  calc add PK 1;
+  get map $PC %PK BST;
+  calc sub PK 1;
+  set val T %NOW;
+  calc sub T %BST;
+  free BST;
+  get map $CFG 12 TO;
+  if TO eq 0;
+    set val TO $FEC_TIMEOUT;
+  end-if;
+  calc mul TO 1000000;
+  if T gt %TO;
+    set val ACT 4;
+  end-if;
+  free TO;
+  if EL eq 0;
+    set val ACT 0;
+  end-if;
+else;
+  if EL eq 1;
+    if FK gt 0;
+      calc-map add $TX 5 1 BIDV;
+      set val ST 1;
+      calc lsh ST 63;
+      set val T %FK;
+      calc lsh T 56;
+      calc or ST %T;
+      set val T %BIDV;
+      free BIDV;
+      calc and T 0xFF;
+      calc lsh T 44;
+      calc or ST %T;
+      calc add PK 1;
+      set map $PC %PK %NOW;
+      calc sub PK 1;
+    end-if;
+  end-if;
+end-if;
+if ACT eq 0;
+  if EL eq 1;
+    if FK gt 0;
+      set val ACT 1;
+    end-if;
+  end-if;
+end-if;
+free EL;
+
+get bytes 14 8 W;
+if ACT eq 1;
+  calc-map add $TX 24 1;
+  # shim: member flag, k and idx of this block (replacing the k written by
+  # the first program: K may have changed since the block started), block
+  set val T 0xFF;
+  calc lsh T 48;
+  calc not T;
+  calc and W %T;
+  set val T 0x10;
+  calc lsh T 56;
+  calc or W %T;
+  set val T %ST;
+  calc rsh T 52;
+  calc and T 0xFF;
+  calc lsh T 48;
+  calc or W %T;
+  set val T %ST;
+  calc rsh T 44;
+  calc and T 0xFF;
+  calc lsh T 24;
+  calc or W %T;
+  set val T %W;
+  calc hton T 64;
+  set bytes 14 8 %T;
+
+  # Fold the IP packet into the accumulator. A TCP/UDP packet may still carry
+  # a partial checksum that the kernel or NIC completes after this program,
+  # so fold in the checksum it will have: recovered packets then carry their
+  # real checksum and the receiving kernel verifies them.
+  # CO = offset of the checksum swapped in (0 = none).
+  decl CO 8;
+  get bytes 28 2 FR;
+  calc and FR 0x3FFF;
+  if FR eq 0;
+    if PROTO eq 6;
+      set val CO 58;
+    end-if;
+    if PROTO eq 17;
+      get bytes 48 2 CS;
+      if CS ne 0;
+        set val CO 48;
+      end-if;
+    end-if;
+  end-if;
+  free FR;
+  if CO eq 58;
+    get bytes 58 2 CS;
+    calc-csum tcp TV 22 1500;
+    calc hton TV 16;
+    set bytes 58 2 %TV;
+  end-if;
+  if CO eq 48;
+    get bytes 48 2 CS;
+    calc-csum udp TV 22 1500;
+    calc hton TV 16;
+    set bytes 48 2 %TV;
+  end-if;
+  free TV;
+  xor-packet $ACC %IPL 22 0;
+  calc hton CS 16;
+  if CO eq 58;
+    set bytes 58 2 %CS;
+  end-if;
+  if CO eq 48;
+    set bytes 48 2 %CS;
+  end-if;
+  free CS;
+  free CO;
+
+  # length-or, seq-xor, idx + 1; full block -> ACT 2
+  set val T %IPL;
+  calc lsh T 32;
+  calc or ST %T;
+  set val T %SQ;
+  calc and T 0xFFFF;
+  calc lsh T 16;
+  calc xor ST %T;
+  set val T 1;
+  calc lsh T 52;
+  calc add ST %T;
+  set val T %ST;
+  calc rsh T 52;
+  set val SQ %T;
+  calc and SQ 0xF;
+  calc rsh T 4;
+  calc and T 0xF;
+  if SQ ge %T;
+    set val ACT 2;
+  else;
+    set map $PC %PK %ST;
+  end-if;
+end-if;
+free SQ;
+
+# Parity: send this packet first (clone), then turn it into the parity frame.
+if ACT ge 2;
+  set map $PC %PK 0;
+  get skb-ifindex IFX;
+  clone %IFX egress;
+  # parity length = OR of member lengths, 38..1492
+  decl PL 8;
+  set val PL %ST;
+  calc rsh PL 32;
+  calc and PL 0xFFF;
+  if PL gt 1492;
+    set val PL 1492;
+  end-if;
+  if PL lt 38;
+    set val PL 38;
+  end-if;
+  set val T %PL;
+  calc add T 22;
+  set len %T;
+  load-packet $ACC %PL 0 22;
+  xor-packet $ACC %PL 22 0;
+  # header: type 2 | FEC on | n | saved checksum bytes | block | code | seq-xor
+  set val W 2;
+  calc lsh W 61;
+  set val T 0x02;
+  calc lsh T 56;
+  calc or W %T;
+  set val T %ST;
+  calc rsh T 52;
+  calc and T 0xF;
+  calc lsh T 48;
+  calc or W %T;
+  set val T %ST;
+  calc rsh T 44;
+  calc and T 0xFF;
+  calc lsh T 24;
+  calc or W %T;
+  set val T %ST;
+  calc rsh T 16;
+  calc and T 0xFFFF;
+  calc or W %T;
+  # The kernel or NIC may still write this packet's TCP/UDP checksum into the
+  # parity bytes; keep the real bytes in the header so the receiver can undo it.
+  if PROTO eq 6;
+    get bytes 58 2 CB;
+    set val T 2;
+  else;
+    if PROTO eq 17;
+      get bytes 48 2 CB;
+      set val T 1;
+    else;
+      decl CB 2;
+      set val T 0;
+    end-if;
+  end-if;
+  calc lsh T 16;
+  calc or W %T;
+  set val T %CB;
+  calc lsh T 32;
+  calc or W %T;
+  calc hton W 64;
+  set bytes 14 8 %W;
+  calc-map add $TX 9 1;
+  if ACT eq 4;
+    calc-map add $TX 23 1;
+  end-if;
+  continue;
+end-if;
+free ST;
+free PK;
+free PROTO;
+
+# Packet-pair probe: this packet goes out twice, back to back, flagged
+# probe 1 and probe 2. The receiver measures the gap and drops the copy.
+get map $TX 10 PLAST;
+set val T %NOW;
+calc div T 1000000;
+calc sub T %PLAST;
+get map $CFG 6 IV;
+if IV eq 0;
+  set val IV $PROBE_MS;
+end-if;
+if FK gt 0;
+  get map $CFG 7 BO;
+  if BO eq 0;
+    set val BO $PROBE_BACKOFF;
+  end-if;
+  calc mul IV %BO;
+  free BO;
+end-if;
+if T ge %IV;
+  free IV;
+  get map $CFG 13 PMIN;
+  if PMIN eq 0;
+    set val PMIN $PROBE_MIN;
+  end-if;
+  if IPL ge %PMIN;
+    set val T %NOW;
+    calc div T 1000000;
+    set map $TX 10 %T;
+    set val T 0x08;
+    calc lsh T 56;
+    calc or W %T;
+    set val T %W;
+    calc hton T 64;
+    set bytes 14 8 %T;
+    get skb-ifindex IFX;
+    clone %IFX egress;
+    set val T 0x0C;
+    calc lsh T 56;
+    calc xor W %T;
+    calc hton W 64;
+    set bytes 14 8 %W;
+    calc-map add $TX 11 1;
+  end-if;
+end-if;
+continue;
+EOF
+
+########################################################################
+# Ingress, first: control frames for our own sending direction.
+#   REPORT (type 5): store what the peer measured, run the FEC controller.
+#   NAK (type 4): retransmit from the ARQ ring.
+########################################################################
+emit ingress $P_CTRL "control" <<EOF
+$HEADER
+shared-buffer-map $ARQ $ARQ_DEPTH 1504;
+array-map $ATAG $ARQ_DEPTH;
+match eth-proto 0x88B5;
+get bytes 14 8 W;
+decl TY 8;
+set val TY %W;
+calc rsh TY 61;
+
+if TY eq 5;
+  get time NOW;
+  calc div NOW 1000000;
+  set map $TX 30 %NOW;
+  calc-map add $TX 43 1;
+  get src-mac PM;
+  set map $TX 44 %PM;
+  free PM;
+  decl T 8;
+  get bytes 22 8 V;
+  set map $TX 31 %V;
+  # loss in the last window (basis points), residual loss after FEC/ARQ
+  get bytes 30 8 LOSS;
+  set val V %LOSS;
+  calc rsh V 32;
+  set map $TX 33 %V;
+  calc lsh LOSS 32;
+  calc rsh LOSS 32;
+  set map $TX 32 %LOSS;
+  get bytes 38 8 V;
+  set map $TX 34 %V;
+  get bytes 46 8 V;
+  set map $TX 35 %V;
+  # RTT from the echoed timestamp: now - echoed ts - time the peer held it
+  get bytes 54 8 V;
+  set val T %V;
+  calc rsh T 63;
+  if T eq 1;
+    get time NS;
+    calc div NS 4000;
+    set val T %V;
+    calc rsh T 32;
+    calc sub NS %T;
+    calc and NS 0xFFFFFF;
+    calc mul NS 4;
+    calc lsh V 32;
+    calc rsh V 32;
+    if NS gt %V;
+      calc sub NS %V;
+      get map $TX 21 RTT;
+      if RTT eq 0;
+        set val RTT %NS;
+      else;
+        calc mul RTT 7;
+        calc add RTT %NS;
+        calc div RTT 8;
+      end-if;
+      set map $TX 21 %RTT;
+      free RTT;
+    end-if;
+    free NS;
+  end-if;
+  get bytes 62 8 CAP;
+  set map $TX 36 %CAP;
+  get bytes 70 8 V;
+  set val T %V;
+  calc rsh T 32;
+  set map $TX 37 %T;
+  calc lsh V 32;
+  calc rsh V 32;
+  set map $TX 38 %V;
+  get bytes 78 8 V;
+  set val T %V;
+  calc rsh T 32;
+  set map $TX 39 %T;
+  calc lsh V 32;
+  calc rsh V 32;
+  set map $TX 40 %V;
+  get bytes 86 8 V;
+  set map $TX 41 %V;
+  get bytes 94 8 V;
+  set map $TX 42 %V;
+  get bytes 102 8 V;
+  set map $TX 45 %V;
+
+  # Send rate since the last report (kbit/s = bytes * 8 / ms) and utilisation.
+  get map $TX 19 LMS;
+  get map $TX 3 B;
+  get map $TX 20 LB;
+  set map $TX 19 %NOW;
+  set map $TX 20 %B;
+  set val T %NOW;
+  calc sub T %LMS;
+  if LMS ne 0;
+    if T gt 0;
+      calc sub B %LB;
+      calc mul B 8;
+      calc div B %T;
+      set map $TX 18 %B;
+    end-if;
+  end-if;
+  free LB;
+  free LMS;
+  decl CONG 8;
+  if CAP gt 0;
+    get map $TX 18 B;
+    calc mul B 100;
+    calc div B %CAP;
+    set map $TX 17 %B;
+    get map $CFG 11 V;
+    if V eq 0;
+      set val V $CONG_PCT;
+    end-if;
+    if B ge %V;
+      set val CONG 1;
+    end-if;
+  end-if;
+  # Queueing delay reported by the peer: loss that comes with a growing
+  # queue is congestion too (shapers can hide the bottleneck from probes).
+  get map $TX 35 B;
+  get map $CFG 15 V;
+  if V eq 0;
+    set val V $CONG_DELAY_MS;
+  end-if;
+  calc mul V 1000;
+  if B ge %V;
+    set val CONG 1;
+  end-if;
+  set map $TX 16 %CONG;
+  free B;
+  free CAP;
+
+  # FEC controller. 6 = parity ratio K in use (0 = off), 7 = last time loss
+  # was at or above the threshold, 8 = on/off changes, 22 = on since.
+  get map $TX 6 FK;
+  decl NK 8;
+  set val NK %FK;
+  # mode: 1 = off, 2 = on, 0 or 3 = automatic
+  get map $CFG 14 V;
+  if V eq 0;
+    set val V $FEC_FORCE;
+  end-if;
+  if V eq 3;
+    set val V 0;
+  end-if;
+  if V eq 1;
+    set val NK 0;
+  end-if;
+  if V eq 2;
+    get map $CFG 3 NK;
+    if NK eq 0;
+      set val NK $FEC_K;
+    end-if;
+  end-if;
+  if V eq 0;
+    get map $CFG 1 V;
+    if V eq 0;
+      set val V $FEC_BP;
+    end-if;
+    if LOSS ge %V;
+      set map $TX 7 %NOW;
+      if CONG eq 1;
+        get map $CFG 3 NK;
+        if NK eq 0;
+          set val NK $FEC_K;
+        end-if;
+      else;
+        # one parity per K packets with K = 1 / (4 * loss), within limits
+        set val NK 2500;
+        calc div NK %LOSS;
+        get map $CFG 4 V;
+        if V eq 0;
+          set val V $FEC_KMIN;
+        end-if;
+        if NK lt %V;
+          set val NK %V;
+        end-if;
+        get map $CFG 5 V;
+        if V eq 0;
+          set val V $FEC_KMAX;
+        end-if;
+        if NK gt %V;
+          set val NK %V;
+        end-if;
+      end-if;
+    else;
+      if FK gt 0;
+        get map $TX 7 V;
+        set val T %NOW;
+        calc sub T %V;
+        get map $CFG 2 V;
+        if V eq 0;
+          set val V $COOLDOWN_MS;
+        end-if;
+        if T ge %V;
+          set val NK 0;
+        end-if;
+      end-if;
+    end-if;
+    # floor: FEC never below 1 parity per FLOOR packets (cfg 16 = 16: no floor)
+    get map $CFG 16 V;
+    if V eq 0;
+      set val V $FEC_FLOOR;
+    end-if;
+    if V gt 0;
+      if V le 15;
+        if NK eq 0;
+          set val NK %V;
+        end-if;
+        if NK gt %V;
+          set val NK %V;
+        end-if;
+      end-if;
+    end-if;
+  end-if;
+  if NK gt 15;
+    set val NK 15;
+  end-if;
+  if NK ne %FK;
+    set map $TX 6 %NK;
+    if FK eq 0;
+      calc-map add $TX 8 1;
+      set map $TX 22 %NOW;
+    end-if;
+    if NK eq 0;
+      calc-map add $TX 8 1;
+    end-if;
+  end-if;
+  free NK;
+  free FK;
+  free CONG;
+  free LOSS;
+  free V;
+  free T;
+  free NOW;
+  drop;
+end-if;
+
+if TY eq 4;
+  calc-map add $TX 12 1;
+  decl CNT 8;
+  set val CNT %W;
+  calc rsh CNT 48;
+  calc and CNT 0xFF;
+  decl S 8;
+  set val S %W;
+  calc rsh S 32;
+  calc and S 0xFFFF;
+  # how far back we answer: the whole ring, or less (or nothing) while FEC is on
+  decl LIM 8;
+  set val LIM $ARQ_DEPTH;
+  get map $TX 6 FK;
+  if FK gt 0;
+    get map $CFG 8 V;
+    if V eq 0;
+      set val V $ARQ_MODE;
+    end-if;
+    if V eq 2;
+      calc-map add $TX 15 %CNT;
+      drop;
+    end-if;
+    if V eq 3;
+      get map $CFG 9 LIM;
+      if LIM eq 0;
+        set val LIM $ARQ_FEC_DEPTH;
+      end-if;
+      if LIM gt $ARQ_DEPTH;
+        set val LIM $ARQ_DEPTH;
+      end-if;
+    end-if;
+  end-if;
+  if CNT eq 0;
+    drop;
+  end-if;
+  if CNT gt $NAK_MAX;
+    set val CNT $NAK_MAX;
+  end-if;
+  get map $TX 1 CUR;
+  get dst-mac DM;
+  get src-mac SM;
+  set dst-mac %SM;
+  set src-mac %DM;
+  free SM;
+  free DM;
+  get skb-ifindex IFX;
+  decl AGE 8;
+  decl T 8;
+  start-loop;
+    # age 1 = the last packet sent; seq = next seq - age
+    set val AGE %CUR;
+    calc sub AGE %S;
+    calc and AGE 0xFFFF;
+    if AGE eq 0;
+      calc-map add $TX 14 1;
+    else;
+      if AGE gt %LIM;
+        if AGE le $ARQ_DEPTH;
+          calc-map add $TX 15 1;
+        else;
+          calc-map add $TX 14 1;
+        end-if;
+      else;
+        set val V %CUR;
+        calc sub V %AGE;
+        set val T %V;
+        calc mod T $ARQ_DEPTH;
+        get map $ATAG %T TAG;
+        set val AGE %TAG;
+        calc rsh AGE 16;
+        if AGE eq %V;
+          calc and TAG 0xFFFF;
+          set val V %TAG;
+          calc add V 14;
+          set len %V;
+          load-packet-keyed $ARQ %T %TAG 0 14;
+          # type 3 (retransmission), probe flags cleared
+          get bytes 14 8 RW;
+          calc lsh RW 3;
+          calc rsh RW 3;
+          set val V 0x0C;
+          calc lsh V 56;
+          calc not V;
+          calc and RW %V;
+          set val V 3;
+          calc lsh V 61;
+          calc or RW %V;
+          calc hton RW 64;
+          set bytes 14 8 %RW;
+          clone %IFX egress;
+          calc-map add $TX 13 1;
+        else;
+          calc-map add $TX 14 1;
+        end-if;
+      end-if;
+    end-if;
+    calc add S 1;
+    calc and S 0xFFFF;
+    calc sub CNT 1;
+  loop CNT;
+  drop;
+end-if;
+continue;
+EOF
+
+# dup_clear <indent>: zero every word of the duplicate bitmap.
+dup_clear() {
+cat <<EOF | sed "s/^/$1/"
+decl DK 8;
+set val DK $DUP_WORDS;
+start-loop;
+  calc sub DK 1;
+  set map $DUP %DK 0;
+loop DK;
+free DK;
+EOF
+}
+
+# Duplicate check for a received or recovered sequence number.
+# In: S (16-bit seq). Out: S32 (extended seq), DUPV = 1 if already seen.
+# The bitmap ($DUP, $DUP_WORDS words of 64 seqs) is valid for the word of the
+# highest seq and the next one; older than 960 or further ahead is not checked.
+dedupe_snippet() {
+cat <<EOF
+get map $RX 1 H;
+decl S32 8;
+decl DUPV 8;
+decl T 8;
+if H ne 0;
+  calc sub H 1;
+  set val S32 %S;
+  calc sub S32 %H;
+  calc and S32 0xFFFF;
+  if S32 lt 0x8000;
+    calc add S32 %H;
+  else;
+    set val T 0x10000;
+    calc sub T %S32;
+    set val S32 %H;
+    calc sub S32 %T;
+  end-if;
+  decl CHK 8;
+  set val CHK 1;
+  if S32 le %H;
+    set val T %H;
+    calc sub T %S32;
+    if T ge $DUP_OLD;
+      set val CHK 0;
+    end-if;
+  else;
+    set val T %S32;
+    calc rsh T 6;
+    calc rsh H 6;
+    calc sub T %H;
+    if T ge 2;
+      set val CHK 0;
+    end-if;
+  end-if;
+  if CHK eq 1;
+    set val CHK %S32;
+    calc rsh CHK 6;
+    calc and CHK $((DUP_WORDS - 1));
+    set val T %S32;
+    calc and T 63;
+    set val H 1;
+    calc lsh H %T;
+    calc-map or $DUP %CHK %H OLD;
+    calc and OLD %H;
+    if OLD ne 0;
+      set val DUPV 1;
+    end-if;
+    free OLD;
+  end-if;
+  free CHK;
+end-if;
+free H;
+EOF
+}
+
+########################################################################
+# Ingress, second: parity frames. If exactly one member of the block is
+# missing, rebuild it from the parity and the members received.
+########################################################################
+{
+cat <<EOF
+$HEADER
+shared-buffer-map $FRX $FEC_SLOTS 1504;
+array-map $FSL $((FEC_SLOTS * 4));
+array-map $DUP $DUP_WORDS;
+match eth-proto 0x88B5;
+get bytes 14 8 W;
+decl TY 8;
+set val TY %W;
+calc rsh TY 61;
+if TY ne 2;
+  continue;
+end-if;
+free TY;
+calc-map add $RX 9 1;
+# receive slot = block & (slots - 1); $FSL keys slot*4: +0 block+1, +1 members, +2 seq-xor
+decl SL 8;
+set val SL %W;
+calc rsh SL 24;
+calc and SL 0xFF;
+decl KB 8;
+set val KB %SL;
+calc and KB $((FEC_SLOTS - 1));
+calc mul KB 4;
+get map $FSL %KB TAG;
+calc add SL 1;
+if TAG ne %SL;
+  calc-map add $RX 8 1;
+  drop;
+end-if;
+free TAG;
+set val SL %KB;
+calc div SL 4;
+set map $FSL %KB 0;
+calc add KB 1;
+get map $FSL %KB CNT;
+calc add KB 1;
+get map $FSL %KB RXX;
+free KB;
+decl N 8;
+set val N %W;
+calc rsh N 48;
+calc and N 0xF;
+if CNT eq %N;
+  zero-buffer-keyed $FRX %SL 1504 0;
+  drop;
+end-if;
+calc add CNT 1;
+if CNT ne %N;
+  calc-map add $RX 8 1;
+  zero-buffer-keyed $FRX %SL 1504 0;
+  drop;
+end-if;
+free CNT;
+free N;
+
+# Put back the two bytes the sender's checksum offload may have overwritten.
+decl CB 8;
+set val CB %W;
+calc rsh CB 32;
+calc and CB 0xFFFF;
+calc hton CB 16;
+decl CODE 8;
+set val CODE %W;
+calc rsh CODE 16;
+calc and CODE 0xFF;
+if CODE eq 2;
+  set bytes 58 2 %CB;
+end-if;
+if CODE eq 1;
+  set bytes 48 2 %CB;
+end-if;
+free CODE;
+free CB;
+
+# missing packet = parity xor received members
+get len PL;
+calc sub PL 22;
+xor-packet-keyed $FRX %SL %PL 22 0;
+load-packet-keyed $FRX %SL %PL 0 22;
+zero-buffer-keyed $FRX %SL 1504 0;
+free SL;
+
+# Check it is a sane IPv4 header with a valid header checksum.
+get bytes 22 1 VI;
+if VI ne 0x45;
+  calc-map add $RX 34 1;
+  drop;
+end-if;
+free VI;
+get bytes 24 2 TL;
+if TL lt 20;
+  calc-map add $RX 34 1;
+  drop;
+end-if;
+if TL gt %PL;
+  calc-map add $RX 34 1;
+  drop;
+end-if;
+decl SUM 8;
+decl T 8;
+get bytes 22 8 A;
+set val T %A;
+calc rsh T 48;
+calc add SUM %T;
+set val T %A;
+calc rsh T 32;
+calc and T 0xFFFF;
+calc add SUM %T;
+set val T %A;
+calc rsh T 16;
+calc and T 0xFFFF;
+calc add SUM %T;
+calc and A 0xFFFF;
+calc add SUM %A;
+get bytes 30 8 A;
+set val T %A;
+calc rsh T 48;
+calc add SUM %T;
+set val T %A;
+calc rsh T 32;
+calc and T 0xFFFF;
+calc add SUM %T;
+set val T %A;
+calc rsh T 16;
+calc and T 0xFFFF;
+calc add SUM %T;
+calc and A 0xFFFF;
+calc add SUM %A;
+free A;
+get bytes 38 4 C;
+set val T %C;
+calc rsh T 16;
+calc add SUM %T;
+calc and C 0xFFFF;
+calc add SUM %C;
+free C;
+set val T %SUM;
+calc rsh T 16;
+calc and SUM 0xFFFF;
+calc add SUM %T;
+set val T %SUM;
+calc rsh T 16;
+calc and SUM 0xFFFF;
+calc add SUM %T;
+if SUM ne 0xFFFF;
+  calc-map add $RX 34 1;
+  drop;
+end-if;
+free SUM;
+free T;
+
+# seq of the missing packet = parity seq-xor ^ received seq-xor
+decl S 8;
+set val S %W;
+calc and S 0xFFFF;
+calc xor S %RXX;
+calc and S 0xFFFF;
+free RXX;
+EOF
+dedupe_snippet
+cat <<EOF
+if DUPV eq 1;
+  calc-map add $RX 37 1;
+  drop;
+end-if;
+decl L 8;
+set val L %TL;
+calc add L 22;
+set len %L;
+free L;
+strip-l2 8 0x0800;
+# The rebuilt packet carries its real TCP/UDP checksum: check it here so a bad
+# rebuild is counted and dropped instead of delivered.
+get bytes 20 2 FR;
+calc and FR 0x3FFF;
+if FR eq 0;
+  get bytes 23 1 PR;
+  if PR eq 6;
+    calc-csum tcp CV 14 1500;
+    get bytes 50 2 CF;
+    if CV ne %CF;
+      calc-map add $RX 34 1;
+      drop;
+    end-if;
+  end-if;
+  if PR eq 17;
+    get bytes 40 2 CF;
+    if CF ne 0;
+      calc-csum udp CV 14 1500;
+      if CV ne %CF;
+        calc-map add $RX 34 1;
+        drop;
+      end-if;
+    end-if;
+  end-if;
+end-if;
+calc-map add $RX 6 1;
+accept;
+EOF
+} | emit ingress $P_PARITY "parity"
+
+########################################################################
+# Ingress, third: data and retransmissions from the peer. Sequence, loss,
+# duplicates and reordering; jitter and relative one-way delay; probe pairs;
+# FEC accumulation; decapsulation; NAKs and periodic reports to the peer.
+########################################################################
+{
+cat <<EOF
+$HEADER
+shared-buffer-map $FRX $FEC_SLOTS 1504;
+array-map $FSL $((FEC_SLOTS * 4));
+array-map $DUP $DUP_WORDS;
+match eth-proto 0x88B5;
+get bytes 14 8 W;
+decl TY 8;
+set val TY %W;
+calc rsh TY 61;
+if TY ne 1;
+  if TY ne 3;
+    drop;
+  end-if;
+end-if;
+get time NOW;
+decl FL 8;
+set val FL %W;
+calc rsh FL 56;
+calc and FL 0x1F;
+decl S 8;
+set val S %W;
+calc rsh S 32;
+calc and S 0xFFFF;
+decl T 8;
+
+# Probe pair: remember when probe 1 arrived; probe 2 is a copy - measure
+# the gap, estimate capacity (frame + 24 bytes preamble/IFG/FCS) and drop it.
+if TY eq 1;
+  set val T %FL;
+  calc and T 0x04;
+  if T ne 0;
+    get map $RX 17 P1;
+    calc sub P1 1;
+    if P1 eq %S;
+      get map $RX 18 P1;
+      set val T %NOW;
+      calc sub T %P1;
+      if T gt 0;
+        if T lt 1000000000;
+          get len L4;
+          decl L 8;
+          set val L %L4;
+          free L4;
+          calc add L 24;
+          calc mul L 8000000;
+          calc div L %T;
+          get map $RX 19 CAP;
+          if CAP eq 0;
+            set val CAP %L;
+          else;
+            calc mul CAP 3;
+            calc add CAP %L;
+            calc div CAP 4;
+          end-if;
+          set map $RX 19 %CAP;
+          calc-map add $RX 20 1;
+          free CAP;
+          free L;
+        end-if;
+      end-if;
+      free P1;
+      drop;
+    end-if;
+    free P1;
+  end-if;
+  set val T %FL;
+  calc and T 0x08;
+  if T ne 0;
+    set val T %S;
+    calc add T 1;
+    set map $RX 17 %T;
+    set map $RX 18 %NOW;
+  end-if;
+end-if;
+
+# Sequence: extend to 64 bits around the highest seen (key 1 = highest + 1).
+get map $RX 1 HP;
+decl S32 8;
+decl HH 8;
+decl GAP 8;
+decl NEW 8;
+if HP eq 0;
+  set val S32 %S;
+  set val NEW 1;
+EOF
+dup_clear "  "
+cat <<EOF
+else;
+  set val HH %HP;
+  calc sub HH 1;
+  set val S32 %S;
+  calc sub S32 %HH;
+  calc and S32 0xFFFF;
+  if S32 eq 0;
+    set val S32 %HH;
+  else;
+    if S32 lt 0x8000;
+      set val GAP %S32;
+      calc sub GAP 1;
+      calc add S32 %HH;
+      set val NEW 1;
+      # words entering the duplicate window: (old >> 6) + 2 .. (new >> 6) + 1
+      set val T %S32;
+      calc rsh T 6;
+      set val HP %HH;
+      calc rsh HP 6;
+      calc sub T %HP;
+      if T ge $DUP_WORDS;
+EOF
+dup_clear "        "
+cat <<EOF
+      else;
+        if T gt 0;
+          decl K 8;
+          start-loop;
+            calc add HP 1;
+            set val K %HP;
+            calc add K 1;
+            calc and K $((DUP_WORDS - 1));
+            set map $DUP %K 0;
+            calc sub T 1;
+          loop T;
+          free K;
+        end-if;
+      end-if;
+    else;
+      set val T 0x10000;
+      calc sub T %S32;
+      set val S32 %HH;
+      calc sub S32 %T;
+      # backwards and the peer says its sequence restarted: start over.
+      # Only new data counts: a retransmission is a stored copy and keeps
+      # the flag of the original, so on a long link it arrives far behind.
+      if TY eq 1;
+        set val HP %FL;
+        calc and HP 0x01;
+        if HP ne 0;
+          if T ge 64;
+            set val S32 %S;
+            set val NEW 2;
+          end-if;
+        end-if;
+      end-if;
+    end-if;
+  end-if;
+end-if;
+# a jump of more than 16384 is a restart too, not loss
+if GAP gt 16384;
+  set val NEW 2;
+end-if;
+if NEW eq 2;
+  set val GAP 0;
+  set val NEW 1;
+  calc-map add $RX 36 1;
+EOF
+dup_clear "  "
+cat <<EOF
+end-if;
+free HP;
+if NEW eq 1;
+  set val T %S32;
+  calc add T 1;
+  set map $RX 1 %T;
+end-if;
+
+# Duplicate check: test-and-set the bit for this seq.
+decl CHK 8;
+set val CHK 1;
+if NEW eq 0;
+  set val T %HH;
+  calc sub T %S32;
+  if T ge $DUP_OLD;
+    set val CHK 0;
+    calc-map add $RX 31 1;
+  end-if;
+end-if;
+if CHK eq 1;
+  set val CHK %S32;
+  calc rsh CHK 6;
+  calc and CHK $((DUP_WORDS - 1));
+  set val T %S32;
+  calc and T 63;
+  decl B 8;
+  set val B 1;
+  calc lsh B %T;
+  calc-map or $DUP %CHK %B OLD;
+  calc and OLD %B;
+  if OLD ne 0;
+    if TY eq 3;
+      calc-map add $RX 38 1;
+    else;
+      calc-map add $RX 3 1;
+    end-if;
+    drop;
+  end-if;
+  free OLD;
+  free B;
+end-if;
+free CHK;
+if NEW eq 0;
+  if TY eq 1;
+    calc-map add $RX 4 1;
+  else;
+    calc-map add $RX 7 1;
+  end-if;
+else;
+  if TY eq 3;
+    calc-map add $RX 7 1;
+  end-if;
+end-if;
+free S32;
+free NEW;
+if GAP gt 0;
+  calc-map add $RX 5 %GAP;
+end-if;
+if TY eq 1;
+  calc-map add $RX 2 1;
+end-if;
+
+decl MS 8;
+set val MS %NOW;
+calc div MS 1000000;
+if TY eq 1;
+  # Transit = arrival - sender timestamp (4 us units, mod 2^24). The clocks
+  # are not synchronised; only differences of transit times are used.
+  decl TR 8;
+  set val TR %NOW;
+  calc div TR 4000;
+  set val T %W;
+  calc and T 0xFFFFFF;
+  calc sub TR %T;
+  calc and TR 0xFFFFFF;
+  # Jitter (RFC 3550): J += (|D| - J) / 16, kept as 16 * J in 4 us units.
+  get map $RX 12 LT;
+  if LT ne 0;
+    calc sub LT 1;
+    set val T %TR;
+    calc sub T %LT;
+    calc and T 0xFFFFFF;
+    if T ge 0x800000;
+      set val LT 0x1000000;
+      calc sub LT %T;
+      set val T %LT;
+    end-if;
+    get map $RX 11 J;
+    set val LT %J;
+    calc div LT 16;
+    calc sub J %LT;
+    calc add J %T;
+    set map $RX 11 %J;
+    free J;
+  end-if;
+  free LT;
+  set val T %TR;
+  calc add T 1;
+  set map $RX 12 %T;
+  # Relative one-way delay: transit minus the smallest transit seen in this
+  # and the previous 30 s window, i.e. the queueing delay on top of the base.
+  get map $RX 15 WS;
+  get map $RX 13 MC;
+  set val T %MS;
+  calc sub T %WS;
+  if T ge 30000;
+    set map $RX 14 %MC;
+    set map $RX 15 %MS;
+    set val MC 0;
+  end-if;
+  free WS;
+  if MC eq 0;
+    set val MC %TR;
+    calc add MC 1;
+  else;
+    set val T %TR;
+    calc add T 1;
+    calc sub T %MC;
+    calc and T 0xFFFFFF;
+    if T ge 0x800000;
+      set val MC %TR;
+      calc add MC 1;
+    end-if;
+  end-if;
+  set map $RX 13 %MC;
+  calc sub MC 1;
+  get map $RX 14 MP;
+  if MP ne 0;
+    calc sub MP 1;
+    set val T %MP;
+    calc sub T %MC;
+    calc and T 0xFFFFFF;
+    if T ge 0x800000;
+      set val MC %MP;
+    end-if;
+  end-if;
+  free MP;
+  set val T %TR;
+  calc sub T %MC;
+  calc and T 0xFFFFFF;
+  if T ge 0x800000;
+    set val T 0;
+  end-if;
+  calc mul T 4;
+  free MC;
+  free TR;
+  get map $RX 16 OW;
+  calc mul OW 7;
+  calc add OW %T;
+  calc div OW 8;
+  set map $RX 16 %OW;
+  free OW;
+  # timestamp to echo in the next report (RTT), 1 << 24 marks it valid
+  set val T %W;
+  calc and T 0xFFFFFF;
+  calc or T 0x1000000;
+  set map $RX 21 %T;
+  set map $RX 22 %NOW;
+  # the peer's FEC state for this direction (its K, 0 = off)
+  set val T %FL;
+  calc and T 0x02;
+  if T ne 0;
+    set val T %W;
+    calc rsh T 52;
+    calc and T 0xF;
+  end-if;
+  set map $RX 30 %T;
+  set map $RX 32 %MS;
+
+end-if;
+free FL;
+
+# Control frame due? 1 = NAK for the gap just seen, 2 = report.
+decl CT 8;
+if GAP gt 0;
+  set val CT 1;
+else;
+  get map $RX 23 RL;
+  set val T %MS;
+  calc sub T %RL;
+  free RL;
+  get map $CFG 10 RI;
+  if RI eq 0;
+    set val RI $REPORT_MS;
+  end-if;
+  if T ge %RI;
+    set val CT 2;
+  end-if;
+  free RI;
+end-if;
+
+# Hand over to the next program: cb[0] = 0xDA7A0000 | control frame due,
+# cb[1] = gap size, cb[2] = first missing seq.
+set val T 0xDA7A;
+calc lsh T 16;
+calc or T %CT;
+set skb-cb 0 %T;
+set skb-cb 1 %GAP;
+calc add HH 1;
+calc and HH 0xFFFF;
+set skb-cb 2 %HH;
+continue;
+EOF
+} | emit ingress $P_DATA "receiver"
+
+########################################################################
+# Ingress, fourth: packets accepted by the receiver program. Fold FEC block
+# members into their slot, decapsulate and deliver; send NAKs and reports.
+########################################################################
+{
+cat <<EOF
+$HEADER
+shared-buffer-map $FRX $FEC_SLOTS 1504;
+array-map $FSL $((FEC_SLOTS * 4));
+match eth-proto 0x88B5;
+get skb-cb 0 C0;
+decl CT 8;
+set val CT %C0;
+calc rsh C0 16;
+if C0 ne 0xDA7A;
+  drop;
+end-if;
+calc and CT 0xFF;
+get skb-cb 1 G4;
+decl GAP 8;
+set val GAP %G4;
+get skb-cb 2 H4;
+decl HH 8;
+set val HH %H4;
+set skb-cb 0 0;
+free H4;
+free G4;
+free C0;
+get bytes 14 8 W;
+decl TY 8;
+set val TY %W;
+calc rsh TY 61;
+decl S 8;
+set val S %W;
+calc rsh S 32;
+calc and S 0xFFFF;
+decl T 8;
+if TY eq 1;
+  set val T %W;
+  calc rsh T 56;
+  calc and T 0x10;
+  if T ne 0;
+    # FEC: fold block members, as received, into the slot for their block.
+    decl SL 8;
+    set val SL %W;
+    calc rsh SL 24;
+    calc and SL 0xFF;
+    decl KB 8;
+    set val KB %SL;
+    calc and KB $((FEC_SLOTS - 1));
+    set val T %KB;
+    calc mul KB 4;
+    get map $FSL %KB TAG;
+    calc add SL 1;
+    if TAG ne %SL;
+      zero-buffer-keyed $FRX %T 1504 0;
+      set map $FSL %KB %SL;
+      calc add KB 1;
+      set map $FSL %KB 0;
+      calc add KB 1;
+      set map $FSL %KB 0;
+      calc sub KB 2;
+    end-if;
+    free TAG;
+    free SL;
+    free KB;
+    # Fold in the packet's true TCP/UDP checksum, as the sender did: virtual
+    # NICs (veth, virtio) can deliver packets whose checksum field still holds
+    # the unfinished value.
+    get bytes 24 2 IPL;
+    get bytes 28 2 FR;
+    calc and FR 0x3FFF;
+    get bytes 31 1 PR;
+    decl DONE 8;
+    if FR eq 0;
+      if PR eq 6;
+        get bytes 58 2 CS;
+        calc-csum tcp TV 22 1500;
+        calc hton TV 16;
+        set bytes 58 2 %TV;
+        xor-packet-keyed $FRX %T %IPL 22 0;
+        calc hton CS 16;
+        set bytes 58 2 %CS;
+        set val DONE 1;
+      end-if;
+      if PR eq 17;
+        get bytes 48 2 CS;
+        if CS ne 0;
+          calc-csum udp TV 22 1500;
+          calc hton TV 16;
+          set bytes 48 2 %TV;
+          xor-packet-keyed $FRX %T %IPL 22 0;
+          calc hton CS 16;
+          set bytes 48 2 %CS;
+          set val DONE 1;
+        end-if;
+      end-if;
+    end-if;
+    if DONE eq 0;
+      xor-packet-keyed $FRX %T %IPL 22 0;
+    end-if;
+    free DONE;
+    free TV;
+    free CS;
+    free PR;
+    free FR;
+    free IPL;
+    calc mul T 4;
+    calc add T 1;
+    calc-map add $FSL %T 1;
+    calc add T 1;
+    calc-map xor $FSL %T %S;
+  end-if;
+end-if;
+
+# Decapsulate. Retransmitted packets may carry a partial checksum (they were
+# stored before the sender's NIC filled it in): recompute it.
+strip-l2 8 0x0800;
+if TY eq 3;
+  get bytes 20 2 FR;
+  calc and FR 0x3FFF;
+  if FR eq 0;
+    get bytes 23 1 PR;
+    if PR eq 6;
+      recalc-tcp-csum 14 1500;
+    end-if;
+    if PR eq 17;
+      recalc-udp-csum 14 1500;
+    end-if;
+    free PR;
+  end-if;
+  free FR;
+end-if;
+if CT eq 0;
+  accept;
+end-if;
+
+# Deliver a copy, and turn this packet into the control frame for the peer.
+get skb-ifindex IFX;
+clone %IFX ingress;
+get dst-mac DM;
+get src-mac SM;
+set dst-mac %SM;
+set src-mac %DM;
+set map $RX 33 %SM;
+free DM;
+free SM;
+set eth-proto 0x88B5;
+if CT eq 1;
+  set len 60;
+  if GAP gt $NAK_MAX;
+    set val GAP $NAK_MAX;
+  end-if;
+  set val W 4;
+  calc lsh W 61;
+  calc lsh GAP 48;
+  calc or W %GAP;
+  calc lsh HH 32;
+  calc or W %HH;
+  calc hton W 64;
+  set bytes 14 8 %W;
+  calc-map add $RX 10 1;
+  redirect %IFX egress;
+end-if;
+
+# Report: 11 values of 8 bytes after the header.
+get time NOW;
+decl MS 8;
+set val MS %NOW;
+calc div MS 1000000;
+set len 110;
+set map $RX 23 %MS;
+calc-map add $RX 29 1;
+set val W 5;
+calc lsh W 61;
+calc hton W 64;
+set bytes 14 8 %W;
+get map $RX 2 V;
+calc hton V 64;
+set bytes 22 8 %V;
+# raw loss = gaps - late arrivals; residual = raw - FEC - ARQ recoveries
+get map $RX 5 G;
+get map $RX 4 RO;
+decl RAW 8;
+if G ge %RO;
+  set val RAW %G;
+  calc sub RAW %RO;
+end-if;
+set val V %RO;
+set val T %G;
+calc hton T 64;
+set bytes 94 8 %T;
+get map $RX 3 G;
+calc lsh G 32;
+calc or V %G;
+calc hton V 64;
+set bytes 70 8 %V;
+get map $RX 6 G;
+get map $RX 7 RO;
+decl RES 8;
+set val RES %RAW;
+if RES ge %G;
+  calc sub RES %G;
+else;
+  set val RES 0;
+end-if;
+if RES ge %RO;
+  calc sub RES %RO;
+else;
+  set val RES 0;
+end-if;
+calc lsh G 32;
+calc or G %RO;
+calc hton G 64;
+set bytes 78 8 %G;
+set val T %RES;
+calc hton T 64;
+set bytes 86 8 %T;
+# this window: packets expected (seq advance), raw and residual loss
+get map $RX 1 G;
+get map $RX 24 RO;
+set map $RX 24 %G;
+calc sub G %RO;
+set map $RX 35 %G;
+set val T %G;
+calc hton T 64;
+set bytes 102 8 %T;
+get map $RX 25 RO;
+set map $RX 25 %RAW;
+if RAW ge %RO;
+  calc sub RAW %RO;
+else;
+  set val RAW 0;
+end-if;
+get map $RX 26 RO;
+set map $RX 26 %RES;
+if RES ge %RO;
+  calc sub RES %RO;
+else;
+  set val RES 0;
+end-if;
+free RO;
+if G gt 0;
+  calc mul RAW 10000;
+  calc div RAW %G;
+  calc mul RES 10000;
+  calc div RES %G;
+end-if;
+set map $RX 27 %RAW;
+set map $RX 28 %RES;
+calc lsh RES 32;
+calc or RES %RAW;
+calc hton RES 64;
+set bytes 30 8 %RES;
+free RES;
+free RAW;
+free G;
+# jitter in us (16 * J, 4 us units), relative one-way delay in us
+get map $RX 11 V;
+calc div V 4;
+calc hton V 64;
+set bytes 38 8 %V;
+get map $RX 16 V;
+calc hton V 64;
+set bytes 46 8 %V;
+# echo: valid:1 | ts:24 << 32 | time held in us
+get map $RX 21 V;
+if V ne 0;
+  get map $RX 22 T2;
+  set val T %NOW;
+  calc sub T %T2;
+  free T2;
+  calc div T 1000;
+  calc lsh T 32;
+  calc rsh T 32;
+  calc and V 0xFFFFFF;
+  calc lsh V 32;
+  calc or V %T;
+  set val T 1;
+  calc lsh T 63;
+  calc or V %T;
+end-if;
+calc hton V 64;
+set bytes 54 8 %V;
+get map $RX 19 V;
+calc hton V 64;
+set bytes 62 8 %V;
+redirect %IFX egress;
+EOF
+} | emit ingress $P_DELIVER "deliver"

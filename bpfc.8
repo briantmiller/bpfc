@@ -63,17 +63,21 @@ Name the TC filter \fIname\fR (shown by \fBtc filter show\fR) and the kernel pro
 .B \-I
 After attaching, print one line describing the program:
 .EX
-BPFC_INFO id=<id> tag=<tag> insns=<n> iface=<if> dir=<dir> prio=<p> proto=<0xNNNN> name=<name>
+BPFC_INFO id=<id> tag=<tag> insns=<n> iface=<if> dir=<dir> prio=<p> proto=<0xNNNN> name=<name> [verified=<n>]
 .EE
+\fBverified\fR (kernel 5.16 and later) is the number of instructions the verifier processed; the kernel rejects a program that reaches 1,000,000.
 .TP
 .BI \-f " file"
 Read instructions from \fIfile\fR (\fB\-\fR for standard input). Line breaks act as spaces, and a \fB#\fR at the start of an instruction begins a comment that ends at the end of the line.
 .TP
 .BI \-m " map_dir"
-Directory for pinned maps (default \fI/sys/fs/bpf\fR).
+Directory for pinned maps (default \fI/sys/fs/bpf\fR). A map is pinned there under its name, which must be 1\-31 characters without \fB/\fR; the kernel's own name for it is the last 15 characters, with characters other than letters, digits, \fB_\fR and \fB.\fR replaced by \fB_\fR.
 .TP
 .BI \-r " map"
 Print the contents of a pinned map and exit.
+.TP
+.BI \-w " map key value"
+Write a 64-bit \fIvalue\fR under \fIkey\fR in a pinned 8-byte map (for example a program's runtime settings) and exit. Numbers may be decimal or 0x hexadecimal.
 .TP
 .B \-v
 Verbose compiler output.
@@ -137,6 +141,54 @@ Encapsulates the original frame within an Outer IPv4 header and GRE key header.
 .TP
 .B "decap-gre"
 Strips 28 bytes of Outer IPv4 + GRE headers.
+.SS Atomic Map Updates
+.TP
+.BI "calc-map " "op map key value [OLD]"
+Applies \fIop\fR (\fBadd\fR, \fBor\fR, \fBand\fR, \fBxor\fR or \fBxchg\fR) atomically to the 64-bit value under \fIkey\fR, creating it as 0 if missing. With \fIOLD\fR (required for \fBxchg\fR) the previous value is stored in that 8-byte variable. Unlike \fBget map\fR / \fBset map\fR, updates from several CPUs at once are never lost. Needs kernel 5.12 (RHEL 9).
+.TP
+.BI "array-map " "map entries"
+Declare \fImap\fR as an array of \fIentries\fR 64-bit values with keys 0..\fIentries\fR\-1, instead of the default LRU hash map of 10000 entries. Entries are never evicted and start at 0; a key out of range reads as 0 and is not stored. Works with \fBget map\fR, \fBset map\fR, \fBcalc-map\fR, \fB\-r\fR and \fB\-w\fR. A pinned map of another size is replaced.
+.SS Buffer Maps
+.TP
+.BI "buffer-map " "map [value_size]"
+.TQ
+.BI "shared-buffer-map " "map [entries [value_size]]"
+Declare a per-CPU (1 entry) or shared buffer map before it is used, with smaller values than the default 18000 bytes (and 10000 entries). A copy at a constant offset in the buffer may fill the rest of the entry; with a variable offset, offset and length are each capped at \fIvalue_size\fR/2. A pinned map of other sizes is replaced; one used without a declaration keeps its own sizes.
+.TP
+.BI "xor-packet " "map len [src [dst]]"
+.TQ
+.BI "xor-packet-keyed " "map key len [src [dst]]"
+XOR \fIlen\fR bytes of the packet from offset \fIsrc\fR into the buffer at \fIdst\fR (rounded down to a multiple of 8), with 64-bit atomic operations. Bytes past the end of the packet count as zero. Used to build and use XOR parity (forward error correction).
+.TP
+.BI "zero-buffer " "map len [dst]"
+.TQ
+.BI "zero-buffer-keyed " "map key len [dst]"
+Zero \fIlen\fR bytes (rounded up to a multiple of 8) of a buffer entry.
+.SS Checksums
+.TP
+.BI "recalc-tcp-csum " "[l3_offset [max_len]]"
+.TQ
+.BI "recalc-udp-csum " "[l3_offset [max_len]]"
+Recompute the TCP or UDP checksum of the IPv4 packet whose header starts at \fIl3_offset\fR (default 14) from scratch: any IHL, length taken from the IP header (Ethernet padding is ignored), up to \fImax_len\fR bytes (default 9000; a lower limit makes the program cheaper to verify). Earlier versions assumed a 20-byte header and failed on packets over 512 bytes. Use it on ingress, or on egress only for packets without checksum offload pending: on egress, locally sent TCP/UDP packets usually still carry a partial checksum that the kernel or NIC completes after the program, and a full checksum written there would be summed again.
+.TP
+.BI "calc-csum " "tcp|udp VAR [l3_offset [max_len]]"
+Compute the correct checksum without changing the packet (the current checksum field is ignored) and store it in \fIVAR\fR in host byte order, like \fBget bytes\fR. Useful to check a packet, or to see the checksum a packet will have after checksum offload.
+.SS Layer-2 Shims
+.TP
+.BI "insert-l2 " "len [ethertype]"
+Insert \fIlen\fR zero bytes (1\-64) after the Ethernet header with \fBbpf_skb_adjust_room\fR and optionally set the EtherType. Network and transport headers keep their place in memory, so checksum offload still works. Only for IPv4/IPv6 packets.
+.TP
+.BI "strip-l2 " "len ethertype"
+Remove \fIlen\fR bytes (a multiple of 4, 4\-56) after the Ethernet header and set the EtherType, whatever the packet's protocol (\fBbpf_skb_adjust_room\fR refuses non-IP packets). Uses the VLAN helpers; the payload is not copied, and skb->protocol is updated so the stack accepts the packet directly.
+.SS Other
+.TP
+.BI "get cpu " "VAR"
+The number of the CPU running the program, for per-CPU state in ordinary maps.
+.TP
+.BI "calc hton " "VAR [bits]"
+.TQ
+.BI "calc ntoh " "VAR [bits]"
+Convert between host and network byte order. \fBget bytes\fR returns host order and \fBset bytes\fR with a variable writes it as stored, so convert before writing.
 .SS Advanced Actions
 .TP
 .BI "add-bytes " "offset hex_string"

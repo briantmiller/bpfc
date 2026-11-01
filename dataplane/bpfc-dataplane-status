@@ -1,0 +1,447 @@
+#!/bin/bash
+# bpfc-dataplane-status - link quality and what the FEC / ARQ / INT dataplane
+# is doing about it, per interface. Reads the dataplane maps with "bpfc -r".
+#
+#   bpfc-dataplane-status [options] [interface...]
+#   bpfc-dataplane-status set <interface> <setting> <value>
+#   bpfc-dataplane-status unset <interface> <setting>
+#
+# Must run as root (reads pinned eBPF maps).
+
+BPFC=${BPFC:-bpfc}
+CONF=/etc/bpfc/bpfc.conf
+CONFIG_DIR=""
+MAP_DIR=""
+ONELINE=0
+
+usage() {
+cat <<EOF
+Usage: $(basename "$0") [-m map_dir] [-c config_dir] [-1] [interface...]
+       $(basename "$0") set <interface> <setting> <value>
+       $(basename "$0") unset <interface> <setting>
+
+Shows, for each interface running the dataplane (all of them by default):
+the peer, the quality of the link in each direction, and what FEC, ARQ and
+probing are doing.
+
+  -m DIR   pinned map directory (default: map_dir in $CONF, else /sys/fs/bpf)
+  -c DIR   program directory (default: config_dir in $CONF, else /etc/bpfc/interfaces.d)
+  -1       one line of key=value per interface, for monitoring
+  -h       help
+
+Settings for set/unset (take effect at once, survive program reloads,
+"unset" returns to the generated value):
+  fec-mode auto|on|off      fec-threshold PCT       fec-cooldown SEC
+  fec-k N   fec-k-min N   fec-k-max N               fec-timeout MS
+  arq-with-fec keep|off|N   report-interval MS      congestion-pct N
+  congestion-delay MS       probe-interval SEC      probe-backoff N
+  probe-min-bytes N         fec-floor N|off
+Times take ms, s or m. Buffer sizes (ARQ ring, duplicate window, FEC slots)
+are fixed when the programs are generated: regenerate to change them.
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+conf_get() {   # conf_get <key>: value from bpfc.conf
+    [ -r "$CONF" ] || return
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*/\1/p" "$CONF" | tail -1
+}
+
+# ---------------------------------------------------------------- reading
+
+declare -A TX RX CFG SET
+
+read_map() {   # read_map <assoc array name> <map>
+    local -n _m=$1
+    _m=()
+    local k v
+    while read -r _ _ k _ _ v; do
+        [[ "$k" == 0x* && "$v" == 0x* ]] || continue
+        _m[$((16#${k#0x}))]=$((16#${v#0x}))
+    done < <("$BPFC" -m "$MAP_DIR" -r "$2" 2>/dev/null)
+}
+
+g() { local -n _m=$1; echo "${_m[$2]:-0}"; }   # g <array> <key>, 0 if missing
+
+now_ms() {     # CLOCK_MONOTONIC, the clock the programs use (bpf_ktime_get_ns)
+    local ns
+    ns=$(sed -n 's/^now at \([0-9]*\) nsecs.*/\1/p' /proc/timer_list 2>/dev/null | head -1)
+    if [ -n "$ns" ]; then echo $((ns / 1000000)); return; fi
+    awk '{printf "%d\n", $1 * 1000}' /proc/uptime     # close enough unless suspended
+}
+
+load_settings() {   # generated settings from the program header, then runtime overrides
+    local f="$1"
+    SET=([arq_depth]=10 [arq_mode]=3 [arq_fec_depth]=3 [fec_bp]=100 [cooldown_ms]=10000
+         [k]=8 [kmin]=2 [kmax]=15 [timeout_ms]=50 [fec_mode]=0 [report_ms]=1000
+         [probe_ms]=10000 [backoff]=6 [probe_min]=600 [cong_pct]=85 [cong_delay_ms]=20
+         [floor]=0 [profile]=none [link_rate]=0 [rtt_ms]=0 [sizing_bytes]=1000 [dup_words]=16 [fec_slots]=16)
+    if [ -r "$f" ]; then
+        local line kv
+        line=$(sed -n 's/^# dataplane: //p' "$f" | head -1)
+        for kv in $line; do SET[${kv%%=*}]=${kv#*=}; done
+    fi
+    local c
+    c=$(g CFG 1);  [ "$c" -gt 0 ] && SET[fec_bp]=$c
+    c=$(g CFG 2);  [ "$c" -gt 0 ] && SET[cooldown_ms]=$c
+    c=$(g CFG 3);  [ "$c" -gt 0 ] && SET[k]=$c
+    c=$(g CFG 4);  [ "$c" -gt 0 ] && SET[kmin]=$c
+    c=$(g CFG 5);  [ "$c" -gt 0 ] && SET[kmax]=$c
+    c=$(g CFG 6);  [ "$c" -gt 0 ] && SET[probe_ms]=$c
+    c=$(g CFG 7);  [ "$c" -gt 0 ] && SET[backoff]=$c
+    c=$(g CFG 8);  [ "$c" -gt 0 ] && SET[arq_mode]=$c
+    c=$(g CFG 9);  [ "$c" -gt 0 ] && SET[arq_fec_depth]=$c
+    c=$(g CFG 10); [ "$c" -gt 0 ] && SET[report_ms]=$c
+    c=$(g CFG 11); [ "$c" -gt 0 ] && SET[cong_pct]=$c
+    c=$(g CFG 12); [ "$c" -gt 0 ] && SET[timeout_ms]=$c
+    c=$(g CFG 13); [ "$c" -gt 0 ] && SET[probe_min]=$c
+    c=$(g CFG 14); [ "$c" -gt 0 ] && SET[fec_mode]=$c
+    c=$(g CFG 15); [ "$c" -gt 0 ] && SET[cong_delay_ms]=$c
+    c=$(g CFG 16); [ "$c" -gt 0 ] && SET[floor]=$c
+    [ "${SET[floor]}" -gt 15 ] && SET[floor]=0
+    [ "${SET[fec_mode]}" = 3 ] && SET[fec_mode]=0
+    return 0
+}
+
+# ---------------------------------------------------------------- formatting
+
+pct() {        # basis points -> "1.23 %"
+    printf "%d.%02d %%" $(($1 / 100)) $(($1 % 100))
+}
+rate() {       # kbit/s -> human
+    local k=$1
+    if   [ "$k" -ge 1000000 ]; then printf "%d.%d Gbit/s" $((k / 1000000)) $((k % 1000000 / 100000))
+    elif [ "$k" -ge 1000 ];    then printf "%d.%d Mbit/s" $((k / 1000)) $((k % 1000 / 100))
+    else printf "%d kbit/s" "$k"; fi
+}
+dur_us() {     # microseconds -> "4.1 ms" / "250 us"
+    local u=$1
+    if [ "$u" -ge 1000 ]; then printf "%d.%d ms" $((u / 1000)) $((u % 1000 / 100)); else printf "%d us" "$u"; fi
+}
+age() {        # milliseconds -> "0.4 s" / "12 s" / "5 min" / "2 h"
+    local m=$1
+    if   [ "$m" -lt 10000 ];   then printf "%d.%d s" $((m / 1000)) $((m % 1000 / 100))
+    elif [ "$m" -lt 120000 ];  then printf "%d s" $((m / 1000))
+    elif [ "$m" -lt 7200000 ]; then printf "%d min" $((m / 60000))
+    else printf "%d h" $((m / 3600000)); fi
+}
+mac() {        # MAC stored as the 6 packet bytes in a little-endian u64
+    local v=$1 i out=""
+    for i in 0 1 2 3 4 5; do out+=$(printf "%02x" $(((v >> (8 * i)) & 255))); [ $i -lt 5 ] && out+=":"; done
+    echo "$out"
+}
+
+# ---------------------------------------------------------------- set / unset
+
+parse_dur() {  # <value> <default unit s|ms> -> milliseconds
+    local v=${1,,}
+    [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)(ms|s|m)?$ ]] || return 1
+    awk -v n="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[3]:-$2}" \
+        'BEGIN{f = (u=="ms")?1:(u=="s")?1000:60000; printf "%.0f\n", n*f}'
+}
+
+cfg_key() {    # setting name -> cfg map key
+    case "$1" in
+        fec-threshold) echo 1 ;; fec-cooldown) echo 2 ;; fec-k) echo 3 ;; fec-k-min) echo 4 ;;
+        fec-k-max) echo 5 ;; probe-interval) echo 6 ;; probe-backoff) echo 7 ;;
+        arq-with-fec) echo 8 ;; report-interval) echo 10 ;; congestion-pct) echo 11 ;;
+        fec-timeout) echo 12 ;; probe-min-bytes) echo 13 ;; fec-mode) echo 14 ;;
+        congestion-delay) echo 15 ;; fec-floor) echo 16 ;; *) return 1 ;;
+    esac
+}
+
+do_set() {     # do_set <iface> <setting> <value|unset>
+    local ifc="$1" name="$2" val="$3" key prefix
+    key=$(cfg_key "$name") || die "unknown setting '$name' (see -h)"
+    prefix=$(find_prefix "$ifc")
+    local map="${prefix}_cfg" v
+    if [ "$val" = "unset" ]; then
+        v=0
+        [ "$name" = arq-with-fec ] && "$BPFC" -m "$MAP_DIR" -w "$map" 9 0 >/dev/null
+    else
+        case "$name" in
+            fec-threshold)
+                [[ "$val" =~ ^[0-9]+(\.[0-9]{1,2})?$ ]] || die "fec-threshold is a percentage, e.g. 1 or 0.5"
+                v=$(awk -v p="$val" 'BEGIN{printf "%d", p*100 + 0.5}') ;;
+            fec-cooldown|probe-interval)
+                v=$(parse_dur "$val" s) || die "$name is a time, e.g. 10s (a bare number is seconds)" ;;
+            fec-timeout|report-interval|congestion-delay)
+                v=$(parse_dur "$val" ms) || die "$name is a time, e.g. 50ms (a bare number is milliseconds)" ;;
+            fec-floor)
+                case "$val" in off|0) v=16 ;;
+                    *) [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ] && [ "$val" -le 15 ] || die "fec-floor is 1-15 or off"; v=$val ;;
+                esac ;;
+            fec-mode)
+                case "$val" in auto) v=3 ;; off) v=1 ;; on) v=2 ;; *) die "fec-mode is auto, on or off" ;; esac ;;
+            arq-with-fec)
+                case "$val" in
+                    keep) v=1 ;; off) v=2 ;;
+                    *) [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ] || die "arq-with-fec is keep, off or a number"
+                       v=3; "$BPFC" -m "$MAP_DIR" -w "$map" 9 "$val" >/dev/null || exit 1 ;;
+                esac ;;
+            *) [[ "$val" =~ ^[0-9]+$ ]] || die "$name needs a whole number"; v=$val ;;
+        esac
+        [ "$v" -gt 0 ] || die "$name must be greater than 0"
+    fi
+    "$BPFC" -m "$MAP_DIR" -w "$map" "$key" "$v" >/dev/null || exit 1
+    if [ "$val" = "unset" ]; then echo "$ifc: $name back to the generated value"
+    else echo "$ifc: $name set to $val"; fi
+}
+
+# ---------------------------------------------------------------- discovery
+
+# map_id <name>: the generator's default prefix, "dp" + 8 base32 characters
+# of SHA-256(name) (keep in step with bpfc-dataplane-gen)
+map_id() {
+    local h n a=abcdefghijklmnopqrstuvwxyz234567 out="" i
+    h=$(printf '%s' "$1" | sha256sum); n=$((16#${h:0:10}))
+    for i in 1 2 3 4 5 6 7 8; do out=${a:$((n & 31)):1}$out; n=$((n >> 5)); done
+    echo "dp$out"
+}
+pct_encode() {   # the interface name in key=value output
+    local LC_ALL=C s=$1 out="" c i
+    for ((i = 0; i < ${#s}; i++)); do
+        c=${s:i:1}
+        if [[ "$c" =~ ^[A-Za-z0-9_.@+-]$ ]]; then out+=$c; else out+=$(printf '%%%02X' "'$c"); fi
+    done
+    echo "$out"
+}
+
+find_prefix() {   # interface -> map prefix (from the program header, else the default)
+    local f="$CONFIG_DIR/$1/egress"
+    local p
+    p=$(sed -n 's/^# dataplane: .* prefix=\([^ ]*\).*/\1/p' "$f"/*.bpfc 2>/dev/null | head -1)
+    echo "${p:-$(map_id "$1")}"
+}
+
+list_ifaces() {
+    local f i
+    for f in "$CONFIG_DIR"/*/egress/*.bpfc; do
+        [ -r "$f" ] || continue
+        grep -q '^# dataplane: ' "$f" || continue
+        i=${f#"$CONFIG_DIR"/}; echo "${i%%/*}"
+    done | sort -u
+}
+
+# ---------------------------------------------------------------- report
+
+show() {
+    local ifc="$1" prefix hdr now ifkv
+    prefix=$(find_prefix "$ifc")
+    ifkv="iface=$(pct_encode "$ifc") maps=$prefix"
+    hdr=$(ls "$CONFIG_DIR/$ifc"/egress/*.bpfc 2>/dev/null | head -1)
+    read_map TX "${prefix}_tx"
+    read_map RX "${prefix}_rx"
+    read_map CFG "${prefix}_cfg"
+    load_settings "$hdr"
+    now=$(now_ms)
+
+    if [ ! -e "$MAP_DIR/${prefix}_tx" ]; then
+        if [ $ONELINE -eq 1 ]; then echo "$ifkv health=\"NOT RUNNING\""
+        else echo "$ifc  NOT RUNNING - no map ${prefix}_tx in $MAP_DIR (programs not installed?)"; echo; fi
+        return
+    fi
+    if [ ${#TX[@]} -eq 0 ] && [ ${#RX[@]} -eq 0 ]; then
+        if [ $ONELINE -eq 1 ]; then echo "$ifkv health=\"IDLE\""
+        else echo "$ifc  IDLE - installed, no traffic yet"; echo; fi
+        return
+    fi
+
+    local rep_ms=${SET[report_ms]} stale=$((3 * SET[report_ms]))
+    [ $stale -lt 5000 ] && stale=5000
+    local r_last r_cnt d_last seen peer peer_state
+    r_last=$(g TX 30); r_cnt=$(g TX 43); d_last=$(g RX 32)
+    seen=$r_last; [ "$d_last" -gt "$seen" ] && seen=$d_last
+    peer=$(g TX 44); [ "$peer" -eq 0 ] && peer=$(g RX 33)
+    if [ "$seen" -eq 0 ]; then peer_state="never seen"
+    elif [ $((now - seen)) -le $stale ]; then peer_state="up"
+    else peer_state="silent for $(age $((now - seen)))"; fi
+
+    # outbound (measured by the peer) and inbound (measured here)
+    local o_loss o_res o_jit o_owd o_rtt o_cap o_rate o_util o_cong
+    o_loss=$(g TX 32); o_res=$(g TX 33); o_jit=$(g TX 34); o_owd=$(g TX 35)
+    o_rtt=$(g TX 21); o_cap=$(g TX 36); o_rate=$(g TX 18); o_util=$(g TX 17); o_cong=$(g TX 16)
+    local i_loss i_res i_jit i_owd i_cap
+    i_loss=$(g RX 27); i_res=$(g RX 28); i_jit=$(( $(g RX 11) / 4 )); i_owd=$(g RX 16); i_cap=$(g RX 19)
+    local out_fresh=0 in_fresh=0
+    [ "$r_last" -gt 0 ] && [ $((now - r_last)) -le $stale ] && out_fresh=1
+    [ "$d_last" -gt 0 ] && [ $((now - d_last)) -le $stale ] && in_fresh=1
+
+    # FEC state for our direction
+    local K fec since high fec_txt cool_left=0
+    K=$(g TX 6); since=$(g TX 22); high=$(g TX 7)
+    local floor=${SET[floor]}
+    if [ "$K" -gt 0 ]; then
+        fec="on"
+        if [ "${SET[fec_mode]}" = 2 ]; then fec_txt="ON (forced), 1 parity per $K packets"
+        elif [ "$floor" -gt 0 ] && [ "$K" -ge "$floor" ]; then
+            fec_txt="ON at the baseline, 1 parity per $K packets (floor; scales up when loss reaches $(pct ${SET[fec_bp]}))"
+            if [ "$high" -gt 0 ] && [ $((now - high)) -le $((rep_ms + rep_ms / 2)) ]; then
+                fec_txt="ON, 1 parity per $K packets (floor; loss at the threshold)"
+            fi
+        else
+            fec_txt="ON for $(age $((now - since))), 1 parity per $K packets"
+            if [ "$o_cong" -eq 1 ]; then fec_txt+=" (fixed ratio: link looks congested)"
+            else fec_txt+=" (scaled to the loss)"; fi
+            if [ "$high" -gt 0 ] && [ $((now - high)) -gt $((rep_ms + rep_ms / 2)) ]; then
+                cool_left=$((SET[cooldown_ms] - (now - high)))
+                local to="off"; [ "$floor" -gt 0 ] && to="back to 1:$floor"
+                if [ $cool_left -gt 0 ]; then
+                    fec_txt+=", loss back below $(pct ${SET[fec_bp]}): $to in $(age $cool_left)"
+                else
+                    fec_txt+=", loss back below $(pct ${SET[fec_bp]}): $to with the next report"
+                fi
+            fi
+        fi
+    else
+        fec="off"
+        case "${SET[fec_mode]}" in
+            1) fec_txt="OFF (forced off)" ;;
+            *) fec_txt="OFF (turns on at $(pct ${SET[fec_bp]}) loss, off again after $(age ${SET[cooldown_ms]}) below it)" ;;
+        esac
+    fi
+
+    # Sizing: what the measured RTT and send rate need, against what the
+    # programs were generated with (only meaningful while traffic flows).
+    local size_warn="" need_arq=0 need_dup=0 pps=0 avg
+    if [ "$(g TX 2)" -gt 0 ]; then avg=$(( $(g TX 3) / $(g TX 2) )); else avg=0; fi
+    if [ "$avg" -gt 0 ] && [ "$o_rate" -gt 0 ] && [ "$o_rtt" -gt 0 ] && [ $out_fresh -eq 1 ]; then
+        pps=$(( o_rate * 1000 / 8 / avg ))
+        need_arq=$(( pps * o_rtt * 3 / 2000000 ))
+        need_dup=$(( pps * (2 * o_rtt + 100000) / 1000000 ))
+        local fix="regenerate with --rtt $(( (o_rtt + 999) / 1000 ))ms --link-rate $(( o_rate / 1000 + 1 ))m (or a profile sized for it)"
+        if [ "${SET[arq_mode]}" != 2 ] || [ "$K" -eq 0 ]; then
+            [ $need_arq -gt $(( SET[arq_depth] * 5 / 4 )) ] &&
+                size_warn="RTT $(dur_us $o_rtt) at $pps packets/s needs an ARQ ring of $need_arq packets, this link has ${SET[arq_depth]}: $fix"
+        fi
+        if [ -z "$size_warn" ] && [ $need_dup -gt $(( SET[dup_words] * 64 * 5 / 4 )) ]; then
+            size_warn="RTT $(dur_us $o_rtt) at $pps packets/s needs a duplicate window of $need_dup packets, this link has $(( SET[dup_words] * 64 )): $fix"
+        fi
+    fi
+
+    # overall health: residual loss first, then raw loss being repaired
+    local health="GOOD" why="" worst_res=0 worst_loss=0
+    [ $out_fresh -eq 1 ] && { worst_res=$o_res; worst_loss=$o_loss; }
+    if [ $in_fresh -eq 1 ]; then
+        [ "$i_res" -gt "$worst_res" ] && worst_res=$i_res
+        [ "$i_loss" -gt "$worst_loss" ] && worst_loss=$i_loss
+    fi
+    if [ "$peer_state" != "up" ]; then
+        health="UNKNOWN"; why="no recent traffic or reports from the peer"
+        [ "$seen" -gt 0 ] && [ $((now - $(g TX 19))) -le $stale ] && { health="PEER DOWN?"; why="sending, but no reports from the peer for $(age $((now - r_last)))"; }
+    elif [ "$worst_res" -ge 100 ]; then health="POOR"; why="$(pct $worst_res) loss left after repair"
+    elif [ "$worst_loss" -ge "${SET[fec_bp]}" ]; then health="DEGRADED"; why="$(pct $worst_loss) loss on the link, being repaired"
+    else why="loss below $(pct ${SET[fec_bp]})"; fi
+
+    if [ $ONELINE -eq 1 ]; then
+        echo "$ifkv health=\"$health\" peer=$(mac $peer) peer_state=\"$peer_state\" out_loss_bp=$o_loss out_residual_bp=$o_res out_jitter_us=$o_jit out_queue_us=$o_owd rtt_us=$o_rtt capacity_kbps=$o_cap rate_kbps=$o_rate utilisation_pct=$o_util congested=$o_cong fec=$fec fec_k=$K parity=$(g TX 9) retransmitted=$(g TX 13) retx_unavailable=$(g TX 14) retx_suppressed=$(g TX 15) in_loss_bp=$i_loss in_residual_bp=$i_res in_jitter_us=$i_jit in_queue_us=$i_owd in_capacity_kbps=$i_cap fec_rebuilt=$(g RX 6) arq_recovered=$(g RX 7) fec_failed=$(g RX 8) fec_bad=$(g RX 34) reordered=$(g RX 4) duplicates=$(g RX 3) redundant_repairs=$(( $(g RX 37) + $(g RX 38) )) peer_fec_k=$(g RX 30) bypassed=$(g TX 4) resyncs=$(g RX 36) profile=${SET[profile]} sized_rate_bps=${SET[link_rate]} sized_rtt_ms=${SET[rtt_ms]} arq_depth=${SET[arq_depth]} arq_needed=$need_arq dup_window=$(( SET[dup_words] * 64 )) dup_needed=$need_dup sizing_ok=$( [ -z "$size_warn" ] && echo 1 || echo 0 )"
+        return
+    fi
+
+    printf "%s  %s - %s\n" "$ifc" "$health" "$why"
+    if [ "$peer" -ne 0 ]; then printf "  Peer        %s, %s" "$(mac $peer)" "$peer_state"
+    else printf "  Peer        %s" "$peer_state"; fi
+    [ "$r_last" -gt 0 ] && printf ", last report %s ago (%d received)" "$(age $((now - r_last)))" "$r_cnt"
+    echo
+    if [ "${SET[profile]}" != none ] || [ "${SET[link_rate]}" -gt 0 ]; then
+        printf "  Profile     %s" "${SET[profile]}"
+        [ "${SET[link_rate]}" -gt 0 ] && printf ", sized for %s and %d ms RTT" "$(rate $(( SET[link_rate] / 1000 )))" "${SET[rtt_ms]}"
+        printf " (ARQ %d, duplicate window %d, FEC slots %d)\n" "${SET[arq_depth]}" $(( SET[dup_words] * 64 )) "${SET[fec_slots]}"
+    fi
+    printf "  Maps        %s_* in %s\n" "$prefix" "$MAP_DIR"
+    [ -n "$size_warn" ] && printf "  Sizing      WARNING: %s\n" "$size_warn"
+
+    echo "  Outbound $ifc -> peer, measured by the peer:"
+    if [ "$r_last" -eq 0 ]; then
+        echo "    no reports yet (the peer reports while it receives traffic from us)"
+    else
+        [ $out_fresh -eq 0 ] && echo "    (last report $(age $((now - r_last))) ago - these values are not current)"
+        printf "    Loss        %s on the link, %s after repair (last %s)\n" "$(pct $o_loss)" "$(pct $o_res)" "$(age $rep_ms)"
+        printf "    Delay       RTT %s, queueing +%s, jitter %s\n" "$(dur_us $o_rtt)" "$(dur_us $o_owd)" "$(dur_us $o_jit)"
+        if [ "$o_cap" -gt 0 ]; then
+            printf "    Capacity    ~%s, sending %s (%d %%)%s\n" "$(rate $o_cap)" "$(rate $o_rate)" "$o_util" \
+                "$( [ "$o_cong" -eq 1 ] && echo ", congested" )"
+        else
+            printf "    Capacity    not measured yet, sending %s%s\n" "$(rate $o_rate)" "$( [ "$o_cong" -eq 1 ] && echo ", congested (queueing delay)" )"
+        fi
+        printf "    Repaired    %d by FEC, %d by ARQ, %d lost, of %d packets\n" "$(g TX 39)" "$(g TX 40)" "$(g TX 41)" "$(g TX 31)"
+    fi
+    echo "  What the dataplane is doing (outbound):"
+    printf "    FEC         %s\n" "$fec_txt"
+    [ "$(g TX 9)" -gt 0 ] && printf "                %d parity packets sent for %d packets, %d sent early (block timeout)\n" "$(g TX 9)" "$(g TX 24)" "$(g TX 23)"
+    local arq_txt
+    case "${SET[arq_mode]}" in
+        1) arq_txt="answers NAKs for the last ${SET[arq_depth]} packets, also while FEC is on" ;;
+        2) arq_txt="answers NAKs for the last ${SET[arq_depth]} packets; off while FEC is on" ;;
+        *) arq_txt="answers NAKs for the last ${SET[arq_depth]} packets; last ${SET[arq_fec_depth]} while FEC is on" ;;
+    esac
+    printf "    ARQ         %s\n" "$arq_txt"
+    printf "                %d retransmitted, %d no longer held, %d not sent because of FEC (%d NAKs)\n" \
+        "$(g TX 13)" "$(g TX 14)" "$(g TX 15)" "$(g TX 12)"
+    local piv=${SET[probe_ms]} plast
+    plast=$(g TX 10)
+    [ "$K" -gt 0 ] && piv=$((piv * SET[backoff]))
+    printf "    Probing     every %s%s" "$(age $piv)" "$( [ "$K" -gt 0 ] && [ "${SET[backoff]}" -gt 1 ] && echo " (backed off x${SET[backoff]} while FEC is on)")"
+    if [ "$plast" -gt 0 ]; then printf ", last %s ago, %d sent\n" "$(age $((now - plast)))" "$(g TX 11)"
+    else printf ", none sent yet (needs packets of %d bytes or more)\n" "${SET[probe_min]}"; fi
+    [ "$(g TX 4)" -gt 0 ] && printf "    Unprotected %d packets too large to encapsulate (GSO/GRO or IP > 1492)\n" "$(g TX 4)"
+
+    echo "  Inbound peer -> $ifc, measured here:"
+    if [ "$d_last" -eq 0 ]; then
+        echo "    nothing received from the peer yet"
+    else
+        [ $in_fresh -eq 0 ] && echo "    (last packet $(age $((now - d_last))) ago - these values are not current)"
+        printf "    Loss        %s on the link, %s after repair (last report window)\n" "$(pct $i_loss)" "$(pct $i_res)"
+        printf "    Delay       queueing +%s, jitter %s\n" "$(dur_us $i_owd)" "$(dur_us $i_jit)"
+        [ "$i_cap" -gt 0 ] && printf "    Capacity    ~%s\n" "$(rate $i_cap)"
+        printf "    Repaired    %d rebuilt by FEC, %d by ARQ; %d blocks could not be rebuilt%s\n" "$(g RX 6)" "$(g RX 7)" "$(g RX 8)" \
+            "$( [ "$(g RX 34)" -gt 0 ] && echo ", $(g RX 34) rebuilds failed checks" )"
+        printf "    Seen        %d packets, %d reordered, %d duplicated on the link, %d NAKs sent\n" "$(g RX 2)" "$(g RX 4)" "$(g RX 3)" "$(g RX 10)"
+        local late=$(( $(g RX 37) + $(g RX 38) ))
+        [ $late -gt 0 ] && printf "                %d repairs arrived after the packet was already recovered\n" $late
+        if [ "$(g RX 30)" -gt 0 ]; then printf "    Peer FEC    on, 1 parity per %d packets\n" "$(g RX 30)"
+        else echo "    Peer FEC    off"; fi
+        [ "$(g RX 36)" -gt 0 ] && printf "    Resyncs     %d (peer sequence restarted)\n" "$(g RX 36)"
+    fi
+    echo
+}
+
+# ---------------------------------------------------------------- main
+
+cmd=show
+parse_opts() {
+    local o OPTIND=1
+    while getopts "m:c:1h" o; do
+        case "$o" in
+            m) MAP_DIR="$OPTARG" ;;
+            c) CONFIG_DIR="$OPTARG" ;;
+            1) ONELINE=1 ;;
+            h) usage; exit 0 ;;
+            *) usage >&2; exit 2 ;;
+        esac
+    done
+    SHIFT=$((OPTIND - 1))
+}
+# options may come before or after set/unset
+parse_opts "$@"; shift $SHIFT
+if [ "$1" = set ] || [ "$1" = unset ]; then
+    cmd=$1; shift
+    parse_opts "$@"; shift $SHIFT
+fi
+[ -n "$MAP_DIR" ] || MAP_DIR=$(conf_get map_dir)
+[ -n "$MAP_DIR" ] || MAP_DIR=/sys/fs/bpf
+[ -n "$CONFIG_DIR" ] || CONFIG_DIR=$(conf_get config_dir)
+[ -n "$CONFIG_DIR" ] || CONFIG_DIR=/etc/bpfc/interfaces.d
+command -v "$BPFC" >/dev/null || { [ -x /usr/sbin/bpfc ] && BPFC=/usr/sbin/bpfc; } || die "bpfc not found (set BPFC=)"
+[ "$(id -u)" -eq 0 ] || die "must run as root to read the dataplane maps"
+
+case "$cmd" in
+    set)   [ $# -eq 3 ] || { usage >&2; exit 2; }; do_set "$1" "$2" "$3" ;;
+    unset) [ $# -eq 2 ] || { usage >&2; exit 2; }; do_set "$1" "$2" unset ;;
+    show)
+        ifaces=("$@")
+        [ ${#ifaces[@]} -gt 0 ] || mapfile -t ifaces < <(list_ifaces)
+        [ ${#ifaces[@]} -gt 0 ] || die "no dataplane programs found in $CONFIG_DIR (give interface names)"
+        for i in "${ifaces[@]}"; do show "$i"; done ;;
+esac
