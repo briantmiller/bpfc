@@ -146,6 +146,27 @@ Strips 28 bytes of Outer IPv4 + GRE headers.
 .BI "calc-map " "op map key value [OLD]"
 Applies \fIop\fR (\fBadd\fR, \fBor\fR, \fBand\fR, \fBxor\fR or \fBxchg\fR) atomically to the 64-bit value under \fIkey\fR, creating it as 0 if missing. With \fIOLD\fR (required for \fBxchg\fR) the previous value is stored in that 8-byte variable. Unlike \fBget map\fR / \fBset map\fR, updates from several CPUs at once are never lost. Needs kernel 5.12 (RHEL 9).
 .TP
+.BI "tcp-option " "kind|%VAR OFF_VAR [LEN_VAR]"
+Find the first TCP option of \fIkind\fR (IPv4, any IHL): \fIOFF_VAR\fR gets its frame offset and \fILEN_VAR\fR its length byte, both 0 if absent.
+.TP
+.BI "fill-bytes " "offset|%VAR len|%VAR byte|%VAR"
+Overwrite 1\-64 packet bytes with one byte value. Checksums are not updated (see \fBrecalc-tcp-csum\fR).
+.TP
+.BI "get " "tcp-seq|tcp-ack|tcp-flags|tcp-win|tcp-hlen|l4-off|payload-off|payload-len VAR"
+TCP header fields, the L4 header offset and the payload offset and length, following the real IPv4 and TCP header lengths; 0 when they do not apply.
+.TP
+.BI "get flow-key " "VAR [reverse|symmetric]"
+64-bit hash of the IPv4 addresses, protocol and TCP/UDP ports; \fBreverse\fR gives the key of the opposite direction, \fBsymmetric\fR one key for both.
+.TP
+.BI "get|set bytes " "%OFF len ..."
+A variable offset reads with \fBbpf_skb_load_bytes\fR (0 outside the packet) and writes with \fBbpf_skb_store_bytes\fR.
+.TP
+.BI "get|set tstamp " "VAR|value"
+\fBskb->tstamp\fR in ns; a future time on egress paces the packet under the fq qdisc.
+.TP
+\fBif\fR \fIA\fR \fBseq-lt\fR|\fBseq-le\fR|\fBseq-gt\fR|\fBseq-ge\fR \fIB\fR
+Serial-number comparison of 32-bit wrapping counters (TCP sequence numbers).
+.TP
 .BI "array-map " "map entries"
 Declare \fImap\fR as an array of \fIentries\fR 64-bit values with keys 0..\fIentries\fR\-1, instead of the default LRU hash map of 10000 entries. Entries are never evicted and start at 0; a key out of range reads as 0 and is not stored. Works with \fBget map\fR, \fBset map\fR, \fBcalc-map\fR, \fB\-r\fR and \fB\-w\fR. A pinned map of another size is replaced.
 .SS Buffer Maps

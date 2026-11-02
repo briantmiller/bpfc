@@ -178,6 +178,68 @@ B $BPFC -i dpb0 -c; A ethtool -K dpa0 tx on >/dev/null
 $BPFC -m $MAPS -w CSUMT 9 0x123456789 >/dev/null
 check "bpfc -w writes a 64-bit value" [ "$(v CSUMT 9)" -eq $((0x123456789)) ]
 
+echo "== bpfc TCP helpers"
+# On egress, locally sent TCP still has its checksum completion pending (it
+# is finished after the program, over the bytes as rewritten), so these
+# rewrites do not recompute it; forwarded packets would need recalc-tcp-csum.
+# B ingress, A -> B port 5010: header fields, options, payload, sequence, flow keys
+B $BPFC -m $MAPS -i dpb0 -d ingress -p 100 'match tcp; match tcp-dst 5010;
+  get tcp-flags F; decl S 8; set val S %F; calc and S 0x02;
+  if S ne 0;
+    get tcp-hlen H; set map TT 1 %H; free H;
+    tcp-option 2 O L; set map TT 2 %L; decl P 8; set val P %O; calc add P 2; get bytes %P 2 M; set map TT 3 %M;
+    free M; free P; free L; free O;
+    tcp-option 8 O L; set map TT 4 %L; free L; free O;
+    tcp-option 99 O; set map TT 5 %O; free O;
+    get tcp-seq Q; calc add Q 1; set map TT 6 %Q; set map TT 7 %Q; free Q;
+    set map TT 8 %F;
+  end-if;
+  free S; free F;
+  get payload-len PL;
+  if PL gt 0;
+    calc-map add TT 9 %PL;
+    get tcp-seq Q; calc add Q %PL; get map TT 7 MX;
+    if Q seq-gt %MX; set map TT 7 %Q; end-if;
+    get flow-key K; set map TT 11 %K; get flow-key K symmetric; set map TT 12 %K;
+  end-if;
+  continue' >/dev/null || echo "    (B ingress program failed to load)"
+# A ingress, B -> A: the same flow seen from the other side, and the ACKs
+A $BPFC -m $MAPS -i dpa0 -d ingress -p 100 'match tcp; match tcp-src 5010;
+  get flow-key K reverse; set map TT 13 %K; get flow-key K symmetric; set map TT 14 %K;
+  get tcp-ack AK; get map TT 15 MX; if MX eq 0; set map TT 15 %AK; end-if; if AK seq-gt %MX; set map TT 15 %AK; end-if;
+  continue' >/dev/null || echo "    (A ingress program failed to load)"
+head -c 3000000 /dev/urandom > $CONF/tx.bin
+tcp_copy 5010 10.77.0.2 $CONF/tx.bin $CONF/rx.bin 30
+check "tcp-flags, tcp-hlen on the SYN (flags $(v TT 8), header $(v TT 1) bytes)" [ "$(v TT 8)" -eq 2 -a "$(v TT 1)" -ge 24 -a "$(v TT 1)" -le 60 ]
+check "tcp-option finds MSS ($(v TT 3), length $(v TT 2)) and timestamps (length $(v TT 4)), not kind 99" [ "$(v TT 2)" -eq 4 -a "$(v TT 3)" -ge 536 -a "$(v TT 3)" -le 1460 -a "$(v TT 4)" -eq 10 -a "$(v TT 5)" -eq 0 ]
+check "payload-len adds up to at least the 3 MB sent ($(v TT 9), with retransmissions)" [ "$(v TT 9)" -ge 3000000 -a "$(v TT 9)" -le 3300000 ]
+check "tcp-seq + seq-gt: highest sequence - ISN = 3 MB ($(( ($(v TT 7) - $(v TT 6) + 4294967296) % 4294967296 )))" [ $(( ($(v TT 7) - $(v TT 6) + 4294967296) % 4294967296 )) -eq 3000000 ]
+check "tcp-ack: the receiver acknowledged it all, and the FIN" [ $(( ($(v TT 15) - $(v TT 6) + 4294967296) % 4294967296 )) -eq 3000001 ]
+check "flow-key: reverse on the return path equals the forward key, symmetric the same both ways" [ "$(v TT 11)" != 0 -a "$(v TT 11)" = "$(v TT 13)" -a "$(v TT 12)" = "$(v TT 14)" ]
+A $BPFC -i dpa0 -c; B $BPFC -i dpb0 -c
+# B egress: lower the MSS B announces to 1000 (set bytes at a variable offset)
+B $BPFC -m $MAPS -i dpb0 -d egress -p 100 'match tcp; match tcp-src 5011;
+  get tcp-flags F; calc and F 0x12;
+  if F eq 0x12; tcp-option 2 O L; if L eq 4; decl P 8; set val P %O; calc add P 2; set bytes %P 2 1000; end-if; end-if;
+  continue' >/dev/null
+B $BPFC -m $MAPS -i dpb0 -d ingress -p 100 'match tcp; match tcp-dst 5011; get payload-len PL; get map TT 20 MX; if PL gt %MX; set map TT 20 %PL; end-if; continue' >/dev/null
+tcp_copy 5011 10.77.0.2 $CONF/tx.bin $CONF/rx.bin 30
+check "set bytes %VAR rewrote the MSS: largest segment $(v TT 20) bytes, data intact" sh -c "[ $(v TT 20) -le 1000 -a $(v TT 20) -ge 900 ] && cmp -s $CONF/tx.bin $CONF/rx.bin"
+B $BPFC -i dpb0 -c
+# A egress: blank the timestamp option with NOPs (fill-bytes at a variable offset and length)
+A $BPFC -m $MAPS -i dpa0 -d egress -p 100 'match tcp; match tcp-dst 5012; tcp-option 8 O L; if O gt 0; fill-bytes %O %L 1; end-if; continue' >/dev/null
+B $BPFC -m $MAPS -i dpb0 -d ingress -p 100 'match tcp; match tcp-dst 5012; calc-map add TT 22 1; tcp-option 8 O L; if O gt 0; calc-map add TT 21 1; end-if; continue' >/dev/null
+tcp_copy 5012 10.77.0.2 $CONF/tx.bin $CONF/rx.bin 30
+check "fill-bytes removed the timestamp option from all $(v TT 22) segments, data intact" sh -c "[ $(v TT 21) -eq 0 -a $(v TT 22) -gt 100 ] && cmp -s $CONF/tx.bin $CONF/rx.bin"
+A $BPFC -i dpa0 -c; B $BPFC -i dpb0 -c
+# skb->tstamp round trip and 64-bit seq compare across the wrap
+A $BPFC -m $MAPS -i dpa0 -d egress -p 100 'match icmp; get time T; set tstamp %T; get tstamp X; if X eq %T; calc-map add TT 30 1; end-if;
+  decl W 8; set val W 0xFFFFFFF0; decl Z 8; set val Z 0x10; if Z seq-gt %W; calc-map add TT 31 1; end-if; if W seq-lt %Z; calc-map add TT 32 1; end-if; if W seq-gt %Z; calc-map add TT 33 1; end-if;
+  continue' >/dev/null
+A ping -c 3 -i 0.2 -q 10.77.0.2 >/dev/null
+check "set / get tstamp, seq-gt / seq-lt across the 32-bit wrap" [ "$(v TT 30)" -eq 3 -a "$(v TT 31)" -eq 3 -a "$(v TT 32)" -eq 3 -a "$(v TT 33)" -eq 0 ]
+A $BPFC -i dpa0 -c
+
 echo "== map names"
 check "default prefix is dp + 8 base32 characters" sh -c "$GEN -i dpa0 --map-prefix | grep -Eq '^dp[a-z2-7]{8}\$'"
 check "same interface, same prefix; others differ" [ "$($GEN -i dpa0 --map-prefix)" = "$MP_dpa0" -a "$MP_dpa0" != "$MP_dpb0" ]
@@ -301,6 +363,26 @@ sleep 9
 check "default sizing: status warns that the ARQ ring is too small" sh -c "$STATUS -m $MAPS -c $CONF/$NSA dps0 | grep -q 'Sizing      WARNING: .*needs an ARQ ring'"
 wait $IPERF_PID
 check "default sizing: most NAKed packets already gone ($(v ${MP_dps0}_tx 14) gone, $(v ${MP_dps0}_tx 13) retransmitted)" [ "$(v ${MP_dps0}_tx 14)" -gt "$(v ${MP_dps0}_tx 13)" ]
+
+echo "== asymmetric link: loss estimate and packet pairs"
+# A -> B 20 Mbit/s, B -> A 10 Mbit/s, 50 ms +- 5 ms each way, 3 % loss, the
+# way netem shapes (a packet never leaves before the one ahead of it)
+kill $EMU_PID 2>/dev/null; wait $EMU_PID 2>/dev/null
+pkill -f "^python3 -I tests/link-emulator.py dpm0 dpm1" 2>/dev/null
+for i in $(seq 25); do pgrep -f "^python3 -I tests/link-emulator.py dpm0 dpm1" >/dev/null || break; sleep 0.2; done
+ip netns exec $NSM python3 -I tests/link-emulator.py dpm0 dpm1 50 --a2b rate=20m,jitter=5,loss=3 --b2a rate=10m,jitter=5,loss=3 2> $CONF/emulator.log & EMU_PID=$!
+sleep 0.5
+install $NSA dps0 --probe-rate 10 && install $NSB dps1 --probe-rate 10
+check "probe-rate 10 means a probe every 100 ms" grep -q "probe_ms=100 " $CONF/$NSA/dps0/egress/100.bpfc
+A ping -c 600 -i 0.025 -s 1200 -q 10.77.2.2 >/dev/null & PA=$!
+B ping -c 600 -i 0.025 -s 1200 -q 10.77.2.1 >/dev/null
+wait $PA
+lo=$(( $(v ${MP_dps0}_tx 46) / 100 )); li=$(( $(v ${MP_dps0}_rx 39) / 100 ))
+check "averaged loss near the 3 % on the link (out $lo bp, in $li bp)" [ "$lo" -ge 150 -a "$lo" -le 500 -a "$li" -ge 150 -a "$li" -le 500 ]
+check "status reports the average" sh -c "$STATUS -m $MAPS -c $CONF/$NSA dps0 | grep -q 'Loss  .*(average of'"
+ca=$(v ${MP_dps0}_rx 19); cb=$(v ${MP_dps1}_rx 19)
+check "packet pairs measure each direction: B -> A ~10 Mbit/s ($ca kbit/s), A -> B ~20 Mbit/s ($cb kbit/s)" [ "$ca" -ge 8000 -a "$ca" -le 13500 -a "$cb" -ge 16000 -a "$cb" -le 28000 ]
+check "the sender sees the peer's measurement of its direction" [ "$(v ${MP_dps0}_tx 36)" -ge 16000 -a "$(v ${MP_dps1}_tx 36)" -le 13500 ]
 
 echo
 echo "$PASSES passed, $FAILS failed"

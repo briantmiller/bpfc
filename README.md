@@ -101,7 +101,7 @@ Instructions are strictly **semicolon-separated**. Variables (denoted by `%`) ar
 
 ### Branching & Control Flow
 * `match|if <field> <value>` - Opens a conditional block. If the packet field does not match the value, execution jumps past the block.
-* `match|if val %VAR <op> <val | %VAR>` - Compares variables logically (`lt`, `gt`, `le`, `ge`, `eq`, `ne`).
+* `match|if val %VAR <op> <val | %VAR>` - Compares variables logically (`lt`, `gt`, `le`, `ge`, `eq`, `ne`). `seq-lt`, `seq-le`, `seq-gt`, `seq-ge` compare 32-bit wrapping counters such as TCP sequence numbers (serial-number order, RFC 1982: A is before B when `(int32)(A - B) < 0`), valid while the two are less than 2^31 apart.
 * `else` - Inverse of match/if criteria.
 * `end-match|end-if` - Closes the most recent conditional `match` block.
 * `continue` - Terminal. Exits eBPF, and tells kernel to evaluate the next TC rule.
@@ -124,7 +124,10 @@ Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val |
 * **ARP:** `arp-htype`, `arp-ptype`, `arp-hlen`, `arp-plen`, `arp-oper`, `arp-sha`, `arp-tha`, `arp-spa`, `arp-tpa`
 * **MPLS:** `mpls-label`, `mpls-bos`
 * **GRE:** `gre-key`, `gre-proto`
-* **Generic:** `bytes <offset> <length>`
+* **TCP (IPv4, any IHL; `get` only):** `tcp-seq`, `tcp-ack`, `tcp-flags` (the flags byte: FIN 0x01, SYN 0x02, RST 0x04, PSH 0x08, ACK 0x10), `tcp-win` (unscaled), `tcp-hlen` (header length incl. options, bytes). 0 when the packet is not IPv4 TCP.
+* **Offsets and lengths (IPv4, any IHL; `get` only):** `l4-off` (offset of the TCP/UDP/... header in the frame), `payload-off` (TCP: after the options, UDP: after 8 bytes), `payload-len` (from the IP total length, so Ethernet padding is not counted). Use them with variable offsets: `get bytes %OFF 4 V`.
+* **Flow key (`get` only):** `flow-key [reverse | symmetric]` - 64-bit hash of the IPv4 addresses, protocol and TCP/UDP ports (never 0; 0 for non-IPv4). `reverse` is the key of the opposite direction, so a returning ACK finds its data flow's map entry; `symmetric` is the same key for both directions.
+* **Generic:** `bytes <offset | %VAR> <length>` - with a variable offset the bytes are read with `bpf_skb_load_bytes` (0 if outside the packet) and written with `bpf_skb_store_bytes` (nothing written if outside).
 
 ### Context Metadata (`__sk_buff`)
 * `len` - Packet length (`u32`).
@@ -133,6 +136,7 @@ Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val |
 * `skb-ingress` - Ingress interface number associated with sk_buff.
 * `skb-mark` - Netfilter/iptables firewall mark (`u32`).
 * `skb-hash` - RPS flow hash (`u32`).
+* `tstamp` - `skb->tstamp`, 64-bit ns. On egress, a time in the future (CLOCK_MONOTONIC, as `get time`) holds the packet until then under the fq qdisc (earliest-departure-time pacing).
 * `skb-cb <0-4>` - 20-byte control buffer array (5x `u32` slots) for passing state across tail-calls and to the next TC priority.
 * `cpu` - (`get` only) number of the CPU running the program.
 * `queue` - Hardware TX queue mapping.
@@ -156,6 +160,8 @@ Allows persistent data storage across packets and network interfaces.
 * `buffer-map <MAP_NAME> [size]` / `shared-buffer-map <MAP_NAME> [entries [size]]` - Declare a buffer map with smaller values (default 18000 bytes, 10000 shared entries) before using it. A copy at a constant offset may fill the rest of the entry; with a variable offset, offset and length are each capped at size/2. A pinned map of other sizes is replaced.
 * Map names are pinned as `<map_dir>/<MAP_NAME>`: 1-31 characters, no `/`. The kernel keeps the last 15 characters of `[A-Za-z0-9_.]` as the map's own name (other characters become `_`), so names of 15 such characters or fewer show unchanged in `bpftool`.
 * `array-map <MAP_NAME> <entries>` - Declare an array of 64-bit values (keys 0..entries-1) instead of the default 10000-entry LRU hash map: never evicts, all entries start at 0. Works with `get map`, `set map`, `calc-map`, `-r` and `-w`. A pinned map of another size is replaced.
+* `tcp-option <kind | %VAR> <OFF_VAR> [LEN_VAR]` - Walks the TCP options (IPv4, any IHL) and sets `OFF_VAR` to the frame offset of the first option of that kind and `LEN_VAR` to its length byte; both 0 if there is none. Read or change the option with `get bytes` / `set bytes` / `fill-bytes` at `%OFF_VAR`.
+* `fill-bytes <offset | %VAR> <len | %VAR> <byte | %VAR>` - Overwrite 1-64 packet bytes with one value (e.g. 1 to turn TCP options into NOPs). Nothing is written when the length is 0 or over 64, or the range is outside the packet. Checksums are not updated: on egress, locally sent TCP/UDP still has its checksum completed after the program (over the bytes as rewritten), so leave it; for forwarded or received packets follow with `recalc-tcp-csum`.
 * `calc-map <add|or|and|xor|xchg> <MAP_NAME> <key | %VAR> <val | %VAR> [OLD_VAR]` - Atomic update of a 64-bit map value (created as 0); `OLD_VAR` receives the previous value. Safe when several CPUs update the same key, unlike `get map` + `set map`.
 * `xor-packet <MAP_NAME> <len> [src [dst]]` / `xor-packet-keyed <MAP_NAME> <key> <len> [src [dst]]` - XOR packet bytes into a buffer (atomically; dst is a multiple of 8). Building block for XOR parity / FEC.
 * `zero-buffer <MAP_NAME> <len> [dst]` / `zero-buffer-keyed <MAP_NAME> <key> <len> [dst]` - Zero part of a buffer.

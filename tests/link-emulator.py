@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """Test helper: bridge two interfaces with a fixed one-way delay.
 
-    link-emulator.py <if-a> <if-b> <delay-ms>
+    link-emulator.py <if-a> <if-b> <delay-ms> [--a2b SPEC] [--b2a SPEC]
 
 Frames received on one interface are sent out of the other <delay-ms> later,
 in order, in both directions (a long-delay link such as a GEO satellite hop,
 for test-dataplane.sh). Frames we transmit ourselves are ignored. Runs until
 killed. Python is used only by the tests; the dataplane itself is bpfc.
+
+--a2b / --b2a shape one direction like "tc qdisc ... netem" would (for
+kernels without sch_netem): SPEC is comma-separated key=value with
+  rate=20m     bits per second (k, m, g), counting the frame without FCS
+  delay=150    one-way delay in ms (replaces <delay-ms> for this direction)
+  jitter=10    +/- ms, uniform, netem's way: with a rate, a packet never
+               leaves before the one ahead of it, but it can be held longer
+  loss=3       random loss in percent, before the rate (as netem does)
+  limit=1000   queue limit in packets (netem's default), excess is dropped
+  order=1      with jitter but no rate, keep packets in order (netem would
+               reorder them); for a kernel shaper (tbf) after the emulator
 
 A veth hands over frames whose TCP/UDP checksum the kernel left for the NIC
 to finish. A real link only ever carries finished frames, so those checksums
@@ -20,6 +31,8 @@ written to stderr every 2 s ("emulator drops: rx <if> N / <if> N, tx ...").
 """
 import array
 import collections
+import heapq
+import random
 import socket
 import struct
 import sys
@@ -86,21 +99,41 @@ def open_if(name):
     return s
 
 
-def forward(rx, tx, delay):
-    queue = collections.deque()
+def parse_spec(spec, delay):
+    cfg = {"rate": 0.0, "delay": delay, "jitter": 0.0, "loss": 0.0, "limit": 1000, "order": 0}
+    for item in filter(None, (spec or "").split(",")):
+        k, v = item.split("=", 1)
+        if k == "rate":
+            mult = {"k": 1e3, "m": 1e6, "g": 1e9}.get(v[-1].lower(), 1)
+            cfg["rate"] = float(v.rstrip("kKmMgG")) * mult
+        elif k in ("delay", "jitter"):
+            cfg[k] = float(v) / 1000.0
+        elif k == "loss":
+            cfg["loss"] = float(v) / 100.0
+        elif k in ("limit", "order"):
+            cfg[k] = int(v)
+        else:
+            raise SystemExit("unknown key %r in %r" % (k, spec))
+    return cfg
+
+
+def forward(rx, tx, cfg):
+    queue = []            # heap of (time to send, order, frame), like netem's tfifo
     cv = threading.Condition()
+    order = [0]
+    last = [0.0]          # time to send of the packet last queued
 
     def sender():
         while True:
             with cv:
                 while not queue:
                     cv.wait()
-                due, frame = queue[0]
-            wait = due - time.monotonic()
-            if wait > 0:
-                time.sleep(wait)
-            with cv:
-                queue.popleft()
+                due, _, frame = queue[0]
+                wait = due - time.monotonic()
+                if wait > 0:
+                    cv.wait(wait)
+                    continue
+                heapq.heappop(queue)
             for attempt in range(50):
                 try:
                     tx.send(frame)
@@ -120,8 +153,28 @@ def forward(rx, tx, delay):
             if level == SOL_PACKET and ctype == PACKET_AUXDATA:
                 if struct.unpack_from("I", cdata, 0)[0] & TP_STATUS_CSUMNOTREADY:
                     frame = finish_checksum(frame)
+        if cfg["loss"] and random.random() < cfg["loss"]:
+            continue
+        now = time.monotonic()
+        delay = cfg["delay"]
+        if cfg["jitter"]:
+            delay += random.uniform(-cfg["jitter"], cfg["jitter"])
         with cv:
-            queue.append((time.monotonic() + delay, frame))
+            if len(queue) >= cfg["limit"]:
+                send_errors["limit"] += 1
+                continue
+            if cfg["rate"]:
+                # netem: the last packet queued is the reference point
+                if queue and last[0] > now:
+                    delay = max(0.0, delay - (last[0] - now))
+                    now = last[0]
+                delay += len(frame) * 8 / cfg["rate"]
+            due = now + max(0.0, delay)
+            if cfg["order"] and queue and due < last[0]:
+                due = last[0]
+            last[0] = due
+            order[0] += 1
+            heapq.heappush(queue, (due, order[0], frame))
             cv.notify()
 
 
@@ -138,21 +191,28 @@ def report(a, b, names):
         if new[0] or new[1]:
             total[names[0]] += new[0]
             total[names[1]] += new[1]
-        print("emulator drops: rx %s %d / %s %d, tx %s %d / %s %d" % (
+        print("emulator drops: rx %s %d / %s %d, tx %s %d / %s %d, queue limit %d" % (
             names[0], total[names[0]], names[1], total[names[1]],
-            names[0], send_errors[a.fileno()], names[1], send_errors[b.fileno()]),
+            names[0], send_errors[a.fileno()], names[1], send_errors[b.fileno()],
+            send_errors["limit"]),
             file=sys.stderr, flush=True)
 
 
 def main():
-    if len(sys.argv) != 4:
+    args = sys.argv[1:]
+    specs = {"--a2b": None, "--b2a": None}
+    while len(args) > 3 and args[-2] in specs:
+        specs[args[-2]] = args[-1]
+        args = args[:-2]
+    if len(args) != 3:
         print(__doc__, file=sys.stderr)
         sys.exit(2)
-    a, b = open_if(sys.argv[1]), open_if(sys.argv[2])
-    delay = float(sys.argv[3]) / 1000.0
-    threading.Thread(target=report, args=(a, b, sys.argv[1:3]), daemon=True).start()
-    threading.Thread(target=forward, args=(a, b, delay), daemon=True).start()
-    forward(b, a, delay)
+    a, b = open_if(args[0]), open_if(args[1])
+    delay = float(args[2]) / 1000.0
+    a2b, b2a = parse_spec(specs["--a2b"], delay), parse_spec(specs["--b2a"], delay)
+    threading.Thread(target=report, args=(a, b, args[0:2]), daemon=True).start()
+    threading.Thread(target=forward, args=(a, b, a2b), daemon=True).start()
+    forward(b, a, b2a)
 
 
 if __name__ == "__main__":

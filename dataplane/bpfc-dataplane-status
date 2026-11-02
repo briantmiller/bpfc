@@ -34,8 +34,9 @@ Settings for set/unset (take effect at once, survive program reloads,
   fec-mode auto|on|off      fec-threshold PCT       fec-cooldown SEC
   fec-k N   fec-k-min N   fec-k-max N               fec-timeout MS
   arq-with-fec keep|off|N   report-interval MS      congestion-pct N
-  congestion-delay MS       probe-interval SEC      probe-backoff N
-  probe-min-bytes N         fec-floor N|off
+  congestion-delay MS       probe-interval SEC      probe-rate N/s
+  probe-backoff N           probe-min-bytes N       fec-floor N|off
+  loss-smoothing PACKETS
 Times take ms, s or m. Buffer sizes (ARQ ring, duplicate window, FEC slots)
 are fixed when the programs are generated: regenerate to change them.
 EOF
@@ -75,7 +76,7 @@ load_settings() {   # generated settings from the program header, then runtime o
     local f="$1"
     SET=([arq_depth]=10 [arq_mode]=3 [arq_fec_depth]=3 [fec_bp]=100 [cooldown_ms]=10000
          [k]=8 [kmin]=2 [kmax]=15 [timeout_ms]=50 [fec_mode]=0 [report_ms]=1000
-         [probe_ms]=10000 [backoff]=6 [probe_min]=600 [cong_pct]=85 [cong_delay_ms]=20
+         [probe_ms]=10000 [backoff]=6 [probe_min]=600 [cong_pct]=85 [cong_delay_ms]=20 [loss_smooth]=2000
          [floor]=0 [profile]=none [link_rate]=0 [rtt_ms]=0 [sizing_bytes]=1000 [dup_words]=16 [fec_slots]=16)
     if [ -r "$f" ]; then
         local line kv
@@ -97,6 +98,7 @@ load_settings() {   # generated settings from the program header, then runtime o
     c=$(g CFG 12); [ "$c" -gt 0 ] && SET[timeout_ms]=$c
     c=$(g CFG 13); [ "$c" -gt 0 ] && SET[probe_min]=$c
     c=$(g CFG 14); [ "$c" -gt 0 ] && SET[fec_mode]=$c
+    c=$(g CFG 17); [ "$c" -gt 0 ] && SET[loss_smooth]=$c
     c=$(g CFG 15); [ "$c" -gt 0 ] && SET[cong_delay_ms]=$c
     c=$(g CFG 16); [ "$c" -gt 0 ] && SET[floor]=$c
     [ "${SET[floor]}" -gt 15 ] && SET[floor]=0
@@ -119,9 +121,14 @@ dur_us() {     # microseconds -> "4.1 ms" / "250 us"
     local u=$1
     if [ "$u" -ge 1000 ]; then printf "%d.%d ms" $((u / 1000)) $((u % 1000 / 100)); else printf "%d us" "$u"; fi
 }
+averaged() {   # packets in the loss average -> text
+    if [ "$1" -ge "${SET[loss_smooth]}" ]; then echo "average of the last ${SET[loss_smooth]} packets"
+    else echo "average of $1 packets so far"; fi
+}
 age() {        # milliseconds -> "0.4 s" / "12 s" / "5 min" / "2 h"
     local m=$1
-    if   [ "$m" -lt 10000 ];   then printf "%d.%d s" $((m / 1000)) $((m % 1000 / 100))
+    if   [ "$m" -lt 1000 ];    then printf "%d ms" "$m"
+    elif [ "$m" -lt 10000 ];   then printf "%d.%d s" $((m / 1000)) $((m % 1000 / 100))
     elif [ "$m" -lt 120000 ];  then printf "%d s" $((m / 1000))
     elif [ "$m" -lt 7200000 ]; then printf "%d min" $((m / 60000))
     else printf "%d h" $((m / 3600000)); fi
@@ -147,7 +154,8 @@ cfg_key() {    # setting name -> cfg map key
         fec-k-max) echo 5 ;; probe-interval) echo 6 ;; probe-backoff) echo 7 ;;
         arq-with-fec) echo 8 ;; report-interval) echo 10 ;; congestion-pct) echo 11 ;;
         fec-timeout) echo 12 ;; probe-min-bytes) echo 13 ;; fec-mode) echo 14 ;;
-        congestion-delay) echo 15 ;; fec-floor) echo 16 ;; *) return 1 ;;
+        congestion-delay) echo 15 ;; fec-floor) echo 16 ;; loss-smoothing) echo 17 ;;
+        probe-rate) echo 6 ;; *) return 1 ;;
     esac
 }
 
@@ -164,8 +172,18 @@ do_set() {     # do_set <iface> <setting> <value|unset>
             fec-threshold)
                 [[ "$val" =~ ^[0-9]+(\.[0-9]{1,2})?$ ]] || die "fec-threshold is a percentage, e.g. 1 or 0.5"
                 v=$(awk -v p="$val" 'BEGIN{printf "%d", p*100 + 0.5}') ;;
-            fec-cooldown|probe-interval)
+            fec-cooldown)
                 v=$(parse_dur "$val" s) || die "$name is a time, e.g. 10s (a bare number is seconds)" ;;
+            probe-interval)
+                v=$(parse_dur "$val" s) || die "$name is a time, e.g. 10s (a bare number is seconds)"
+                [ "$v" -ge 10 ] || die "probe-interval must be at least 10 ms" ;;
+            probe-rate)
+                [[ "$val" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v r="$val" 'BEGIN{exit !(r >= 0.00002 && r <= 100)}' ||
+                    die "probe-rate is 0.00002-100 probes per second"
+                v=$(awk -v r="$val" 'BEGIN{printf "%d", 1000 / r + 0.5}') ;;
+            loss-smoothing)
+                [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 100 ] && [ "$val" -le 1000000 ] || die "loss-smoothing is 100-1000000 packets"
+                v=$val ;;
             fec-timeout|report-interval|congestion-delay)
                 v=$(parse_dur "$val" ms) || die "$name is a time, e.g. 50ms (a bare number is milliseconds)" ;;
             fec-floor)
@@ -260,10 +278,11 @@ show() {
 
     # outbound (measured by the peer) and inbound (measured here)
     local o_loss o_res o_jit o_owd o_rtt o_cap o_rate o_util o_cong
-    o_loss=$(g TX 32); o_res=$(g TX 33); o_jit=$(g TX 34); o_owd=$(g TX 35)
+    # loss: averaged over the last loss-smoothing packets (1/100 bp in the maps)
+    o_loss=$(( $(g TX 46) / 100 )); o_res=$(( $(g TX 47) / 100 )); o_jit=$(g TX 34); o_owd=$(g TX 35)
     o_rtt=$(g TX 21); o_cap=$(g TX 36); o_rate=$(g TX 18); o_util=$(g TX 17); o_cong=$(g TX 16)
     local i_loss i_res i_jit i_owd i_cap
-    i_loss=$(g RX 27); i_res=$(g RX 28); i_jit=$(( $(g RX 11) / 4 )); i_owd=$(g RX 16); i_cap=$(g RX 19)
+    i_loss=$(( $(g RX 39) / 100 )); i_res=$(( $(g RX 40) / 100 )); i_jit=$(( $(g RX 11) / 4 )); i_owd=$(g RX 16); i_cap=$(g RX 19)
     local out_fresh=0 in_fresh=0
     [ "$r_last" -gt 0 ] && [ $((now - r_last)) -le $stale ] && out_fresh=1
     [ "$d_last" -gt 0 ] && [ $((now - d_last)) -le $stale ] && in_fresh=1
@@ -332,10 +351,14 @@ show() {
         [ "$seen" -gt 0 ] && [ $((now - $(g TX 19))) -le $stale ] && { health="PEER DOWN?"; why="sending, but no reports from the peer for $(age $((now - r_last)))"; }
     elif [ "$worst_res" -ge 100 ]; then health="POOR"; why="$(pct $worst_res) loss left after repair"
     elif [ "$worst_loss" -ge "${SET[fec_bp]}" ]; then health="DEGRADED"; why="$(pct $worst_loss) loss on the link, being repaired"
+    elif [ "$worst_loss" -ge $(( SET[fec_bp] / 2 )) ] && [ "$high" -gt 0 ] && [ $((now - high)) -lt "${SET[cooldown_ms]}" ]; then
+        # hysteresis: stays DEGRADED until the loss falls to half the threshold
+        # or the FEC cool-down has passed
+        health="DEGRADED"; why="$(pct $worst_loss) loss on the link, being repaired (recovering)"
     else why="loss below $(pct ${SET[fec_bp]})"; fi
 
     if [ $ONELINE -eq 1 ]; then
-        echo "$ifkv health=\"$health\" peer=$(mac $peer) peer_state=\"$peer_state\" out_loss_bp=$o_loss out_residual_bp=$o_res out_jitter_us=$o_jit out_queue_us=$o_owd rtt_us=$o_rtt capacity_kbps=$o_cap rate_kbps=$o_rate utilisation_pct=$o_util congested=$o_cong fec=$fec fec_k=$K parity=$(g TX 9) retransmitted=$(g TX 13) retx_unavailable=$(g TX 14) retx_suppressed=$(g TX 15) in_loss_bp=$i_loss in_residual_bp=$i_res in_jitter_us=$i_jit in_queue_us=$i_owd in_capacity_kbps=$i_cap fec_rebuilt=$(g RX 6) arq_recovered=$(g RX 7) fec_failed=$(g RX 8) fec_bad=$(g RX 34) reordered=$(g RX 4) duplicates=$(g RX 3) redundant_repairs=$(( $(g RX 37) + $(g RX 38) )) peer_fec_k=$(g RX 30) bypassed=$(g TX 4) resyncs=$(g RX 36) profile=${SET[profile]} sized_rate_bps=${SET[link_rate]} sized_rtt_ms=${SET[rtt_ms]} arq_depth=${SET[arq_depth]} arq_needed=$need_arq dup_window=$(( SET[dup_words] * 64 )) dup_needed=$need_dup sizing_ok=$( [ -z "$size_warn" ] && echo 1 || echo 0 )"
+        echo "$ifkv health=\"$health\" peer=$(mac $peer) peer_state=\"$peer_state\" out_loss_bp=$o_loss out_residual_bp=$o_res out_loss_window_bp=$(g TX 32) out_loss_packets=$(g TX 48) out_jitter_us=$o_jit out_queue_us=$o_owd rtt_us=$o_rtt capacity_kbps=$o_cap rate_kbps=$o_rate utilisation_pct=$o_util congested=$o_cong fec=$fec fec_k=$K parity=$(g TX 9) retransmitted=$(g TX 13) retx_unavailable=$(g TX 14) retx_suppressed=$(g TX 15) in_loss_bp=$i_loss in_residual_bp=$i_res in_loss_window_bp=$(g RX 27) in_loss_packets=$(g RX 41) in_capacity_samples=$(g RX 20) in_capacity_last_kbps=$(g RX 52) in_jitter_us=$i_jit in_queue_us=$i_owd in_capacity_kbps=$i_cap fec_rebuilt=$(g RX 6) arq_recovered=$(g RX 7) fec_failed=$(g RX 8) fec_bad=$(g RX 34) reordered=$(g RX 4) duplicates=$(g RX 3) redundant_repairs=$(( $(g RX 37) + $(g RX 38) )) peer_fec_k=$(g RX 30) bypassed=$(g TX 4) resyncs=$(g RX 36) profile=${SET[profile]} sized_rate_bps=${SET[link_rate]} sized_rtt_ms=${SET[rtt_ms]} arq_depth=${SET[arq_depth]} arq_needed=$need_arq dup_window=$(( SET[dup_words] * 64 )) dup_needed=$need_dup sizing_ok=$( [ -z "$size_warn" ] && echo 1 || echo 0 )"
         return
     fi
 
@@ -357,7 +380,8 @@ show() {
         echo "    no reports yet (the peer reports while it receives traffic from us)"
     else
         [ $out_fresh -eq 0 ] && echo "    (last report $(age $((now - r_last))) ago - these values are not current)"
-        printf "    Loss        %s on the link, %s after repair (last %s)\n" "$(pct $o_loss)" "$(pct $o_res)" "$(age $rep_ms)"
+        printf "    Loss        %s on the link, %s after repair (%s; last %s: %s)\n" "$(pct $o_loss)" "$(pct $o_res)" \
+            "$(averaged $(g TX 48))" "$(age $rep_ms)" "$(pct $(g TX 32))"
         printf "    Delay       RTT %s, queueing +%s, jitter %s\n" "$(dur_us $o_rtt)" "$(dur_us $o_owd)" "$(dur_us $o_jit)"
         if [ "$o_cap" -gt 0 ]; then
             printf "    Capacity    ~%s, sending %s (%d %%)%s\n" "$(rate $o_cap)" "$(rate $o_rate)" "$o_util" \
@@ -385,16 +409,23 @@ show() {
     printf "    Probing     every %s%s" "$(age $piv)" "$( [ "$K" -gt 0 ] && [ "${SET[backoff]}" -gt 1 ] && echo " (backed off x${SET[backoff]} while FEC is on)")"
     if [ "$plast" -gt 0 ]; then printf ", last %s ago, %d sent\n" "$(age $((now - plast)))" "$(g TX 11)"
     else printf ", none sent yet (needs packets of %d bytes or more)\n" "${SET[probe_min]}"; fi
-    [ "$(g TX 4)" -gt 0 ] && printf "    Unprotected %d packets too large to encapsulate (GSO/GRO or IP > 1492)\n" "$(g TX 4)"
+    local byp=$(g TX 4) sent=$(g TX 2)
+    if [ "$byp" -gt 0 ]; then
+        printf "    Unprotected %d packets too large to encapsulate (GSO/GRO or IP > 1492), %d %% of all sent\n" \
+            "$byp" $(( byp * 100 / (byp + sent) ))
+        [ $(( byp * 100 / (byp + sent) )) -ge 5 ] &&
+            echo "                WARNING: check IP MTU 1492 and TSO/GSO/GRO off (see bpfc-dataplane-gen --setup-hints)"
+    fi
 
     echo "  Inbound peer -> $ifc, measured here:"
     if [ "$d_last" -eq 0 ]; then
         echo "    nothing received from the peer yet"
     else
         [ $in_fresh -eq 0 ] && echo "    (last packet $(age $((now - d_last))) ago - these values are not current)"
-        printf "    Loss        %s on the link, %s after repair (last report window)\n" "$(pct $i_loss)" "$(pct $i_res)"
+        printf "    Loss        %s on the link, %s after repair (%s; last report window: %s)\n" "$(pct $i_loss)" "$(pct $i_res)" \
+            "$(averaged $(g RX 41))" "$(pct $(g RX 27))"
         printf "    Delay       queueing +%s, jitter %s\n" "$(dur_us $i_owd)" "$(dur_us $i_jit)"
-        [ "$i_cap" -gt 0 ] && printf "    Capacity    ~%s\n" "$(rate $i_cap)"
+        [ "$i_cap" -gt 0 ] && printf "    Capacity    ~%s (%d probe pairs, last %s)\n" "$(rate $i_cap)" "$(g RX 20)" "$(rate $(g RX 52))"
         printf "    Repaired    %d rebuilt by FEC, %d by ARQ; %d blocks could not be rebuilt%s\n" "$(g RX 6)" "$(g RX 7)" "$(g RX 8)" \
             "$( [ "$(g RX 34)" -gt 0 ] && echo ", $(g RX 34) rebuilds failed checks" )"
         printf "    Seen        %d packets, %d reordered, %d duplicated on the link, %d NAKs sent\n" "$(g RX 2)" "$(g RX 4)" "$(g RX 3)" "$(g RX 10)"
