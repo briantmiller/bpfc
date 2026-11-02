@@ -17,9 +17,12 @@ reports back, and the sender adapts:
 - **ARQ.** The receiver NAKs gaps right away, and the sender retransmits
   from a ring of recent packets, sized from the link rate × RTT. While FEC is
   on, ARQ keeps going, answers only for the most recent packets, or stops.
-- **Bandwidth probing.** Every 10 s the sender sends one packet twice back to
-  back. The receiver turns the gap between the copies into a capacity
-  estimate. Probes are sent less often (×6) while FEC is on. The estimate,
+- **Bandwidth probing.** Every 10 s (`probe-interval`, or `probe-rate`
+  probes per second) the sender sends one packet twice back to back. The
+  receiver turns the gap between the copies, and the bytes that arrived in
+  it, into a capacity sample for that direction; the estimate is a high
+  percentile of the last 16 samples. Probes are sent less often (×6) while
+  FEC is on. The estimate,
   together with the queueing delay, tells loss caused by congestion apart
   from loss on the line. When the link is congested, FEC uses a fixed ratio
   instead of scaling up and adding more traffic.
@@ -57,12 +60,19 @@ bpfc-dataplane-status set eth0 fec-threshold 2      # unset eth0 fec-threshold
   routes through the link: `ip route ... mtu lock 1492`. If an IP packet is
   still larger, it is sent without the shim and counted as bypassed. It is
   not dropped.
+  On a VLAN subinterface (`eth0.100`) it is simpler to set the VLAN's own
+  MTU to 1492 and leave the parent at 1500: routing daemons then see 1492
+  (set it on both ends, OSPF compares MTUs) and no route needs a lock.
 - **One TCP segment per packet.** TC sees packets before segmentation, so
   a GSO "super-packet" can't be encapsulated. Set
   `ip link set dev eth0 gso_max_segs 1` and
   `ethtool -K eth0 tso off gso off gro off`. Packets forwarded into the link
   from other interfaces must not be GRO-merged either
   (`ethtool -K <lan-if> gro off`). Merged packets go out unprotected.
+  Hosts or containers attached by veth hand their TSO/GSO super-packets to
+  the router unchanged (GRO settings do not help there): turn TSO/GSO off
+  on those hosts (`ethtool -K <if> tso off gso off`). Status counts such
+  packets as "Unprotected ... too large to encapsulate".
 - **No hard drops after the dataplane on egress.** The FEC program copies
   each packet into its parity block before the qdisc runs. If a later TC
   program drops the packet (`TC_ACT_SHOT`) or the qdisc drops it and reports
@@ -86,9 +96,9 @@ bpfc-dataplane-status set eth0 fec-threshold 2      # unset eth0 fec-threshold
 |---|---|---|---|
 | egress | 100 | encapsulate | Sequence number, timestamp and shim; ARQ copy; hands over to 110 in `skb->cb` |
 | egress | 110 | fec | Per-CPU FEC block, parity, packet-pair probes |
-| ingress | 100 | control | REPORT: stores what the peer measured, runs the FEC controller. NAK: retransmits |
+| ingress | 100 | control | Packet-pair samples. REPORT: stores what the peer measured, runs the FEC controller. NAK: retransmits |
 | ingress | 110 | parity | Rebuilds a missing packet from parity |
-| ingress | 120 | receiver | Sequence, duplicates, gaps, reordering, jitter, delay, probes; hands over to 130 |
+| ingress | 120 | receiver | Sequence, duplicates, gaps, reordering, jitter, delay; hands over to 130 |
 | ingress | 130 | deliver | Folds FEC members into their block, decapsulates, delivers; sends NAKs and reports |
 
 The work is split across priorities to keep each program well inside the
@@ -231,9 +241,17 @@ so far. K never changes inside a block.
 **Probes.** If the probe interval has passed and the packet is at least 600
 bytes, the packet is cloned with flag probe 1 and the original follows with
 probe 2. The interval is multiplied by the backoff while FEC is on.
+`probe-rate N` sets the interval to 1/N s (0.00002–100 per second, so
+10 ms at most often); each probe duplicates one packet, e.g. 10 probes/s of
+1500 bytes add 120 kbit/s.
+
+Each direction is measured by its receiver and reported back, so an
+asymmetric link shows two different capacities: status lists the
+outbound one (measured by the peer) and the inbound one (measured here).
 
 **Controller (ingress 100, on each REPORT).** Records the peer's
 measurements and the RTT (now − echoed ts − time the peer held it). It
+updates the loss estimate (below) and
 computes the send rate, the utilisation (`rate / capacity`) and congestion:
 the link counts as congested when utilisation ≥ 85 % or queueing delay
 ≥ 20 ms.
@@ -243,6 +261,23 @@ the link counts as congested when utilisation ≥ 85 % or queueing delay
 | loss ≥ threshold, congested | `fec-k` (8), fixed |
 | loss ≥ threshold, not congested | `2500 / loss_bp` (1 / (4 · loss)), clamped to [`fec-k-min`, `fec-k-max`] = [2, 15] |
 | loss < threshold for `fec-cooldown` | 0 (off) |
+
+**Loss estimate.** A report covers the packets since the last one, which
+can be a handful on a quiet link: one loss in three packets reads as 33 %.
+The controller (and status) therefore use an average over the last
+`loss-smoothing` packets (2000), weighted by the packets each report
+covers:
+
+    est = (est × n + window_loss × packets) / (n + packets),  n ≤ loss-smoothing
+
+`n` is the packets averaged so far, so the estimate is the plain average
+until that many have arrived, then a moving average whose memory is
+counted in packets, not time: a report of 3 packets moves it by about
+3/2000 of the difference. At 3 % loss over 2000 packets the estimate is
+within about ±0.5 %. The controller acts on it once a quarter of
+`loss-smoothing` packets have been seen. Both ends keep the same estimate
+for their inbound direction (`_rx` 39–41). Lower `loss-smoothing` reacts
+faster and is noisier.
 
 The controller only runs when a report arrives, and reports only come while
 traffic flows. An idle link therefore keeps its last FEC state until traffic
@@ -313,6 +348,24 @@ When a NAK or report is due, a copy of the packet is delivered
 (`clone ... ingress`). The original is turned into the control frame, with
 MACs swapped, and redirected out of the interface.
 
+**Packet pairs (ingress 100).** Probe 1 opens a pair: its arrival time is
+kept and a byte count started. Every frame that arrives until probe 2 adds
+its length + 24 bytes (preamble, inter-frame gap, FCS), because it crossed
+the bottleneck between the two copies; this happens before any EtherType
+match, so ARP and other traffic count too. Probe 2 closes the pair:
+
+    sample = bytes (including probe 2) × 8 / (t2 − t1)
+
+A sender queue that put other packets between the copies therefore does
+not make the link look slower. The last 16 samples are kept (`_rx` 60–75)
+and the estimate (`_rx` 19) is the fourth largest, about the 80th
+percentile: delay jitter (each packet delayed independently, as netem
+does) only stretches a gap and a receiver that batches packets only
+shrinks one, so the estimate is right while at least 4 of 16 pairs got
+through cleanly and no more than 3 were squeezed. A pair open for more than
+1 s is abandoned. The old estimator (an average of single samples) settled
+near half the rate on a link where half the pairs were stretched by jitter.
+
 **Reports.** Sent every `report-interval` while data arrives. Each report
 covers the last window:
 - raw loss = (gaps − late arrivals) / sequences expected
@@ -366,7 +419,8 @@ status script decodes them with `bpfc -r`.
 | 14 | NAKed but no longer held | 43 | reports received |
 | 15 | not retransmitted because FEC is on | 44 | peer MAC |
 | 16 / 17 / 18 | congested / utilisation % / send rate kbit/s | 45 | peer: expected packets, last window |
-| 19 / 20 | rate sample time / bytes | | |
+| 19 / 20 | rate sample time / bytes | 46 / 47 | loss / residual loss estimate, 1/100 bp |
+| | | 48 | packets in the loss estimate |
 
 `<prefix>_rx` — receiver side:
 
@@ -385,6 +439,9 @@ status script decodes them with `bpfc -r`.
 | 12–15 | transit state, delay windows | 35 | expected packets, last window |
 | 16 | queueing delay µs (EWMA) | 36 | resyncs |
 | 17–20 | probe state, capacity kbit/s, probes | 37 / 38 | redundant FEC rebuilds / retransmissions |
+| 39 / 40 | loss / residual loss estimate, 1/100 bp | 41 | packets in the loss estimate |
+| 42 / 43 | bytes in the open pair / pairs measured | 52 | last capacity sample, kbit/s |
+| 60–75 | last 16 capacity samples, kbit/s | | |
 | | | | |
 
 `<prefix>_cfg` holds runtime overrides; 0 or missing means the generated
@@ -398,7 +455,7 @@ value. Use `bpfc-dataplane-status set`, or `bpfc -w <prefix>_cfg <key> <value>`.
 | 6 / 7 | probe interval ms / backoff | 12 | FEC block timeout, ms |
 | 8 | ARQ with FEC: 1 keep, 2 off, 3 last N | 13 | minimum probe size, bytes |
 | 14 | FEC mode: 1 off, 2 on, 3 auto | 15 | congestion: queueing delay, ms |
-| 16 | FEC floor: 1–15, or 16 for none | | |
+| 16 | FEC floor: 1–15, or 16 for none | 17 | loss-smoothing, packets |
 
 Also: `<prefix>_pcpu` (FEC block per CPU), `<prefix>_arq` (ring × 1504
 bytes), `<prefix>_ftx` (per-CPU 1504 bytes), `<prefix>_frx` (slots × 1504
@@ -466,6 +523,10 @@ The existing tests give the same results before and after these changes.
 - Packet-pair probes see line rate through token-bucket shapers that still
   have burst credit, so capacity is overestimated there. The queueing-delay
   signal still detects congestion.
+- With the default probe interval (10 s) the 16 samples span minutes; use
+  `probe-rate` 1–10 on links whose rate changes or where many pairs are
+  disturbed (jitter, cross traffic). Traffic from other senders sharing the
+  bottleneck between the copies is not seen and lowers a sample.
 - Tested on kernel 6.18 with veth pairs, including an emulated 800 ms link
   (`tests/link-emulator.py`) and a content check on every delivered datagram
   (`tests/udp-verify.py`). RHEL 9 (5.14) has every helper used: BPF atomics
