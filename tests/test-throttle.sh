@@ -1,11 +1,10 @@
 #!/bin/bash
 
 
-if [ $(whoami) != "root" ]
-then
-	echo "Must be run as root"
-	exit 1
-fi
+cd "$(dirname "$0")/.." || exit 1
+source tests/lib.sh
+require_root throttle
+require_cmds throttle ping ethtool iperf numfmt
 
 sysctl net.ipv4.ip_forward=1 &>/dev/null
 
@@ -27,12 +26,6 @@ COPTS=""
 [ $DEBUG -eq 1 ] && COPTS=" -v "
 
 
-# Color Definitions
-RED='\e[31m'
-GREEN='\e[32m'
-YELLOW='\e[33m'
-BLUE='\e[34m'
-NC='\e[0m' # No Color (Reset)
 IPERF="iperf"
 TEST=""
 
@@ -49,15 +42,7 @@ function test_enabled()
 	return 1
 }
 
-function test_pass()
-{
-	echo -e "$@ ${GREEN}PASS${NC}"
-}
 
-function test_fail()
-{
-	echo -e "$@ ${RED}FAIL${NC}"
-}
 
 #Setup network
 ulimit -l unlimited
@@ -250,12 +235,12 @@ then
 
 	echo H1-H2 Throughput $(echo $h1h2bps | numfmt --to=si)bps, Efficiency $loss1%
 	echo H2-H1 Throughput $(echo $h2h1bps | numfmt --to=si)bps, Efficiency $loss2%
-	[ $loss1 -ge 10 ] && test_pass Frag-efficiency-1 || test_fail Frag-efficiency-1
-	[ $loss2 -ge 10 ] && test_pass Frag-efficiency-2 || test_fail Frag-efficiency-2
+	[ $loss1 -ge 10 ] && test_pass Throttle-efficiency-1 || test_fail Throttle-efficiency-1
+	[ $loss2 -ge 10 ] && test_pass Throttle-efficiency-2 || test_fail Throttle-efficiency-2
 
 	else
-		test_fail Frag-efficiency-1
-		test_fail Frag-efficiency-2
+		test_fail Throttle-efficiency-1
+		test_fail Throttle-efficiency-2
 	fi
 
 	{ kill -9 $P1 $P2 && wait $P1 $P2; } &>/dev/null
@@ -285,3 +270,5 @@ ip netns del H2
 ip netns del R3
 ip netns del R1
 ip netns del R2
+
+tests_exit

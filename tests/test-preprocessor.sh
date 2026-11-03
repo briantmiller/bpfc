@@ -148,7 +148,7 @@ expect_error PP-err-macro-trace 'in macro m called from <command line>:1' 'defin
 #   NEST[k] += 1 << k          nested repeat, k = I*2 + J
 
 if [ "$(id -u)" != 0 ]; then
-	echo "kernel tests skipped (need root)"
+	echo "PP-kernel tests (need root) SKIP"
 	exit $FAILED
 fi
 

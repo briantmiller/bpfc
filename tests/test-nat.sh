@@ -1,10 +1,9 @@
 #!/bin/bash
 
-if [ $(whoami) != "root" ]
-then
-	echo "Must be run as root"
-	exit 1
-fi
+cd "$(dirname "$0")/.." || exit 1
+source tests/lib.sh
+require_root nat
+require_cmds nat ping nc ncat tcpdump
 
 sysctl net.ipv4.ip_forward=1 &>/dev/null
 
@@ -26,12 +25,6 @@ COPTS=""
 [ $DEBUG -eq 1 ] && COPTS=" -v "
 
 
-# Color Definitions
-RED='\e[31m'
-GREEN='\e[32m'
-YELLOW='\e[33m'
-BLUE='\e[34m'
-NC='\e[0m' # No Color (Reset)
 
 TEST=""
 
@@ -48,15 +41,7 @@ function test_enabled()
 	return 1
 }
 
-function test_pass()
-{
-	echo -e "$@ ${GREEN}PASS${NC}"
-}
 
-function test_fail()
-{
-	echo -e "$@ ${RED}FAIL${NC}"
-}
 
 #Setup network
 ulimit -l unlimited
@@ -98,13 +83,18 @@ ip -n HOST2 route add default via 192.168.0.1
 
 ip netns exec WAN nc -kl 7 &>/dev/null &
 TCP_PID=$!
-ip netns exec WAN ncat -l 7 --keep-open --udp --exec "/bin/cat" &
+ip netns exec WAN ncat -l 7 --keep-open --udp --exec "/bin/cat" &>/dev/null &
 UDP_PID=$!
 
 #Test bed validation
-ip netns exec RTR   ping -c 4 -i 0.1 -W 0.2 10.0.0.1    &>/dev/null && test_pass RTR-WAN   || test_fail RTR-WAN &
-ip netns exec HOST1 ping -c 4 -i 0.1 -W 0.2 192.168.0.1 &>/dev/null && test_pass HOST1-RTR || test_fail HOST1-RTR &
-ip netns exec HOST2 ping -c 4 -i 0.1 -W 0.2 192.168.0.1 &>/dev/null && test_pass HOST2-RTR || test_fail HOST2-RTR &
+ip netns exec RTR   ping -c 4 -i 0.1 -W 0.2 10.0.0.1    &>/dev/null && test_pass RTR-WAN   || test_fail RTR-WAN & P1=$!
+ip netns exec HOST1 ping -c 4 -i 0.1 -W 0.2 192.168.0.1 &>/dev/null && test_pass HOST1-RTR || test_fail HOST1-RTR & P2=$!
+ip netns exec HOST2 ping -c 4 -i 0.1 -W 0.2 192.168.0.1 &>/dev/null && test_pass HOST2-RTR || test_fail HOST2-RTR & P3=$!
+
+wait $P1 $P2 $P3
+# WAN has no route back to 192.168.0.0/24: without NAT, HOST1 cannot reach it.
+# (This makes the NAT checks below meaningful.)
+timeout 3 ip netns exec HOST1 ping -c 1 -W 1 10.0.0.1 &>/dev/null && test_fail NAT-required || test_pass NAT-required
 
 #ICMP NAT testing
 ip netns exec RTR ./bpfc $COPTS -i wan -d egress -p 100 -m /var/run/bpf/RTR 'match icmp; match icmp-type 8; get ip-src IP_SRC; get bytes 38 2 ICMP_IDENT; set map ICMP_NAT %ICMP_IDENT %IP_SRC; set ip-src 10.0.0.30' && test_pass ICMP-NAT-OUT || test_fail ICMP-NAT-OUT
@@ -128,11 +118,11 @@ ip netns exec HOST1 ping -c 3 10.0.0.1 &>/dev/null && test_pass ICMP-NAT || test
 #Register new TCP connections into TCP NAT table
 ip netns exec RTR ./bpfc $COPTS -i wan -d egress -p 106 -m /var/run/bpf/RTR 'match tcp; match tcp-flags SYN; get ip-src IP_SRC; get tcp-src TCP_SRC; set map TCP_NAT %TCP_SRC %IP_SRC' && test_pass TCP-NAT-OUT || test_fail TCP-NAT-OUT
 #Change all outgoing TCP packets to be sourced from wan interface
-ip netns exec RTR ./bpfc $COPTS -i wan -d egress -p 1061 -m /var/run/bpf/RTR 'match tcp; set ip-src 10.0.0.30' && test_pass TCP-NAT-OUT || test_fail TCP-NAT-OUT
+ip netns exec RTR ./bpfc $COPTS -i wan -d egress -p 1061 -m /var/run/bpf/RTR 'match tcp; set ip-src 10.0.0.30' && test_pass TCP-NAT-OUT-2 || test_fail TCP-NAT-OUT-2
 #Change the IP destination of TCP packets back to NAT'ed address
 ip netns exec RTR ./bpfc $COPTS -i wan -d ingress -p 106 -m /var/run/bpf/RTR 'match tcp; get tcp-dst TCP_DST; get map TCP_NAT %TCP_DST IP_DST; set ip-dst %IP_DST' && test_pass TCP-NAT-IN || test_fail TCP-NAT-IN
 
-echo "TCP Echo" | timeout 4 ip netns exec HOST1 nc -w 1 10.0.01 7 && test_pass TCP-NAT || test_fail TCP-NAT
+echo "TCP Echo" | timeout 4 ip netns exec HOST1 nc -w 1 10.0.0.1 7 &>/dev/null && test_pass TCP-NAT || test_fail TCP-NAT
 
 
 #UDP NAT testing
@@ -143,8 +133,7 @@ ip netns exec RTR ./bpfc $COPTS -i wan -d ingress -p 117 -m /var/run/bpf/RTR 'ma
 timeout 5 ip netns exec HOST1 tcpdump -c 1 -lvnpi rtr udp and ip src 10.0.0.1 &>/dev/null && test_pass UDP-NAT || test_fail UDP-NAT &
 sleep 0.5s 
 
-echo "UDP Echo" | timeout 4 ip netns exec HOST1 ncat -u 10.0.0.1 7 
-#&& test_pass UDP-NAT || test_fail UDP-NAT
+echo "UDP Echo" | timeout 4 ip netns exec HOST1 ncat -u 10.0.0.1 7 &>/dev/null
 
 
 #Test bed cleanup
@@ -159,3 +148,5 @@ ip netns del RTR
 ip netns del WAN
 ip netns del HOST1
 ip netns del HOST2
+
+tests_exit

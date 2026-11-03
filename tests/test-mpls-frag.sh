@@ -1,14 +1,13 @@
 #!/bin/bash
 
 
-if [ $(whoami) != "root" ]
-then
-	echo "Must be run as root"
-	exit 1
-fi
+cd "$(dirname "$0")/.." || exit 1
+source tests/lib.sh
+require_root mpls-frag
+require_cmds mpls-frag ping ethtool
 
 sysctl net.ipv4.ip_forward=1 &>/dev/null
-lsmod | grep -q mpls-router || modprobe mpls-router
+require_kernel_mpls mpls-frag
 
 DEBUG=0
 declare -a TESTS
@@ -28,12 +27,6 @@ COPTS=""
 [ $DEBUG -eq 1 ] && COPTS=" -v "
 
 
-# Color Definitions
-RED='\e[31m'
-GREEN='\e[32m'
-YELLOW='\e[33m'
-BLUE='\e[34m'
-NC='\e[0m' # No Color (Reset)
 IPERF="iperf"
 TEST=""
 
@@ -50,15 +43,7 @@ function test_enabled()
 	return 1
 }
 
-function test_pass()
-{
-	echo -e "$@ ${GREEN}PASS${NC}"
-}
 
-function test_fail()
-{
-	echo -e "$@ ${RED}FAIL${NC}"
-}
 
 #Setup network
 ulimit -l unlimited
@@ -329,29 +314,17 @@ MAX=$(( $FRAG_SIZE + 50 ))
 ip netns exec CE1 ./bpfc $COPTS -i h1 -d ingress -p 10 -m /var/run/bpf/CE1 "ip-frag $FRAG_SIZE 3000" && test_pass CE1-frag-$FRAG_SIZE-install || (test_fail CE1-frag-$FRAG_SIZE-install ; exit 1)
 ip netns exec CE2 ./bpfc $COPTS -i h2 -d ingress -p 10 -m /var/run/bpf/CE2 "ip-frag $FRAG_SIZE 3000" && test_pass CE2-frag-$FRAG_SIZE-install || (test_fail CE2-frag-$FRAG_SIZE-install ; exit 1)
 
-PPIDS=()
+# Correctness: three pings that each need fragmenting must all be answered.
 
-#timeout 5 ip netns exec PE1 tcpdump -c 1 -lvnpi ce1 "greater $MAX" &>/dev/null && test_fail "Pkt-mon-$FRAG_SIZE" || test_pass "Pkt-mon-$FRAG_SIZE"
+timeout 10 ip netns exec H1 ping -c 3 -i 0.2 -W 2 -s $PING_SIZE 192.168.0.2 &>/dev/null && test_pass "MPLS-IP-Frag-size-$FRAG_SIZE" || test_fail "MPLS-IP-Frag-size-$FRAG_SIZE"
 
-for I in $( seq 1 $PING_PROC_NUM )
-do
-#timeout 15 ip netns exec H1 ping -c $PING_COUNT -s $PING_SIZE -i 0.01 192.168.0.2 &>/dev/null && test_pass IP-Frag-$I || test_fail IP-Frag-$I & 
-timeout 15 ip netns exec H1 ping -c $PING_COUNT -s $PING_SIZE -i 0.01 -W 2 192.168.0.2 &>/dev/null & 
-PPIDS+=($!)
-done
+# Load: $PING_PROC_NUM pings at once; the loss over all of them must stay under
 
-PASS=1
-for PINGPID in "${PPIDS[@]}"
-do
-	wait "$PINGPID" 
-	RET=$?
-	if [ $RET -ne 0 ]
-	then
-		PASS=0
-		test_fail "MPLS-IP-Frag-$PINGPID"
-	fi
-done 
-[ $PASS -eq 1 ] && test_pass "MPLS-IP-Frag-size-$FRAG_SIZE" || test_fail "MPLS-IP-Frag-size-$FRAG_SIZE"
+# STRESS_MAX_LOSS (hundredths of a percent; default 1 %).
+
+LOSS=$(ping_loss H1 $PING_PROC_NUM $PING_COUNT -s $PING_SIZE -i 0.01 -W 2 192.168.0.2)
+
+[ "$LOSS" -le "${STRESS_MAX_LOSS:-100}" ] && test_pass "MPLS-IP-Frag-stress-$FRAG_SIZE (loss $(pct $LOSS) %)" || test_fail "MPLS-IP-Frag-stress-$FRAG_SIZE (loss $(pct $LOSS) %)"
 done
 #cat out*.txt
 #rm -f out*.txt
@@ -449,3 +422,5 @@ ip netns del H2
 ip netns del PE1
 ip netns del CE1
 ip netns del CE2
+
+tests_exit

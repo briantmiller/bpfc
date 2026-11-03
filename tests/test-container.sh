@@ -20,10 +20,10 @@ RED='\e[31m'; GREEN='\e[32m'; YELLOW='\e[33m'; NC='\e[0m'
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 BUSYBOX=${BUSYBOX:-$(command -v busybox)}
 for t in unshare nsenter setpriv; do
-	command -v $t >/dev/null || { echo -e "${YELLOW}SKIP${NC}: $t not found"; exit 0; }
+	command -v $t >/dev/null || { echo -e "container tests ($t not found) ${YELLOW}SKIP${NC}"; exit 0; }
 done
 if [ -z "$BUSYBOX" ] || ! file -L "$BUSYBOX" | grep -q "statically linked"; then
-	echo -e "${YELLOW}SKIP${NC}: needs a statically linked busybox (install busybox-static or set BUSYBOX=)"
+	echo -e "container tests (need a statically linked busybox: install busybox-static or set BUSYBOX=) ${YELLOW}SKIP${NC}"
 	exit 0
 fi
 if [ -z "${RPMS:-}" ]; then

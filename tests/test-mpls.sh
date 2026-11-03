@@ -1,13 +1,12 @@
 #!/bin/bash
 
-if [ $(whoami) != "root" ]
-then
-	echo "Must be run as root"
-	exit 1
-fi
+cd "$(dirname "$0")/.." || exit 1
+source tests/lib.sh
+require_root mpls
+require_cmds mpls ping ethtool
 
 sysctl net.ipv4.ip_forward=1 &>/dev/null
-lsmod | grep -q mpls-router || modprobe mpls-router
+require_kernel_mpls mpls
 
 DEBUG=0
 declare -a TESTS
@@ -27,12 +26,6 @@ COPTS=""
 [ $DEBUG -eq 1 ] && COPTS=" -v "
 
 
-# Color Definitions
-RED='\e[31m'
-GREEN='\e[32m'
-YELLOW='\e[33m'
-BLUE='\e[34m'
-NC='\e[0m' # No Color (Reset)
 IPERF="iperf"
 TEST=""
 
@@ -49,15 +42,7 @@ function test_enabled()
 	return 1
 }
 
-function test_pass()
-{
-	echo -e "$@ ${GREEN}PASS${NC}"
-}
 
-function test_fail()
-{
-	echo -e "$@ ${RED}FAIL${NC}"
-}
 
 #Setup network
 ulimit -l unlimited
@@ -413,3 +398,5 @@ ip netns del H2
 ip netns del PE1
 ip netns del CE1
 ip netns del CE2
+
+tests_exit

@@ -40,7 +40,7 @@ RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
 TARBALL    = bpfc-$(VERSION).tar.gz
 
-.PHONY: check-dataplane all clean install dist rpm srpm check
+.PHONY: check-dataplane check-all all clean install dist rpm srpm check
 
 all: $(TARGET) $(DAEMON) $(CTL)
 
@@ -98,14 +98,19 @@ srpm: $(TARBALL)
 	rpmbuild $(RPMBUILD_OPTS) --define "_topdir $(RPMTOP)" -bs $(RPMTOP)/SPECS/bpfc.spec
 
 # Integration test for bpfcd/bpfcctl (needs root; creates and deletes veth pairs).
+# Test suites via tests/run-tests.sh, which totals pass/fail/skip at the end.
+# TESTFLAGS=-f prints failures only; -v prints full suite output.
+TESTFLAGS ?=
+
 check: all
-	bash tests/test-preprocessor.sh
-	bash tests/test-stack.sh
-	bash tests/test-bpfcd.sh
-	bash tests/test-container.sh
+	bash tests/run-tests.sh $(TESTFLAGS) preprocessor stack bpfcd container
 
 check-dataplane: $(TARGET)
-	bash tests/test-dataplane.sh
+	bash tests/run-tests.sh $(TESTFLAGS) dataplane
+
+# Every suite, including the network suites and pytest (root; about an hour).
+check-all: all
+	bash tests/run-tests.sh $(TESTFLAGS)
 
 clean:
 	rm -f $(TARGET) $(DAEMON) $(CTL) output.bpf $(TARBALL)

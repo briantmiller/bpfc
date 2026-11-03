@@ -1,10 +1,9 @@
 #!/bin/bash
 
-if [ $(whoami) != "root" ]
-then
-	echo "Must be run as root"
-	exit 1
-fi
+cd "$(dirname "$0")/.." || exit 1
+source tests/lib.sh
+require_root loops
+require_cmds loops ping nc ncat
 
 sysctl net.ipv4.ip_forward=1 &>/dev/null
 
@@ -26,12 +25,6 @@ COPTS=""
 [ $DEBUG -eq 1 ] && COPTS=" -v "
 
 
-# Color Definitions
-RED='\e[31m'
-GREEN='\e[32m'
-YELLOW='\e[33m'
-BLUE='\e[34m'
-NC='\e[0m' # No Color (Reset)
 
 TEST=""
 
@@ -48,15 +41,7 @@ function test_enabled()
 	return 1
 }
 
-function test_pass()
-{
-	echo -e "$@ ${GREEN}PASS${NC}"
-}
 
-function test_fail()
-{
-	echo -e "$@ ${RED}FAIL${NC}"
-}
 
 #Setup network
 ulimit -l unlimited
@@ -75,7 +60,6 @@ ip link add wan netns RTR type veth peer name rtr netns WAN
 ip link add host1 netns RTR type veth peer name rtr netns HOST1
 ip link add host2 netns RTR type veth peer name rtr netns HOST2
 
-ip -n WAN link add lo0 type dummy
 
 ip -n RTR link add br0 type bridge
 ip -n RTR link set host1 master br0
@@ -86,12 +70,11 @@ do
 	ip -n RTR link set $I up
 done
 ip -n WAN link set rtr up
-ip -n WAN link set lo0 up
 ip -n HOST1 link set rtr up
 ip -n HOST2 link set rtr up
 
 ip -n WAN addr add 10.0.0.1/24 dev rtr
-ip -n WAN addr add 10.0.1.1/32 dev lo0
+ip -n WAN addr add 10.0.1.1/32 dev lo   # on lo: a dummy interface needs a kernel module some systems lack
 ip -n RTR addr add 10.0.0.30/24 dev wan
 ip -n RTR addr add 192.168.0.1/24 dev br0
 ip -n HOST1 addr add 192.168.0.50/24 dev rtr
@@ -157,3 +140,5 @@ ip netns del RTR
 ip netns del WAN
 ip netns del HOST1
 ip netns del HOST2
+
+tests_exit
