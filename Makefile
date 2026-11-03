@@ -64,6 +64,7 @@ install: all
 	install -D -m 0644 dist/bpfcd.service $(DESTDIR)$(UNITDIR)/bpfcd.service
 	install -D -m 0644 dist/bpfc.conf $(DESTDIR)$(SYSCONFDIR)/bpfc/bpfc.conf
 	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/interfaces.d
+	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/include
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/ingress
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/egress
 	install -m 0644 dist/examples/interfaces.d/eth0/ingress/*.bpfc $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/ingress/
@@ -98,6 +99,8 @@ srpm: $(TARBALL)
 
 # Integration test for bpfcd/bpfcctl (needs root; creates and deletes veth pairs).
 check: all
+	bash tests/test-preprocessor.sh
+	bash tests/test-stack.sh
 	bash tests/test-bpfcd.sh
 	bash tests/test-container.sh
 

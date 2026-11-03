@@ -67,10 +67,15 @@ static int daemon_alive(int pid) {
     return !strcmp(comm, "bpfcd");
 }
 
+/* The bpfc the daemon uses (from its state file), so programs with includes
+ * hash the same here as in bpfcd. */
+static char daemon_bpfc[PATH_MAX];
+
 static int load_state(struct daemon_info *di, struct slot **slots) {
     char path[PATH_MAX + 32];
     snprintf(path, sizeof(path), "%s/%s", state_dir(), STATE_FILE_NAME);
     int n = state_read(path, di, slots);
+    if (n >= 0) snprintf(daemon_bpfc, sizeof(daemon_bpfc), "%s", di->bpfc_path[0] ? di->bpfc_path : cfg.bpfc_path);
     if (n < 0) {
         if (n == -ENOENT)
             fprintf(stderr, "No state at %s: bpfcd has not run yet (start it with: systemctl start bpfcd)\n", path);
@@ -80,14 +85,15 @@ static int load_state(struct daemon_info *di, struct slot **slots) {
     return n;
 }
 
-/* Has the file on disk changed since bpfcd last read it? Mirrors the daemon's mtime-then-hash rule. */
+/* Has the file on disk (or a file it includes) changed since bpfcd last read it?
+ * Always hashes: the program's own mtime does not show changes to its includes. */
 static int file_state(const struct slot *s) {
     struct stat st;
     if (stat(s->path, &st) < 0) return -1; /* deleted */
-    int64_t m = (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
-    if (m == s->mtime_ns) return 0;
     char hex[65];
-    if (sha256_file(s->path, hex) < 0) return -1;
+    int has_includes;
+    if (sha256_program(daemon_bpfc[0] ? daemon_bpfc : cfg.bpfc_path, s->path, cfg.compile_timeout,
+                       hex, &has_includes) < 0) return -1;
     return strcmp(hex, s->sha256) ? 1 : 0;
 }
 

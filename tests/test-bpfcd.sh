@@ -138,6 +138,24 @@ printf 'match ip6; drop\n' > "$CFG/$A/egress/40.bpfc"; reload
 check "new file installed"                     has_prog $A egress 40
 printf 'match tcp; drop\n' > "$CFG/$A/egress/30.bpfc"; reload
 check "fixed file installs on reload"          is_status $A egress 30 installed
+
+echo "includes"
+mkdir -p "$T/lib"
+printf 'define block-proto P;\n  match $P; drop; end-match;\nend-define;\n' > "$T/lib/blk.bpfc"
+printf 'include %s/lib/blk.bpfc;\nblock-proto tcp\n' "$T" > "$CFG/$A/egress/50.bpfc"; reload
+check "program with include installed"         is_status $A egress 50 installed
+ID50=$(prog_at $A egress 50)
+reload
+check "unchanged include keeps program"        same_id $A egress 50 "$ID50"
+printf 'define block-proto P;\n  match $P; match tcp-dst 23; drop; end-match; end-match;\nend-define;\n' > "$T/lib/blk.bpfc"
+check "bpfcctl sees the changed include"       eval '$BPFCCTL -s $T/run status | grep -E "^$A +egress +50 " | grep -q "modified, reload pending"'
+reload
+check "changed include replaces program"       diff_id $A egress 50 "$ID50"
+check "bpfcctl: no change after reload"        eval '! $BPFCCTL -s $T/run status | grep -E "^$A +egress +50 " | grep -q "modified, reload pending"'
+chmod o+w "$T/lib/blk.bpfc"; printf '# touched\n' >> "$T/lib/blk.bpfc"; reload
+check "world-writable include refused"         is_status $A egress 50 failed
+rm "$CFG/$A/egress/50.bpfc"; chmod o-w "$T/lib/blk.bpfc"; reload
+
 ID20=$(prog_at $A ingress 20)
 printf 'start-loop; loop-reg\n' > "$CFG/$A/ingress/20.bpfc"; reload
 check "verifier rejection marked failed"       is_status $A ingress 20 failed

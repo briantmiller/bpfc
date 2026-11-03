@@ -83,6 +83,29 @@ int config_apply_env(struct config *c, char *err, size_t errlen);
 /* SHA-256 of a file as 64 lowercase hex chars + NUL. Returns 0 or -errno. */
 int sha256_file(const char *path, char out_hex[65]);
 
+/*
+ * Hash of a program for change detection. A program that mentions "include"
+ * is hashed together with every file it reads (bpfc -M lists them), so
+ * editing an included file counts as a change; *has_includes is then set,
+ * because the program file's own mtime no longer shows every change. Any
+ * other program hashes exactly as sha256_file(). Returns 0 or -errno.
+ */
+int sha256_program(const char *bpfc_path, const char *path, int timeout_s,
+                   char out_hex[65], int *has_includes);
+
+/* ---------------- running bpfc ---------------- */
+
+#define MAX_CAPTURE (1024 * 1024)      /* bpfc output kept per run (verifier logs can be long) */
+
+struct run_result { int exit_code; int timed_out; char *out; size_t outlen; };
+
+/*
+ * Runs argv (in workdir, if given) with stdout+stderr captured, killing it
+ * after timeout_s seconds. exit_code is -1 if it did not exit normally.
+ * The caller frees r->out.
+ */
+int run_capture(char *const argv[], struct run_result *r, int timeout_s, const char *workdir);
+
 /* ---------------- state file ---------------- */
 
 enum slot_status {
@@ -117,6 +140,7 @@ struct slot {
     int seen;                 /* present in the latest scan of the config dir */
     int dirty;                /* needs (re)install */
     int is_new;               /* first seen in this scan (for log wording) */
+    int has_includes;         /* hash covers included files; mtime alone does not show changes */
     time_t reinstall_window;  /* start of the current one-minute reinstall window */
     int reinstall_count;
 };
@@ -129,6 +153,7 @@ struct daemon_info {
     char version[32];
     char config_dir[PATH_MAX];
     int on_external_change;
+    char bpfc_path[PATH_MAX];   /* the daemon's bpfc, for hashing programs with includes */
 };
 
 /* Atomically writes the state file (temp file + rename). Returns 0 or -errno. */

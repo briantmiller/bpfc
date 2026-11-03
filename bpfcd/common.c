@@ -15,6 +15,9 @@
 #include <string.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -338,6 +341,148 @@ int sha256_file(const char *path, char out_hex[65]) {
     return 0;
 }
 
+static void hex32(const uint8_t d[32], char out_hex[65]) {
+    for (int i = 0; i < 32; i++) sprintf(out_hex + i * 2, "%02x", d[i]);
+    out_hex[64] = '\0';
+}
+
+/* Does the file contain the word "include" anywhere? Cheap pre-check so
+ * programs without includes never run bpfc here. */
+static int mentions_include(const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    char buf[8192 + 8];
+    size_t keep = 0;
+    int found = 0;
+    for (;;) {
+        ssize_t n = read(fd, buf + keep, sizeof(buf) - 1 - keep);
+        if (n < 0) { if (errno == EINTR) continue; int e = -errno; close(fd); return e; }
+        if (n == 0) break;
+        size_t len = keep + (size_t)n;
+        buf[len] = '\0';
+        for (size_t i = 0; i < len; i++) if (!buf[i]) buf[i] = ' ';
+        if (strstr(buf, "include")) { found = 1; break; }
+        keep = len < 6 ? len : 6;          /* a word split across reads */
+        memmove(buf, buf + len - keep, keep);
+    }
+    close(fd);
+    return found;
+}
+
+int sha256_program(const char *bpfc_path, const char *path, int timeout_s,
+                   char out_hex[65], int *has_includes) {
+    *has_includes = 0;
+    int m = mentions_include(path);
+    if (m < 0) return m;
+    if (!m) return sha256_file(path, out_hex);
+    *has_includes = 1;
+
+    char main_hex[65];
+    int rc = sha256_file(path, main_hex);
+    if (rc < 0) return rc;
+
+    char *argv[] = {(char *)bpfc_path, "-M", "-f", (char *)path, NULL};
+    struct run_result r;
+    rc = run_capture(argv, &r, timeout_s, NULL);
+    if (rc < 0) return rc;
+
+    /* Hash "path NUL hash LF" for every file. If bpfc cannot list them (a
+     * syntax error, a missing include), hash its message instead: the program
+     * fails to compile anyway, and fixing the cause changes the message. */
+    struct sha256_ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, (const uint8_t *)main_hex, 64);
+    if (r.exit_code != 0 || r.timed_out || !r.out) {
+        const char *tag = "\nunresolved\n";
+        sha256_update(&ctx, (const uint8_t *)tag, strlen(tag));
+        if (r.out) sha256_update(&ctx, (const uint8_t *)r.out, r.outlen);
+    } else {
+        for (char *ln = r.out; *ln;) {
+            char *nl = strchr(ln, '\n');
+            if (nl) *nl = '\0';
+            if (*ln) {
+                char dep_hex[65];
+                if (sha256_file(ln, dep_hex) < 0) memset(dep_hex, '-', 64), dep_hex[64] = '\0';
+                sha256_update(&ctx, (const uint8_t *)ln, strlen(ln) + 1);
+                sha256_update(&ctx, (const uint8_t *)dep_hex, 64);
+                sha256_update(&ctx, (const uint8_t *)"\n", 1);
+            }
+            if (!nl) break;
+            ln = nl + 1;
+        }
+    }
+    free(r.out);
+    uint8_t d[32];
+    sha256_final(&ctx, d);
+    hex32(d, out_hex);
+    return 0;
+}
+
+/* ======================= running bpfc ======================= */
+
+int run_capture(char *const argv[], struct run_result *r, int timeout_s, const char *workdir) {
+    memset(r, 0, sizeof(*r));
+    r->exit_code = -1;
+    int p[2];
+    if (pipe2(p, O_CLOEXEC) < 0) return -errno;
+    pid_t pid = fork();
+    if (pid < 0) { int e = -errno; close(p[0]); close(p[1]); return e; }
+    if (pid == 0) {
+        /* The daemon blocks signals for its signalfd; the child must not inherit that. */
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) dup2(devnull, 0);
+        dup2(p[1], 1);
+        dup2(p[1], 2);
+        /* bpfc writes output.bpf when compiling without -i; keep it out of the way. */
+        if (workdir && chdir(workdir) < 0) { /* not fatal */ }
+        execv(argv[0], argv);
+        fprintf(stderr, "cannot execute %s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+    close(p[1]);
+
+    size_t cap = 8192;
+    r->out = malloc(cap);
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
+        long left = timeout_s * 1000L - elapsed;
+        if (left <= 0) { r->timed_out = 1; kill(pid, SIGKILL); break; }
+        struct pollfd pfd = {.fd = p[0], .events = POLLIN};
+        int pr = poll(&pfd, 1, (int)left);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) continue;
+        char buf[8192];
+        ssize_t n = read(p[0], buf, sizeof(buf));
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        if (n == 0) break;
+        if (r->out && r->outlen < MAX_CAPTURE) {
+            size_t take = (size_t)n;
+            if (r->outlen + take > MAX_CAPTURE) take = MAX_CAPTURE - r->outlen;
+            if (r->outlen + take + 1 > cap) {
+                while (r->outlen + take + 1 > cap) cap *= 2;
+                char *nb = realloc(r->out, cap);
+                if (!nb) { free(r->out); r->out = NULL; continue; }
+                r->out = nb;
+            }
+            memcpy(r->out + r->outlen, buf, take);
+            r->outlen += take;
+        }
+    }
+    close(p[0]);
+    if (r->out) r->out[r->outlen] = '\0';
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) ;
+    if (WIFEXITED(st)) r->exit_code = WEXITSTATUS(st);
+    return 0;
+}
+
 /* ======================= state file ======================= */
 
 /*
@@ -393,6 +538,7 @@ int state_write(const char *path, const struct daemon_info *di,
     snprintf(num, sizeof(num), "%u", di->reload_count); put_enc(f, "reload_count", num);
     put_enc(f, "version", di->version);
     put_enc(f, "config_dir", di->config_dir);
+    if (di->bpfc_path[0]) put_enc(f, "bpfc_path", di->bpfc_path);
     put_enc(f, "on_external_change", di->on_external_change == EXT_LOG ? "log" : "reinstall");
     fputc('\n', f);
 
@@ -462,6 +608,7 @@ int state_read(const char *path, struct daemon_info *di, struct slot **slots_out
                 else if (!strcmp(k, "reload_count")) di->reload_count = (unsigned)strtoul(val, NULL, 10);
                 else if (!strcmp(k, "version")) snprintf(di->version, sizeof(di->version), "%s", val);
                 else if (!strcmp(k, "config_dir")) snprintf(di->config_dir, sizeof(di->config_dir), "%s", val);
+                else if (!strcmp(k, "bpfc_path")) snprintf(di->bpfc_path, sizeof(di->bpfc_path), "%s", val);
                 else if (!strcmp(k, "on_external_change")) di->on_external_change = strcmp(val, "log") ? EXT_REINSTALL : EXT_LOG;
                 continue;
             }
