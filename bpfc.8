@@ -290,7 +290,7 @@ Remove the eBPF program from eth0 and clean up the TC hook:
 .B bpfc \-i eth0 \-c
 .RE
 .SH NOTES
-The 512-byte eBPF stack holds 128 bytes of fixed instruction scratch, then one 8-byte slot per variable, up to 48. Instructions that need more scratch (\fBfib-lookup\fR 72 bytes, \fBpush-eth\fR 32, \fBrecalc-icmp-csum\fR 128, byte insertion and deletion) use the space below the variables while they run. \fBxor-packet\fR and the TCP/UDP checksums work in chunks of up to 256 bytes, smaller when more than 16 variables leave less room (more verifier instructions, same result). \fBfib-lookup\fR adds five variables. When something does not fit, bpfc names the instruction and the bytes it needs; \fBfree\fR variables that are no longer used. Arbitrary byte injection (\fBadd-bytes\fR) is constrained to 256 bytes per instruction to satisfy kernel verifier bounds.
+The 512-byte eBPF stack holds 128 bytes of fixed instruction scratch, then one 8-byte slot per variable (two for a 16-byte IPv6 address), up to 48 slots. Instructions that need more scratch (\fBfib-lookup\fR 72 bytes, \fBpush-eth\fR 32, \fBrecalc-icmp-csum\fR 128, byte insertion and deletion) use the space below the variables while they run. \fBxor-packet\fR and the TCP/UDP checksums work in chunks of up to 256 bytes, smaller when more than 16 variables leave less room (more verifier instructions, same result). \fBfib-lookup\fR adds five variables. When something does not fit, bpfc names the instruction and the bytes it needs; \fBfree\fR variables that are no longer used. Arbitrary byte injection (\fBadd-bytes\fR) is constrained to 256 bytes per instruction to satisfy kernel verifier bounds.
 .SH SEE ALSO
 .BR bpfcd (8),
 .BR bpfcctl (8),

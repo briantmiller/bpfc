@@ -109,11 +109,11 @@ See [dataplane/DESIGN.md](dataplane/DESIGN.md) for the wire format, the algorith
 Instructions are strictly **semicolon-separated**. Variables (denoted by `%`) are dynamically allocated on the 512-byte eBPF stack and natively converted to Host Byte Order for mathematical operations.
 
 ### Variables
-* `decl <VAR> <size>` - Create a new variable of `<size>` bytes (1,2,4 or 8).
+* `decl <VAR> <size>` - Create a new variable of `<size>` bytes (1, 2, 4, 8 or 16). A 16-byte variable holds an IPv6 address in network byte order, for `get`, `set` and `match` of `ip6-src`/`ip6-dst`.
 * `set val <VAR> <%VAR | int>` - Set variable to integer value or value from another variable
 * `free <VAR>` - Free `VAR` from the stack, making space available for later variables.  
 
-**Stack layout.** The 512-byte stack holds 128 bytes of fixed scratch used inside single instructions, then one 8-byte slot per variable (whatever its size), as many as the program declares, up to 48. Instructions that need more scratch (`fib-lookup`: 72 bytes, `push-eth`: 32, `recalc-icmp-csum`: 128, the byte-insertion and deletion commands) take it below the variables and give it back when they finish. `xor-packet` and the TCP/UDP checksums stage packet data in chunks of up to 256 bytes: with more than 16 variables the chunks get smaller (down to 8 and 4 bytes), which works the same but costs more verifier instructions. The variables `fib-lookup` adds (`FIB_RESULT`, `FIB_SMAC`, `FIB_DMAC`, `FIB_IP_DST`, `FIB_IFINDEX`) count as five. If something does not fit, bpfc says which instruction needs how much; `free` variables you no longer need.
+**Stack layout.** The 512-byte stack holds 128 bytes of fixed scratch used inside single instructions, then one 8-byte slot per variable (two for a 16-byte one), as many as the program declares, up to 48 slots. Instructions that need more scratch (`fib-lookup`: 72 bytes, `push-eth`: 32, `recalc-icmp-csum`: 128, the byte-insertion and deletion commands) take it below the variables and give it back when they finish. `xor-packet` and the TCP/UDP checksums stage packet data in chunks of up to 256 bytes: with more than 16 variables the chunks get smaller (down to 8 and 4 bytes), which works the same but costs more verifier instructions. The variables `fib-lookup` adds (`FIB_RESULT`, `FIB_SMAC`, `FIB_DMAC`, `FIB_IP_DST`, `FIB_IFINDEX`) count as five. If something does not fit, bpfc says which instruction needs how much; `free` variables you no longer need.
 
 ### Branching & Control Flow
 * `match|if <field> <value>` - Opens a conditional block. If the packet field does not match the value, execution jumps past the block.
@@ -133,8 +133,8 @@ Quick boolean filters for specific L2/L3 types. Use as standalone matches (e.g.,
 ### Packet Data Fields (`get`, `set`, `match`)
 Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val | %VAR>`), and evaluation (`match <field> <val | %VAR>`). Subnets (`10.0.0.0/24`) and port ranges (`80-100`) are fully supported.
 
-* **L2:** `dst-mac`, `src-mac`, `eth-proto`, `vlan-id`
-* **IPv4:** `ip-src`, `ip-dst`, `ip-tos`, `ip-proto`
+* **L2:** `dst-mac`, `src-mac`, `eth-proto`, `vlan-id` (`set vlan-id` replaces the id of the tag and keeps its priority and TPID; without a tag it adds an 802.1Q one)
+* **IPv4:** `ip-src`, `ip-dst`, `ip-tos`, `ip-proto` (`set ip-src`/`ip-dst` update the IP checksum and the TCP/UDP checksum, whose pseudo-header covers the addresses; a UDP checksum of 0 stays 0)
 * **IPv6:** `ip6-src`, `ip6-dst`, `ip6-tclass`, `ip6-flow`, `ip6-proto`
 * **L4:** `tcp-src`, `tcp-dst`, `udp-src`, `udp-dst`
 * **ARP:** `arp-htype`, `arp-ptype`, `arp-hlen`, `arp-plen`, `arp-oper`, `arp-sha`, `arp-tha`, `arp-spa`, `arp-tpa`
@@ -196,7 +196,7 @@ Allows persistent data storage across packets and network interfaces.
 * `add-bytes <offset> <len>` / `del-bytes <offset> <len>` - Inserts `<len>` number of bytes at `<offset>` and shifts packet tail down/up.
 * `add-head-bytes <len>` - Adds bytes to head of packet.
 * `del-bytes <offset> <len>` - Delete bytes at specific offset. Will attempt to use buffer maps if available, then revert to unrolled loop if necessary.
-* `add-l2-bytes <len>` / `del-l2-bytes <len>` - Shifts memory exactly at Offset 14. Possibly not working depending on kernel version.
+* `add-l2-bytes <len>` / `del-l2-bytes <len>` - Insert or remove `<len>` bytes right after the Ethernet header (offset 14), for any protocol; the same as `add-bytes 14 <len>` / `del-bytes 14 <len>`. For IPv4/IPv6 packets `insert-l2` / `strip-l2` are cheaper.
 * `insert-l2 <len> [ethertype]` - Insert `len` zero bytes after the Ethernet header (IPv4/IPv6 packets) and optionally set the EtherType. Headers behind it keep their place in memory, so checksum offload keeps working.
 * `strip-l2 <len> <ethertype>` - Remove `len` bytes (multiple of 4) after the Ethernet header and set the EtherType, for any protocol (`bpf_skb_adjust_room` refuses non-IP packets). No payload copy; the stack sees the new protocol directly.
 * `recalc-tcp-csum [l3 [max]]`, `recalc-udp-csum [l3 [max]]`, `recalc-icmp-csum` - L4 checksum recomputed from scratch via `bpf_csum_diff`: any IHL, length from the IP header, packets up to `max` bytes (default 9000). On egress, locally sent TCP/UDP packets usually still have checksum offload pending (the kernel or NIC completes the checksum after the program), so recalculate on ingress or for forwarded packets.

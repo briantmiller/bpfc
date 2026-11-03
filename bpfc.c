@@ -220,6 +220,7 @@ int prog_idx = 0;
 struct { char name[32];
     int stack_off;
     int size;
+    int slot;      /* stack bytes it occupies: 8, or 16 for a 16-byte (IPv6) value */
     int free;
     } vars[MAX_VARS];
 int num_vars = 0;
@@ -341,6 +342,7 @@ void define_var_at_offset(const char *name, int size, int stack_off) {
     }
     strncpy(vars[num_vars].name, name, 31);
     vars[num_vars].size = size;
+    vars[num_vars].slot = 8;
     vars[num_vars].stack_off = stack_off;
     num_vars++;
 }
@@ -537,34 +539,46 @@ int allocate_var(const char *name, int size) {
             return vars[i].stack_off;
     }
 
-    // 2. Reuse a freed slot. (This used to zero the variable at the top of
-    //    the stack instead of the reused slot, wiping a live variable, and
-    //    could shadow a variable of the same name declared later.)
+    // A 16-byte value (an IPv6 address) takes two 8-byte slots; anything
+    // else one.
+    int slot = size > 8 ? 16 : 8;
+    if (size > 16) {
+        fprintf(stderr, "Error: variable '%s' of %d bytes; at most 16\n", name, size);
+        exit(1);
+    }
+
+    // 2. Reuse a freed slot that is big enough. (This used to zero the
+    //    variable at the top of the stack instead of the reused slot, wiping a
+    //    live variable, and could shadow a variable of the same name declared
+    //    later.)
     for (int i = 0; i < num_vars; i++) {
-        if (vars[i].free) {
+        if (vars[i].free && vars[i].slot >= slot) {
             vars[i].free = 0;
             memset(vars[i].name, 0, sizeof(vars[i].name));
             strncpy(vars[i].name, name, 31);
             vars[i].size = size;
-            emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, vars[i].stack_off, 0));
+            for (int b = 0; b < vars[i].slot; b += 8)
+                emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, vars[i].stack_off + b, 0));
             return vars[i].stack_off;
         }
     }
 
     // 3. New 8-byte slot
-    if (num_vars >= MAX_VARS || next_var_offset - 8 < STACK_FLOOR) {
+    if (num_vars >= MAX_VARS || next_var_offset - slot < STACK_FLOOR) {
         fprintf(stderr, "Error: no stack left for variable '%s': %d variables fill the %d bytes "
                         "available (counting any the compiler adds for fib-lookup, ip-frag and similar "
                         "instructions); free variables that are no longer needed\n",
                 name, num_vars, VAR_TOP - STACK_FLOOR);
         exit(1);
     }
-    next_var_offset -= 8;
+    next_var_offset -= slot;
     memset(vars[num_vars].name, 0, sizeof(vars[num_vars].name));
     strncpy(vars[num_vars].name, name, 31);
     vars[num_vars].size = size;
+    vars[num_vars].slot = slot;
     vars[num_vars].free = 0;
-    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, next_var_offset, 0));
+    for (int b = 0; b < slot; b += 8)
+        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, next_var_offset + b, 0));
     return vars[num_vars++].stack_off = next_var_offset;
 }
 
@@ -622,7 +636,7 @@ void compile_free_var(const char *name) {
      */
     while (num_vars > 0 && vars[num_vars - 1].free &&
            vars[num_vars - 1].stack_off == next_var_offset) {
-        next_var_offset += 8;
+        next_var_offset += vars[num_vars - 1].slot;
         num_vars--;
     }
 }
@@ -905,8 +919,9 @@ void compile_decl_var(const char *name, int size) {
     else if (size == 2) emit(BPF_ST_MEM(BPF_H, BPF_REG_10, v_off, 0));
     else if (size == 4) emit(BPF_ST_MEM(BPF_W, BPF_REG_10, v_off, 0));
     else if (size == 8) emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, v_off, 0));
+    else if (size == 16) { emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, v_off, 0)); emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, v_off + 8, 0)); }
     else {
-        fprintf(stderr, "Error: decl size must be 1, 2, 4, or 8.\n");
+        fprintf(stderr, "Error: decl size must be 1, 2, 4, 8 or 16.\n");
         exit(1);
     }
 }
@@ -1366,6 +1381,17 @@ void compile_get_field(int base_offset, int extract_size, const char *var) {
     add_safety_jump();
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_3, .src_reg=BPF_REG_9}));
 
+    if (extract_size == 16) {
+        /* 16 bytes (an IPv6 address) are copied as they are, in network
+         * order, which is how set ip6-* and match ip6-* read them. (A 128-bit
+         * byte swap used to be emitted here, which the verifier rejects.) */
+        for (int b = 0; b < 16; b += 4) {
+            emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_8, b));
+            emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, v_off + b));
+        }
+        return;
+    }
+
     // 3. Perform safe direct memory read into R1
     if (extract_size == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_8, 0));
     else if (extract_size == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_8, 0));
@@ -1618,6 +1644,14 @@ void compile_match_core(int offset, int size, uint32_t exp, uint32_t mask, const
         
         add_block_jump();
         emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2, .imm=0}));
+    } else if ((int32_t)exp < 0) {
+        /* The immediate of a 64-bit compare is sign-extended, R1 is zero-
+         * extended: a value with bit 31 set never matched (IPv4 addresses
+         * ending in 128-255, most IPv6 words, many MACs). Compare with a
+         * register loaded by a 32-bit move instead (no JMP32: kernels < 5.1). */
+        emit(BPF_MOV32_IMM(BPF_REG_2, exp));
+        add_block_jump();
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2, .imm=0}));
     } else {
         add_block_jump();
         emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=exp}));
@@ -1634,8 +1668,27 @@ void compile_match_mac(int off, const char *m) {
 void compile_match_ipv6(int offset, char *ip6_str, const char *var) {
     start_match_block();
     if (var) {
-        for (int i = 0; i < 4; i++) 
-	    compile_match_core(offset + (i * 4), 4, 0, 0xFFFFFFFF, var);
+        /* Word i of the packet against word i of the 16-byte variable (each
+         * word used to be compared with the variable's first word). */
+        if (get_var_size(var) != 16) {
+            fprintf(stderr, "Error: match ip6-src/ip6-dst %s needs a 16-byte variable (get ip6-src/ip6-dst or decl %s 16)\n", var, var + (var[0] == '%'));
+            exit(1);
+        }
+        int v_off = get_var_offset(var);
+        for (int i = 0; i < 4; i++) {
+            emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+            emit(BPF_MOV64_IMM(BPF_REG_2, offset + i * 4));
+            emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+            emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, -4));
+            emit(BPF_MOV64_IMM(BPF_REG_4, 4));
+            emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+            add_block_jump();
+            emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+            emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, -4));
+            emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off + i * 4));
+            add_block_jump();
+            emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2, .imm=0}));
+        }
     } else {
         uint32_t ip_chunks[4], mask_chunks[4];
         parse_ipv6_cidr(ip6_str, ip_chunks, mask_chunks);
@@ -2129,6 +2182,47 @@ void compile_set_ip_addr(int is_dst, uint32_t ip, const char *var) {
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, -8));
     emit(BPF_MOV64_IMM(BPF_REG_5, 4));
     emit(BPF_CALL_FUNC(BPF_FUNC_l3_csum_replace));
+
+    /* TCP and UDP checksums cover the addresses through their pseudo-header,
+     * so update them too (this used to be left out: forwarded packets with
+     * complete checksums were dropped after the rewrite). BPF_F_PSEUDO_HDR
+     * also handles packets whose checksum is still being offloaded. Only the
+     * first fragment carries the L4 header; a UDP checksum of 0 (none) stays 0. */
+    const int H = -24;                       /* IPv4 header bytes 0-9, from offset 14 */
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, 14));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, H));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 10));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    int j_err = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, H + 9));         /* protocol */
+    emit(BPF_MOV64_IMM(BPF_REG_2, 16));                             /* TCP checksum offset */
+    emit(BPF_MOV64_IMM(BPF_REG_5, BPF_F_PSEUDO_HDR | 4));
+    int j_tcp = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=6}));
+    emit(BPF_MOV64_IMM(BPF_REG_2, 6));                              /* UDP checksum offset */
+    emit(BPF_MOV64_IMM(BPF_REG_5, BPF_F_PSEUDO_HDR | BPF_F_MARK_MANGLED_0 | 4));
+    int j_not_udp = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=17}));
+    prog[j_tcp].off = prog_idx - j_tcp - 1;
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, H + 6));         /* flags + fragment offset */
+    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, htons(0x1FFF)));
+    int j_frag = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=0}));
+    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, H));             /* version + IHL */
+    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0x0F));
+    emit(BPF_ALU64_IMM(BPF_LSH, BPF_REG_1, 2));
+    emit(BPF_ALU64_REG(BPF_ADD, BPF_REG_2, BPF_REG_1));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, 14));
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_10, -4));
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, -8));
+    emit(BPF_CALL_FUNC(BPF_FUNC_l4_csum_replace));
+    prog[j_err].off = prog_idx - j_err - 1;
+    prog[j_not_udp].off = prog_idx - j_not_udp - 1;
+    prog[j_frag].off = prog_idx - j_frag - 1;
 }
 
 /*
@@ -2403,43 +2497,6 @@ void compile_set_cb(uint8_t i, uint32_t val, const char *var) {
     }
 }
 
-//TODO: Need to set skb->vlan_tci or pop/push
-void compile_set_vlan_id(uint16_t vid, const char *var) {
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, 14));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-4}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 2));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
-
-    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, -4));
-#if defined(HOST_LITTLE_ENDIAN)      
-    emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
-#endif    
-
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=0xF000}));
-    
-
-    if (var) {
-        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, get_var_offset(var)));
-        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_2, .imm=0x0FFF}));
-        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_OR|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2}));
-    } else {
-        emit(((struct bpf_insn){.code=BPF_ALU64|BPF_OR|BPF_K,  .dst_reg=BPF_REG_1, .imm=(vid & 0x0FFF)}));
-    }
-#if defined(HOST_LITTLE_ENDIAN)
-    emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
-#endif
-    emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, -4));
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, 14));
-           
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-4}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 2));
-    emit(BPF_MOV64_IMM(BPF_REG_5, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
-}
 
 void compile_set_mpls_field(int is_bos, uint32_t val, const char *var) {
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
@@ -2699,10 +2756,10 @@ void compile_push_vlan(const char *vid_arg, const char *pcp_arg) {
         int v_off = get_var_offset(vid_arg);
         int v_sz = get_var_size(vid_arg);
 
-        // Load variable size into R2
-        if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_10, v_off));
-        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_10, v_off));
-        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+        // VLAN id into R3 (1-4 byte variables used to land in R2, the priority)
+        if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_3, BPF_REG_10, v_off));
+        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_3, BPF_REG_10, v_off));
+        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_10, v_off));
         else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_3, BPF_REG_10, v_off));
 
     } else {
@@ -2719,6 +2776,44 @@ void compile_push_vlan(const char *vid_arg, const char *pcp_arg) {
     //emit(BPF_MOV32_IMM(BPF_REG_3, ((pcp & 0x07) << 13) | (vid & 0x0FFF)));
     emit(BPF_MOV64_IMM(BPF_REG_4, 0));
     emit(BPF_MOV64_IMM(BPF_REG_5, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_vlan_push));
+}
+
+/*
+ * set vlan-id <vid | %VAR>: replaces the VLAN id of the packet's tag, keeping
+ * its priority, DEI and TPID (pop + push). Without a tag it adds an 802.1Q tag.
+ * (The dispatcher used to pass "vlan-id" as the id and the new id as the
+ * priority, so the tag became VLAN 0 with a random priority.)
+ * Stack scratch: -8 TPID, -16 new TCI.
+ */
+void compile_set_vlan_id(const char *vid_arg) {
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto)));
+    int j_have = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_2, .imm=0}));
+    emit(BPF_MOV32_IMM(BPF_REG_2, htons(ETH_P_8021Q)));
+    prog[j_have].off = prog_idx - j_have - 1;
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_2, -8));
+
+    if (vid_arg[0] == '%') {
+        int v_off = get_var_offset(vid_arg), v_sz = get_var_size(vid_arg);
+        if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_3, BPF_REG_10, v_off));
+        else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_3, BPF_REG_10, v_off));
+        else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_10, v_off));
+        else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_3, BPF_REG_10, v_off));
+    } else {
+        emit(BPF_MOV64_IMM(BPF_REG_3, (int)(strtoul(vid_arg, NULL, 0) & 0x0FFF)));
+    }
+    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_3, 0x0FFF));
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_tci)));
+    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0xF000));             /* priority + DEI */
+    emit(BPF_ALU64_REG(BPF_OR, BPF_REG_3, BPF_REG_1));
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_3, -16));
+
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_vlan_pop));
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, -8));
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_3, BPF_REG_10, -16));
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_vlan_push));
 }
 
@@ -4483,7 +4578,16 @@ void compile_ip_frag(int mtu, int max, const char *dir) {
     uint32_t max_len = mtu + 14;
     uint32_t ip_max  = (( mtu - 20 ) / 8 ) * 8;
     uint32_t ip_tlen = 20 + ip_max;
-    uint32_t loops   = (( max  - 34 ) / mtu ) + 1;
+    /* Fragments after the first: each carries ip_max bytes of the at most
+     * max - 34 bytes of IP payload. (This used to divide by mtu instead of
+     * ip_max, which ran out of fragments for small sizes: at 200, a
+     * 2958-byte payload lost its last 142 bytes.) */
+    if (ip_max < 8 || max <= 34) {
+        fprintf(stderr, "Error: ip-frag needs a fragment size of at least 28 and an input MTU over 34\n");
+        exit(1);
+    }
+    uint32_t loops   = ( max - 34 + ip_max - 1 ) / ip_max;
+    if (loops > 1) loops--;
     char len_str1[5];
     char len_str2[5];
     //decl __IPLEN__ 2
@@ -6168,7 +6272,7 @@ void help(const char *arg0) {
         "-v"			,"verbose output",
     };
     char *cmds[] = {
-	"decl <VAR> <1|2|4|8>"			,"declare variable VAR of specified length",
+	"decl <VAR> <1|2|4|8|16>"		,"declare variable VAR of specified length (16: an IPv6 address)",
 	"free <VAR>"				,"free var from stack - make space available",
 	"set <field> <INT|0x00|%VAR>"		,"set specified field to integer, hex value or value stored in variable VAR",
 	"get <field> <VAR>"			,"get specified field and store into VAR",
@@ -6580,7 +6684,7 @@ int process_cmd(char *cmd, const char *dir) {
             else if (strcmp(f,"tcp-dst")==0) compile_set_l4_port(0, 1, v?0:atoi(val), v);
             else if (strcmp(f,"udp-src")==0) compile_set_l4_port(1, 0, v?0:atoi(val), v);
             else if (strcmp(f,"udp-dst")==0) compile_set_l4_port(1, 1, v?0:atoi(val), v);
-            else if (strcmp(f,"vlan-id")==0) { compile_pop_vlan(); compile_push_vlan(a1, t>2?a2:NULL); }
+            else if (strcmp(f,"vlan-id")==0) compile_set_vlan_id(val);
             else if (strcmp(f,"mpls-label")==0) compile_set_mpls_field(0, v?0:atoi(val), v);
             else if (strcmp(f,"mpls-bos")==0) compile_set_mpls_field(1, v?0:atoi(val), v);
             else if (strcmp(f,"queue")==0) compile_set_queue(v?0:atoi(val), v);
@@ -6820,12 +6924,16 @@ int process_cmd(char *cmd, const char *dir) {
         else if (strcmp(op, "encap-gre")==0 && t>6) compile_encap_gre(inet_addr(tok[2]), inet_addr(tok[4]), atoi(tok[6]));
         else if (strcmp(op, "decap-gre")==0) compile_decap_gre();
 	//else if (strcmp(op, "push-mac-bytes")==0 && t>1) compile_push_bytes_mac(atoi(a1));
-	else if (strcmp(op, "add-l2-bytes")==0 && t>1) compile_push_bytes_mac(atoi(a1));
+	/* add-l2-bytes / del-l2-bytes: insert or remove bytes right after the
+	 * Ethernet header, for any protocol, with the general byte insertion and
+	 * deletion. (add-l2-bytes used to grow the packet at the tail without
+	 * moving the data, so writes at offset 14 overwrote the next header.) */
+	else if (strcmp(op, "add-l2-bytes")==0 && t>1) compile_insert_bytes(14, atoi(a1));
         //else if (strcmp(op, "pop-mac-bytes")==0 && t>1) compile_pop_bytes_mac(atoi(a1));
         //else if (strcmp(op, "push-net-bytes")==0 && t>1) compile_push_bytes_net(atoi(a1));
         //else if (strcmp(op, "pop-net-bytes")==0 && t>1) compile_pop_bytes_net(atoi(a1));
 	//else if (strcmp(op, "add-l2-bytes") == 0 && t > 1) compile_add_l2_bytes(atoi(a1));
-        else if (strcmp(op, "del-l2-bytes") == 0 && t > 1) compile_del_l2_bytes(atoi(a1));
+        else if (strcmp(op, "del-l2-bytes") == 0 && t > 1) compile_delete_bytes_buffered(14, atoi(a1));
 	else if (strcmp(op, "add-head-bytes") == 0 && t > 1) compile_add_head_bytes(a1);
 	//else if (strcmp(op, "del-head-bytes") == 0 && t > 1) compile_del_head_bytes(a1);
         else if (strcmp(op, "add-bytes")==0 && t>2) compile_insert_bytes(atoi(a1), atoi(a2));

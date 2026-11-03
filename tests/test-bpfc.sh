@@ -241,9 +241,7 @@ timeout 3 ip netns exec TX ping -c 2 -i 0.2 -W 1 2.2.2.2 &>/dev/null && test_fai
 ip netns exec TX ./bpfc $COPTS -i tx0 -c
 
 # add-l2-bytes / del-l2-bytes: 4 bytes after the Ethernet header on the way
-# out, removed again on the way in.
-# KNOWN BUG: add-l2-bytes grows the packet at the tail without moving the data,
-# so the marker overwrites the start of the IP header (insert-l2 / strip-l2 work).
+# out (marked 0xdeadbeef), removed again on the way in only if the marker is there.
 check Add-l2-bytes-install ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match ip; add-l2-bytes 4; set bytes 14 4 0xdeadbeef; continue'
 check Del-l2-bytes-install ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 100 'get bytes 14 4 L25; match val L25 eq 0xdeadbeef; del-l2-bytes 4'
 timeout 4 ip netns exec TX ping -c 3 -i 0.2 -W 1 2.2.2.2 &>/dev/null && test_pass Add/del-l2-bytes || test_fail Add/del-l2-bytes
@@ -268,7 +266,9 @@ timeout 3 ip netns exec TX ping -c 3 -i 0.5 -W0.2 2.2.2.2 &>/dev/null && test_pa
 
 ip netns exec RX ./bpfc $COPTS -i rx0 -c
 ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 101 'match vlan-id 100-101; get vlan-id VLAN; calc add VLAN 20; set vlan-id %VLAN' && test_pass VLAN change install 1 || test_fail VLAN change install 1
-ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 105 'match vlan-id 120-121; pop-vlan' && test_pass VLAN change install 2 || test_fail VLAN change install 2
+# Only VLAN 120-121 is let through (untagged or other ICMP is dropped), so the
+# ping works only if set vlan-id really changed 100 to 120.
+ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 105 'match vlan-id 120-121; pop-vlan; continue; end-match; match icmp; drop' && test_pass VLAN change install 2 || test_fail VLAN change install 2
 timeout 3 ip netns exec TX ping -c 3 -i 0.5 -W0.2 2.2.2.2 &>/dev/null && test_pass VLAN change || test_fail VLAN change
 
 ip netns exec TX ./bpfc $COPTS -i tx0 -c
