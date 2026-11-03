@@ -21,7 +21,7 @@
 
 cd "$(dirname "$0")/.." || exit 1
 
-ALL="compile preprocessor stack bpfc util loops nat mpls frag mpls-frag throttle bpfcd container dataplane pytest"
+ALL="compile preprocessor stack bpfc util loops nat mpls frag mpls-frag throttle cve-2026-98432 bpfcd container dataplane pytest"
 FAILURES_ONLY=0
 VERBOSE=0
 LOGDIR=

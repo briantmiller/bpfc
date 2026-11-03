@@ -69,6 +69,7 @@ install: all
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/egress
 	install -m 0644 dist/examples/interfaces.d/eth0/ingress/*.bpfc $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/ingress/
 	install -m 0644 dist/examples/interfaces.d/eth0/egress/*.bpfc $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/egress/
+	install -m 0644 dist/examples/cve-2026-98432.bpfc $(DESTDIR)$(DOCDIR)/examples/
 	install -m 0644 README.md $(DESTDIR)$(DOCDIR)/README.md
 	install -D -m 0755 dist/container/bpfcd-entrypoint $(DESTDIR)$(SBINDIR)/bpfcd-entrypoint
 	install -D -m 0644 dist/container/README.md $(DESTDIR)$(CONTAINER_DOCDIR)/README.md
