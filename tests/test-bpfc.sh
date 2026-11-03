@@ -1,10 +1,9 @@
 #!/bin/bash
 
-if [ $(whoami) != "root" ]
-then
-	echo "Must be run as root"
-	exit 1
-fi
+cd "$(dirname "$0")/.." || exit 1
+source tests/lib.sh
+require_root bpfc
+require_cmds bpfc ping nc tcpdump
 
 sysctl net.ipv4.ip_forward=1 &>/dev/null
 
@@ -26,12 +25,6 @@ COPTS=""
 [ $DEBUG -eq 1 ] && COPTS=" -v "
 
 
-# Color Definitions
-RED='\e[31m'
-GREEN='\e[32m'
-YELLOW='\e[33m'
-BLUE='\e[34m'
-NC='\e[0m' # No Color (Reset)
 
 TEST=""
 
@@ -48,15 +41,7 @@ function test_enabled()
 	return 1
 }
 
-function test_pass()
-{
-	echo -e "$@ ${GREEN}PASS${NC}"
-}
 
-function test_fail()
-{
-	echo -e "$@ ${RED}FAIL${NC}"
-}
 
 #echo "${TESTS[@]}"
 #if test_enabled TEST 
@@ -109,14 +94,11 @@ ip -n TX addr add 10.0.0.1/24 dev br0
 ip -n RX addr add 10.0.0.2/24 dev br0
 ip -n TX addr add 10.1.1.1/30 dev host1
 ip -n HOST1 addr add 10.1.1.2/30 dev tx1
-ip -n TX link add lo0 type dummy
-ip -n RX link add lo0 type dummy
-ip -n TX addr add 1.1.1.1/32 dev lo0
-ip -n RX addr add 2.2.2.2/32 dev lo0
+# Host addresses on each namespace's own lo (a dummy interface needs a kernel module some systems lack)
+ip -n TX addr add 1.1.1.1/32 dev lo
+ip -n RX addr add 2.2.2.2/32 dev lo
 ip -n RX addr add 10.2.2.1/30 dev rx1
 ip -n RX2 addr add 10.2.2.2/30 dev rx1
-ip -n TX link set lo0 up
-ip -n RX link set lo0 up
 ip -n TX route add 2.2.2.2/32 via 10.0.0.2
 ip -n TX route add default via 10.0.0.2
 ip -n RX route add 1.1.1.1/32 via 10.0.0.1
@@ -203,7 +185,7 @@ ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 102 'match icmp; match icmp-
 #timeout 3 ip netns exec TX tcpdump -c5 -levnnpi tx0 icmp & P1=$!
 sleep 0.5s 
 timeout 4 ip netns exec TX ping -c2 -i 0.1 -W 2 10.0.0.30 &>/dev/null && test_pass ICMP-Echo || test_fail ICMP-Echo
-ip netns exec TX ip neigh show 10.0.0.30 dev br0 | grep -q "de:ad:be:ef:ca:fe" && test_pass ARP-reply || test_pass ARP-reply
+ip netns exec TX ip neigh show 10.0.0.30 dev br0 | grep -q "de:ad:be:ef:ca:fe" && test_pass ARP-reply || test_fail ARP-reply
 #kill -9 $P1
 
 
@@ -234,50 +216,37 @@ timeout 3 ip netns exec RX2 tcpdump -c 2 -levnnpi rx1 icmp &>/dev/null && test_p
 sleep 0.5s
 ip netns exec HOST1 ping -c 3 2.2.2.2 &>/dev/null && test_pass Clone-2 || test_fail Clone-2
 
-if [ 0 -eq 1 ]
-then
-ip netns exec TX ip route get 2.2.2.2 || echo "Setup for FIB testing FAIL"
 ip netns exec TX ./bpfc $COPTS -i tx0 -c
-#ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match icmp; match ip-dst 2.2.2.2; set ip-dst 5.5.5.5; set dst-mac 01:23:45:67:89:fe; set src-mac 00:00:00:00:00:00; reclassify'
-ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match icmp; match ip-tos 192; continue; match src-mac 00:00:00:00:00:00; continue ; match ip-dst 2.2.2.2; set dst-mac 01:23:45:67:89:fe; set src-mac 00:00:00:00:00:00; set ip-tos 192; continue'
-#ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 101 'match icmp; match ip-dst 5.5.5.5; set ip-dst 2.2.2.2; fib-lookup; set src-mac %FIB_SMAC; set dst-mac %FIB_DMAC'
-#ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 101 'match icmp; fib-lookup direct; set src-mac %FIB_SMAC; set dst-mac %FIB_DMAC'
-ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 101 'match icmp; match src-mac 00:00:00:00:00:00; redirect-neigh tx0'
-#ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 101 'match icmp; match ip-dst 5.5.5.5; set ip-dst 2.2.2.2'
-timeout 5 ip netns exec TX tcpdump -c4 -levnnpi tx0 icmp &
-sleep 0.5s
-timeout 5 ip netns exec TX ping -W 0.2 -c 5 -i 0.1 2.2.2.2 &>/dev/null && echo "FIB PASS" || echo "FIB FAIL"
+ip netns exec TX ./bpfc $COPTS -i host1 -c
+ip netns exec RX ./bpfc $COPTS -i rx0 -c
 
-ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 250 "match icmp; set dst-mac $RX2_rx1_mac; redirect rx1 egress"
-timeout 5 ip netns exec RX2 tcpdump -c 3 -lvnpi rx1 icmp &>/dev/null && test_pass Redirect || test_fail Redirect &
+# Redirect: ICMP for 2.2.2.2 (RX's own address) would end at RX; the program
+# sends it out rx1, so only with it does RX2 see packets for 2.2.2.2.
+check Redirect-install ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 250 "match icmp; match ip-dst 2.2.2.2; set dst-mac $RX2_rx1_mac; redirect rx1 egress"
+( timeout 4 ip netns exec RX2 tcpdump -c 3 -lnpi rx1 icmp and dst host 2.2.2.2 &>/dev/null && test_pass Redirect || test_fail Redirect ) &
+SNIFF=$!
 sleep 0.5
-timeout 5 ip netns exec TX ping -W 0.2 -c 5 -i 0.1 10.2.2.2 &>/dev/null &
-
-ip netns exec TX ./bpfc $COPTS -i tx0 -c
-ip netns exec TX ./bpfc $COPTS -i host1 -c
+timeout 3 ip netns exec TX ping -W 0.2 -c 5 -i 0.1 2.2.2.2 &>/dev/null
+wait $SNIFF
 ip netns exec RX ./bpfc $COPTS -i rx0 -c
 
-#skb-cb will get cleared when going through br0, so we can't rely on that, but mark persists within the same namespace
-ip netns exec TX ./bpfc $COPTS -i host1 -d ingress -p 101 'match icmp; match ip-dst 2.2.2.2; set skb-mark 100'
-#Before sending to the RX namespace, set the cb value since the mark will not persist across namespace changes
-ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match skb-mark 100; set skb-cb 0 100; continue; drop'
-#Only allow ICMP packets that have been tagged from our peer with cb 0 = 100, otherwise drop
-ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 100 'match icmp; match ip-dst 2.2.2.2; match skb-cb 0 100; continue; drop'
-ip netns exec HOST1 ping -c 3 2.2.2.2 &>/dev/null && test_pass Skb-mark-cb || test_fail Skb-mark-cb
-
+# skb-mark and skb-cb carry from one program to the next on the same hook (not
+# between namespaces). Priority 101 drops ICMP for 2.2.2.2 unless priority 100
+# marked it; without priority 100 the same ping must fail.
+check Skb-mark-cb-install-1 ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match icmp; match ip-dst 2.2.2.2; set skb-mark 100; set skb-cb 0 77'
+check Skb-mark-cb-install-2 ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 101 'match skb-mark 100; match skb-cb 0 77; continue; end-match; end-match; match icmp; match ip-dst 2.2.2.2; drop'
+timeout 4 ip netns exec TX ping -c 3 -i 0.2 -W 1 2.2.2.2 &>/dev/null && test_pass Skb-mark-cb || test_fail Skb-mark-cb
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 -D
+timeout 3 ip netns exec TX ping -c 2 -i 0.2 -W 1 2.2.2.2 &>/dev/null && test_fail Skb-mark-cb-unmarked-dropped || test_pass Skb-mark-cb-unmarked-dropped
 ip netns exec TX ./bpfc $COPTS -i tx0 -c
-ip netns exec TX ./bpfc $COPTS -i host1 -c
-ip netns exec RX ./bpfc $COPTS -i rx0 -c
 
-ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match ip; add-l2-bytes 4; set bytes 14 4 0xdeadbeef; continue' && test_pass Add-l2-bytes-install || test_fail Add-l2-bytes-install
-#ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 100 'get bytes 14 2 L25_1; get bytes 16 2 L25_2; match val L25_1 eq 0xdead; match val L25_2 eq 0xbeef; del-l2-bytes 4' && test_pass Del-l2-bytes-install || test_fail Del-l2-bytes-install
-ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 100 'get bytes 14 4 L25; match val L25 eq 0xdeadbeef; del-l2-bytes 4' && test_pass Del-l2-bytes-install || test_fail Del-l2-bytes-install
-#timeout 12 ip netns exec TX tcpdump -levnnpi tx0 -XX &
-#sleep 0.5s
-#Currently not working, need to fix add/del l2-bytes
-#ip netns exec HOST1 ping -c 3 2.2.2.2 &>/dev/null && test_pass Add/del-l2-bytes || test_fail Add/del-l2-bytes
-
-fi
+# add-l2-bytes / del-l2-bytes: 4 bytes after the Ethernet header on the way
+# out, removed again on the way in.
+# KNOWN BUG: add-l2-bytes grows the packet at the tail without moving the data,
+# so the marker overwrites the start of the IP header (insert-l2 / strip-l2 work).
+check Add-l2-bytes-install ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 100 'match ip; add-l2-bytes 4; set bytes 14 4 0xdeadbeef; continue'
+check Del-l2-bytes-install ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 100 'get bytes 14 4 L25; match val L25 eq 0xdeadbeef; del-l2-bytes 4'
+timeout 4 ip netns exec TX ping -c 3 -i 0.2 -W 1 2.2.2.2 &>/dev/null && test_pass Add/del-l2-bytes || test_fail Add/del-l2-bytes
 
 ip netns exec TX ./bpfc $COPTS -i tx0 -c
 ip netns exec TX ./bpfc $COPTS -i host1 -c
@@ -305,17 +274,12 @@ timeout 3 ip netns exec TX ping -c 3 -i 0.5 -W0.2 2.2.2.2 &>/dev/null && test_pa
 ip netns exec TX ./bpfc $COPTS -i tx0 -c
 ip netns exec RX ./bpfc $COPTS -i rx0 -c
 
-if [ 1 -eq 0 ]
-then
-#Test variable declarations and free
-ip netns exec TX ./bpfc -v $COPTS -i tx0 -d egress -p 90 'decl V1 4; set val V1 4; free V1; decl V2 2; match tcp; get tcp-dst TDST; calc add TDST %V2; set tcp-dst %TDST'
-#ip netns exec RX ./bpfc $COPTS -i rx0 -d ingress -p 90 'decl V1 4; match tcp; get tcp-dst TDST; calc sub TDST 8; set tcp-dst %TDST'
-timeout 3 ip netns exec TX tcpdump -lvnnpi tx0 &
-#timeout 3 ip netns exec RX tcpdump -lvnpi rx0 &
-sleep 0.5s     
-#ip netns exec TX ping -c 1 2.2.2.2
+# A variable declared after a free gets a zeroed slot: V2 must read 0, not
+# V1's 4, or the destination port becomes 11 and the connection is refused.
+timeout 6 ip netns exec RX nc -kl 7 &>/dev/null &
+check Var-Free-install ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 90 'decl V1 4; set val V1 4; free V1; decl V2 2; match tcp; get tcp-dst TDST; calc add TDST %V2; set tcp-dst %TDST'
+sleep 0.3
 echo "ping " | timeout 4 ip netns exec TX nc -w 1 2.2.2.2 7 &>/dev/null && test_pass Var-Free || test_fail Var-Free
-fi
 
 
 ip netns exec TX ./bpfc $COPTS -i tx0 -c
@@ -343,3 +307,5 @@ ip netns del TX
 ip netns del RX
 ip netns del RX2
 ip netns del HOST1
+
+tests_exit

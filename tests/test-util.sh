@@ -1,10 +1,9 @@
 #!/bin/bash
 
-if [ $(whoami) != "root" ]
-then
-        echo "Must be run as root"
-        exit 1
-fi
+cd "$(dirname "$0")/.." || exit 1
+source tests/lib.sh
+require_root util
+require_cmds util ping awk
 
 sysctl net.ipv4.ip_forward=1 &>/dev/null
 
@@ -26,12 +25,6 @@ COPTS=""
 [ $DEBUG -eq 1 ] && COPTS=" -v "
 
 
-# Color Definitions
-RED='\e[31m'
-GREEN='\e[32m'
-YELLOW='\e[33m'
-BLUE='\e[34m'
-NC='\e[0m' # No Color (Reset)
 
 TEST=""
 
@@ -48,15 +41,7 @@ function test_enabled()
         return 1
 }
 
-function test_pass()
-{
-        echo -e "$@ ${GREEN}PASS${NC}"
-}
 
-function test_fail()
-{
-        echo -e "$@ ${RED}FAIL${NC}"
-}
 
 #Test bed setup
 ip netns add H1
@@ -121,3 +106,5 @@ do
 	ip netns del $N
 	umount /var/run/bpf/$N &>/dev/null
 done
+
+tests_exit

@@ -6441,6 +6441,15 @@ int process_cmd(char *cmd, const char *dir) {
 	            printf("\n");
         }
 
+	/* A terminal command straight after another one would be unreachable code,
+	 * which the kernel verifier rejects ("unreachable insn"); refuse it here,
+	 * like any other command after a terminal one. */
+	if (last_cmd_terminal && (!strcmp(op, "drop") || !strcmp(op, "continue") || !strcmp(op, "accept") ||
+	                          !strcmp(op, "reclassify") || !strcmp(op, "redirect") || !strcmp(op, "redirect-neigh"))) {
+		printf("error with cmd '%s', last command was terminal, must have end-if, end-match or else\n", op);
+		return 1;
+	}
+
 	if (strcmp(op, "drop")==0){ compile_drop_packet(); return 0; }
         else if (strcmp(op, "continue")==0){ compile_continue_packet(); return 0; }
         else if (strcmp(op, "accept")==0){ compile_accept_packet(); return 0; }

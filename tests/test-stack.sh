@@ -33,16 +33,18 @@ expect_compile ST-48-vars          'repeat 48 as I; decl V$I 8; end-repeat'
 expect_error   ST-49-vars          "no stack left for variable 'V48'" 'repeat 49 as I; decl V$I 8; end-repeat'
 expect_compile ST-free-reuse       'repeat 48 as I; decl V$I 8; end-repeat; free V47; decl Z 4'
 expect_compile ST-csum-small-room  'repeat 47 as I; decl V$I 8; end-repeat; recalc-udp-csum'
-expect_error   ST-xor-no-room      'xor-packet needs at least 8 bytes' \
-	'shared-buffer-map SB 4 512; repeat 48 as I; decl V$I 8; end-repeat; xor-packet-keyed SB 0 64 42 0'
 expect_error   ST-fib-no-room      'fib-lookup needs 72 bytes' 'repeat 41 as I; decl V$I 8; end-repeat; fib-lookup 10.0.0.1'
 # push-eth used to keep its 32 bytes of scratch for the rest of the program
 expect_compile ST-scratch-released 'repeat 20; push-eth aa:bb:cc:dd:ee:ff 11:22:33:44:55:66; end-repeat; repeat 40 as I; decl V$I 8; end-repeat'
 
 if [ "$(id -u)" != 0 ]; then
-	echo "kernel tests skipped (need root)"
+	echo "ST-kernel tests (need root) SKIP"
 	exit $FAILED
 fi
+
+# Creating the buffer map needs root, even when compiling only.
+expect_error   ST-xor-no-room      'xor-packet needs at least 8 bytes' \
+	'shared-buffer-map SB 4 512; repeat 48 as I; decl V$I 8; end-repeat; xor-packet-keyed SB 0 64 42 0'
 
 ulimit -l unlimited 2>/dev/null
 ip netns add STA

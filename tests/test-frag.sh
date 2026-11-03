@@ -1,11 +1,10 @@
 #!/bin/bash
 
 
-if [ $(whoami) != "root" ]
-then
-	echo "Must be run as root"
-	exit 1
-fi
+cd "$(dirname "$0")/.." || exit 1
+source tests/lib.sh
+require_root frag
+require_cmds frag ping ethtool tcpdump iperf numfmt
 
 sysctl net.ipv4.ip_forward=1 &>/dev/null
 
@@ -27,12 +26,6 @@ COPTS=""
 [ $DEBUG -eq 1 ] && COPTS=" -v "
 
 
-# Color Definitions
-RED='\e[31m'
-GREEN='\e[32m'
-YELLOW='\e[33m'
-BLUE='\e[34m'
-NC='\e[0m' # No Color (Reset)
 IPERF="iperf"
 TEST=""
 
@@ -49,15 +42,7 @@ function test_enabled()
 	return 1
 }
 
-function test_pass()
-{
-	echo -e "$@ ${GREEN}PASS${NC}"
-}
 
-function test_fail()
-{
-	echo -e "$@ ${RED}FAIL${NC}"
-}
 
 #Setup network
 ulimit -l unlimited
@@ -241,25 +226,17 @@ do
 	#ip netns exec H1 ping -c 3 -s $PING_SIZE -i 0.1 -W 1 192.168.2.2
 	#ip netns exec H1 ping -c 3 -s 1578 -i 0.1 -W 1 192.168.2.2
 
-	PPIDS=()
-	for I in $( seq 1 $PING_PROC_NUM )
-	do
-		timeout 15 ip netns exec H1 ping -c $PING_COUNT -s $PING_SIZE -i 0.01 -W 2 192.168.2.2 &>/dev/null & 
-		PPIDS+=($!)
-	done
+	# Correctness: three pings that each need fragmenting must all be answered.
 
-	PASS=1
-	for PINGPID in "${PPIDS[@]}"
-	do
-		wait "$PINGPID" 
-		RET=$?
-		if [ $RET -ne 0 ]
-		then
-			PASS=0
-			test_fail "IP-Frag-$PINGPID"
-		fi
-	done 
-	[ $PASS -eq 1 ] && test_pass "IP-Frag-size-$FRAG_SIZE" || test_fail "IP-Frag-size-$FRAG_SIZE"
+	timeout 10 ip netns exec H1 ping -c 3 -i 0.2 -W 2 -s $PING_SIZE 192.168.2.2 &>/dev/null && test_pass "IP-Frag-size-$FRAG_SIZE" || test_fail "IP-Frag-size-$FRAG_SIZE"
+
+	# Load: $PING_PROC_NUM pings at once; the loss over all of them must stay under
+
+	# STRESS_MAX_LOSS (hundredths of a percent; default 1 %).
+
+	LOSS=$(ping_loss H1 $PING_PROC_NUM $PING_COUNT -s $PING_SIZE -i 0.01 -W 2 192.168.2.2)
+
+	[ "$LOSS" -le "${STRESS_MAX_LOSS:-100}" ] && test_pass "IP-Frag-stress-$FRAG_SIZE (loss $(pct $LOSS) %)" || test_fail "IP-Frag-stress-$FRAG_SIZE (loss $(pct $LOSS) %)"
 done
 #wait $P1 $P2
 #cat out*.txt
@@ -385,3 +362,5 @@ ip netns del H2
 ip netns del R3
 ip netns del R1
 ip netns del R2
+
+tests_exit
