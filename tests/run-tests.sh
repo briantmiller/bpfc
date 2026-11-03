@@ -4,7 +4,7 @@
 #
 #   tests/run-tests.sh [-f] [-v] [-l DIR] [-t SECS] [suite ...]
 #
-#   suite   preprocessor, stack, bpfc, util, loops, nat, mpls, frag,
+#   suite   compile, preprocessor, stack, bpfc, util, loops, nat, mpls, frag,
 #           mpls-frag, throttle, bpfcd, container, dataplane or pytest
 #           (default: all of them, in that order)
 #   -f      print failures only (plus the summary)
@@ -21,7 +21,7 @@
 
 cd "$(dirname "$0")/.." || exit 1
 
-ALL="preprocessor stack bpfc util loops nat mpls frag mpls-frag throttle bpfcd container dataplane pytest"
+ALL="compile preprocessor stack bpfc util loops nat mpls frag mpls-frag throttle bpfcd container dataplane pytest"
 FAILURES_ONLY=0
 VERBOSE=0
 LOGDIR=

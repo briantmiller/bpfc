@@ -662,6 +662,14 @@ unsigned int get_ifindex(const char *n) {
     return idx;
 }
 
+/* Interface name or number for redirect, clone and fib-lookup. An unknown
+ * name used to compile to ifindex 0 (packets sent nowhere) with exit 0. */
+unsigned int require_ifindex(const char *n) {
+    unsigned int idx = get_ifindex(n);
+    if (!idx) exit(1);          /* get_ifindex printed the error */
+    return idx;
+}
+
 void parse_ip_cidr(char *v, uint32_t *ip, uint32_t *mask) {
     char *s = strchr(v, '/');
     if (s) {
@@ -757,7 +765,7 @@ void compile_redirect_core(const char *iface_arg, int flags) {
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
     } else {
         int idx = atoi(iface_arg);
-        if (!idx) idx = get_ifindex(iface_arg);
+        if (!idx) idx = require_ifindex(iface_arg);
         emit(BPF_MOV64_IMM(BPF_REG_1, idx));
     }
     
@@ -780,7 +788,7 @@ void compile_redirect_neigh(const char *iface_arg) {
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
     } else {
         int idx = atoi(iface_arg);
-        if (!idx) idx = get_ifindex(iface_arg);
+        if (!idx) idx = require_ifindex(iface_arg);
         emit(BPF_MOV64_IMM(BPF_REG_1, idx));
     }
 
@@ -807,7 +815,7 @@ void compile_redirect(const char *iface_arg, const char *d) {
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
     } else {
         int idx = atoi(iface_arg);
-        if (!idx) idx = get_ifindex(iface_arg);
+        if (!idx) idx = require_ifindex(iface_arg);
         emit(BPF_MOV64_IMM(BPF_REG_1, idx));
     }
     emit(BPF_MOV64_IMM(BPF_REG_2, f));
@@ -833,7 +841,7 @@ void compile_clone(const char *iface_arg, const char *d) {
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
     } else {
         int idx = atoi(iface_arg);
-        if (!idx) idx = get_ifindex(iface_arg);
+        if (!idx) idx = require_ifindex(iface_arg);
         emit(BPF_MOV64_IMM(BPF_REG_2, idx));
     }
     emit(BPF_MOV64_IMM(BPF_REG_3, f));
@@ -1176,7 +1184,7 @@ void compile_fib_lookup(int flags, const char *dst_ip_arg, const char *src_ip_ar
         } else {
             // Resolve string name to integer index at compile time
             int idx = atoi(iface_arg);
-            if (!idx) idx = get_ifindex(iface_arg);
+            if (!idx) idx = require_ifindex(iface_arg);
             emit(BPF_ST_MEM(BPF_W, BPF_REG_10, base + bpf_fib_idx_off, idx));
         }
     } else {
@@ -1318,7 +1326,7 @@ void compile_fib_lookup6(int flags, const char *dst_ip_arg, const char *src_ip_a
         } else {
             // Resolve string name to integer index at compile time
             int idx = atoi(iface_arg);
-            if (!idx) idx = get_ifindex(iface_arg);
+            if (!idx) idx = require_ifindex(iface_arg);
             emit(BPF_ST_MEM(BPF_W, BPF_REG_10, base + 56, idx));
         }
     } else {
@@ -1637,7 +1645,21 @@ void compile_match_core(int offset, int size, uint32_t exp, uint32_t mask, const
     if (mask != 0xFFFFFFFF) emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=mask}));
 
     if (var) {
+        /* Variables hold host-order values (get, set val, calc): the packet
+         * field is brought to host order and its masked bits shifted down
+         * before the compare. (The raw network-order bytes used to be
+         * compared, so match ip-src %V never matched what get ip-src V read.) */
         int v_off = get_var_offset(var);
+#if defined(HOST_LITTLE_ENDIAN)
+        if (size > 1) {
+            emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=8 * (size == 2 ? 2 : 4)}));
+            if (mask != 0xFFFFFFFF) mask = (size == 2) ? ntohs((uint16_t)mask) : ntohl(mask);
+        }
+#endif
+        if (mask != 0xFFFFFFFF && mask != 0 && (mask & 1) == 0) {
+            int shift = __builtin_ctz(mask);
+            emit(((struct bpf_insn){.code=BPF_ALU64|BPF_RSH|BPF_K, .dst_reg=BPF_REG_1, .imm=shift}));
+        }
         if (size==1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_10, v_off));
         else if (size==2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_10, v_off));
         else emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
@@ -1656,6 +1678,28 @@ void compile_match_core(int offset, int size, uint32_t exp, uint32_t mask, const
         add_block_jump();
         emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=exp}));
     }
+}
+
+/*
+ * match vlan / match qinq: the outer tag's TPID is <tpid> (network order).
+ * The tag is either offloaded (skb->vlan_proto) or, when no tag is
+ * offloaded, still in the packet at offset 12 (a frame from a packet socket
+ * or a device without VLAN offload). Only the offloaded tag used to be
+ * looked at.
+ */
+void compile_match_outer_tag(uint32_t tpid) {
+    /* the caller opened the block */
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_present)));
+    int j_payload = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=0}));
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto)));
+    add_block_jump();
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=tpid}));
+    int j_ok = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JA}));
+    prog[j_payload].off = prog_idx - j_payload - 1;
+    compile_match_core(12, 2, tpid, 0xFFFFFFFF, NULL);
+    prog[j_ok].off = prog_idx - j_ok - 1;
 }
 
 void compile_match_mac(int off, const char *m) {
@@ -1785,7 +1829,7 @@ void compile_match_gre_proto(uint32_t proto, const char *var) {
     start_match_block();
     compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL); 
     compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL); 
-    compile_match_core(34, 2, htons(proto), 0xFFFF, var);
+    compile_match_core(36, 2, htons(proto), 0xFFFF, var);   /* 34-35 are the flags */
 }   
 
 void compile_get_gre_key(const char *var) {
@@ -2140,7 +2184,22 @@ void compile_push_eth(const char *dst, const char *src) {
 }
 
 
+/*
+ * pop-eth: removes the outer Ethernet header, the reverse of push-eth.
+ * bpf_skb_adjust_room() takes the bytes out after the first 14, so the
+ * inner header (bytes 14-27) is saved first and written over the outer one
+ * afterwards. (It used to remove the inner header and keep the outer one.)
+ */
 void compile_pop_eth() {
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, 14));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, -32));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 14));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    add_safety_jump();
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV64_IMM(BPF_REG_2, -14));
     emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_MAC));
@@ -2148,6 +2207,14 @@ void compile_pop_eth() {
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));
     add_safety_jump();
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JSLT|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, 0));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, -32));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 14));
+    emit(BPF_MOV64_IMM(BPF_REG_5, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
 }
 
 void compile_set_ip_addr(int is_dst, uint32_t ip, const char *var) {
@@ -2321,99 +2388,46 @@ void compile_set_ip_field16(int offset, uint16_t new_val, const char *var) {
  * Bypasses RHEL 8 verifier limitations by copying the payload to the stack 
  * before running bpf_csum_diff, supporting up to 128 bytes of ICMP payload.
  */
-void compile_recalculate_icmp_csum(void) {
-    target_tc_protocol = ETH_P_IP;
-    // 1. Clear the existing checksum (Offset 36)
-    emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -8, 0));
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));  
-    emit(BPF_MOV64_IMM(BPF_REG_2, 36));
-
+/*
+ * set icmp-type: rewrites the type byte (offset 34, IHL 5) and updates the
+ * ICMP checksum incrementally from the old and new type/code word. (It used
+ * to recompute the checksum over the first 128 bytes only, so any longer
+ * message got a wrong checksum.) Stack scratch: -4 old word, -8 new word.
+ */
+void compile_set_icmp_type(uint8_t type, const char *var) {
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, 34));
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-8}));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, -4));
     emit(BPF_MOV64_IMM(BPF_REG_4, 2));
-    emit(BPF_MOV64_IMM(BPF_REG_5, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    int j_err = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
 
-    // 2. Allocate and ZERO a 128-byte buffer on the eBPF stack
-    // Scratch below the variables, handed back after this instruction (release_scratch).
-    int buf_off = stack_scratch(128, "recalc-icmp-csum");
-    next_var_offset = buf_off;
-    
-    for (int i = 0; i < 128; i += 8) {
-        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, buf_off + i, 0));
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, -4));
+    emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, -8));            /* keeps the code byte */
+    if (var) {
+        emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, get_var_offset(var)));
+        emit(BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_1, -8));
+    } else {
+        emit(BPF_ST_MEM(BPF_B, BPF_REG_10, -8, type));
     }
 
-    // 3. Load payload length into R8 (skb->len - 34)
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len)));
-    emit(BPF_ALU64_IMM(BPF_SUB, BPF_REG_8, 34)); 
-
-    // 4. Bound the length: If (R8 <= 0) jump to epilogue
-    add_safety_jump();
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_8, .src_reg=0, .off=0, .imm=0}));
-    
-    // Cap the length at 128 bytes (Maximum our stack buffer can hold)
-    int j_cap_skip = prog_idx;
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_8, .src_reg=0, .off=0, .imm=128}));
-    emit(BPF_MOV64_IMM(BPF_REG_8, 128)); // Force to 128 if greater
-    prog[j_cap_skip].off = prog_idx - j_cap_skip - 1;
-
-    // 5. Load the packet payload safely into the stack buffer
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
-    emit(BPF_MOV64_IMM(BPF_REG_2, 34)); // ICMP payload start
+    emit(BPF_MOV64_IMM(BPF_REG_2, 34));
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=buf_off}));
-    emit(BPF_MOV64_REG(BPF_REG_4, BPF_REG_8)); // Actual length (up to 128)
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
-
-    // 6. bpf_csum_diff requires the size to be a multiple of 4.
-    // Calculate aligned length in R9: R9 = (R8 + 3) & ~3
-    emit(BPF_MOV64_REG(BPF_REG_9, BPF_REG_8));
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_9, 3));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_9, .imm=~3}));
-
-    // Ensure the aligned length doesn't magically exceed 128
-    int j_align_skip = prog_idx;
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_K, .dst_reg=BPF_REG_9, .src_reg=0, .off=0, .imm=128}));
-    emit(BPF_MOV64_IMM(BPF_REG_9, 128));
-    prog[j_align_skip].off = prog_idx - j_align_skip - 1;
-
-    // 7. Calculate raw checksum using bpf_csum_diff against the STACK BUFFER
-    emit(BPF_MOV64_IMM(BPF_REG_1, 0)); 
-    emit(BPF_MOV64_IMM(BPF_REG_2, 0)); 
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=buf_off}));
-    emit(BPF_MOV64_REG(BPF_REG_4, BPF_REG_9)); // Aligned length
-    emit(BPF_MOV64_IMM(BPF_REG_5, 0)); 
-    emit(BPF_CALL_FUNC(BPF_FUNC_csum_diff));
-
-    // 8. Fold the 32-bit checksum in R0 into a 16-bit integer (One's Complement)
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_0));
-    
-    // Fold 1
-    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_1));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_RSH|BPF_K, .dst_reg=BPF_REG_2, .imm=16}));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=0xFFFF}));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2}));
-    
-    // Fold 2
-    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_1));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_RSH|BPF_K, .dst_reg=BPF_REG_2, .imm=16}));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=0xFFFF}));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2}));
-
-    // Invert bits
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_XOR|BPF_K, .dst_reg=BPF_REG_1, .imm=0xFFFF}));
-
-    // 9. Store final 16-bit checksum into the packet (Offset 36)
-    emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, -8));
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
-    emit(BPF_MOV64_IMM(BPF_REG_2, 36));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-8}));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, -8));
     emit(BPF_MOV64_IMM(BPF_REG_4, 2));
     emit(BPF_MOV64_IMM(BPF_REG_5, 0));
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, 36));                              /* ICMP checksum */
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_3, BPF_REG_10, -4));
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, -8));
+    emit(BPF_MOV64_IMM(BPF_REG_5, 2));
+    emit(BPF_CALL_FUNC(BPF_FUNC_l4_csum_replace));
+    prog[j_err].off = prog_idx - j_err - 1;
 }
 
 /*
@@ -2837,36 +2851,6 @@ void compile_push_qinq(uint16_t o_vid, uint16_t i_vid, uint8_t o_pcp, uint8_t i_
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_vlan_push));
 }
 
-void compile_push_bytes_mac(uint32_t len) {
-
-    // 1. PRE-EXPAND THE TAIL: Prevent clipping bugs by allocating physical room first.
-    // Read current packet length (skb->len) into R8
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len)));
-    // R2 = new length (skb->len + requested expansion length)
-    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_8));
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, len));
-    // Call bpf_skb_change_tail(skb, new_len, 0)
-    emit(BPF_MOV64_IMM(BPF_REG_3, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_change_tail));
-
-    /*emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, len));
-    emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_MAC));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));*/
-    //add_safety_jump();
-}
-
-void compile_pop_bytes_mac(uint32_t len) {
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, -len));
-    emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_MAC));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));
-    add_safety_jump();
-}
-
 void compile_push_bytes_net(uint32_t len) {
 
     /*// 1. PRE-EXPAND THE TAIL: Prevent clipping bugs by allocating physical room first.
@@ -2897,132 +2881,6 @@ void compile_pop_bytes_net(uint32_t len) {
     add_safety_jump();
 }
 
-/*
- * Emits bytecode to insert an empty block of zeroes between L2 and L3.
- * Uses native bpf_skb_adjust_room to bypass verifier loop limits.
- */
-void compile_add_l2_bytes(int len) {
-    // 1. Expand the packet at the MAC layer natively
-    // The kernel will push the MAC header forward (outward) by 'len' bytes.
-    // The existing L3 payload remains exactly where it was in physical memory.
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
-    emit(BPF_MOV64_IMM(BPF_REG_2, len)); 
-    emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_MAC)); 
-    emit(BPF_MOV64_IMM(BPF_REG_4, 0)); 
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));
-
-    return;
-    
-    // Safety abort if expansion fails
-    //add_safety_jump(); 
-    //emit(((struct bpf_insn){.code=BPF_JMP|BPF_JSLT|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
-
-    // 2. The MAC header was pushed 'len' bytes forward.
-    // The space previously occupied by the original MAC header is now a gap of 
-    // uninitialized kernel memory. We must zero it out to prevent data leaks.
-    // Because the L3 payload didn't move, the gap is located exactly at offset 14!
-   
-    //TODO: Don't mess with next_var_offset, build scratch without affecting it 
-    int aligned_len = (len + 7) & ~7;
-    int stack_off = next_var_offset - aligned_len;
-    if (stack_off < -512) {
-        fprintf(stderr, "Error: add-l2-bytes length too large for eBPF stack.\n"); exit(1);
-    }
-    next_var_offset = stack_off;
-    
-    // Write zeroes to the stack scratch pad
-    for (int i = 0; i < aligned_len; i += 8) {
-        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, stack_off + i, 0));
-    }
-
-    // Flush zeroes into the newly exposed gap at offset 14
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
-    emit(BPF_MOV64_IMM(BPF_REG_2, 14)); 
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); 
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=stack_off}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, len)); 
-    emit(BPF_MOV64_IMM(BPF_REG_5, 0)); 
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
-
-    // --- FIX CLIPPING BUG: Adjust IPv4 tot_len ---
-    // Since the kernel adjusted room at the MAC layer, it did not update the inner L3 length.
-    // If this is an IPv4 packet, the kernel network stack will clip the tail to match tot_len!
-    
-    // 3. Verify it's an IPv4 packet
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
-    emit(BPF_MOV64_IMM(BPF_REG_2, 12));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); 
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=stack_off}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 2)); 
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
-
-    int j_fail = prog_idx;
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
-    
-    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, stack_off));
-    int j_skip_l3 = prog_idx;
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=htons(0x0800)}));
-
-    // 4. Read IPv4 tot_len (Offset 16 + len)
-    // The IP header is immediately after the MAC header and the gap.
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
-    emit(BPF_MOV64_IMM(BPF_REG_2, 16 + len));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); 
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=stack_off}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 2)); 
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
-
-    // Convert tot_len to Host Byte Order, add len, and convert back
-    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, stack_off));
-#if defined(HOST_LITTLE_ENDIAN)
-    emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16})); 
-#endif
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, len));
-#if defined(HOST_LITTLE_ENDIAN)
-    emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16})); 
-#endif
-    emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, stack_off));
-
-    // 5. Write the updated tot_len back to the IP header
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
-    emit(BPF_MOV64_IMM(BPF_REG_2, 16 + len));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10)); 
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=stack_off}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 2)); 
-    emit(BPF_MOV64_IMM(BPF_REG_5, 0)); 
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
-
-    prog[j_fail].off = prog_idx - j_fail - 1;
-    prog[j_skip_l3].off = prog_idx - j_skip_l3 - 1;
-}
-
-
-/*
- * Emits bytecode to delete bytes immediately following the L2 MAC header.
- * Syntax: del-l2-bytes <len>
- */
-void compile_del_l2_bytes(int len) {
-
-    // 1. Change protocol to IPv4 to force changing Layer-2 room
-    //emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    //emit(BPF_MOV64_IMM(BPF_REG_2, htons(0x0800)));
-    //emit(BPF_MOV64_IMM(BPF_REG_3, 0));
-    //emit(BPF_MOV64_IMM(BPF_REG_4, 0));
-    //emit(BPF_CALL_FUNC(BPF_FUNC_change_proto));
-
-    // 1. Ask kernel to shrink the packet at the MAC layer
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, -len)); // Negative delta shrinks
-    emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_MAC));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));
-
-    return;
-
-    // SAFETY JUMP: If kernel refuses, abort
-    add_safety_jump();
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JSLT|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
-}
 
 /*
  * Emits bytecode to prepend a block of bytes to the front of the packet.
@@ -3465,50 +3323,42 @@ void compile_encap_mpls(uint32_t lbl, uint8_t bos) {
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
 }
 
+void compile_strip_l2(int len, uint16_t ethertype);
+
+/*
+ * decap-mpls: removes one MPLS label (and a pseudowire control word, when
+ * the first nibble after the label is 0 or 1) and sets the EtherType from
+ * the IP version that follows: 0x86DD for 6, 0x0800 otherwise.
+ * bpf_skb_adjust_room() refuses MPLS packets (skb->protocol is not IP), so
+ * this used to leave the packet as it was; it now uses strip-l2.
+ */
 void compile_decap_mpls() {
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV64_IMM(BPF_REG_2, 18));
-
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-4}));
     emit(BPF_MOV64_IMM(BPF_REG_4, 1));
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
-
     add_safety_jump();
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
     emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, -4));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_RSH|BPF_K, .dst_reg=BPF_REG_1, .imm=4}));
-    
 
-    int j_no_cw = prog_idx;
+    int j_v6 = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=6}));
+    int j_v4 = prog_idx;
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_1, .imm=1}));
-
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, -8));
-    emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_MAC));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));
-    int j_safe = prog_idx;
+    compile_strip_l2(8, 0x0800);                 /* label + control word */
+    int j_end1 = prog_idx;
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JA}));
-
-    prog[j_no_cw].off = prog_idx - j_no_cw - 1;
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, -4));
-    emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_MAC));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));
-
-    prog[j_safe].off = prog_idx - j_safe - 1;
-    add_safety_jump();
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JSLT|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
-    emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -2, htons(0x0800)));
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, 12));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-2}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 2));
-    emit(BPF_MOV64_IMM(BPF_REG_5, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+    prog[j_v4].off = prog_idx - j_v4 - 1;
+    compile_strip_l2(4, 0x0800);
+    int j_end2 = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JA}));
+    prog[j_v6].off = prog_idx - j_v6 - 1;
+    compile_strip_l2(4, 0x86DD);
+    prog[j_end1].off = prog_idx - j_end1 - 1;
+    prog[j_end2].off = prog_idx - j_end2 - 1;
 }
 
 void compile_encap_gre(uint32_t src, uint32_t dst, uint32_t key) {
@@ -3681,6 +3531,7 @@ void compile_set_skb_proto(const char *val_str) {
         int v_off = get_var_offset(val_str);
         // 1. Load the variable from the stack into R1
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+        emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_2, .imm=16}));
     } else {
         uint32_t imm = strtoul(val_str, NULL, 0);
         // 1. Load the constant into R1 (Instead of BPF_ST_MEM directly)
@@ -6514,6 +6365,103 @@ void compile_ip_defrag(const char *dir) {
     }
 }
 
+/* ---- Checking instruction arguments ---- */
+
+/* Whole-string unsigned number (decimal or 0x hex) no larger than max. */
+static int parse_num(const char *s, uint64_t max, uint64_t *out) {
+    if (!s || !*s || *s == '-' || *s == '+') return -1;
+    char *end;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) ? 16 : 10);
+    if (errno || *end || v > max) return -1;
+    *out = v;
+    return 0;
+}
+
+static int valid_mac(const char *s) {
+    for (int i = 0; i < 6; i++) {
+        int n = 0;
+        while (isxdigit((unsigned char)s[n])) n++;
+        if (n < 1 || n > 2) return 0;
+        s += n;
+        if (i < 5) { if (*s != ':') return 0; s++; }
+    }
+    return *s == '\0';
+}
+
+/* addr[/prefix]: prefix 0-max, or for IPv4 also a dotted mask. */
+static int valid_ip(const char *s, int v6, int allow_prefix) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s", s);
+    char *slash = strchr(buf, '/');
+    unsigned char tmp[16];
+    if (slash) {
+        if (!allow_prefix) return 0;
+        *slash++ = '\0';
+        uint64_t p;
+        if (parse_num(slash, v6 ? 128 : 32, &p) && (v6 || inet_pton(AF_INET, slash, tmp) != 1)) return 0;
+    }
+    return inet_pton(v6 ? AF_INET6 : AF_INET, buf, tmp) == 1;
+}
+
+/* What a set/match value of each field must look like: n = number up to max,
+ * r = number or (match only) range lo-hi up to max, m = MAC, 4 = IPv4,
+ * 6 = IPv6 (match: with an optional prefix). */
+static const struct { const char *f; char kind; uint64_t max; } field_kinds[] = {
+    {"ip-tos", 'n', 255}, {"ip-proto", 'n', 255}, {"ip6-proto", 'n', 255}, {"ip6-tclass", 'n', 255},
+    {"icmp-type", 'n', 255}, {"arp-hlen", 'n', 255}, {"arp-plen", 'n', 255}, {"mpls-bos", 'n', 1},
+    {"eth-proto", 'n', 65535}, {"ip-len", 'n', 65535}, {"ip-frag", 'n', 65535}, {"arp-htype", 'n', 65535},
+    {"arp-ptype", 'n', 65535}, {"arp-oper", 'n', 65535}, {"protocol", 'n', 65535}, {"queue", 'n', 65535},
+    {"ip-frag-off", 'n', 8191}, {"mpls-label", 'n', 1048575}, {"ip6-flow", 'n', 1048575},
+    {"gre-key", 'n', 0xFFFFFFFFULL}, {"skb-mark", 'n', 0xFFFFFFFFULL}, {"skb-hash", 'n', 0xFFFFFFFFULL},
+    {"len", 'n', 0xFFFFFFFFULL},
+    {"tcp-src", 'r', 65535}, {"tcp-dst", 'r', 65535}, {"udp-src", 'r', 65535}, {"udp-dst", 'r', 65535},
+    {"vlan-id", 'r', 4095},
+    {"src-mac", 'm', 0}, {"dst-mac", 'm', 0}, {"arp-sha", 'm', 0}, {"arp-tha", 'm', 0},
+    {"ip-src", '4', 0}, {"ip-dst", '4', 0}, {"arp-spa", '4', 0}, {"arp-tpa", '4', 0},
+    {"ip6-src", '6', 0}, {"ip6-dst", '6', 0},
+};
+
+/* Checks the value of "set/match <field> <value>"; variables are not checked.
+ * Returns 0, or prints why and returns 1. (Bad values used to compile:
+ * 10.0.0.300, a 5-byte MAC or port 70000 became some other value.) */
+static int check_field_value(const char *op, const char *f, const char *val) {
+    if (!val || val[0] == '%') return 0;
+    int is_match = strcmp(op, "set") != 0;
+    for (size_t i = 0; i < sizeof(field_kinds) / sizeof(field_kinds[0]); i++) {
+        if (strcmp(field_kinds[i].f, f)) continue;
+        uint64_t a, b;
+        const char *want = NULL;
+        switch (field_kinds[i].kind) {
+        case 'n':
+            if (parse_num(val, field_kinds[i].max, &a)) want = "a number";
+            break;
+        case 'r': {
+            const char *d = strchr(val, '-');
+            if (d && is_match) {
+                char lo[32];
+                snprintf(lo, sizeof(lo), "%.*s", (int)(d - val), val);
+                if (parse_num(lo, field_kinds[i].max, &a) || parse_num(d + 1, field_kinds[i].max, &b) || a > b)
+                    want = "a number or a range low-high";
+            } else if (parse_num(val, field_kinds[i].max, &a))
+                want = is_match ? "a number or a range low-high" : "a number";
+            break;
+        }
+        case 'm': if (!valid_mac(val)) want = "a MAC address (aa:bb:cc:dd:ee:ff)"; break;
+        case '4': if (!valid_ip(val, 0, is_match)) want = is_match ? "an IPv4 address or address/prefix" : "an IPv4 address"; break;
+        case '6': if (!valid_ip(val, 1, is_match)) want = is_match ? "an IPv6 address or address/prefix" : "an IPv6 address"; break;
+        }
+        if (!want) return 0;
+        if (field_kinds[i].kind == 'n' || field_kinds[i].kind == 'r')
+            fprintf(stderr, "Error: %s %s %s: must be %s from 0 to %llu\n", op, f, val, want,
+                    (unsigned long long)field_kinds[i].max);
+        else
+            fprintf(stderr, "Error: %s %s %s: must be %s\n", op, f, val, want);
+        return 1;
+    }
+    return 0;
+}
+
 int process_cmd(char *cmd, const char *dir) {
 
 	char *save_w ;
@@ -6532,6 +6480,38 @@ int process_cmd(char *cmd, const char *dir) {
 	}
         if (t == 0)
 	    return 0;
+	if (w) {
+		fprintf(stderr, "Error: '%s' has more than 16 words\n", tok[0]);
+		return 1;
+	}
+	/* Hex literals (0x...) become decimal, so the many fields read with
+	 * atoi() get their value: "set ip-tos 0x10" used to write 0. */
+	static char hexbuf[16][24];
+	for (int k = 1; k < t; k++) {
+		char *dash = strchr(tok[k], '-');
+		if (dash && dash != tok[k] && strstr(tok[k], "0x")) {
+			/* a range lo-hi with hex ends (match tcp-dst 0x50-0x5A) */
+			char lo[24];
+			uint64_t a, b;
+			snprintf(lo, sizeof(lo), "%.*s", (int)(dash - tok[k]), tok[k]);
+			if (!parse_num(lo, UINT64_MAX, &a) && !parse_num(dash + 1, UINT64_MAX, &b)) {
+				snprintf(hexbuf[k], sizeof(hexbuf[k]), "%llu-%llu", (unsigned long long)a, (unsigned long long)b);
+				tok[k] = hexbuf[k];
+			}
+			continue;
+		}
+		if (tok[k][0] != '0' || (tok[k][1] != 'x' && tok[k][1] != 'X')) continue;
+		uint64_t v;
+		if (parse_num(tok[k], UINT64_MAX, &v)) {
+			fprintf(stderr, "Error: '%s' is not a valid number in '%s'\n", tok[k], tok[0]);
+			return 1;
+		}
+		snprintf(hexbuf[k], sizeof(hexbuf[k]), "%llu", (unsigned long long)v);
+		tok[k] = hexbuf[k];
+	}
+	if ((!strcmp(tok[0], "set") || !strcmp(tok[0], "match") || !strcmp(tok[0], "if")) && t > 2 &&
+	    check_field_value(tok[0], tok[1], tok[2]))
+		return 1;
         
         char *op = tok[0]; 
 	char *a1 = t>1 ? tok[1] : NULL; 
@@ -6548,6 +6528,41 @@ int process_cmd(char *cmd, const char *dir) {
 	/* A terminal command straight after another one would be unreachable code,
 	 * which the kernel verifier rejects ("unreachable insn"); refuse it here,
 	 * like any other command after a terminal one. */
+	{
+		/* commands that read their first argument unchecked (and crashed) */
+		static const char *need1[] = {"redirect", "redirect-neigh", "clone", "debug-log", "push-vlan", NULL};
+		for (int k = 0; need1[k]; k++)
+			if (!strcmp(op, need1[k]) && t < 2) {
+				fprintf(stderr, "Error: %s needs an argument\n", op);
+				return 1;
+			}
+		if (!strcmp(op, "ip-frag") && t < 3) {
+			fprintf(stderr, "Error: usage: ip-frag <size> <max-input-mtu>\n");
+			return 1;
+		}
+		uint64_t n;
+		if (!strcmp(op, "push-vlan") && ((a1[0] != '%' && parse_num(a1, 4095, &n)) ||
+		                                 (t > 2 && tok[2][0] != '%' && parse_num(tok[2], 7, &n)))) {
+			fprintf(stderr, "Error: usage: push-vlan <vlan-id 0-4095> [priority 0-7]\n");
+			return 1;
+		}
+		if (!strcmp(op, "push-qinq") && (t < 3 || parse_num(tok[1], 4095, &n) || parse_num(tok[2], 4095, &n) ||
+		                                 (t > 3 && parse_num(tok[3], 7, &n)) || (t > 4 && parse_num(tok[4], 7, &n)))) {
+			fprintf(stderr, "Error: usage: push-qinq <outer-id 0-4095> <inner-id 0-4095> [outer-prio 0-7] [inner-prio 0-7]\n");
+			return 1;
+		}
+		if (!strcmp(op, "push-eth") && (t < 3 || !valid_mac(tok[1]) || !valid_mac(tok[2]))) {
+			fprintf(stderr, "Error: usage: push-eth <dst-mac> <src-mac>\n");
+			return 1;
+		}
+		if (!strcmp(op, "encap-gre") && (t < 7 || strcmp(tok[1], "ip-src") || strcmp(tok[3], "ip-dst") ||
+		                                 strcmp(tok[5], "key") || !valid_ip(tok[2], 0, 0) || !valid_ip(tok[4], 0, 0) ||
+		                                 parse_num(tok[6], 0xFFFFFFFFULL, &n))) {
+			fprintf(stderr, "Error: usage: encap-gre ip-src <ipv4> ip-dst <ipv4> key <0-4294967295>\n");
+			return 1;
+		}
+	}
+
 	if (last_cmd_terminal && (!strcmp(op, "drop") || !strcmp(op, "continue") || !strcmp(op, "accept") ||
 	                          !strcmp(op, "reclassify") || !strcmp(op, "redirect") || !strcmp(op, "redirect-neigh"))) {
 		printf("error with cmd '%s', last command was terminal, must have end-if, end-match or else\n", op);
@@ -6562,6 +6577,10 @@ int process_cmd(char *cmd, const char *dir) {
         else if (strcmp(op, "redirect-neigh")==0){ compile_redirect_neigh(a1); return 0; }
 	
 	if (strcmp(op, "label") == 0 && t > 1){ compile_label(a1); last_cmd_terminal=0; return 0; }
+        else if ((strcmp(op, "end-match")==0 || strcmp(op, "end-if")==0) && num_blocks == 0) {
+		fprintf(stderr, "Error: %s without an open match or if\n", op);
+		return 1;
+	}
         else if (strcmp(op, "end-match")==0){ compile_end_match(); last_cmd_terminal=0; return 0; }
         else if (strcmp(op, "end-if")==0){ compile_end_match(); last_cmd_terminal=0; return 0; }
 	else if (strcmp(op, "else") == 0) {
@@ -6569,9 +6588,19 @@ int process_cmd(char *cmd, const char *dir) {
                         fprintf(stderr, "Usage: else\n");
                         return 1;
                 }
-		if (last_cmd_terminal)
+		if (num_blocks == 0) {
+			fprintf(stderr, "Error: else without an open match or if\n");
+			return 1;
+		}
+		if (last_cmd_terminal) {
+			/* The true branch ended in a terminal command, so the false
+			 * branch simply follows. Close the block here and open an
+			 * empty one for the matching end-if/end-match (it used to close
+			 * the enclosing block instead, so code after it lost the
+			 * enclosing condition). */
 			compile_end_match();
-		else
+			start_match_block();
+		} else
 	                compile_else();
 		last_cmd_terminal=0;
 		return 0;
@@ -6642,7 +6671,14 @@ int process_cmd(char *cmd, const char *dir) {
 	    else if (strcmp(f,"cpu") == 0) compile_get_cpu(var);
 	    else if (strcmp(f,"len") == 0) compile_get_skb_field(offsetof(struct __sk_buff, len), 0,0,var);
 	    else if (strcmp(f,"data") == 0) compile_get_skb_field(offsetof(struct __sk_buff, data), 0,0,var);
-	    else if (strcmp(f,"protocol") == 0) compile_get_skb_field(offsetof(struct __sk_buff, protocol), 0,0,var);
+	    else if (strcmp(f,"protocol") == 0) {
+		/* skb->protocol is network order: store it as a host-order value like the other fields */
+		compile_get_skb_field(offsetof(struct __sk_buff, protocol), 0,0,var);
+		int v_off = get_var_offset(var);
+		emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+		emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
+		emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, v_off));
+	    }
 	    else if (strcmp(f,"queue") == 0) compile_get_skb_field(offsetof(struct __sk_buff, queue_mapping), 0,0,var);
 	    else if (strcmp(f,"skb-mark") == 0) compile_get_skb_field(offsetof(struct __sk_buff, mark), 0,0,var);
             else if (strcmp(f,"skb-hash") == 0) compile_get_skb_field(offsetof(struct __sk_buff, hash), 0,0,var);
@@ -6702,7 +6738,7 @@ int process_cmd(char *cmd, const char *dir) {
             else if (strcmp(f,"ip6-proto")==0) compile_set_field(20, 1, v?0:atoi(val), v);
             else if (strcmp(f,"ip6-tclass")==0) compile_set_ipv6_bitfield(1, v?0:atoi(val), v);
             else if (strcmp(f,"ip6-flow")==0) compile_set_ipv6_bitfield(0, v?0:atoi(val), v);
-            else if (strcmp(f,"icmp-type")==0){ compile_set_field(34, 1, v?0:atoi(val), v); compile_recalculate_icmp_csum(); }
+            else if (strcmp(f,"icmp-type")==0) compile_set_icmp_type(v?0:atoi(val), v);
 	    else if (strcmp(f,"map") == 0 && t > 4) compile_set_map(get_or_create_map(tok[2]), tok[3], tok[4]);
 	    else if (strcmp(f,"data") == 0) compile_set_skb_field(offsetof(struct __sk_buff, data), val);
 	    else if (strcmp(f,"len") == 0) compile_set_length(val);
@@ -6786,10 +6822,10 @@ int process_cmd(char *cmd, const char *dir) {
                 compile_match_core(20,1,0x20,0x20,NULL);
             } else if (strcmp(f,"vlan")==0) {
                 start_match_block();
-		compile_match_skb_field(offsetof(struct __sk_buff, vlan_proto), htons(ETH_P_8021Q), 0xFFFFFFFF, NULL);
+		compile_match_outer_tag(htons(ETH_P_8021Q));
             } else if (strcmp(f,"qinq")==0) {
                 start_match_block();
-		compile_match_skb_field(offsetof(struct __sk_buff, vlan_proto), htons(ETH_P_8021AD), 0xFFFFFFFF, NULL);
+		compile_match_outer_tag(htons(ETH_P_8021AD));
             } else {
                  printf("Invalid match instruction %s\n",f);
 		 return 1;
@@ -6806,9 +6842,9 @@ int process_cmd(char *cmd, const char *dir) {
             else if (strcmp(f,"mpls-bos")==0) { start_match_block(); compile_match_core(14,4,htonl((atoi(val)&1)<<8),htonl(0x00000100),mv); }
             else if (strcmp(f,"ip-proto")==0) { start_match_block(); compile_match_core(23,1,atoi(val),0xFFFFFFFF,mv); }
             else if (strcmp(f,"ip-tos")==0) { start_match_block(); compile_match_core(15,1,atoi(val),0xFFFFFFFF,mv); }
-            else if (strcmp(f,"ip-frag")==0) { start_match_block(); compile_match_core(20,2,atoi(val),0xFFFFFFFF,mv); }
-            else if (strcmp(f,"ip-frag-off")==0) { start_match_block(); compile_match_core(20,2,atoi(val),htons(0x1FFF),mv); }
-            else if (strcmp(f,"ip-len")==0) { start_match_block(); compile_match_core(16,2,atoi(val),0xFFFFFFFF,mv); }
+            else if (strcmp(f,"ip-frag")==0) { start_match_block(); compile_match_core(20,2,htons(atoi(val)),0xFFFFFFFF,mv); }
+            else if (strcmp(f,"ip-frag-off")==0) { start_match_block(); compile_match_core(20,2,htons(atoi(val)),htons(0x1FFF),mv); }
+            else if (strcmp(f,"ip-len")==0) { start_match_block(); compile_match_core(16,2,htons(atoi(val)),0xFFFFFFFF,mv); }
             else if (strcmp(f,"ip-src")==0) { start_match_block(); uint32_t ip,mk; parse_ip_cidr(val,&ip,&mk); compile_match_core(26,4,ip,mk,mv); }
             else if (strcmp(f,"ip-dst")==0) { start_match_block(); uint32_t ip,mk; parse_ip_cidr(val,&ip,&mk); compile_match_core(30,4,ip,mk,mv); }
             else if (strcmp(f,"tcp-src")==0 || strcmp(f,"udp-src")==0) { uint16_t mn,mx; parse_port_range(val,&mn,&mx); compile_match_port_range(34,mn,mx); }
@@ -6831,8 +6867,8 @@ int process_cmd(char *cmd, const char *dir) {
             else if (strcmp(f,"ip6-flow")==0) { start_match_block(); compile_match_core(14, 4, htonl(atoi(val)), htonl(0x000FFFFF), mv); }
             else if (strcmp(f,"icmp-type")==0) { start_match_block(); compile_match_core(34,1,atoi(val),0xFFFFFFFF,mv); }
 	    else if (strcmp(a1,"len")==0) compile_match_skb_field(offsetof(struct __sk_buff, len), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
-	    else if (strcmp(a1,"protocol")==0) compile_match_skb_field(offsetof(struct __sk_buff, queue_mapping), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
-	    else if (strcmp(a1,"protocol")==0) compile_match_skb_field(offsetof(struct __sk_buff, protocol), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
+	    else if (strcmp(a1,"queue")==0) compile_match_skb_field(offsetof(struct __sk_buff, queue_mapping), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
+	    else if (strcmp(a1,"protocol")==0) compile_match_skb_field(offsetof(struct __sk_buff, protocol), htons(strtoul(val, NULL, 0)), 0xFFFFFFFF, mv);
 	    else if (strcmp(a1,"skb-mark")==0) compile_match_skb_field(offsetof(struct __sk_buff, mark), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-hash")==0) compile_match_skb_field(offsetof(struct __sk_buff, hash), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-ifindex")==0) compile_match_skb_field(offsetof(struct __sk_buff, ifindex), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
@@ -6923,16 +6959,13 @@ int process_cmd(char *cmd, const char *dir) {
         else if (strcmp(op, "decap-mpls")==0) compile_decap_mpls();
         else if (strcmp(op, "encap-gre")==0 && t>6) compile_encap_gre(inet_addr(tok[2]), inet_addr(tok[4]), atoi(tok[6]));
         else if (strcmp(op, "decap-gre")==0) compile_decap_gre();
-	//else if (strcmp(op, "push-mac-bytes")==0 && t>1) compile_push_bytes_mac(atoi(a1));
 	/* add-l2-bytes / del-l2-bytes: insert or remove bytes right after the
 	 * Ethernet header, for any protocol, with the general byte insertion and
 	 * deletion. (add-l2-bytes used to grow the packet at the tail without
 	 * moving the data, so writes at offset 14 overwrote the next header.) */
 	else if (strcmp(op, "add-l2-bytes")==0 && t>1) compile_insert_bytes(14, atoi(a1));
-        //else if (strcmp(op, "pop-mac-bytes")==0 && t>1) compile_pop_bytes_mac(atoi(a1));
         //else if (strcmp(op, "push-net-bytes")==0 && t>1) compile_push_bytes_net(atoi(a1));
         //else if (strcmp(op, "pop-net-bytes")==0 && t>1) compile_pop_bytes_net(atoi(a1));
-	//else if (strcmp(op, "add-l2-bytes") == 0 && t > 1) compile_add_l2_bytes(atoi(a1));
         else if (strcmp(op, "del-l2-bytes") == 0 && t > 1) compile_delete_bytes_buffered(14, atoi(a1));
 	else if (strcmp(op, "add-head-bytes") == 0 && t > 1) compile_add_head_bytes(a1);
 	//else if (strcmp(op, "del-head-bytes") == 0 && t > 1) compile_del_head_bytes(a1);
@@ -6976,7 +7009,7 @@ int process_cmd(char *cmd, const char *dir) {
         else if (strcmp(op, "start-loop") == 0) compile_start_loop();
         else if (strcmp(op, "loop") == 0 && t > 1) compile_loop(a1);
         else if (strcmp(op, "set-reg-loop") == 0 && t > 1) compile_set_reg_loop(a1);
-        else if (strcmp(op, "dec-reg-loop") == 0 && t > 1) compile_dec_reg_loop(a1);
+        else if (strcmp(op, "dec-reg-loop") == 0) compile_dec_reg_loop(t > 1 ? a1 : "1");   /* amount defaults to 1 */
         else if (strcmp(op, "loop-reg") == 0) compile_loop_reg();
         else if (strcmp(op, "goto") == 0 && t > 1) compile_goto(a1);
         else if (strcmp(op, "label") == 0 && t > 1) compile_label(a1);
@@ -7152,7 +7185,7 @@ static const char *pp_reserved[] = {
     "free", "get", "goto", "if", "insert-l2", "ip-defrag", "ip-frag", "label", "load-packet",
     "load-packet-keyed", "loop", "loop-reg", "match", "pop-eth", "pop-mac-bytes", "pop-net-bytes",
     "pop-vlan", "push-eth", "push-mac-bytes", "push-net-bytes", "push-qinq", "push-vlan",
-    "recalc-icmp-csum", "recalc-tcp-csum", "recalc-udp-csum", "reclassify", "redirect",
+    "recalc-tcp-csum", "recalc-udp-csum", "reclassify", "redirect",
     "redirect-neigh", "save-packet", "save-packet-keyed", "set", "set-reg-loop",
     "shared-buffer-map", "start-loop", "strip-l2", "tcp-option", "xor-packet", "xor-packet-keyed",
     "zero-buffer", "zero-buffer-keyed",
@@ -8079,6 +8112,10 @@ int main(int argc, char **argv) {
 
     if(process_cmd_list(instr, dir))
 	    exit(1);
+    if (num_loop_starts > 0) {
+        fprintf(stderr, "Error: start-loop without a matching loop or loop-reg\n");
+        exit(1);
+    }
 
     // --- RESOLVE FORWARD GOTOS ---
     for (int i = 0; i < num_unresolved_gotos; i++) {

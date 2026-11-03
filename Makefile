@@ -40,7 +40,7 @@ RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
 TARBALL    = bpfc-$(VERSION).tar.gz
 
-.PHONY: check-dataplane check-all all clean install dist rpm srpm check
+.PHONY: check-compile check-dataplane check-all all clean install dist rpm srpm check
 
 all: $(TARGET) $(DAEMON) $(CTL)
 
@@ -103,7 +103,12 @@ srpm: $(TARBALL)
 TESTFLAGS ?=
 
 check: all
-	bash tests/run-tests.sh $(TESTFLAGS) preprocessor stack bpfcd container
+	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd container
+
+# Compile-only checks of every field and command and of the error messages;
+# needs no root (the few commands that create maps are skipped without it).
+check-compile: $(TARGET)
+	bash tests/run-tests.sh $(TESTFLAGS) compile
 
 check-dataplane: $(TARGET)
 	bash tests/run-tests.sh $(TESTFLAGS) dataplane
