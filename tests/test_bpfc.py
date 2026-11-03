@@ -19,7 +19,8 @@ import tempfile
 import pytest
 
 scapy_all = pytest.importorskip("scapy.all")
-from scapy.all import Ether, IP, IPv6, ICMP, ICMPv6EchoRequest, TCP, UDP, GRE, Dot1Q, rdpcap, wrpcap  # noqa: E402
+from scapy.all import Ether, IP, IPv6, ICMP, ICMPv6EchoRequest, TCP, UDP, GRE, Dot1Q, Dot1AD, ARP, Raw, rdpcap, wrpcap  # noqa: E402
+from scapy.contrib.mpls import MPLS  # noqa: E402
 
 if os.geteuid() != 0:
     pytest.skip("needs root", allow_module_level=True)
@@ -322,3 +323,288 @@ def test_match_values_with_high_bit():
     out = send_and_capture(pkt, "icmp")
     assert out is not None
     assert out[IP].tos == 4, "a match on a value with bit 31 set did not match"
+
+
+def test_set_icmp_type_keeps_checksum():
+    """set icmp-type keeps the ICMP checksum valid, also past 128 bytes"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match icmp; match icmp-type 8; set icmp-type 0'")
+    pkt = Ether(src=state["tx_mac"], dst=state["rx_mac"]) / IP(src="10.0.0.1", dst="10.0.0.2") / ICMP(type=8) / (b"x" * 500)
+    out = send_and_capture(pkt, "icmp")
+    assert out is not None and out[ICMP].type == 0
+    rebuilt = ICMP(bytes(out[ICMP]))
+    del rebuilt.chksum
+    assert ICMP(bytes(rebuilt)).chksum == out[ICMP].chksum, "ICMP checksum wrong after set icmp-type"
+
+
+def test_else_after_terminal_keeps_enclosing_match():
+    """'drop; else; ...; end-if' inside a match: code after end-if is still inside the match"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match tcp; decl X 4; if val X eq 1; drop; else; set ip-tos 4; end-if; set ip-tos 8'")
+    udp = Ether(src=state["tx_mac"], dst=state["rx_mac"]) / IP(src="10.0.0.1", dst="10.0.0.2", tos=0) / UDP(sport=1, dport=2)
+    out = send_and_capture(udp, "udp")
+    assert out is not None and out[IP].tos == 0, "the code after end-if ran outside 'match tcp'"
+    tcp = Ether(src=state["tx_mac"], dst=state["rx_mac"]) / IP(src="10.0.0.1", dst="10.0.0.2", tos=0) / TCP(sport=1, dport=2)
+    out = send_and_capture(tcp, "tcp")
+    assert out is not None and out[IP].tos == 8
+
+
+# =====================================================================
+# Less used commands, in the kernel
+# =====================================================================
+
+def eth():
+    return Ether(src=state["tx_mac"], dst=state["rx_mac"])
+
+
+def tos_of(out):
+    return out[IP].tos if out is not None and out.haslayer(IP) else None
+
+
+# ---- MPLS ----
+
+def test_encap_mpls():
+    """encap-mpls label 16 bos 1: an MPLS shim (TTL 64) between Ethernet and IP"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match ip; match icmp; encap-mpls label 16 bos 1'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / ICMP(), "mpls")
+    assert out is not None and out[Ether].type == 0x8847
+    assert out[MPLS].label == 16 and out[MPLS].s == 1 and out[MPLS].ttl == 64
+    assert IP(bytes(out[MPLS].payload)).dst == "10.0.0.2"
+
+
+def test_decap_mpls():
+    """decap-mpls removes the label and makes the frame IPv4 again"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match mpls; decap-mpls'")
+    pkt = Ether(src=state["tx_mac"], dst=state["rx_mac"], type=0x8847) / MPLS(label=16, s=1, ttl=64) / IP(src="10.0.0.1", dst="10.0.0.2") / ICMP()
+    out = send_and_capture(pkt, "icmp")
+    assert out is not None, "the decapsulated packet did not arrive as IPv4/ICMP"
+    assert out[Ether].type == 0x0800 and not out.haslayer(MPLS)
+    assert out[IP].dst == "10.0.0.2"
+
+
+def mpls_packet(label=100, s=1, ttl=50):
+    return Ether(src=state["tx_mac"], dst=state["rx_mac"], type=0x8847) / MPLS(label=label, s=s, ttl=ttl) / IP(src="10.0.0.1", dst="10.0.0.2") / ICMP()
+
+
+def test_mpls_label_match_and_set():
+    """match mpls-label / mpls-bos, set mpls-label keeps bos and TTL"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match mpls; match mpls-label 100; match mpls-bos 1; set mpls-label 200'")
+    out = send_and_capture(mpls_packet(), "mpls")
+    assert out is not None and out.haslayer(MPLS)
+    assert out[MPLS].label == 200 and out[MPLS].s == 1 and out[MPLS].ttl == 50
+
+
+def test_mpls_label_through_variable():
+    """get mpls-label, calc, set mpls-label %VAR; set mpls-bos"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match mpls; get mpls-label L; calc add L 1; set mpls-label %L; set mpls-bos 0'")
+    out = send_and_capture(mpls_packet(label=100, s=1), "mpls")
+    assert out is not None and out.haslayer(MPLS)
+    assert out[MPLS].label == 101 and out[MPLS].s == 0 and out[MPLS].ttl == 50
+
+
+# ---- QinQ, Ethernet ----
+
+def test_push_qinq():
+    """push-qinq 10 20 1 2: outer 802.1ad tag 10/prio 1, inner 802.1Q tag 20/prio 2"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match ip; match icmp; push-qinq 10 20 1 2; continue'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / ICMP())
+    assert out is not None and out.haslayer(Dot1AD) and out.haslayer(Dot1Q)
+    assert out[Dot1AD].vlan == 10 and out[Dot1AD].prio == 1
+    assert out[Dot1Q].vlan == 20 and out[Dot1Q].prio == 2
+    assert out[IP].dst == "10.0.0.2"
+
+
+def test_match_qinq():
+    """match qinq: double-tagged frames only"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match qinq; drop'")
+    qinq = Ether(src=state["tx_mac"], dst=state["rx_mac"]) / Dot1AD(vlan=10) / Dot1Q(vlan=20) / IP(dst="10.0.0.2") / ICMP()
+    assert send_and_capture(qinq, "", timeout=2) is None
+    assert send_and_capture(eth() / IP(dst="10.0.0.2") / ICMP(), "icmp") is not None
+
+
+def test_match_qinq_block_closes():
+    """end-match after match qinq closes its block (code after it runs for every packet)"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match qinq; drop; end-match; match udp; set ip-tos 4'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2), "udp")
+    assert tos_of(out) == 4
+
+
+def test_match_field_against_variable():
+    """match <field> %VAR compares with the host-order value get stored"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; get ip-src S; get ip-len L; "
+                f"match ip-src %S; match ip-len %L; set ip-tos 4'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2), "udp")
+    assert tos_of(out) == 4
+
+
+def test_mpls_label_match_variable():
+    """match mpls-label %VAR (masked, shifted field)"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match mpls; decl L 4; set val L 100; match mpls-label %L; set mpls-label 300'")
+    out = send_and_capture(mpls_packet(label=100), "mpls")
+    assert out is not None and out[MPLS].label == 300
+
+
+def test_match_queue_and_protocol_variable():
+    """match queue, get protocol (host order)"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; match queue 0; get protocol P; "
+                f"decl E 4; set val E 2048; match val %P eq %E; set ip-tos 4'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2), "udp")
+    assert tos_of(out) == 4
+
+
+def test_decap_mpls_ipv6():
+    """decap-mpls sets EtherType 0x86DD when IPv6 follows the label"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match mpls; decap-mpls'")
+    pkt = Ether(src=state["tx_mac"], dst=state["rx_mac"], type=0x8847) / MPLS(label=16, s=1, ttl=64) / IPv6(src="fd00::1", dst="fd00::2") / UDP(sport=1, dport=2)
+    out = send_and_capture(pkt, "ip6")
+    assert out is not None and out[Ether].type == 0x86DD and out[IPv6].dst == "fd00::2"
+
+
+def test_push_eth():
+    """push-eth: a new outer Ethernet header in front of the original frame"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match ip; match icmp; push-eth 02:00:00:00:00:aa 02:00:00:00:00:bb'")
+    pkt = eth() / IP(src="10.0.0.1", dst="10.0.0.2") / ICMP()
+    out = send_and_capture(pkt)
+    assert out is not None
+    raw = bytes(out)
+    assert raw[0:6] == bytes.fromhex("0200000000aa") and raw[6:12] == bytes.fromhex("0200000000bb")
+    assert raw[14:14 + len(bytes(pkt))] == bytes(pkt), "the original frame does not follow the new header"
+
+
+def test_push_eth_then_pop_eth():
+    """pop-eth removes what push-eth added"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress -p 100 'match ip; match icmp; push-eth 02:00:00:00:00:aa 02:00:00:00:00:bb'")
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress -p 200 'pop-eth'")
+    pkt = eth() / IP(src="10.0.0.1", dst="10.0.0.2") / ICMP()
+    out = send_and_capture(pkt, "icmp")
+    assert out is not None and bytes(out)[:len(bytes(pkt))] == bytes(pkt)
+
+
+# ---- ARP ----
+
+def arp_request():
+    return Ether(src="02:00:00:00:00:01", dst="ff:ff:ff:ff:ff:ff") / ARP(op=1, hwsrc="02:00:00:00:00:01", psrc="10.0.0.200", pdst="10.0.0.2")
+
+
+def test_arp_match_all_fields():
+    """match arp-htype/ptype/hlen/plen/oper/sha/spa/tpa (all must match), then set arp-oper"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match arp; match arp-htype 1; match arp-ptype 0x0800; match arp-hlen 6; "
+                f"match arp-plen 4; match arp-oper 1; match arp-sha 02:00:00:00:00:01; match arp-spa 10.0.0.200; "
+                f"match arp-tpa 10.0.0.2; set arp-oper 2'")
+    out = send_and_capture(arp_request(), "arp")
+    assert out is not None and out[ARP].op == 2
+
+
+def test_arp_set_fields():
+    """set arp-sha/tha/spa/tpa and the header fields"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match arp; set arp-sha 02:00:00:00:00:99; set arp-tha 02:00:00:00:00:88; "
+                f"set arp-spa 10.0.0.7; set arp-tpa 10.0.0.8; set arp-htype 6; set arp-ptype 0x0801; set arp-hlen 6; set arp-plen 4'")
+    out = send_and_capture(arp_request(), "arp")
+    assert out is not None
+    a = bytes(out)[14:42]           # raw: scapy decodes the addresses by htype/ptype
+    assert a[0:2] == b"\x00\x06" and a[2:4] == b"\x08\x01" and a[4] == 6 and a[5] == 4
+    assert a[8:14] == bytes.fromhex("020000000099") and a[14:18] == bytes([10, 0, 0, 7])
+    assert a[18:24] == bytes.fromhex("020000000088") and a[24:28] == bytes([10, 0, 0, 8])
+
+
+def test_arp_get_fields():
+    """get arp-spa/sha into variables and write them back swapped (sender <-> target)"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match arp; get arp-spa SPA; get arp-tpa TPA; get arp-sha SHA; "
+                f"get arp-oper OP; calc add OP 1; set arp-oper %OP; set arp-spa %TPA; set arp-tpa %SPA; set arp-tha %SHA'")
+    out = send_and_capture(arp_request(), "arp")
+    assert out is not None
+    a = out[ARP]
+    assert a.op == 2 and a.psrc == "10.0.0.2" and a.pdst == "10.0.0.200" and a.hwdst == "02:00:00:00:00:01"
+
+
+# ---- other packet fields ----
+
+def test_match_ip_proto_len_frag():
+    """match ip-proto, ip-len, ip-frag (flags word), ip-frag-off"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match ip-proto 17; match ip-len 36; match ip-frag 0x4000; match ip-frag-off 0; set ip-tos 4'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2", flags="DF") / UDP(sport=1, dport=2) / (b"x" * 8), "udp")
+    assert tos_of(out) == 4
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2", flags="DF") / UDP(sport=1, dport=2) / (b"x" * 9), "udp")
+    assert tos_of(out) == 0, "match ip-len matched a different length"
+
+
+def test_get_tcp_win_and_offsets():
+    """get tcp-win, l4-off and payload-off (TCP options; the IPv4 offsets assume a 20-byte header)"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match tcp; get tcp-win W; set tcp-dst %W; get l4-off O; set ip-tos %O; "
+                f"get payload-off P; set tcp-src %P'")
+    pkt = eth() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP(sport=1, dport=2, window=4321, options=[("NOP", None)] * 4)
+    out = send_and_capture(pkt, "tcp")
+    assert out is not None
+    assert out[TCP].dport == 4321
+    assert out[IP].tos == 14 + 20
+    assert out[TCP].sport == 14 + 20 + 24          # TCP header 24 bytes with options
+
+
+def test_gre_key_and_proto():
+    """get gre-key, match gre-proto"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match gre; match gre-proto 0x0800; get gre-key K; set ip-tos %K'")
+    pkt = eth() / IP(src="10.0.0.1", dst="10.0.0.2") / GRE(key_present=1, key=77, proto=0x0800) / IP(dst="1.2.3.4") / ICMP()
+    out = send_and_capture(pkt, "ip proto gre")
+    assert tos_of(out) == 77
+
+
+def test_match_len_and_protocol():
+    """match len (frame length) and match protocol (skb->protocol, IPv4 = 0x0800)"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match protocol 0x0800; match len 60; set ip-tos 4'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2) / (b"x" * 18), "udp")
+    assert tos_of(out) == 4
+
+
+# ---- metadata between programs on one hook ----
+
+def test_skb_hash_and_queue_between_programs():
+    """set skb-hash / queue in one program, match / get them in the next"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress -p 100 'match udp; set skb-hash 4660; set queue 0'")
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress -p 200 'match udp; match skb-hash 4660; get queue Q; calc add Q 4; set ip-tos %Q'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2), "udp")
+    assert tos_of(out) == 4
+
+
+def test_skb_ifindex_and_ingress():
+    """match skb-ifindex is the interface the program runs on"""
+    ifindex = int(ns_exec(NS_TX, f"cat /sys/class/net/{VETH_TX}/ifindex"))
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; match skb-ifindex {ifindex}; set ip-tos 4'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2), "udp")
+    assert tos_of(out) == 4
+
+
+# ---- debug-log ----
+
+def test_debug_log_reaches_trace_pipe():
+    """debug-log writes its message to the trace buffer"""
+    if not os.path.exists("/sys/kernel/tracing/trace"):
+        subprocess.run("mount -t tracefs nodev /sys/kernel/tracing", shell=True, capture_output=True)
+    trace = next((d for d in ("/sys/kernel/tracing", "/sys/kernel/debug/tracing") if os.path.exists(d + "/trace")), None)
+    if trace is None:
+        pytest.skip("tracefs not mounted")
+    with open(trace + "/trace", "w"):
+        pass                                         # clear the buffer
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; debug-log bpfc-pytest-marker'")
+    send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2), "udp")
+    with open(trace + "/trace") as f:
+        assert "bpfc-pytest-marker" in f.read()
+
+
+# ---- byte insertion and deletion ----
+
+def test_del_bytes_middle():
+    """del-bytes 42 4 removes 4 bytes after the UDP header, the rest moves up"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; del-bytes 42 4'")
+    pkt = eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2) / b"AAAABBBBCCCC"
+    out = send_and_capture(pkt, "udp")
+    assert out is not None
+    raw = bytes(out)
+    assert len(raw) >= 50 and raw[42:50] == b"BBBBCCCC" and raw[:42] == bytes(pkt)[:42]
+
+
+def test_add_bytes_middle():
+    """add-bytes 42 4 inserts 4 zero bytes after the UDP header"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; add-bytes 42 4'")
+    pkt = eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2) / b"AAAABBBB"
+    out = send_and_capture(pkt, "udp")
+    assert out is not None
+    raw = bytes(out)
+    assert raw[:42] == bytes(pkt)[:42] and raw[42:54] == b"\0\0\0\0AAAABBBB"

@@ -72,7 +72,7 @@ See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)`. Build an RPM (RHEL 9/10) with `
 
 ## Tests
 
-**Tests.** `./test.sh` runs every suite (root; about an hour) and ends with pass/fail/skip totals per suite; it exits non-zero if anything failed. Name suites to run only those (`./test.sh bpfc nat`), add `-f` to print failures only, or `-v` for each suite's full output; logs are kept under `/tmp/bpfc-tests.*`. `make check` (preprocessor, stack, bpfcd, container), `make check-dataplane` and `make check-all` use the same runner; pass flags with `make check TESTFLAGS=-f`. Suites skip (rather than fail) when they are not run as root or need something the system lacks: a tool (tcpdump, ncat, iperf), kernel MPLS routing (`mpls_router`), or scapy for `tests/test_bpfc.py`. The fragmentation suites check each fragment size with three ordinary pings and, separately, the loss under load (100 parallel pings), which must stay below `STRESS_MAX_LOSS` hundredths of a percent (default 100, i.e. 1 %). New shell suites should `source tests/lib.sh` for `test_pass`/`test_fail`/`test_skip`, `check` and `tests_exit`.
+**Tests.** `./test.sh` runs every suite (root; about an hour) and ends with pass/fail/skip totals per suite; it exits non-zero if anything failed. Name suites to run only those (`./test.sh bpfc nat`), add `-f` to print failures only, or `-v` for each suite's full output; logs are kept under `/tmp/bpfc-tests.*`. `make check` (compile, preprocessor, stack, bpfcd, container), `make check-dataplane` and `make check-all` use the same runner; `make check-compile` needs no root and checks that every field and command compiles, that hex and decimal values give the same code, and that invalid programs are refused with a clear message; pass flags with `make check TESTFLAGS=-f`. Suites skip (rather than fail) when they are not run as root or need something the system lacks: a tool (tcpdump, ncat, iperf), kernel MPLS routing (`mpls_router`), or scapy for `tests/test_bpfc.py`. The fragmentation suites check each fragment size with three ordinary pings and, separately, the loss under load (100 parallel pings), which must stay below `STRESS_MAX_LOSS` hundredths of a percent (default 100, i.e. 1 %). New shell suites should `source tests/lib.sh` for `test_pass`/`test_fail`/`test_skip`, `check` and `tests_exit`.
 
 ---
 
@@ -113,7 +113,7 @@ Instructions are strictly **semicolon-separated**. Variables (denoted by `%`) ar
 * `set val <VAR> <%VAR | int>` - Set variable to integer value or value from another variable
 * `free <VAR>` - Free `VAR` from the stack, making space available for later variables.  
 
-**Stack layout.** The 512-byte stack holds 128 bytes of fixed scratch used inside single instructions, then one 8-byte slot per variable (two for a 16-byte one), as many as the program declares, up to 48 slots. Instructions that need more scratch (`fib-lookup`: 72 bytes, `push-eth`: 32, `recalc-icmp-csum`: 128, the byte-insertion and deletion commands) take it below the variables and give it back when they finish. `xor-packet` and the TCP/UDP checksums stage packet data in chunks of up to 256 bytes: with more than 16 variables the chunks get smaller (down to 8 and 4 bytes), which works the same but costs more verifier instructions. The variables `fib-lookup` adds (`FIB_RESULT`, `FIB_SMAC`, `FIB_DMAC`, `FIB_IP_DST`, `FIB_IFINDEX`) count as five. If something does not fit, bpfc says which instruction needs how much; `free` variables you no longer need.
+**Stack layout.** The 512-byte stack holds 128 bytes of fixed scratch used inside single instructions, then one 8-byte slot per variable (two for a 16-byte one), as many as the program declares, up to 48 slots. Instructions that need more scratch (`fib-lookup`: 72 bytes, `push-eth`: 32, the byte-insertion and deletion commands) take it below the variables and give it back when they finish. `xor-packet` and the TCP/UDP checksums stage packet data in chunks of up to 256 bytes: with more than 16 variables the chunks get smaller (down to 8 and 4 bytes), which works the same but costs more verifier instructions. The variables `fib-lookup` adds (`FIB_RESULT`, `FIB_SMAC`, `FIB_DMAC`, `FIB_IP_DST`, `FIB_IFINDEX`) count as five. If something does not fit, bpfc says which instruction needs how much; `free` variables you no longer need.
 
 ### Branching & Control Flow
 * `match|if <field> <value>` - Opens a conditional block. If the packet field does not match the value, execution jumps past the block.
@@ -131,7 +131,7 @@ Quick boolean filters for specific L2/L3 types. Use as standalone matches (e.g.,
 * Supported: `ip`, `ip6`, `arp`, `icmp`, `gre`, `tcp`, `udp`, `igmp`, `ospf`, `pim`, `esp`, `rsvp`, `l2tp`, `vlan`, `qinq`.
 
 ### Packet Data Fields (`get`, `set`, `match`)
-Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val | %VAR>`), and evaluation (`match <field> <val | %VAR>`). Subnets (`10.0.0.0/24`) and port ranges (`80-100`) are fully supported.
+Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val | %VAR>`), and evaluation (`match <field> <val | %VAR>`). Subnets (`10.0.0.0/24`) and port ranges (`80-100`) are fully supported. Numbers may be decimal or `0x` hex anywhere. Values are checked when compiling: a number must fit the field (port 0-65535, `ip-tos` 0-255, `vlan-id` 0-4095, ...), addresses must be complete (`10.0.0.300`, `10.0.0` or a 5-byte MAC are errors), and a range must be low-high; `redirect`/`clone` to an interface that does not exist is an error too. Variables hold host-order values, so `match <field> %VAR` compares with what `get <field>` stored (for `mpls-label`, the label itself). `match vlan` / `match qinq` look at the offloaded tag, or at the frame when no tag is offloaded.
 
 * **L2:** `dst-mac`, `src-mac`, `eth-proto`, `vlan-id` (`set vlan-id` replaces the id of the tag and keeps its priority and TPID; without a tag it adds an 802.1Q one)
 * **IPv4:** `ip-src`, `ip-dst`, `ip-tos`, `ip-proto` (`set ip-src`/`ip-dst` update the IP checksum and the TCP/UDP checksum, whose pseudo-header covers the addresses; a UDP checksum of 0 stays 0)
@@ -147,7 +147,7 @@ Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val |
 
 ### Context Metadata (`__sk_buff`)
 * `len` - Packet length (`u32`).
-* `protocol` - Protocol stored in sk_buff.
+* `protocol` - Protocol stored in sk_buff, as an EtherType (`match protocol 0x0800`; `get` stores it in host order).
 * `skb-ifindex` - Interface number associated with sk_buff.
 * `skb-ingress` - Ingress interface number associated with sk_buff.
 * `skb-mark` - Netfilter/iptables firewall mark (`u32`).
@@ -187,10 +187,10 @@ Allows persistent data storage across packets and network interfaces.
 * `redirect <ifname | %VAR> [egress|ingress]`, `redirect-neigh` - Terminal forwarding actions. If direction is not specified, will use same direction as attached mode.
 * `clone <ifname | %VAR> [egress|ingress]` - Clone packet to specified interface. If direction is not specified, will use the same direction as attached mode.
 * `encap-gre ip-src <ip> ip-dst <ip> key <val>` / `decap-gre`
-* `encap-mpls <label> <bos>` / `decap-mpls`
+* `encap-mpls label <label> bos <0|1>` / `decap-mpls` - `decap-mpls` removes one label (and a pseudowire control word when one follows) and sets the EtherType to 0x86DD when IPv6 follows, 0x0800 otherwise.
 * `push-vlan <vid> [pcp]` / `pop-vlan`
 * `push-qinq <outer_vid> <inner_vid> [o_pcp] [i_pcp]`
-* `push-eth <d_mac> <s_mac>` / `pop-eth`
+* `push-eth <d_mac> <s_mac>` / `pop-eth` - `pop-eth` removes the outer Ethernet header, leaving the inner one (IP packets).
 
 ### Structural Manipulation & Checksums
 * `add-bytes <offset> <len>` / `del-bytes <offset> <len>` - Inserts `<len>` number of bytes at `<offset>` and shifts packet tail down/up.
@@ -199,7 +199,7 @@ Allows persistent data storage across packets and network interfaces.
 * `add-l2-bytes <len>` / `del-l2-bytes <len>` - Insert or remove `<len>` bytes right after the Ethernet header (offset 14), for any protocol; the same as `add-bytes 14 <len>` / `del-bytes 14 <len>`. For IPv4/IPv6 packets `insert-l2` / `strip-l2` are cheaper.
 * `insert-l2 <len> [ethertype]` - Insert `len` zero bytes after the Ethernet header (IPv4/IPv6 packets) and optionally set the EtherType. Headers behind it keep their place in memory, so checksum offload keeps working.
 * `strip-l2 <len> <ethertype>` - Remove `len` bytes (multiple of 4) after the Ethernet header and set the EtherType, for any protocol (`bpf_skb_adjust_room` refuses non-IP packets). No payload copy; the stack sees the new protocol directly.
-* `recalc-tcp-csum [l3 [max]]`, `recalc-udp-csum [l3 [max]]`, `recalc-icmp-csum` - L4 checksum recomputed from scratch via `bpf_csum_diff`: any IHL, length from the IP header, packets up to `max` bytes (default 9000). On egress, locally sent TCP/UDP packets usually still have checksum offload pending (the kernel or NIC completes the checksum after the program), so recalculate on ingress or for forwarded packets.
+* `recalc-tcp-csum [l3 [max]]`, `recalc-udp-csum [l3 [max]]` - L4 checksum recomputed from scratch via `bpf_csum_diff`: any IHL, length from the IP header, packets up to `max` bytes (default 9000). On egress, locally sent TCP/UDP packets usually still have checksum offload pending (the kernel or NIC completes the checksum after the program), so recalculate on ingress or for forwarded packets.
 * `calc-csum <tcp|udp> <VAR> [l3 [max]]` - Compute the correct TCP/UDP checksum into `VAR` (host order) without changing the packet.
 * `ip-frag <len> <max-input-mtu>` - Fragment IP payloads into `<len>` size fragments up to `<max-input-mtu>` input size.  
 * `ip-defrag` - Reassemble fragmented IP packets back into a single packet. 
