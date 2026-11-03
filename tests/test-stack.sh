@@ -34,6 +34,11 @@ expect_error   ST-49-vars          "no stack left for variable 'V48'" 'repeat 49
 expect_compile ST-free-reuse       'repeat 48 as I; decl V$I 8; end-repeat; free V47; decl Z 4'
 expect_compile ST-csum-small-room  'repeat 47 as I; decl V$I 8; end-repeat; recalc-udp-csum'
 expect_error   ST-fib-no-room      'fib-lookup needs 72 bytes' 'repeat 41 as I; decl V$I 8; end-repeat; fib-lookup 10.0.0.1'
+# 16-byte variables (IPv6 addresses) take two slots: 24 of them fill the stack
+expect_compile ST-16-byte-vars     'repeat 24 as I; decl V$I 16; end-repeat'
+expect_error   ST-16-byte-vars-full "no stack left for variable 'V24'" 'repeat 25 as I; decl V$I 16; end-repeat'
+expect_compile ST-16-byte-reuse    'repeat 24 as I; decl V$I 16; end-repeat; free V23; decl Z 16'
+expect_error   ST-16-byte-no-8-reuse "no stack left for variable 'Z'" 'repeat 48 as I; decl V$I 8; end-repeat; free V47; decl Z 16'
 # push-eth used to keep its 32 bytes of scratch for the rest of the program
 expect_compile ST-scratch-released 'repeat 20; push-eth aa:bb:cc:dd:ee:ff 11:22:33:44:55:66; end-repeat; repeat 40 as I; decl V$I 8; end-repeat'
 

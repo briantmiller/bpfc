@@ -174,6 +174,24 @@ def test_set_ip_dst_keeps_l4_checksum():
     assert checksums_valid(out), "TCP checksum not updated after set ip-dst"
 
 
+def test_set_ip_src_keeps_udp_checksum():
+    """set ip-src also fixes the UDP checksum"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; set ip-src 172.16.5.4'")
+    pkt = Ether(src=state["tx_mac"], dst=state["rx_mac"]) / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=5000, dport=6000) / b"payload"
+    out = send_and_capture(pkt, "udp")
+    assert out is not None and out[IP].src == "172.16.5.4"
+    assert checksums_valid(out), "UDP checksum not updated after set ip-src"
+
+
+def test_set_ip_dst_leaves_udp_checksum_zero():
+    """a UDP checksum of 0 means none and must stay 0"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; set ip-dst 10.9.8.7'")
+    pkt = Ether(src=state["tx_mac"], dst=state["rx_mac"]) / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=5000, dport=6000, chksum=0) / b"payload"
+    out = send_and_capture(pkt, "udp")
+    assert out is not None and out[IP].dst == "10.9.8.7"
+    assert out[UDP].chksum == 0
+
+
 def test_set_tcp_dst_keeps_checksum():
     """set tcp-dst keeps the TCP checksum valid"""
     bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match tcp; set tcp-dst 9999'")
@@ -211,6 +229,16 @@ def test_vlan_push_then_set_id():
     assert out is not None and out.haslayer(Dot1Q)
     assert out[Dot1Q].vlan == 100
     assert out[Dot1Q].prio == 3
+
+
+def test_vlan_set_id_from_variable():
+    """get vlan-id, calc, set vlan-id %VAR keeps the priority"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match ip-tos 20; push-vlan 100 5; get vlan-id V; calc add V 20; set vlan-id %V; continue'")
+    pkt = Ether(src=state["tx_mac"], dst=state["rx_mac"]) / IP(src="10.0.0.1", dst="10.0.0.2", tos=20) / ICMP()
+    out = send_and_capture(pkt, "vlan")
+    assert out is not None and out.haslayer(Dot1Q)
+    assert out[Dot1Q].vlan == 120
+    assert out[Dot1Q].prio == 5
 
 
 def test_gre_encap():
@@ -276,3 +304,21 @@ def test_ipv6_copy_address_through_variable():
     out = send_and_capture(ipv6_packet(), "ip6")
     assert out is not None
     assert out[IPv6].src == "2001:db8::2"
+
+
+def test_ipv6_match_against_variable():
+    """match ip6-dst %VAR compares all four words: equal matches, different does not"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match ip6; get ip6-dst D; match ip6-dst %D; set ip6-tclass 46; "
+                f"end-match; match ip6-src %D; set ip6-tclass 99'")
+    out = send_and_capture(ipv6_packet(), "ip6")
+    assert out is not None
+    assert out[IPv6].tc == 46, "ip6-dst did not match itself through a variable"
+
+
+def test_match_values_with_high_bit():
+    """match ip-dst / src-mac where the 32-bit word has bit 31 set (10.0.0.200, aa:bb:cc:dd:..)"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match ip-dst 10.0.0.200; match src-mac aa:bb:cc:dd:ee:ff; set ip-tos 4'")
+    pkt = Ether(src="aa:bb:cc:dd:ee:ff", dst=state["rx_mac"]) / IP(src="10.0.0.1", dst="10.0.0.200") / ICMP()
+    out = send_and_capture(pkt, "icmp")
+    assert out is not None
+    assert out[IP].tos == 4, "a match on a value with bit 31 set did not match"
