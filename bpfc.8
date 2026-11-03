@@ -15,6 +15,11 @@ bpfc \- Pure C eBPF bytecode compiler and direct network fabric loader
 .RB [ \-m
 .IR map_dir ]
 .RB [ \-v ]
+.RB [ \-s
+.IR NAME = value ]
+.RB [ \-L
+.IR dir ]
+.RB [ \-E | \-M ]
 .RI { "<instructions>" " | " \-f " file" }
 .PP
 .B bpfc
@@ -68,7 +73,7 @@ BPFC_INFO id=<id> tag=<tag> insns=<n> iface=<if> dir=<dir> prio=<p> proto=<0xNNN
 \fBverified\fR (kernel 5.16 and later) is the number of instructions the verifier processed; the kernel rejects a program that reaches 1,000,000.
 .TP
 .BI \-f " file"
-Read instructions from \fIfile\fR (\fB\-\fR for standard input). Line breaks act as spaces, and a \fB#\fR at the start of an instruction begins a comment that ends at the end of the line.
+Read instructions from \fIfile\fR (\fB\-\fR for standard input). Line breaks act as spaces, and a \fB#\fR at the start of an instruction begins a comment that ends at the end of the line. Include files are read the same way.
 .TP
 .BI \-m " map_dir"
 Directory for pinned maps (default \fI/sys/fs/bpf\fR). A map is pinned there under its name, which must be 1\-31 characters without \fB/\fR; the kernel's own name for it is the last 15 characters, with characters other than letters, digits, \fB_\fR and \fB.\fR replaced by \fB_\fR.
@@ -78,6 +83,18 @@ Print the contents of a pinned map and exit.
 .TP
 .BI \-w " map key value"
 Write a 64-bit \fIvalue\fR under \fIkey\fR in a pinned 8-byte map (for example a program's runtime settings) and exit. Numbers may be decimal or 0x hexadecimal.
+.TP
+.B \-E
+Print the program after preprocessing (\fBinclude\fR, \fBconst\fR, \fBdefine\fR, \fBrepeat\fR, \fBwhen\fR and \fB$\fR substitution) as plain instructions, one per line, and exit without compiling.
+.TP
+.BI \-s " NAME" = value
+Set the constant \fINAME\fR, overriding a \fBconst\fR \fINAME\fR in the program. May be given more than once.
+.TP
+.BI \-L " dir"
+Search \fIdir\fR for include files, before the default \fI/etc/bpfc/include\fR. May be given more than once.
+.TP
+.B \-M
+Print the program file and every file it includes, one per line, and exit. \fBbpfcd\fR(8) uses this to notice changes to included files.
 .TP
 .B \-v
 Verbose compiler output.
@@ -91,6 +108,45 @@ Conditional matching acts as a gatekeeper. If a packet fails a match rule, the e
 .BI "match " "field value"
 Compares a specific packet header field to a value. 
 Supported fields: \fBsrc-mac\fR, \fBdst-mac\fR, \fBeth-proto\fR, \fBeth-vlan\fR, \fBmpls-label\fR, \fBmpls-bos\fR, \fBip-proto\fR, \fBip-tos\fR, \fBip-src\fR, \fBip-dst\fR, \fBtcp-src\fR, \fBtcp-dst\fR, \fBudp-src\fR, \fBudp-dst\fR.
+.SS Preprocessor
+These are expanded before compilation; \fB\-E\fR shows the result. A program that uses none of them and no \fB$\fR is compiled exactly as written.
+.TP
+.BI "const " "NAME value"
+Define \fB$\fINAME\fR. A number or constant expression is stored as a number, anything else (an address, a MAC, an interface name) as text. \fB\-s\fR overrides it; defining a const twice with different values is an error.
+.TP
+\fBdefine\fR \fINAME\fR [\fIPARAM\fR ...] ; ... ; \fBend-define\fR
+Define a macro, used as an instruction: \fINAME arg ...\fR. In the body, \fB$\fIPARAM\fR is the argument and \fB$UNIQUE\fR a number unique to each use (for labels). The body sees only its parameters and consts. A macro may not be named after a bpfc instruction.
+.TP
+.BI "include " file
+Read \fIfile\fR here, once per program. A relative name is looked up next to the including file, then in the \fB\-L\fR directories, then in \fI/etc/bpfc/include\fR. World-writable files are refused.
+.TP
+\fBrepeat\fR \fIcount\fR [\fBas\fR \fII\fR] ; ... ; \fBend-repeat\fR
+Copy the body \fIcount\fR times (0\-4096) with \fB$\fII\fR = 0, 1, ... The result is straight-line code without backward jumps, so it needs no loop support from the kernel verifier. Every copy adds instructions; bpfc accepts programs of up to 32768.
+.TP
+\fBrepeat\fR \fI%VAR\fR \fBmax\fR \fIcount\fR [\fBas\fR \fII\fR] ; ... ; \fBend-repeat\fR
+As above, but stop once \fI%VAR\fR <= \fB$\fII\fR (checked before each copy): the body runs \fI%VAR\fR times, at most \fIcount\fR.
+.TP
+.B break-repeat
+.TQ
+.B next-repeat
+Leave the innermost \fBrepeat\fR, or continue with its next copy.
+.TP
+\fBwhen\fR \fIexpr\fR ; ... ; [\fBotherwise\fR ; ...] ; \fBend-when\fR
+Keep the first branch if \fIexpr\fR is not 0, else the \fBotherwise\fR branch. \fBdefined(\fINAME\fB)\fR is 1 for a defined const.
+.TP
+\fB$\fINAME\fR, \fB$(\fIexpr\fB)\fR, \fB$$\fR
+Replaced anywhere in an instruction by a const, macro parameter or repeat counter, by the value of \fIexpr\fR, or by \fB$\fR. Expressions use C operators and precedence on 64-bit integers (\fB>>\fR is logical); names inside \fB$( )\fR need no \fB$\fR. A name ends at the first character that is not a letter, digit or \fB_\fR, so write \fB$(I)_x\fR rather than \fB$I_x\fR.
+.PP
+Errors name the file and line. Example: sum four 32-bit words after a variable-length count.
+.EX
+const WORDS 4;
+decl W 4; decl N 4; decl S 8;
+get bytes 16 2 N;
+repeat %N max $WORDS as I;
+  get bytes $(18 + I*4) 4 W;
+  calc add S %W;
+end-repeat
+.EE
 .SS L2 / Ethernet Actions
 .TP
 .BI "set-dst-mac " "mac_address"

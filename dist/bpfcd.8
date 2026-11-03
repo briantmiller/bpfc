@@ -47,6 +47,18 @@ and rescans the directory:
 A file is hashed only if its modification time changed, and reinstalled only
 if the hash differs too. Touching a file therefore does not reinstall it.
 .IP \(bu
+A program that uses
+.B include
+is hashed together with every file it includes (as listed by
+.BR "bpfc \-M" )
+on every rescan, so editing a shared include file reinstalls the programs
+that use it. Keep include files outside
+.I interfaces.d
+(for example in
+.IR /etc/bpfc/include ),
+where bpfcd does not treat them as programs. World-writable include files
+are refused, like world-writable programs.
+.IP \(bu
 A changed program replaces the old one atomically at the same priority, so
 packets are never left unfiltered during the swap. (If the filter at that
 priority has a different protocol or classifier, the kernel cannot swap them

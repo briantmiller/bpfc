@@ -36,6 +36,10 @@ sudo ./bpfc -i <interface> -c
 | `-r <map>` | Dump the contents of a pinned map. |
 | `-w <map> <key> <value>` | Write a 64-bit value into a pinned map (e.g. runtime settings). |
 | `-v` | Verbose mode. Prints a trace of jump offset calculations and block resolutions. |
+| `-E` | Print the program after `include`, `const`, `define`, `repeat` and `when` are expanded, then exit. |
+| `-s <NAME>=<value>` | Set `const NAME`, overriding the program's own value. Repeatable. |
+| `-L <dir>` | Search `dir` for include files (before `/etc/bpfc/include`). Repeatable. |
+| `-M` | Print the program file and every file it includes, one per line, then exit. |
 
 ---
 
@@ -56,7 +60,7 @@ bpfcctl                      # what is installed, from which file, and whether t
 bpfcctl show eth0 ingress 100 --bytecode
 ```
 
-* **Reload** (`systemctl reload bpfcd` or `bpfcctl reload`): new and changed files are installed (atomic replace at the same priority), deleted files are detached. A file is only re-hashed when its mtime changes and only reinstalled when its SHA-256 differs.
+* **Reload** (`systemctl reload bpfcd` or `bpfcctl reload`): new and changed files are installed (atomic replace at the same priority), deleted files are detached. A file is only re-hashed when its mtime changes and only reinstalled when its SHA-256 differs. A program that uses `include` is hashed together with the files it includes (as listed by `bpfc -M`) on every reload, so editing a shared library reinstalls every program that uses it. Keep libraries outside `interfaces.d` (for example in `/etc/bpfc/include`), or bpfcd will try to install them as programs.
 * **Failures**: if a file does not compile or the verifier rejects it, its priority is left empty rather than running the old version; `bpfcctl show` prints the verifier log.
 * **Interfaces**: programs are installed when a configured interface appears and re-installed when it is re-created.
 * **External changes**: if something else removes or replaces a managed program, bpfcd reinstalls it or only logs it, per `on_external_change` in `/etc/bpfc/bpfc.conf`.
@@ -187,6 +191,35 @@ Allows persistent data storage across packets and network interfaces.
 * `calc-csum <tcp|udp> <VAR> [l3 [max]]` - Compute the correct TCP/UDP checksum into `VAR` (host order) without changing the packet.
 * `ip-frag <len> <max-input-mtu>` - Fragment IP payloads into `<len>` size fragments up to `<max-input-mtu>` input size.  
 * `ip-defrag` - Reassemble fragmented IP packets back into a single packet. 
+
+### Constants, Macros, Includes and Unrolled Loops
+A preprocessing step runs before compilation; `bpfc -E` prints its output (plain bpfc commands). Programs that use none of these keywords and no `$` compile exactly as before.
+
+* `const <NAME> <value>` - Defines `$NAME`. A number or constant expression is stored as a number; anything else (an address, a MAC, an interface) as text. `-s NAME=VALUE` on the command line overrides it.
+* `define <NAME> [PARAM ...]` ... `end-define` - A macro, used like a command: `NAME arg1 arg2`. Parameters are `$PARAM` in the body. A macro body sees only its parameters and consts; `$UNIQUE` is a number unique to each use (for labels). Macro names may contain `-` but may not be bpfc commands.
+* `include <file>` - Reads a file once (later includes of the same file are skipped). Relative names are looked up next to the including file, then in `-L` directories, then in `/etc/bpfc/include`. World-writable files are refused.
+* `repeat <count> [as I]` ... `end-repeat` - The body is copied `count` times (0-4096) with `$I` = 0, 1, ...: straight-line code with no backward jump, so it loads on any kernel and needs no loop support from the verifier.
+* `repeat %VAR max <count> [as I]` ... `end-repeat` - The same, but stops once `%VAR <= $I`, so it runs `%VAR` times, at most `count`. `%VAR` is checked before each copy.
+* `break-repeat` / `next-repeat` - Leave the innermost repeat / skip to its next copy (a forward jump).
+* `when <expr>` ... [`otherwise` ...] `end-when` - Keep one branch, decided at compile time. `defined(NAME)` tests for a const.
+* `$NAME`, `$(expr)`, `$$` - Substitution anywhere in a command, constant arithmetic (C operators and precedence on 64-bit integers; `>>` is logical), and a literal `$`. Names inside `$( )` need no `$`. A name runs until the first character that is not a letter, digit or `_`: write `$(I)_x`, not `$I_x`.
+
+```
+include fec-lib.bpfc;                   # const SHIM 8; define read-word ...
+const WORDS 4;
+decl W 4;
+decl N 4;
+get bytes 16 2 N;
+repeat %N max $WORDS as I;
+  get bytes $(14 + $SHIM + I*4) 4 W;
+  match val %W eq 0;
+    break-repeat;
+  end-match;
+  calc-map add WORDS $I %W;
+end-repeat
+```
+
+Each copy is real code: a 250-instruction body repeated 32 times is 8,000 instructions (bpfc allows 32,768; the kernel's limit is on instructions the verifier processes, 1,000,000). Repeats suit short bodies and small counts; `start-loop`/`loop` remains for long runtime loops on kernels 5.3+.
 
 ### Diagnostics
 * `debug-log <string>` - Writes to `/sys/kernel/debug/tracing/trace_pipe`.

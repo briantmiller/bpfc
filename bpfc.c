@@ -6,6 +6,9 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include <errno.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <net/if.h>
@@ -191,7 +194,14 @@ int loop_start_indices[MAX_LOOPS];
 int num_loop_starts = 0;
 
 /* --- Globals --- */
-#define MAX_INSNS 8192
+/* The kernel takes up to 1M instructions; jump offsets are 16-bit, so stay
+ * within reach of them. */
+#define MAX_INSNS 32768
+
+/* Default directory for include files (bpfc -L adds more). */
+#ifndef BPFC_INCLUDE_DIR
+#define BPFC_INCLUDE_DIR "/etc/bpfc/include"
+#endif
 struct bpf_insn prog[MAX_INSNS];
 int prog_idx = 0;
 
@@ -215,21 +225,21 @@ int num_jumps = 0;
 int block_jump_counts[MAX_BLOCKS];
 int num_blocks = 0;
 
-#define MAX_SAFETY_JUMPS 128
+#define MAX_SAFETY_JUMPS 4096
 int safety_jump_indices[MAX_SAFETY_JUMPS];
 int num_safety_jumps = 0;
 int verbose_mode = 0; // Tracks if -v was passed
 
 int is_xdp = 0; // Global flag activated by -x
 
-#define MAX_LABELS 128
+#define MAX_LABELS 1024
 struct {
     char name[32];
     int target_idx;
 } labels[MAX_LABELS];
 int num_labels = 0;
 
-#define MAX_UNRESOLVED_GOTOS 128
+#define MAX_UNRESOLVED_GOTOS 1024
 struct {
     char target_name[32];
     int insn_idx; // The prog_idx where the BPF_JA instruction was emitted
@@ -252,8 +262,13 @@ void reset() {
 }
 
 void emit(struct bpf_insn insn) {
-        if (prog_idx < MAX_INSNS)
-                prog[prog_idx++] = insn;
+        /* Instructions past the end used to be dropped silently, leaving a
+         * truncated program; unrolled repeats make that easy to reach. */
+        if (prog_idx >= MAX_INSNS) {
+                fprintf(stderr, "Error: program exceeds %d instructions\n", MAX_INSNS);
+                exit(1);
+        }
+        prog[prog_idx++] = insn;
 }
 
 /*
@@ -432,12 +447,21 @@ int emit_var_compare_false_jump(const char *var1_name,
 }
 
 
+/* Overflowing these tables used to drop jumps silently, leaving them
+ * unpatched (offset 0: fall through instead of skipping the block). */
+static void table_full(const char *what, int limit) {
+    fprintf(stderr, "Error: too many %s (limit %d)\n", what, limit);
+    exit(1);
+}
+
 void start_match_block(void) {
-    if (num_blocks < MAX_BLOCKS) block_jump_counts[num_blocks++] = 0;
+    if (num_blocks >= MAX_BLOCKS) table_full("nested match/if blocks", MAX_BLOCKS);
+    block_jump_counts[num_blocks++] = 0;
 }
 
 void add_block_jump(void) {
-    if (num_jumps < MAX_JUMPS) jump_patch_indices[num_jumps++] = prog_idx;
+    if (num_jumps >= MAX_JUMPS) table_full("pending match/if jumps", MAX_JUMPS);
+    jump_patch_indices[num_jumps++] = prog_idx;
     if (num_blocks > 0) block_jump_counts[num_blocks - 1]++;
 	
 	if (verbose_mode) {
@@ -447,7 +471,8 @@ void add_block_jump(void) {
 }
 
 void add_safety_jump(void) {
-    if (num_safety_jumps < MAX_SAFETY_JUMPS) safety_jump_indices[num_safety_jumps++] = prog_idx;
+    if (num_safety_jumps >= MAX_SAFETY_JUMPS) table_full("packet bounds checks", MAX_SAFETY_JUMPS);
+    safety_jump_indices[num_safety_jumps++] = prog_idx;
 }
 
 void resolve_pending_jumps(void) {
@@ -6052,7 +6077,7 @@ char* read_instructions_from_file(const char *filename) {
         // Newlines act as whitespace so tokens on adjacent lines never merge.
         if (c == '\n' || c == '\r') {
             at_cmd_start = 1;
-            c = ' ';
+            c = c == '\n' ? '\n' : ' ';  /* kept for line numbers; the preprocessor turns it into a space */
         }
 
         // Convert tabs to spaces for the tokenizer
@@ -6061,7 +6086,7 @@ char* read_instructions_from_file(const char *filename) {
         }
 
         if (c == ';') at_cmd_start = 1;
-        else if (c != ' ') at_cmd_start = 0;
+        else if (c != ' ' && c != '\n') at_cmd_start = 0;
 
         buffer[len++] = (char)c;
     }
@@ -6086,6 +6111,10 @@ void help(const char *arg0) {
         "-r <map>"		,"dump contents of specified map",
         "-w <map> <key> <value>"	,"write a 64-bit value under key in a pinned 8-byte map (e.g. runtime settings)",
         "-f <file>"		,"read command instructions from file, - for STDIN",
+        "-E"			,"print the program after include, const, define, repeat and when are expanded, then exit",
+        "-s <NAME>=<value>"	,"set const NAME (overrides 'const NAME' in the program); repeatable",
+        "-L <dir>"		,"search dir for include files (before " BPFC_INCLUDE_DIR "); repeatable",
+        "-M"			,"print the program file and every file it includes, one per line, then exit",
         "-v"			,"verbose output",
     };
     char *cmds[] = {
@@ -6159,6 +6188,15 @@ void help(const char *arg0) {
 	"strip-l2 <len> <ethertype>"		,"remove len bytes (multiple of 4) after the Ethernet header and set the EtherType, any protocol",
 	"get cpu <VAR>"				,"number of the CPU running the program",
 	"calc hton|ntoh <VAR> [bits]"		,"convert VAR between host and network byte order (before set bytes / after get bytes)",
+	"Preprocessor"				,"expanded before compiling; bpfc -E prints the result",
+	"  const <NAME> <value>"		,"define $NAME (a number, expression or text); -s NAME=VALUE overrides it",
+	"  define <NAME> [P ...] ... end-define","macro used as 'NAME arg ...'; $P in the body, $UNIQUE differs per use",
+	"  include <file>"			,"read file once: next to this file, then -L dirs, then " BPFC_INCLUDE_DIR,
+	"  repeat <n> [as I] ... end-repeat"	,"copy the body n times with $I = 0..n-1 (unrolled, no backward jump)",
+	"  repeat %VAR max <n> [as I] ..."	,"same, stopping once %VAR <= $I: runs %VAR times, at most n",
+	"  break-repeat | next-repeat"		,"leave the innermost repeat | go on with its next copy",
+	"  when <expr> ... [otherwise ...] end-when","keep one branch, chosen at compile time; defined(NAME) tests a const",
+	"  $NAME  $(expr)  $$"			,"substitute a name, a constant expression (C operators, 64-bit) or a '$'",
 	"Terminal Commands"			,"These commands stop further processing and must be the last command or followed by 'end-if' 'end-match' or 'else'",
 	"  continue"				,"continue processing packet - terminal command",
 	"  accept"				,"accept packet without continuing down processing chain - terminal command",
@@ -6859,6 +6897,924 @@ int process_cmd_list(char *instr, const char *dir) {
     return 0;
 }
 
+/* ======================================================================
+ * Preprocessor: include, const, define, repeat, when, $NAME and $(expr)
+ *
+ * Runs on the source text before anything is compiled and turns it into
+ * plain bpfc commands (bpfc -E prints them). A program that uses none of
+ * these keywords and no '$' comes out unchanged.
+ *
+ *   include <file>                 read a file once (relative to the
+ *                                  including file, then -L dirs, then
+ *                                  BPFC_INCLUDE_DIR)
+ *   const NAME <value>             $NAME; -s NAME=VALUE overrides it
+ *   define NAME [P1 ...] ... end-define
+ *                                  macro, used as "NAME arg1 ..."
+ *   repeat <n> [as I] ... end-repeat
+ *   repeat %VAR max <n> [as I] ... end-repeat
+ *                                  n copies of the body ($I = 0..n-1); the
+ *                                  %VAR form stops once %VAR <= $I
+ *   break-repeat / next-repeat     leave the repeat / go to the next copy
+ *   when <expr> ... [otherwise ...] end-when
+ *                                  keep one branch, decided at compile time
+ *   $NAME  $(expr)  $$             substitution, constant arithmetic, '$'
+ * ====================================================================== */
+
+#define PP_NAME_MAX 64
+#define PP_MAX_PARAMS 16
+#define PP_MAX_DEPTH 64
+#define PP_MAX_INCLUDE_DIRS 16
+#define PP_MAX_REPEAT 4096
+#define PP_MAX_OUTPUT_CMDS 200000
+
+struct pp_cmd { char *text; const char *file; int line; };
+static struct pp_cmd *pp_cmds;
+static int pp_ncmds, pp_capcmds;
+
+struct pp_const { char name[PP_NAME_MAX]; char *value; int locked; };
+static struct pp_const *pp_consts;
+static int pp_nconsts, pp_capconsts;
+
+struct pp_macro {
+    char name[PP_NAME_MAX];
+    int nparams;
+    char params[PP_MAX_PARAMS][PP_NAME_MAX];
+    int body, body_end, def;          /* command indexes */
+};
+static struct pp_macro *pp_macros;
+static int pp_nmacros, pp_capmacros;
+
+/* Names bound by a macro call or a repeat copy. Macro bodies do not see the
+ * caller's names (only their parameters and consts); repeat bodies see the
+ * enclosing ones. */
+struct pp_scope {
+    const struct pp_scope *up;
+    int n;
+    const char *names[PP_MAX_PARAMS];
+    const char *values[PP_MAX_PARAMS];
+    long uid;                         /* $UNIQUE */
+};
+
+/* Open repeats, innermost last, for break-repeat and next-repeat. */
+struct pp_rep { long id; int copy; int used_break, used_next; };
+static struct pp_rep pp_reps[PP_MAX_DEPTH];
+static int pp_nreps;
+
+static long pp_uid_counter, pp_rep_counter;
+static char *pp_out;
+static size_t pp_outlen, pp_outcap;
+static int pp_outcmds;
+
+static const char *pp_inc_dirs[PP_MAX_INCLUDE_DIRS];
+static int pp_ninc_dirs;
+struct pp_seen { dev_t dev; ino_t ino; };
+static struct pp_seen *pp_seen;
+static int pp_nseen, pp_capseen;
+static const char **pp_files;           /* files read, in order (bpfc -M) */
+static int pp_nfiles, pp_capfiles;
+
+
+/* Command names a macro may not take. */
+static const char *pp_reserved[] = {
+    "accept", "add-bytes", "add-head-bytes", "add-l2-bytes", "array-map", "buffer-map", "calc",
+    "calc-csum", "calc-map", "clone", "continue", "debug-log", "dec-reg-loop", "decap-gre",
+    "decap-mpls", "decl", "del-bytes", "del-head-bytes", "del-l2-bytes", "drop", "else",
+    "encap-gre", "encap-mpls", "end-if", "end-match", "fib-lookup", "fib-lookup6", "fill-bytes",
+    "free", "get", "goto", "if", "insert-l2", "ip-defrag", "ip-frag", "label", "load-packet",
+    "load-packet-keyed", "loop", "loop-reg", "match", "pop-eth", "pop-mac-bytes", "pop-net-bytes",
+    "pop-vlan", "push-eth", "push-mac-bytes", "push-net-bytes", "push-qinq", "push-vlan",
+    "recalc-icmp-csum", "recalc-tcp-csum", "recalc-udp-csum", "reclassify", "redirect",
+    "redirect-neigh", "save-packet", "save-packet-keyed", "set", "set-reg-loop",
+    "shared-buffer-map", "start-loop", "strip-l2", "tcp-option", "xor-packet", "xor-packet-keyed",
+    "zero-buffer", "zero-buffer-keyed",
+    "include", "const", "define", "end-define", "repeat", "end-repeat", "break-repeat",
+    "next-repeat", "when", "otherwise", "end-when", "UNIQUE", NULL
+};
+
+static void *pp_grow(void *p, int *cap, int need, size_t sz) {
+    if (need <= *cap) return p;
+    int nc = *cap ? *cap : 64;
+    while (nc < need) nc *= 2;
+    void *q = realloc(p, (size_t)nc * sz);
+    if (!q) { perror("realloc"); exit(1); }
+    *cap = nc;
+    return q;
+}
+
+static char *pp_strndup(const char *s, size_t n) {
+    char *d = malloc(n + 1);
+    if (!d) { perror("malloc"); exit(1); }
+    memcpy(d, s, n);
+    d[n] = 0;
+    return d;
+}
+static char *pp_strdup(const char *s) { return pp_strndup(s, strlen(s)); }
+
+static void pp_add_file(const char *path) {
+    pp_files = pp_grow(pp_files, &pp_capfiles, pp_nfiles + 1, sizeof(*pp_files));
+    pp_files[pp_nfiles++] = path;
+}
+
+static void pp_err(const struct pp_cmd *c, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    if (c) fprintf(stderr, "Error: %s:%d: ", c->file, c->line);
+    else fprintf(stderr, "Error: ");
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+
+/* Growable string. */
+struct pp_buf { char *s; size_t len, cap; };
+static void pp_put(struct pp_buf *b, const char *s, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap : 256;
+        while (b->len + n + 1 > nc) nc *= 2;
+        b->s = realloc(b->s, nc);
+        if (!b->s) { perror("realloc"); exit(1); }
+        b->cap = nc;
+    }
+    memcpy(b->s + b->len, s, n);
+    b->len += n;
+    b->s[b->len] = 0;
+}
+
+static int pp_emit(const struct pp_cmd *c, const char *text) {
+    if (++pp_outcmds > PP_MAX_OUTPUT_CMDS) {
+        pp_err(c, "expansion produced more than %d commands (runaway repeat or macro?)",
+               PP_MAX_OUTPUT_CMDS);
+        return -1;
+    }
+    struct pp_buf b = { pp_out, pp_outlen, pp_outcap };
+    pp_put(&b, text, strlen(text));
+    pp_put(&b, ";\n", 2);
+    pp_out = b.s; pp_outlen = b.len; pp_outcap = b.cap;
+    return 0;
+}
+
+static int pp_emitf(const struct pp_cmd *c, const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    return pp_emit(c, buf);
+}
+
+/* Splits source text into commands at ';', remembering the line each starts
+ * on. A command starting with '#' is a comment (files lose theirs up to the
+ * end of the line in read_instructions_from_file). Newlines and tabs become
+ * spaces. Returns the index of the first new command. */
+static int pp_split(const char *text, const char *file) {
+    int first = pp_ncmds, line = 1;
+    const char *p = text;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+            if (*p == '\n') line++;
+            p++;
+        }
+        if (!*p) break;
+        const char *s = p;
+        int sline = line;
+        while (*p && *p != ';') {
+            if (*p == '\n') line++;
+            p++;
+        }
+        size_t n = (size_t)(p - s);
+        if (*p == ';') p++;
+        if (*s == '#') continue;
+        while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n')) n--;
+        char *t = pp_strndup(s, n);
+        for (char *q = t; *q; q++)
+            if (*q == '\n' || *q == '\r' || *q == '\t') *q = ' ';
+        pp_cmds = pp_grow(pp_cmds, &pp_capcmds, pp_ncmds + 1, sizeof(*pp_cmds));
+        pp_cmds[pp_ncmds++] = (struct pp_cmd){ t, file, sline };
+    }
+    return first;
+}
+
+/* First word of s into w. */
+static void pp_word(const char *s, char *w, size_t wlen) {
+    while (*s == ' ') s++;
+    size_t n = 0;
+    while (s[n] && s[n] != ' ') n++;
+    if (n >= wlen) n = wlen - 1;
+    memcpy(w, s, n);
+    w[n] = 0;
+}
+
+/* The text after the first word. */
+static const char *pp_rest(const char *s) {
+    while (*s == ' ') s++;
+    while (*s && *s != ' ') s++;
+    while (*s == ' ') s++;
+    return s;
+}
+
+/* Splits s in place at spaces. Returns the count, or -1 if over max. */
+static int pp_tokens(char *s, char **tok, int max) {
+    int n = 0;
+    char *save, *w;
+    for (w = strtok_r(s, " ", &save); w; w = strtok_r(NULL, " ", &save)) {
+        if (n == max) return -1;
+        tok[n++] = w;
+    }
+    return n;
+}
+
+static int pp_valid_name(const char *s) {
+    if (!(isalpha((unsigned char)*s) || *s == '_')) return 0;
+    size_t n = 0;
+    for (; s[n]; n++)
+        if (!(isalnum((unsigned char)s[n]) || s[n] == '_')) return 0;
+    return n < PP_NAME_MAX;
+}
+
+/* Macro names may also contain '-', like bpfc's own commands. */
+static int pp_valid_macro_name(const char *s) {
+    if (!(isalpha((unsigned char)*s) || *s == '_')) return 0;
+    size_t n = 0;
+    for (; s[n]; n++)
+        if (!(isalnum((unsigned char)s[n]) || s[n] == '_' || s[n] == '-')) return 0;
+    return n < PP_NAME_MAX;
+}
+
+static int pp_is_reserved(const char *s) {
+    for (int i = 0; pp_reserved[i]; i++)
+        if (!strcmp(pp_reserved[i], s)) return 1;
+    return 0;
+}
+
+static struct pp_const *pp_find_const(const char *name) {
+    for (int i = 0; i < pp_nconsts; i++)
+        if (!strcmp(pp_consts[i].name, name)) return &pp_consts[i];
+    return NULL;
+}
+
+static struct pp_macro *pp_find_macro(const char *name) {
+    for (int i = 0; i < pp_nmacros; i++)
+        if (!strcmp(pp_macros[i].name, name)) return &pp_macros[i];
+    return NULL;
+}
+
+/* Value of a name: the innermost binding, then UNIQUE, then a const. */
+static const char *pp_lookup(const struct pp_scope *sc, const char *name, char *tmp, size_t tmplen) {
+    for (const struct pp_scope *s = sc; s; s = s->up)
+        for (int i = 0; i < s->n; i++)
+            if (!strcmp(s->names[i], name)) return s->values[i];
+    if (!strcmp(name, "UNIQUE")) {
+        snprintf(tmp, tmplen, "%ld", sc ? sc->uid : 0L);
+        return tmp;
+    }
+    struct pp_const *k = pp_find_const(name);
+    return k ? k->value : NULL;
+}
+
+/* Integer literal: [-]decimal, 0x hex or 0b binary, nothing else. */
+static int pp_parse_int(const char *s, int64_t *v) {
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    int base = 10;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
+    else if (s[0] == '0' && (s[1] == 'b' || s[1] == 'B')) { base = 2; s += 2; }
+    if (!*s) return -1;
+    uint64_t r = 0;
+    for (; *s; s++) {
+        int d;
+        if (*s >= '0' && *s <= '9') d = *s - '0';
+        else if (*s >= 'a' && *s <= 'f') d = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'F') d = *s - 'A' + 10;
+        else return -1;
+        if (d >= base) return -1;
+        r = r * (uint64_t)base + (uint64_t)d;
+    }
+    *v = neg ? (int64_t)(0 - r) : (int64_t)r;
+    return 0;
+}
+
+/* ---- constant expressions: C operators and precedence, 64-bit ---- */
+
+struct pp_ex { const char *p; const struct pp_scope *sc; const struct pp_cmd *c; int quiet, err; };
+
+static void pp_ex_fail(struct pp_ex *e, const char *fmt, ...) {
+    if (e->err) return;
+    e->err = 1;
+    if (e->quiet) return;
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    pp_err(e->c, "%s", buf);
+}
+
+static void pp_ws(struct pp_ex *e) { while (*e->p == ' ') e->p++; }
+
+/* Matches operator op, but not when it is the start of a longer one
+ * (so "<" does not take the first half of "<<" or "<="). */
+static int pp_op(struct pp_ex *e, const char *op) {
+    pp_ws(e);
+    size_t n = strlen(op);
+    if (strncmp(e->p, op, n)) return 0;
+    char nx = e->p[n];
+    if (n == 1 && (op[0] == '<' || op[0] == '>') && (nx == op[0] || nx == '=')) return 0;
+    if (n == 1 && (op[0] == '&' || op[0] == '|') && nx == op[0]) return 0;
+    if (n == 1 && (op[0] == '!' || op[0] == '=') && nx == '=') return 0;
+    e->p += n;
+    return 1;
+}
+
+static int64_t pp_ex_expr(struct pp_ex *e);
+
+static int64_t pp_ex_primary(struct pp_ex *e) {
+    pp_ws(e);
+    if (e->err) return 0;
+    if (*e->p == '(') {
+        e->p++;
+        int64_t v = pp_ex_expr(e);
+        pp_ws(e);
+        if (*e->p != ')') { pp_ex_fail(e, "missing ')' in expression"); return 0; }
+        e->p++;
+        return v;
+    }
+    if (isdigit((unsigned char)*e->p)) {
+        const char *s = e->p;
+        while (isalnum((unsigned char)*e->p)) e->p++;
+        char num[64];
+        size_t n = (size_t)(e->p - s);
+        if (n >= sizeof(num)) n = sizeof(num) - 1;
+        memcpy(num, s, n); num[n] = 0;
+        int64_t v;
+        if (pp_parse_int(num, &v)) { pp_ex_fail(e, "bad number '%s'", num); return 0; }
+        return v;
+    }
+    if (*e->p == '$') e->p++;           /* $NAME means the same as NAME here */
+    if (isalpha((unsigned char)*e->p) || *e->p == '_') {
+        const char *s = e->p;
+        while (isalnum((unsigned char)*e->p) || *e->p == '_') e->p++;
+        char name[PP_NAME_MAX];
+        size_t n = (size_t)(e->p - s);
+        if (n >= sizeof(name)) { pp_ex_fail(e, "name too long in expression"); return 0; }
+        memcpy(name, s, n); name[n] = 0;
+        char tmp[32];
+        if (!strcmp(name, "defined")) {
+            pp_ws(e);
+            if (*e->p != '(') { pp_ex_fail(e, "defined needs (NAME)"); return 0; }
+            e->p++; pp_ws(e);
+            s = e->p;
+            while (isalnum((unsigned char)*e->p) || *e->p == '_') e->p++;
+            n = (size_t)(e->p - s);
+            if (!n || n >= sizeof(name)) { pp_ex_fail(e, "defined needs (NAME)"); return 0; }
+            memcpy(name, s, n); name[n] = 0;
+            pp_ws(e);
+            if (*e->p != ')') { pp_ex_fail(e, "defined needs (NAME)"); return 0; }
+            e->p++;
+            return pp_lookup(e->sc, name, tmp, sizeof(tmp)) != NULL;
+        }
+        const char *val = pp_lookup(e->sc, name, tmp, sizeof(tmp));
+        if (!val) { pp_ex_fail(e, "undefined name '%s' in expression", name); return 0; }
+        int64_t v;
+        if (pp_parse_int(val, &v)) { pp_ex_fail(e, "%s is '%s', not a number", name, val); return 0; }
+        return v;
+    }
+    if (*e->p) pp_ex_fail(e, "unexpected '%s' in expression", e->p);
+    else pp_ex_fail(e, "expression ends too early");
+    return 0;
+}
+
+static int64_t pp_ex_unary(struct pp_ex *e) {
+    if (pp_op(e, "-")) return (int64_t)(0 - (uint64_t)pp_ex_unary(e));
+    if (pp_op(e, "+")) return pp_ex_unary(e);
+    if (pp_op(e, "~")) return ~pp_ex_unary(e);
+    if (pp_op(e, "!")) return !pp_ex_unary(e);
+    return pp_ex_primary(e);
+}
+
+static int64_t pp_ex_mul(struct pp_ex *e) {
+    int64_t a = pp_ex_unary(e);
+    for (;;) {
+        if (pp_op(e, "*")) a = (int64_t)((uint64_t)a * (uint64_t)pp_ex_unary(e));
+        else if (pp_op(e, "/") || pp_op(e, "%")) {
+            int mod = e->p[-1] == '%';
+            int64_t b = pp_ex_unary(e);
+            if (e->err) return 0;
+            if (b == 0) { pp_ex_fail(e, "division by zero in expression"); return 0; }
+            if (b == -1) a = mod ? 0 : (int64_t)(0 - (uint64_t)a);
+            else a = mod ? a % b : a / b;
+        } else return a;
+    }
+}
+
+static int64_t pp_ex_add(struct pp_ex *e) {
+    int64_t a = pp_ex_mul(e);
+    for (;;) {
+        if (pp_op(e, "+")) a = (int64_t)((uint64_t)a + (uint64_t)pp_ex_mul(e));
+        else if (pp_op(e, "-")) a = (int64_t)((uint64_t)a - (uint64_t)pp_ex_mul(e));
+        else return a;
+    }
+}
+
+static int64_t pp_ex_shift(struct pp_ex *e) {
+    int64_t a = pp_ex_add(e);
+    for (;;) {
+        int left;
+        if (pp_op(e, "<<")) left = 1;
+        else if (pp_op(e, ">>")) left = 0;
+        else return a;
+        int64_t b = pp_ex_add(e);
+        if (e->err) return 0;
+        if (b < 0 || b > 63) { pp_ex_fail(e, "shift count %lld is not 0-63", (long long)b); return 0; }
+        a = left ? (int64_t)((uint64_t)a << b) : (int64_t)((uint64_t)a >> b);  /* >> is logical */
+    }
+}
+
+static int64_t pp_ex_rel(struct pp_ex *e) {
+    int64_t a = pp_ex_shift(e);
+    for (;;) {
+        if (pp_op(e, "<=")) a = a <= pp_ex_shift(e);
+        else if (pp_op(e, ">=")) a = a >= pp_ex_shift(e);
+        else if (pp_op(e, "<")) a = a < pp_ex_shift(e);
+        else if (pp_op(e, ">")) a = a > pp_ex_shift(e);
+        else return a;
+    }
+}
+
+static int64_t pp_ex_eq(struct pp_ex *e) {
+    int64_t a = pp_ex_rel(e);
+    for (;;) {
+        if (pp_op(e, "==")) a = a == pp_ex_rel(e);
+        else if (pp_op(e, "!=")) a = a != pp_ex_rel(e);
+        else return a;
+    }
+}
+
+static int64_t pp_ex_band(struct pp_ex *e) {
+    int64_t a = pp_ex_eq(e);
+    while (pp_op(e, "&")) a &= pp_ex_eq(e);
+    return a;
+}
+
+static int64_t pp_ex_bxor(struct pp_ex *e) {
+    int64_t a = pp_ex_band(e);
+    while (pp_op(e, "^")) a ^= pp_ex_band(e);
+    return a;
+}
+
+static int64_t pp_ex_bor(struct pp_ex *e) {
+    int64_t a = pp_ex_bxor(e);
+    while (pp_op(e, "|")) a |= pp_ex_bxor(e);
+    return a;
+}
+
+static int64_t pp_ex_land(struct pp_ex *e) {
+    int64_t a = pp_ex_bor(e);
+    while (pp_op(e, "&&")) { int64_t b = pp_ex_bor(e); a = a && b; }
+    return a;
+}
+
+static int64_t pp_ex_expr(struct pp_ex *e) {
+    int64_t a = pp_ex_land(e);
+    while (pp_op(e, "||")) { int64_t b = pp_ex_land(e); a = a || b; }
+    return a;
+}
+
+/* Evaluates the whole of s. quiet: report nothing, just fail. */
+static int pp_eval(const char *s, const struct pp_scope *sc, const struct pp_cmd *c, int quiet, int64_t *out) {
+    struct pp_ex e = { s, sc, c, quiet, 0 };
+    int64_t v = pp_ex_expr(&e);
+    pp_ws(&e);
+    if (!e.err && *e.p) pp_ex_fail(&e, "unexpected '%s' in expression '%s'", e.p, s);
+    if (e.err) return -1;
+    *out = v;
+    return 0;
+}
+
+/* Replaces $NAME, $(expr) and $$ in s. Returns malloc'd text, or NULL after
+ * reporting an error. */
+static char *pp_subst(const char *s, const struct pp_scope *sc, const struct pp_cmd *c) {
+    if (!strchr(s, '$')) return pp_strdup(s);
+    struct pp_buf b = { 0 };
+    pp_put(&b, "", 0);
+    const char *p = s;
+    while (*p) {
+        if (*p != '$') { pp_put(&b, p, 1); p++; continue; }
+        p++;
+        if (*p == '$') { pp_put(&b, "$", 1); p++; continue; }
+        if (*p == '(') {
+            const char *q = p + 1;
+            int depth = 1;
+            for (; *q; q++) {
+                if (*q == '(') depth++;
+                else if (*q == ')' && --depth == 0) break;
+            }
+            if (!*q) { pp_err(c, "unterminated $( in '%s'", s); free(b.s); return NULL; }
+            char *inner = pp_strndup(p + 1, (size_t)(q - p - 1));
+            char *x = pp_subst(inner, sc, c);
+            free(inner);
+            if (!x) { free(b.s); return NULL; }
+            int64_t v;
+            int r = pp_eval(x, sc, c, 0, &v);
+            free(x);
+            if (r) { free(b.s); return NULL; }
+            char num[32];
+            snprintf(num, sizeof(num), "%lld", (long long)v);
+            pp_put(&b, num, strlen(num));
+            p = q + 1;
+            continue;
+        }
+        if (isalpha((unsigned char)*p) || *p == '_') {
+            const char *n0 = p;
+            while (isalnum((unsigned char)*p) || *p == '_') p++;
+            char name[PP_NAME_MAX];
+            size_t n = (size_t)(p - n0);
+            if (n >= sizeof(name)) { pp_err(c, "name too long after '$'"); free(b.s); return NULL; }
+            memcpy(name, n0, n); name[n] = 0;
+            char tmp[32];
+            const char *v = pp_lookup(sc, name, tmp, sizeof(tmp));
+            if (!v) { pp_err(c, "undefined $%s", name); free(b.s); return NULL; }
+            pp_put(&b, v, strlen(v));
+            continue;
+        }
+        pp_err(c, "'$' must be followed by a name, '(' or '$' in '%s'", s);
+        free(b.s);
+        return NULL;
+    }
+    return b.s;
+}
+
+/* const NAME value. A plain number is kept as written, an expression is
+ * stored as its value and anything else (an address, a MAC, an interface)
+ * as text. Values from -s (locked) win over the program's. */
+static int pp_set_const(const char *name, const char *value, int locked, const struct pp_cmd *c) {
+    if (!pp_valid_name(name) || !strcmp(name, "UNIQUE")) {
+        pp_err(c, "bad const name '%s'", name);
+        return -1;
+    }
+    char *stored;
+    int64_t v;
+    if (!*value) { pp_err(c, "const %s has no value", name); return -1; }
+    if (!pp_parse_int(value, &v)) stored = pp_strdup(value);
+    else if (!pp_eval(value, NULL, c, 1, &v)) {
+        char num[32];
+        snprintf(num, sizeof(num), "%lld", (long long)v);
+        stored = pp_strdup(num);
+    } else stored = pp_strdup(value);
+
+    struct pp_const *k = pp_find_const(name);
+    if (k) {
+        if (k->locked && !locked) { free(stored); return 0; }
+        if (!locked && strcmp(k->value, stored)) {
+            pp_err(c, "const %s is already defined as '%s'", name, k->value);
+            free(stored);
+            return -1;
+        }
+        free(k->value);
+        k->value = stored;
+        k->locked = locked;
+        return 0;
+    }
+    pp_consts = pp_grow(pp_consts, &pp_capconsts, pp_nconsts + 1, sizeof(*pp_consts));
+    k = &pp_consts[pp_nconsts++];
+    snprintf(k->name, sizeof(k->name), "%s", name);
+    k->value = stored;
+    k->locked = locked;
+    return 0;
+}
+
+/* Finds the close keyword matching the open keyword at i (nesting counted),
+ * before end. mid, if given, is recorded at depth 1 (otherwise). */
+static int pp_find_close(int i, int end, const char *open, const char *close, const char *mid, int *midpos) {
+    int depth = 0;
+    if (midpos) *midpos = -1;
+    for (int j = i; j < end; j++) {
+        char w[PP_NAME_MAX];
+        pp_word(pp_cmds[j].text, w, sizeof(w));
+        if (!strcmp(w, open)) depth++;
+        else if (!strcmp(w, close)) { if (--depth == 0) return j; }
+        else if (mid && depth == 1 && !strcmp(w, mid)) {
+            if (*midpos >= 0) return -2;
+            *midpos = j;
+        }
+    }
+    return -1;
+}
+
+static int pp_expand(int start, int end, const struct pp_scope *sc, int depth);
+
+static int pp_include(const struct pp_cmd *c, const char *arg, int depth) {
+    char path[4096];
+    size_t n = strlen(arg);
+    if (n >= 2 && ((arg[0] == '"' && arg[n - 1] == '"') || (arg[0] == '<' && arg[n - 1] == '>'))) {
+        arg++;
+        n -= 2;
+    }
+    if (!n || n >= sizeof(path) - 256) { pp_err(c, "bad include path"); return -1; }
+    char want[4096];
+    memcpy(want, arg, n);
+    want[n] = 0;
+
+    /* Relative to the including file (or the current directory for
+     * programs from the command line or stdin), then -L dirs, then the
+     * default directory. */
+    const char *cands[PP_MAX_INCLUDE_DIRS + 2];
+    int nc = 0;
+    char here[4096];
+    if (want[0] == '/') here[0] = 0;
+    else if (c->file[0] == '<') snprintf(here, sizeof(here), ".");
+    else {
+        snprintf(here, sizeof(here), "%s", c->file);
+        char *slash = strrchr(here, '/');
+        if (slash) *slash = 0;
+        else snprintf(here, sizeof(here), ".");
+    }
+    cands[nc++] = here;
+    if (want[0] != '/') {
+        for (int i = 0; i < pp_ninc_dirs; i++) cands[nc++] = pp_inc_dirs[i];
+        cands[nc++] = BPFC_INCLUDE_DIR;
+    }
+    struct stat st;
+    int found = 0;
+    for (int i = 0; i < nc && !found; i++) {
+        int len = want[0] == '/' ? snprintf(path, sizeof(path), "%s", want)
+                                 : snprintf(path, sizeof(path), "%s/%s", cands[i], want);
+        if (len < 0 || (size_t)len >= sizeof(path)) continue;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) found = 1;
+    }
+    if (!found) { pp_err(c, "include file '%s' not found", want); return -1; }
+
+    for (int i = 0; i < pp_nseen; i++)
+        if (pp_seen[i].dev == st.st_dev && pp_seen[i].ino == st.st_ino) return 0;  /* once */
+    pp_seen = pp_grow(pp_seen, &pp_capseen, pp_nseen + 1, sizeof(*pp_seen));
+    pp_seen[pp_nseen++] = (struct pp_seen){ st.st_dev, st.st_ino };
+
+    /* bpfcd refuses world-writable programs; an include must not be a way around that. */
+    if (st.st_mode & S_IWOTH) { pp_err(c, "include file '%s' is world-writable", path); return -1; }
+
+    char *fname = pp_strdup(path);
+    pp_add_file(fname);
+    char *text = read_instructions_from_file(path);
+    int first = pp_split(text, fname);
+    int last = pp_ncmds;
+    free(text);
+    /* Included files start with no names bound: only consts and macros. */
+    return pp_expand(first, last, NULL, depth + 1);
+}
+
+static int pp_define(int i, int end) {
+    struct pp_cmd c = pp_cmds[i];
+    char *line = pp_strdup(c.text);
+    char *tok[PP_MAX_PARAMS + 3];
+    int t = pp_tokens(line, tok, PP_MAX_PARAMS + 2);
+    int rc = -1;
+    if (t < 0) { pp_err(&c, "a macro takes at most %d parameters", PP_MAX_PARAMS); goto out; }
+    if (t < 2) { pp_err(&c, "usage: define NAME [PARAM ...]"); goto out; }
+    if (!pp_valid_macro_name(tok[1])) { pp_err(&c, "bad macro name '%s'", tok[1]); goto out; }
+    if (pp_is_reserved(tok[1])) { pp_err(&c, "'%s' is a bpfc command and cannot be a macro name", tok[1]); goto out; }
+
+    int close = -1;
+    for (int j = i + 1; j < end; j++) {
+        char w[PP_NAME_MAX];
+        pp_word(pp_cmds[j].text, w, sizeof(w));
+        if (!strcmp(w, "define")) { pp_err(&pp_cmds[j], "define inside a define"); goto out; }
+        if (!strcmp(w, "end-define")) { close = j; break; }
+    }
+    if (close < 0) { pp_err(&c, "define %s without end-define", tok[1]); goto out; }
+
+    struct pp_macro *m = pp_find_macro(tok[1]);
+    if (m) {
+        if (m->def == i) { rc = close; goto out; }  /* same define reached again */
+        pp_err(&c, "macro %s is already defined at %s:%d", tok[1], pp_cmds[m->def].file, pp_cmds[m->def].line);
+        goto out;
+    }
+    pp_macros = pp_grow(pp_macros, &pp_capmacros, pp_nmacros + 1, sizeof(*pp_macros));
+    m = &pp_macros[pp_nmacros];
+    memset(m, 0, sizeof(*m));
+    snprintf(m->name, sizeof(m->name), "%s", tok[1]);
+    for (int k = 2; k < t; k++) {
+        if (!pp_valid_name(tok[k]) || !strcmp(tok[k], "UNIQUE")) { pp_err(&c, "bad parameter name '%s'", tok[k]); goto out; }
+        for (int q = 0; q < m->nparams; q++)
+            if (!strcmp(m->params[q], tok[k])) { pp_err(&c, "parameter %s given twice", tok[k]); goto out; }
+        snprintf(m->params[m->nparams++], PP_NAME_MAX, "%s", tok[k]);
+    }
+    m->body = i + 1;
+    m->body_end = close;
+    m->def = i;
+    pp_nmacros++;
+    rc = close;
+out:
+    free(line);
+    return rc;
+}
+
+/* repeat at index i; close is its end-repeat. */
+static int pp_repeat(int i, int close, const struct pp_scope *sc, int depth) {
+    struct pp_cmd c = pp_cmds[i];
+    char *hdr = pp_subst(pp_rest(c.text), sc, &c);
+    if (!hdr) return -1;
+    char *tok[64];
+    int t = pp_tokens(hdr, tok, 64);
+    int rc = -1;
+    const char *var = NULL, *as = NULL;
+    if (t < 1) { pp_err(&c, "usage: repeat <count> [as NAME] | repeat %%VAR max <count> [as NAME]"); goto out; }
+    if (t < 0) { pp_err(&c, "repeat header too long"); goto out; }
+    if (t >= 3 && !strcmp(tok[t - 2], "as")) {
+        as = tok[t - 1];
+        t -= 2;
+        if (!pp_valid_name(as) || !strcmp(as, "UNIQUE")) { pp_err(&c, "bad repeat name '%s'", as); goto out; }
+    }
+    int e0 = 0;
+    if (tok[0][0] == '%') {
+        if (t < 3 || strcmp(tok[1], "max")) { pp_err(&c, "usage: repeat %%VAR max <count> [as NAME]"); goto out; }
+        var = tok[0];
+        e0 = 2;
+    }
+    if (e0 >= t) { pp_err(&c, "repeat needs a count"); goto out; }
+    struct pp_buf eb = { 0 };
+    for (int k = e0; k < t; k++) {
+        if (k > e0) pp_put(&eb, " ", 1);
+        pp_put(&eb, tok[k], strlen(tok[k]));
+    }
+    int64_t count;
+    int r = pp_eval(eb.s, sc, &c, 0, &count);
+    free(eb.s);
+    if (r) goto out;
+    if (count < 0 || count > PP_MAX_REPEAT) {
+        pp_err(&c, "repeat count %lld is not 0-%d", (long long)count, PP_MAX_REPEAT);
+        goto out;
+    }
+    if (pp_nreps >= PP_MAX_DEPTH) { pp_err(&c, "repeats nested more than %d deep", PP_MAX_DEPTH); goto out; }
+
+    long id = ++pp_rep_counter;
+    struct pp_rep *rep = &pp_reps[pp_nreps++];
+    rep->id = id;
+    rep->used_break = 0;
+    for (int k = 0; k < count; k++) {
+        if (var) {
+            /* Stop once VAR <= copy number: VAR copies run (at most max). */
+            if (pp_emitf(&c, "match val %s le %d", var, k) || pp_emitf(&c, "goto __rep%ld_end", id) ||
+                pp_emit(&c, "end-match")) { pp_nreps--; goto out; }
+        }
+        char kv[24];
+        snprintf(kv, sizeof(kv), "%d", k);
+        struct pp_scope child = { sc, 0, { 0 }, { 0 }, ++pp_uid_counter };
+        if (as) { child.names[0] = as; child.values[0] = kv; child.n = 1; }
+        rep->copy = k;
+        rep->used_next = 0;
+        if (pp_expand(i + 1, close, &child, depth + 1)) { pp_nreps--; goto out; }
+        if (rep->used_next && pp_emitf(&c, "label __rep%ld_%d", id, k)) { pp_nreps--; goto out; }
+    }
+    pp_nreps--;
+    if ((var && count > 0) || rep->used_break) {
+        if (pp_emitf(&c, "label __rep%ld_end", id)) goto out;
+    }
+    rc = 0;
+out:
+    free(hdr);
+    return rc;
+}
+
+static int pp_expand(int start, int end, const struct pp_scope *sc, int depth) {
+    if (depth > PP_MAX_DEPTH) {
+        pp_err(&pp_cmds[start < pp_ncmds ? start : 0], "nested more than %d deep (recursive macro or include?)", PP_MAX_DEPTH);
+        return -1;
+    }
+    for (int i = start; i < end; i++) {
+        struct pp_cmd c = pp_cmds[i];     /* copy: includes may grow pp_cmds */
+        char w[PP_NAME_MAX];
+        pp_word(c.text, w, sizeof(w));
+
+        if (!strcmp(w, "include")) {
+            char *arg = pp_subst(pp_rest(c.text), sc, &c);
+            if (!arg) return -1;
+            if (!*arg || strchr(arg, ' ')) { pp_err(&c, "usage: include <file>"); free(arg); return -1; }
+            int r = pp_include(&c, arg, depth);
+            free(arg);
+            if (r) return -1;
+        } else if (!strcmp(w, "const")) {
+            const char *rest = pp_rest(c.text);
+            char name[PP_NAME_MAX];
+            pp_word(rest, name, sizeof(name));
+            char *val = pp_subst(pp_rest(rest), sc, &c);
+            if (!val) return -1;
+            int r = pp_set_const(name, val, 0, &c);
+            free(val);
+            if (r) return -1;
+        } else if (!strcmp(w, "define")) {
+            int close = pp_define(i, end);
+            if (close < 0) return -1;
+            i = close;
+        } else if (!strcmp(w, "repeat")) {
+            int close = pp_find_close(i, end, "repeat", "end-repeat", NULL, NULL);
+            if (close < 0) { pp_err(&c, "repeat without end-repeat"); return -1; }
+            if (pp_repeat(i, close, sc, depth)) return -1;
+            i = close;
+        } else if (!strcmp(w, "when")) {
+            int mid;
+            int close = pp_find_close(i, end, "when", "end-when", "otherwise", &mid);
+            if (close == -2) { pp_err(&c, "when with two otherwise"); return -1; }
+            if (close < 0) { pp_err(&c, "when without end-when"); return -1; }
+            char *x = pp_subst(pp_rest(c.text), sc, &c);
+            if (!x) return -1;
+            int64_t v;
+            int r = *x ? pp_eval(x, sc, &c, 0, &v) : (pp_err(&c, "usage: when <expr>"), -1);
+            free(x);
+            if (r) return -1;
+            int r2;
+            if (v) r2 = pp_expand(i + 1, mid >= 0 ? mid : close, sc, depth + 1);
+            else r2 = mid >= 0 ? pp_expand(mid + 1, close, sc, depth + 1) : 0;
+            if (r2) return -1;
+            i = close;
+        } else if (!strcmp(w, "break-repeat") || !strcmp(w, "next-repeat")) {
+            if (*pp_rest(c.text)) { pp_err(&c, "%s takes no arguments", w); return -1; }
+            if (!pp_nreps) { pp_err(&c, "%s outside a repeat", w); return -1; }
+            struct pp_rep *rep = &pp_reps[pp_nreps - 1];
+            int r;
+            if (w[0] == 'b') { rep->used_break = 1; r = pp_emitf(&c, "goto __rep%ld_end", rep->id); }
+            else { rep->used_next = 1; r = pp_emitf(&c, "goto __rep%ld_%d", rep->id, rep->copy); }
+            if (r) return -1;
+        } else if (!strcmp(w, "end-define") || !strcmp(w, "end-repeat") ||
+                   !strcmp(w, "end-when") || !strcmp(w, "otherwise")) {
+            pp_err(&c, "%s without a matching opening command", w);
+            return -1;
+        } else {
+            char *x = pp_subst(c.text, sc, &c);
+            if (!x) return -1;
+            char w2[PP_NAME_MAX];
+            pp_word(x, w2, sizeof(w2));
+            struct pp_macro *m = pp_find_macro(w2);
+            if (!m) {
+                int r = pp_emit(&c, x);
+                free(x);
+                if (r) return -1;
+                continue;
+            }
+            char *tok[PP_MAX_PARAMS + 2];
+            int t = pp_tokens(x, tok, PP_MAX_PARAMS + 1);
+            if (t < 0 || t - 1 != m->nparams) {
+                pp_err(&c, "macro %s takes %d argument%s", m->name, m->nparams, m->nparams == 1 ? "" : "s");
+                free(x);
+                return -1;
+            }
+            struct pp_scope child = { NULL, m->nparams, { 0 }, { 0 }, ++pp_uid_counter };
+            for (int k = 0; k < m->nparams; k++) {
+                child.names[k] = m->params[k];
+                child.values[k] = tok[k + 1];
+            }
+            int r = pp_expand(m->body, m->body_end, &child, depth + 1);
+            free(x);
+            if (r) {
+                fprintf(stderr, "  in macro %s called from %s:%d\n", m->name, c.file, c.line);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* -s NAME=VALUE */
+int pp_cli_const(const char *arg) {
+    const char *eq = strchr(arg, '=');
+    if (!eq || eq == arg) { fprintf(stderr, "Error: -s needs NAME=VALUE\n"); return -1; }
+    char name[PP_NAME_MAX];
+    size_t n = (size_t)(eq - arg);
+    if (n >= sizeof(name)) { fprintf(stderr, "Error: -s name too long\n"); return -1; }
+    memcpy(name, arg, n);
+    name[n] = 0;
+    struct pp_cmd c = { (char *)arg, "-s", 0 };
+    return pp_set_const(name, eq + 1, 1, &c);
+}
+
+/* -M: the files the program was read from, one per line. */
+void pp_print_files(FILE *f) {
+    for (int i = 0; i < pp_nfiles; i++) fprintf(f, "%s\n", pp_files[i]);
+}
+
+/* -L dir */
+int pp_cli_include_dir(const char *dir) {
+    if (pp_ninc_dirs >= PP_MAX_INCLUDE_DIRS) {
+        fprintf(stderr, "Error: at most %d -L directories\n", PP_MAX_INCLUDE_DIRS);
+        return -1;
+    }
+    pp_inc_dirs[pp_ninc_dirs++] = dir;
+    return 0;
+}
+
+/* Expands a program (file is NULL for the command line, "-" for stdin) into
+ * plain commands. Returns malloc'd text, or NULL after reporting an error. */
+char *pp_run(const char *src, const char *file) {
+    const char *name = !file ? "<command line>" : !strcmp(file, "-") ? "<stdin>" : file;
+    struct stat st;
+    if (file && strcmp(file, "-") && stat(file, &st) == 0) {
+        pp_seen = pp_grow(pp_seen, &pp_capseen, pp_nseen + 1, sizeof(*pp_seen));
+        pp_seen[pp_nseen++] = (struct pp_seen){ st.st_dev, st.st_ino };
+        pp_add_file(file);
+    }
+    int first = pp_split(src, pp_strdup(name));
+    if (pp_expand(first, pp_ncmds, NULL, 0)) return NULL;
+    return pp_out ? pp_out : pp_strdup("");
+}
+
 /* --- Main CLI & Tokenizer --- */
 int main(int argc, char **argv) {
     int pri = 0;
@@ -6866,12 +7822,12 @@ int main(int argc, char **argv) {
     char *filename = NULL;
     char *read_map = NULL;
     char *write_map = NULL, *write_key = NULL, *write_val = NULL;
-    int delete_prio = 0, show_info = 0;
+    int delete_prio = 0, show_info = 0, expand_only = 0, list_files = 0;
     for (int i = 1; i < argc; i++) {
         /* Options that take a value must not run past the end of argv. */
         int needs_arg = !strcmp(argv[i],"-i") || !strcmp(argv[i],"-d") || !strcmp(argv[i],"-p") ||
                         !strcmp(argv[i],"-m") || !strcmp(argv[i],"-r") || !strcmp(argv[i],"-f") ||
-                        !strcmp(argv[i],"-n");
+                        !strcmp(argv[i],"-n") || !strcmp(argv[i],"-s") || !strcmp(argv[i],"-L");
         if (needs_arg && i + 1 >= argc) {
             fprintf(stderr, "Error: option %s requires an argument\n", argv[i]);
             return 1;
@@ -6891,6 +7847,10 @@ int main(int argc, char **argv) {
             write_map = argv[++i]; write_key = argv[++i]; write_val = argv[++i];
         }
         else if (strcmp(argv[i],"-f")==0) filename = argv[++i];
+        else if (strcmp(argv[i],"-E")==0) expand_only = 1;
+        else if (strcmp(argv[i],"-M")==0) list_files = 1;
+        else if (strcmp(argv[i],"-s")==0) { if (pp_cli_const(argv[++i])) return 1; }
+        else if (strcmp(argv[i],"-L")==0) { if (pp_cli_include_dir(argv[++i])) return 1; }
         else if (strcmp(argv[i],"-h")==0 || strcmp(argv[i],"--help")==0) { help(argv[0]); return 0; }
         else instr = argv[i];
     }
@@ -6924,6 +7884,17 @@ int main(int argc, char **argv) {
         instr = read_instructions_from_file(filename);
     }
     if (!instr) { printf("Usage: %s -i <iface> [-d ingress|egress] \"<cmds>\"\n", argv[0]); return 1; }
+
+    instr = pp_run(instr, filename);
+    if (!instr) return 1;
+    if (list_files) {
+        pp_print_files(stdout);
+        return 0;
+    }
+    if (expand_only) {
+        fputs(instr, stdout);
+        return 0;
+    }
 
     emit(BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
 
