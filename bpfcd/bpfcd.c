@@ -39,7 +39,6 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 
-#define MAX_CAPTURE (1024 * 1024)      /* bpfc output kept per run (verifier logs can be long) */
 #define VERIFY_DELAY_MS 200            /* debounce for TC change bursts */
 
 static struct config cfg;
@@ -123,6 +122,7 @@ static void write_state(void) {
     qsort(slots, nslots, sizeof(*slots), slot_cmp);
     dinfo.on_external_change = cfg.on_external_change;
     snprintf(dinfo.config_dir, sizeof(dinfo.config_dir), "%s", cfg.config_dir);
+    snprintf(dinfo.bpfc_path, sizeof(dinfo.bpfc_path), "%s", cfg.bpfc_path);
     int rc = state_write(path, &dinfo, slots, nslots);
     if (rc < 0) logmsg(LOG_LVL_ERR, "cannot write %s: %s", path, strerror(-rc));
     state_dirty = 0;
@@ -130,71 +130,7 @@ static void write_state(void) {
 
 /* ======================= running bpfc ======================= */
 
-struct run_result { int exit_code; int timed_out; char *out; size_t outlen; };
-
-/* Runs argv with stdout+stderr captured. exit_code is -1 if it did not exit normally. */
-static int run_capture(char *const argv[], struct run_result *r) {
-    memset(r, 0, sizeof(*r));
-    r->exit_code = -1;
-    int p[2];
-    if (pipe2(p, O_CLOEXEC) < 0) return -errno;
-    pid_t pid = fork();
-    if (pid < 0) { int e = -errno; close(p[0]); close(p[1]); return e; }
-    if (pid == 0) {
-        /* The daemon blocks signals for its signalfd; the child must not inherit that. */
-        sigset_t none;
-        sigemptyset(&none);
-        sigprocmask(SIG_SETMASK, &none, NULL);
-        int devnull = open("/dev/null", O_RDONLY);
-        if (devnull >= 0) dup2(devnull, 0);
-        dup2(p[1], 1);
-        dup2(p[1], 2);
-        /* bpfc writes output.bpf when compiling without -i; keep it out of the way. */
-        if (chdir(cfg.state_dir) < 0) { /* not fatal */ }
-        execv(argv[0], argv);
-        fprintf(stderr, "cannot execute %s: %s\n", argv[0], strerror(errno));
-        _exit(127);
-    }
-    close(p[1]);
-
-    size_t cap = 8192;
-    r->out = malloc(cap);
-    struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    for (;;) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
-        long left = cfg.compile_timeout * 1000L - elapsed;
-        if (left <= 0) { r->timed_out = 1; kill(pid, SIGKILL); break; }
-        struct pollfd pfd = {.fd = p[0], .events = POLLIN};
-        int pr = poll(&pfd, 1, (int)left);
-        if (pr < 0) { if (errno == EINTR) continue; break; }
-        if (pr == 0) continue;
-        char buf[8192];
-        ssize_t n = read(p[0], buf, sizeof(buf));
-        if (n < 0) { if (errno == EINTR) continue; break; }
-        if (n == 0) break;
-        if (r->out && r->outlen < MAX_CAPTURE) {
-            size_t take = (size_t)n;
-            if (r->outlen + take > MAX_CAPTURE) take = MAX_CAPTURE - r->outlen;
-            if (r->outlen + take + 1 > cap) {
-                while (r->outlen + take + 1 > cap) cap *= 2;
-                char *nb = realloc(r->out, cap);
-                if (!nb) { free(r->out); r->out = NULL; continue; }
-                r->out = nb;
-            }
-            memcpy(r->out + r->outlen, buf, take);
-            r->outlen += take;
-        }
-    }
-    close(p[0]);
-    if (r->out) r->out[r->outlen] = '\0';
-    int st;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) ;
-    if (WIFEXITED(st)) r->exit_code = WEXITSTATUS(st);
-    return 0;
-}
+/* run_capture() and struct run_result are in common.c. */
 
 /* Picks the most useful single line from bpfc output for the status table. */
 static void summarize_failure(const struct run_result *r, char *out, size_t len) {
@@ -268,7 +204,7 @@ static int bpfc_delete(const struct slot *s) {
     char *argv[] = {cfg.bpfc_path, "-i", (char *)s->iface, "-d", (char *)dir_name(s->dir),
                     "-p", prio, "-D", NULL};
     struct run_result r;
-    int rc = run_capture(argv, &r);
+    int rc = run_capture(argv, &r, cfg.compile_timeout, cfg.state_dir);
     if (rc < 0 || r.exit_code != 0) {
         char why[256];
         if (rc < 0) snprintf(why, sizeof(why), "%s", strerror(-rc));
@@ -349,7 +285,7 @@ static void install_slot(struct slot *s, const char *why) {
     argv[a] = NULL;
 
     struct run_result r;
-    int rc = run_capture(argv, &r);
+    int rc = run_capture(argv, &r, cfg.compile_timeout, cfg.state_dir);
     struct slot probe = *s;
     if (rc == 0 && r.exit_code == 0 && parse_info_line(r.out, &probe) == 0) {
         s->prog_id = probe.prog_id;
@@ -450,10 +386,11 @@ static void scan_file(const char *iface, int dir, const char *dirpath, const cha
     s->seen = 1;
     snprintf(s->path, sizeof(s->path), "%s", path);
 
-    /* Per bpfcd(8): only hash when the mtime moved; reload only when the hash differs too. */
-    if (s->dirty || s->mtime_ns != mtime || !s->sha256[0]) {
+    /* Per bpfcd(8): only hash when the mtime moved; reload only when the hash differs too.
+     * A program with includes is always re-hashed: an included file may have changed. */
+    if (s->dirty || s->mtime_ns != mtime || !s->sha256[0] || s->has_includes) {
         char hex[65];
-        int rc = sha256_file(path, hex);
+        int rc = sha256_program(cfg.bpfc_path, path, cfg.compile_timeout, hex, &s->has_includes);
         if (rc < 0) {
             logmsg(LOG_LVL_ERR, "%s: cannot read: %s", path, strerror(-rc));
             s->seen = 0; /* treat as absent rather than install something stale */

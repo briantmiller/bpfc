@@ -85,6 +85,7 @@ Containerfile and run instructions.
 %dir %{_sysconfdir}/bpfc
 %config(noreplace) %{_sysconfdir}/bpfc/bpfc.conf
 %dir %{_sysconfdir}/bpfc/interfaces.d
+%dir %{_sysconfdir}/bpfc/include
 
 %files container
 %{_sbindir}/bpfcd-entrypoint
