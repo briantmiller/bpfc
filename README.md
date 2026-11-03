@@ -68,7 +68,15 @@ bpfcctl show eth0 ingress 100 --bytecode
 
 See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)`. Build an RPM (RHEL 9/10) with `make rpm`; run the daemon's integration and container tests with `make check` (root).
 
+---
+
+## Tests
+
 **Tests.** `./test.sh` runs every suite (root; about an hour) and ends with pass/fail/skip totals per suite; it exits non-zero if anything failed. Name suites to run only those (`./test.sh bpfc nat`), add `-f` to print failures only, or `-v` for each suite's full output; logs are kept under `/tmp/bpfc-tests.*`. `make check` (preprocessor, stack, bpfcd, container), `make check-dataplane` and `make check-all` use the same runner; pass flags with `make check TESTFLAGS=-f`. Suites skip (rather than fail) when they are not run as root or need something the system lacks: a tool (tcpdump, ncat, iperf), kernel MPLS routing (`mpls_router`), or scapy for `tests/test_bpfc.py`. The fragmentation suites check each fragment size with three ordinary pings and, separately, the loss under load (100 parallel pings), which must stay below `STRESS_MAX_LOSS` hundredths of a percent (default 100, i.e. 1 %). New shell suites should `source tests/lib.sh` for `test_pass`/`test_fail`/`test_skip`, `check` and `tests_exit`.
+
+---
+
+## Container integration
 
 **Containers (no systemd):** the `bpfc-container` package adds `/usr/sbin/bpfcd-entrypoint`, which runs bpfcd as the container's PID 1. Neither package requires systemd, and settings can be passed as `BPFCD_*` environment variables. See [dist/container/README.md](dist/container/README.md) for an example Containerfile and run options. `make rpm RPMBUILD_OPTS="--with static"` builds statically linked binaries for images without a matching libc.
 
