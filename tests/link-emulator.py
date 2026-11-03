@@ -123,17 +123,39 @@ def forward(rx, tx, cfg):
     order = [0]
     last = [0.0]          # time to send of the packet last queued
 
+    sent = [-1.0]         # when the previous frame went out
+
     def sender():
         while True:
             with cv:
                 while not queue:
                     cv.wait()
                 due, _, frame = queue[0]
+                if cfg["rate"]:
+                    # A shaped link needs a frame's serialization time after
+                    # the one before it. When this thread wakes late, two due
+                    # frames would otherwise go out back to back, and the
+                    # peer would see the link as much faster than it is
+                    # (packet-pair probes on slower machines, e.g. aarch64).
+                    due = max(due, sent[0] + len(frame) * 8 / cfg["rate"])
                 wait = due - time.monotonic()
-                if wait > 0:
-                    cv.wait(wait)
+                # Shaped: sleep until 2 ms before, then spin (yielding the
+                # GIL), so the gap is not stretched by a late wake-up either.
+                early = 0.002 if cfg["rate"] else 0.0
+                if wait > early:
+                    cv.wait(wait - early)
                     continue
-                heapq.heappop(queue)
+                if wait <= 0:
+                    heapq.heappop(queue)
+                    sent[0] = time.monotonic()
+            if wait > 0:
+                while time.monotonic() < due:
+                    time.sleep(0)
+                with cv:
+                    # still the head: with a rate, every frame queued
+                    # meanwhile is due after the last one queued
+                    heapq.heappop(queue)
+                    sent[0] = time.monotonic()
             for attempt in range(50):
                 try:
                     tx.send(frame)
@@ -199,6 +221,9 @@ def report(a, b, names):
 
 
 def main():
+    # Hand the GIL over sooner than the default 5 ms, so a thread due to
+    # send is not kept waiting by one busy receiving or checksumming.
+    sys.setswitchinterval(0.0005)
     args = sys.argv[1:]
     specs = {"--a2b": None, "--b2a": None}
     while len(args) > 3 and args[-2] in specs:
