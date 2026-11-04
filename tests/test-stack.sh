@@ -61,6 +61,9 @@ ip -n STA addr add 10.6.0.1/24 dev sta
 ip -n STB addr add 10.6.0.2/24 dev stb
 ip -n STA neigh replace 10.6.0.2 lladdr "$(ip -n STB -br link show stb | awk '{print $3}')" dev sta nud permanent
 ip netns exec STA ethtool -K sta tx off >/dev/null 2>&1   # full UDP checksums on the wire
+# fib-lookup reports "forwarding disabled" (5) without it; a new namespace
+# copies the host's setting, which other suites change
+ip netns exec STA sysctl -qw net.ipv4.conf.all.forwarding=1
 mkdir -p /var/run/bpf/STA /var/run/bpf/STB
 for n in STA STB; do umount /var/run/bpf/$n &>/dev/null; mount -t bpf bpffs /var/run/bpf/$n; done
 
@@ -76,8 +79,6 @@ ip netns exec STA "$BPFC" -i sta -d egress -p 3 -m /var/run/bpf/STA "match icmp;
 ip netns exec STA ping -c 1 -W 1 10.6.0.2 &>/dev/null
 [ "$(map_value STA FIB 1)$(map_value STA FIB 2)$(map_value STA FIB 3)" == "$(hex 1111)$(hex 2222)$(hex 3333)" ] \
 	&& test_pass ST-kernel-fib-keeps-vars || test_fail ST-kernel-fib-keeps-vars "(B=$(map_value STA FIB 2) C=$(map_value STA FIB 3))"
-# The first packet can race the new route (seen once in a full run): retry once.
-[ "$(map_value STA FIB 9)" == "$(hex 0)" ] || { sleep 0.5; ip netns exec STA ping -c 1 -W 1 10.6.0.2 &>/dev/null; }
 [ "$(map_value STA FIB 9)" == "$(hex 0)" ] && test_pass ST-kernel-fib-result || test_fail ST-kernel-fib-result "(FIB_RESULT $(map_value STA FIB 9))"
 
 # 42 variables: the UDP checksum and XOR work in 32-byte chunks instead of 256.

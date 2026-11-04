@@ -670,6 +670,91 @@ unsigned int require_ifindex(const char *n) {
     return idx;
 }
 
+/*
+ * Device type and kind of an interface, from RTM_GETLINK:
+ *   type  ARPHRD_* (skb->dev->type): 1 Ethernet, 772 loopback, 778 GRE, ...
+ *   kind  the rtnetlink kind as "ip -d link" shows it (veth, gre, gretap,
+ *         vxlan, wireguard, bridge, bond, vlan, ...); "lo" for loopback and
+ *         "nic" for any other device without a kind (a physical NIC).
+ * bpfcd uses the same rule to pick %<kind>% directories. Returns 0 or -1.
+ */
+static int get_link_info(unsigned int ifindex, int *type, char *kind, size_t klen) {
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (s < 0) return -1;
+    struct { struct nlmsghdr n; struct ifinfomsg i; } req = {
+        .n = { .nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg)), .nlmsg_type = RTM_GETLINK,
+               .nlmsg_flags = NLM_F_REQUEST, .nlmsg_seq = 1 },
+        .i = { .ifi_family = AF_UNSPEC, .ifi_index = (int)ifindex },
+    };
+    struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+    if (sendto(s, &req, req.n.nlmsg_len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(s); return -1; }
+    static char buf[32768];
+    ssize_t len;
+    do len = recv(s, buf, sizeof(buf), 0); while (len < 0 && errno == EINTR);
+    close(s);
+    if (len <= 0) return -1;
+    for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (unsigned)len); h = NLMSG_NEXT(h, len)) {
+        if (h->nlmsg_type != RTM_NEWLINK) continue;
+        struct ifinfomsg *ifi = NLMSG_DATA(h);
+        if ((unsigned)ifi->ifi_index != ifindex) continue;
+        *type = ifi->ifi_type;
+        kind[0] = '\0';
+        int alen = h->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
+        for (struct rtattr *a = IFLA_RTA(ifi); RTA_OK(a, alen); a = RTA_NEXT(a, alen)) {
+            if (a->rta_type != IFLA_LINKINFO) continue;
+            int nlen = RTA_PAYLOAD(a);
+            for (struct rtattr *b = RTA_DATA(a); RTA_OK(b, nlen); b = RTA_NEXT(b, nlen))
+                if (b->rta_type == IFLA_INFO_KIND)
+                    snprintf(kind, klen, "%.*s", (int)RTA_PAYLOAD(b), (char *)RTA_DATA(b));
+        }
+        if (!kind[0])
+            snprintf(kind, klen, "%s", ifi->ifi_type == 772 /* ARPHRD_LOOPBACK */ ? "lo" : "nic");
+        kind[strcspn(kind, "\n")] = '\0';
+        return 0;
+    }
+    return -1;
+}
+
+/* IFTYPE / IFKIND: set from -i before preprocessing (or with -s for a
+ * program compiled without -i). Defined with the preprocessor below. */
+static const char *pp_const_value(const char *name);
+void compile_match_var(const char *var1_name, const char *op, const char *var2_or_val);
+
+static const char *dev_value(const char *field, const char *name) {
+    const char *v = pp_const_value(name);
+    if (!v) {
+        fprintf(stderr, "Error: %s needs the interface (-i <interface>, or -s %s=<value>)\n", field, name);
+        exit(1);
+    }
+    return v;
+}
+
+/* match/if dev-type <n | %VAR>, dev-kind <name>: known while compiling, so
+ * a constant either opens an always-true block (no code) or one that is
+ * never entered (a single jump). */
+void compile_match_dev(const char *field, const char *val) {
+    if (!strcmp(field, "dev-type") && val[0] == '%') {
+        compile_match_var(val, "eq", dev_value(field, "IFTYPE"));
+        return;
+    }
+    int same;
+    if (!strcmp(field, "dev-type")) same = strtoul(val, NULL, 0) == strtoul(dev_value(field, "IFTYPE"), NULL, 0);
+    else same = !strcmp(val, dev_value(field, "IFKIND"));
+    start_match_block();
+    if (!same) {
+        /* Not JA: code after an unconditional jump is unreachable, which the
+         * verifier rejects; a known-constant compare is pruned instead. */
+        emit(BPF_MOV64_IMM(BPF_REG_1, 0));
+        add_block_jump();
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JEQ | BPF_K, .dst_reg = BPF_REG_1, .imm = 0}));
+    }
+}
+
+void compile_get_dev_type(const char *var) {
+    int v_off = allocate_var(var, 4);
+    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, v_off, (int32_t)strtoul(dev_value("dev-type", "IFTYPE"), NULL, 0)));
+}
+
 void parse_ip_cidr(char *v, uint32_t *ip, uint32_t *mask) {
     char *s = strchr(v, '/');
     if (s) {
@@ -6261,6 +6346,8 @@ void help(const char *arg0) {
 	"skb-hash"		,"software hash",
 	"skb-cb <0-4>"		,"context buffer scratch pad, 5 32-bit values can be stored and passed down the stack",
 	"skb-ifindex"		,"interface number - get/match only",
+	"dev-type"		,"device type (ARPHRD: 1 Ethernet, 772 loopback, 778 GRE, 65534 none) of the -i interface, known when compiling - get/match only",
+	"dev-kind"		,"device kind of the -i interface (veth, gre, gretap, vxlan, wireguard, ...; nic, lo) - match only",
 	"skb-ingress"		,"ingress interface number - get/match only",
 	"protocol"		,"Packet protocol number",
 	"len"			,"Packet length - get/match only",
@@ -6414,7 +6501,7 @@ static const struct { const char *f; char kind; uint64_t max; } field_kinds[] = 
     {"arp-ptype", 'n', 65535}, {"arp-oper", 'n', 65535}, {"protocol", 'n', 65535}, {"queue", 'n', 65535},
     {"ip-frag-off", 'n', 8191}, {"mpls-label", 'n', 1048575}, {"ip6-flow", 'n', 1048575},
     {"gre-key", 'n', 0xFFFFFFFFULL}, {"skb-mark", 'n', 0xFFFFFFFFULL}, {"skb-hash", 'n', 0xFFFFFFFFULL},
-    {"len", 'n', 0xFFFFFFFFULL},
+    {"len", 'n', 0xFFFFFFFFULL}, {"dev-type", 'n', 65535},
     {"tcp-src", 'r', 65535}, {"tcp-dst", 'r', 65535}, {"udp-src", 'r', 65535}, {"udp-dst", 'r', 65535},
     {"vlan-id", 'r', 4095},
     {"src-mac", 'm', 0}, {"dst-mac", 'm', 0}, {"arp-sha", 'm', 0}, {"arp-tha", 'm', 0},
@@ -6684,6 +6771,7 @@ int process_cmd(char *cmd, const char *dir) {
             else if (strcmp(f,"skb-hash") == 0) compile_get_skb_field(offsetof(struct __sk_buff, hash), 0,0,var);
             else if (strcmp(f,"skb-ingress") == 0) compile_get_skb_field(offsetof(struct __sk_buff, ingress_ifindex), 0,0,var);
             else if (strcmp(f,"skb-ifindex") == 0) compile_get_skb_field(offsetof(struct __sk_buff, ifindex), 0,0,var);
+            else if (strcmp(f,"dev-type") == 0) compile_get_dev_type(var);
             else if (strcmp(f,"skb-cb") == 0 && t > 3) {
                 // Syntax: get skb-cb <0-4> <VAR>
                 int cb_index = atoi(tok[2]);
@@ -6872,6 +6960,7 @@ int process_cmd(char *cmd, const char *dir) {
 	    else if (strcmp(a1,"skb-mark")==0) compile_match_skb_field(offsetof(struct __sk_buff, mark), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-hash")==0) compile_match_skb_field(offsetof(struct __sk_buff, hash), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-ifindex")==0) compile_match_skb_field(offsetof(struct __sk_buff, ifindex), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
+            else if (strcmp(a1,"dev-type")==0 || strcmp(a1,"dev-kind")==0) compile_match_dev(a1, val);
             else if (strcmp(a1,"skb-ingress")==0) compile_match_skb_field(offsetof(struct __sk_buff, ingress_ifindex), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-cb")==0 && t > 3) {
                 // Syntax: match skb-cb <0-4> <expected_val | %VAR>
@@ -7354,6 +7443,11 @@ static struct pp_const *pp_find_const(const char *name) {
     return NULL;
 }
 
+static const char *pp_const_value(const char *name) {
+    struct pp_const *k = pp_find_const(name);
+    return k ? k->value : NULL;
+}
+
 static struct pp_macro *pp_find_macro(const char *name) {
     for (int i = 0; i < pp_nmacros; i++)
         if (!strcmp(pp_macros[i].name, name)) return &pp_macros[i];
@@ -7694,6 +7788,20 @@ static int pp_set_const(const char *name, const char *value, int locked, const s
     return 0;
 }
 
+/* "when <word> == <word>" (or !=) where a side is not a number compares the
+ * words as text, e.g. "when $IFKIND == gre". Returns 1 with *v set if the
+ * expression has that form. */
+static int pp_when_text(const char *x, int64_t *v) {
+    char l[64], op[4], r[64], extra;
+    int64_t n;
+    if (sscanf(x, " %63s %3s %63s %c", l, op, r, &extra) != 3) return 0;
+    if (strcmp(op, "==") && strcmp(op, "!=")) return 0;
+    if (!pp_parse_int(l, &n) && !pp_parse_int(r, &n)) return 0;
+    if (strpbrk(l, "()") || strpbrk(r, "()")) return 0;
+    *v = (strcmp(l, r) == 0) == (op[0] == '=');
+    return 1;
+}
+
 /* Finds the close keyword matching the open keyword at i (nesting counted),
  * before end. mid, if given, is recorded at depth 1 (otherwise). */
 static int pp_find_close(int i, int end, const char *open, const char *close, const char *mid, int *midpos) {
@@ -7929,7 +8037,7 @@ static int pp_expand(int start, int end, const struct pp_scope *sc, int depth) {
             char *x = pp_subst(pp_rest(c.text), sc, &c);
             if (!x) return -1;
             int64_t v;
-            int r = *x ? pp_eval(x, sc, &c, 0, &v) : (pp_err(&c, "usage: when <expr>"), -1);
+            int r = *x ? (pp_when_text(x, &v) ? 0 : pp_eval(x, sc, &c, 0, &v)) : (pp_err(&c, "usage: when <expr>"), -1);
             free(x);
             if (r) return -1;
             int r2;
@@ -8096,6 +8204,23 @@ int main(int argc, char **argv) {
         instr = read_instructions_from_file(filename);
     }
     if (!instr) { printf("Usage: %s -i <iface> [-d ingress|egress] \"<cmds>\"\n", argv[0]); return 1; }
+
+    /* $IFNAME, $IFINDEX, $IFTYPE and $IFKIND for the -i interface (bpfcd
+     * compiles a %all% or %<kind>% template once per interface). -s wins. */
+    if (iface) {
+        pp_set_const("IFNAME", iface, 0, NULL);
+        unsigned int idx = if_nametoindex(iface);
+        int type;
+        char kind[32];
+        if (idx && !get_link_info(idx, &type, kind, sizeof(kind))) {
+            char num[16];
+            snprintf(num, sizeof(num), "%u", idx);
+            pp_set_const("IFINDEX", num, 0, NULL);
+            snprintf(num, sizeof(num), "%d", type);
+            pp_set_const("IFTYPE", num, 0, NULL);
+            pp_set_const("IFKIND", kind, 0, NULL);
+        }
+    }
 
     instr = pp_run(instr, filename);
     if (!instr) return 1;

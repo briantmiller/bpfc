@@ -28,7 +28,7 @@ and checks it against the kernel.
 .SH COMMANDS
 .TP
 .B status
-The default. One line per program file: interface, direction, priority,
+The default. One line per program (interface, direction and priority): interface, direction, priority,
 status, kernel program id and tag, a kernel check, and the file. Errors are
 printed under the line they belong to. Statuses are:
 .RS
@@ -58,7 +58,22 @@ is
 .B reinstall-limit
 Kept being removed or replaced; bpfcd stopped reinstalling it until the next
 reload.
+.TP
+.B excluded
+An empty file in the interface's own or its kind's directory opts it out of
+the
+.I %all%
+or
+.I %<kind>%
+program at this priority.
 .RE
+.IP
+Programs from
+.I %all%/
+or
+.I %<kind>%/
+appear once per interface they apply to; the FILE column shows which
+directory each came from.
 .IP
 The KERNEL column is
 .B ok

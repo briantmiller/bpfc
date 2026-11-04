@@ -416,7 +416,7 @@ def test_match_qinq():
     """match qinq: double-tagged frames only"""
     bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match qinq; drop'")
     qinq = Ether(src=state["tx_mac"], dst=state["rx_mac"]) / Dot1AD(vlan=10) / Dot1Q(vlan=20) / IP(dst="10.0.0.2") / ICMP()
-    assert send_and_capture(qinq, "", timeout=2) is None
+    assert send_and_capture(qinq, "ether[12:2] = 0x88a8", timeout=2) is None
     assert send_and_capture(eth() / IP(dst="10.0.0.2") / ICMP(), "icmp") is not None
 
 
@@ -608,3 +608,27 @@ def test_add_bytes_middle():
     assert out is not None
     raw = bytes(out)
     assert raw[:42] == bytes(pkt)[:42] and raw[42:54] == b"\0\0\0\0AAAABBBB"
+
+
+# ---- device type and kind (known while compiling, from -i) ----
+
+def test_dev_kind_and_type_match():
+    """match dev-kind / dev-type of the veth the program is compiled for"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; match dev-kind veth; match dev-type 1; set ip-tos 4'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2), "udp")
+    assert tos_of(out) == 4
+
+
+def test_dev_kind_mismatch_takes_else():
+    """if dev-kind gre on a veth: the else branch runs"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; if dev-kind gre; set ip-tos 1; else; set ip-tos 2; end-if'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2), "udp")
+    assert tos_of(out) == 2
+
+
+def test_ifkind_preprocessor_and_get_dev_type():
+    """when $IFKIND == veth keeps the code; get dev-type into a variable"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; when $IFKIND == veth; get dev-type T; calc add T 9; set ip-tos %T; "
+                f"otherwise; set ip-tos 3; end-when'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2), "udp")
+    assert tos_of(out) == 10

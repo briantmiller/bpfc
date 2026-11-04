@@ -210,6 +210,29 @@ bad CC-err-skb-cb-index     "skb-cb index must be between 0 and 4" "set skb-cb 7
 bad CC-err-too-many-vars    "no stack left for variable"          "repeat 49 as I; decl V\$I 8; end-repeat"
 bad CC-err-too-many-words   "more than 16 words"                  "debug-log a b c d e f g h i j k l m n o p q"
 
+# ---------------- device type and kind ----------------
+# known while compiling: from -i, or -s IFTYPE=/IFKIND= without an interface
+okx() { local n=$1; shift; local out; if out=$("$BPFC" "$@" 2>&1); then test_pass "$n"; else test_fail "$n"; echo "$out" | head -3 | sed 's/^/    /'; fi; }
+D="-s IFTYPE=778 -s IFKIND=gre"
+okx CC-dev-match-type       $D "match dev-type 778; drop"
+okx CC-dev-match-kind       $D "match dev-kind gre; drop"
+okx CC-dev-if-else          $D "if dev-kind veth; drop; else; accept; end-if"
+okx CC-dev-get-type         $D "get dev-type T; set ip-tos %T"
+okx CC-dev-match-var        $D "decl T 4; set val T 778; match dev-type %T; drop"
+out=$("$BPFC" -s IFTYPE=778 -s IFKIND=gre -E 'when $IFKIND == gre; drop; otherwise; accept; end-when; when $IFTYPE != 1; continue; end-when')
+check CC-dev-when-text      [ "$out" == "$(printf 'drop;\ncontinue;\n')" ]
+"$BPFC" $D "match dev-kind gre; set ip-tos 1" >/dev/null && mv output.bpf a.bpf
+"$BPFC" $D "set ip-tos 1" >/dev/null
+check CC-dev-true-costs-nothing cmp -s a.bpf output.bpf
+out=$("$BPFC" -i lo -E 'debug-log $IFNAME $IFINDEX $IFTYPE $IFKIND' 2>&1)
+check CC-dev-lo-constants   [ "$out" == "debug-log lo 1 772 lo;" ]
+out=$("$BPFC" -i lo -s IFKIND=gre -E 'debug-log $IFKIND' 2>&1)
+check CC-dev-s-wins         [ "$out" == "debug-log gre;" ]
+bad CC-err-dev-no-iface     "dev-type needs the interface"        "match dev-type 1"
+bad CC-err-dev-kind-no-iface "dev-kind needs the interface"       "match dev-kind gre"
+bad CC-err-dev-type-value   "must be a number from 0 to 65535"    "match dev-type gre"
+bad CC-err-dev-set          "Invalid set instruction dev-type"    "set dev-type 1"
+
 # ---------------- commands that create maps (root) ----------------
 if [ "$(id -u)" -ne 0 ]; then
 	test_skip "CC-maps (creating maps needs root)"
