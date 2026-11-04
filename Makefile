@@ -112,7 +112,7 @@ check-compile: $(TARGET)
 	bash tests/run-tests.sh $(TESTFLAGS) compile
 
 check-dataplane: $(TARGET)
-	bash tests/run-tests.sh $(TESTFLAGS) dataplane
+	bash tests/run-tests.sh $(TESTFLAGS) verifier-budget dataplane
 
 # Every suite, including the network suites and pytest (root; about an hour).
 check-all: all

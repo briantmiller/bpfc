@@ -5,7 +5,8 @@
 #   tests/run-tests.sh [-f] [-v] [-l DIR] [-t SECS] [suite ...]
 #
 #   suite   compile, preprocessor, stack, bpfc, util, loops, nat, mpls, frag,
-#           mpls-frag, throttle, bpfcd, container, dataplane or pytest
+#           mpls-frag, throttle, cve-2026-98432, bpfcd, container,
+#           verifier-budget, dataplane or pytest
 #           (default: all of them, in that order)
 #   -f      print failures only (plus the summary)
 #   -v      print each suite's full output, not just its results
@@ -21,7 +22,7 @@
 
 cd "$(dirname "$0")/.." || exit 1
 
-ALL="compile preprocessor stack bpfc util loops nat mpls frag mpls-frag throttle cve-2026-98432 bpfcd container dataplane pytest"
+ALL="compile preprocessor stack bpfc util loops nat mpls frag mpls-frag throttle cve-2026-98432 bpfcd container verifier-budget dataplane pytest"
 FAILURES_ONLY=0
 VERBOSE=0
 LOGDIR=

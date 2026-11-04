@@ -108,6 +108,7 @@ Conditional matching acts as a gatekeeper. If a packet fails a match rule, the e
 .BI "match " "field value"
 Compares a specific packet header field to a value. 
 Supported fields: \fBsrc-mac\fR, \fBdst-mac\fR, \fBeth-proto\fR, \fBeth-vlan\fR, \fBmpls-label\fR, \fBmpls-bos\fR, \fBip-proto\fR, \fBip-tos\fR, \fBip-src\fR, \fBip-dst\fR, \fBtcp-src\fR, \fBtcp-dst\fR, \fBudp-src\fR, \fBudp-dst\fR.
+The TCP/UDP ports, \fBtcp-flags\fR, \fBicmp-type\fR and the GRE fields are found from the real IPv4 header length, so packets with IP options are handled (earlier versions read them at fixed offsets that assume a 20-byte header). On a packet that is not IPv4 such a match does not match, \fBget\fR stores 0 and \fBset\fR changes nothing.
 .TP
 .BI "match dev-type " "n | %VAR"
 .TQ
