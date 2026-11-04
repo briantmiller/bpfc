@@ -51,6 +51,16 @@ bpfc-dataplane-status [-1] [eth0 ...]
 bpfc-dataplane-status set eth0 fec-threshold 2      # unset eth0 fec-threshold
 ```
 
+Health, from the loss estimates (averages over `loss-smoothing` packets,
+not single report windows) of both directions: **POOR** when 1 % or more
+is still lost after FEC and ARQ; it stays POOR until that falls to half,
+or for the FEC cool-down after it was last at 1 %. **DEGRADED** when the
+loss on the link is at the FEC threshold or more but repair brings it
+under 1 %; it stays DEGRADED until the loss falls to half the threshold or
+the cool-down passes. **GOOD** otherwise. Status tools older than the loss
+estimate (no `out_loss_window_bp` in `-1` output) judge single report
+windows and swing between states on a steady lossy link.
+
 ## Link requirements
 
 - **Both ends run the dataplane.** IPv4 frames that arrive without the shim
@@ -254,7 +264,13 @@ measurements and the RTT (now − echoed ts − time the peer held it). It
 updates the loss estimate (below) and
 computes the send rate, the utilisation (`rate / capacity`) and congestion:
 the link counts as congested when utilisation ≥ 85 % or queueing delay
-≥ 20 ms.
+≥ 20 ms, or when repair is failing: FEC already sends its most parity
+(`fec-k-min`) and the loss left after FEC and ARQ is still at or above
+the FEC threshold. More parity cannot fix that, and on a full link it adds
+to the loss it repairs (an overloaded 10 Mbit/s link went to 20 % loss with
+1:4 parity). The repair-failing state (`_tx` 50) holds until the loss left
+falls below half the threshold or the loss below the threshold, because the
+lighter fixed ratio would otherwise end it at the next report.
 
 | Condition | K |
 |---|---|
@@ -301,7 +317,11 @@ starts again.
   one word per 64 sequences in the `_dup` array map (window sized as above),
   atomic `calc-map or`.
 - A forward jump over 4096, or a backward jump on a sequence flagged as
-  restarted, resynchronises without counting loss (peer reboot).
+  restarted, resynchronises without counting loss (peer reboot). The report
+  window across a resync is empty: it used to wrap to an enormous window
+  with no loss, which replaced both loss estimates with ~0 for minutes
+  (the sender also ignores a window of 2^32 packets or more from an older
+  peer).
 
 **Telemetry.**
 - **Transit:** `arrival − ts` in 4 µs units. The clock offset between the
@@ -359,7 +379,12 @@ match, so ARP and other traffic count too. Probe 2 closes the pair:
 A sender queue that put other packets between the copies therefore does
 not make the link look slower. The last 16 samples are kept (`_rx` 60–75)
 and the estimate (`_rx` 19) is the fourth largest, about the 80th
-percentile: delay jitter (each packet delayed independently, as netem
+percentile; with fewer samples the same share from the top (the largest of
+up to 4, the 2nd of up to 8, the 3rd of up to 12; taking the 4th from the
+start gave the smallest of 3 samples, 1.3 Mbit/s on a 10 Mbit/s link). The
+probe program keeps the four largest (`_rx` 53–56) and the program that
+sends reports picks among them, which keeps the choice out of the probe
+program's verifier budget: delay jitter (each packet delayed independently, as netem
 does) only stretches a gap and a receiver that batches packets only
 shrinks one, so the estimate is right while at least 4 of 16 pairs got
 through cleanly and no more than 3 were squeezed. A pair open for more than
@@ -420,7 +445,8 @@ status script decodes them with `bpfc -r`.
 | 15 | not retransmitted because FEC is on | 44 | peer MAC |
 | 16 / 17 / 18 | congested / utilisation % / send rate kbit/s | 45 | peer: expected packets, last window |
 | 19 / 20 | rate sample time / bytes | 46 / 47 | loss / residual loss estimate, 1/100 bp |
-| | | 48 | packets in the loss estimate |
+| 49 | last time the residual estimate was ≥ 1 % (ms) | 48 | packets in the loss estimate |
+| 50 | repair failing (counts as congestion) | | |
 
 `<prefix>_rx` — receiver side:
 
@@ -441,6 +467,7 @@ status script decodes them with `bpfc -r`.
 | 17–20 | probe state, capacity kbit/s, probes | 37 / 38 | redundant FEC rebuilds / retransmissions |
 | 39 / 40 | loss / residual loss estimate, 1/100 bp | 41 | packets in the loss estimate |
 | 42 / 43 | bytes in the open pair / pairs measured | 52 | last capacity sample, kbit/s |
+| 49 | last time the inbound residual estimate was ≥ 1 % (ms) | 53–56 | four largest capacity samples |
 | 60–75 | last 16 capacity samples, kbit/s | | |
 | | | | |
 

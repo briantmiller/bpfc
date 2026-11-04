@@ -273,9 +273,11 @@ def test_drop_action():
     """drop: matching packets never arrive, others do"""
     bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match ip-src 10.0.0.77; drop'")
     pkt = Ether(src=state["tx_mac"], dst=state["rx_mac"]) / IP(src="10.0.0.77", dst="10.0.0.2") / ICMP()
-    assert send_and_capture(pkt, "icmp", timeout=2) is None
+    # only this test's packets: an earlier test's late ICMP error (host
+    # unreachable once ARP gives up) would otherwise count as delivered
+    assert send_and_capture(pkt, "icmp and src host 10.0.0.77", timeout=2) is None
     pkt = Ether(src=state["tx_mac"], dst=state["rx_mac"]) / IP(src="10.0.0.88", dst="10.0.0.2") / ICMP()
-    assert send_and_capture(pkt, "icmp") is not None
+    assert send_and_capture(pkt, "icmp and src host 10.0.0.88") is not None
 
 
 def ipv6_packet():
@@ -462,7 +464,7 @@ def test_push_eth():
     """push-eth: a new outer Ethernet header in front of the original frame"""
     bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match ip; match icmp; push-eth 02:00:00:00:00:aa 02:00:00:00:00:bb'")
     pkt = eth() / IP(src="10.0.0.1", dst="10.0.0.2") / ICMP()
-    out = send_and_capture(pkt)
+    out = send_and_capture(pkt, "ether src 02:00:00:00:00:bb")      # not some other frame
     assert out is not None
     raw = bytes(out)
     assert raw[0:6] == bytes.fromhex("0200000000aa") and raw[6:12] == bytes.fromhex("0200000000bb")

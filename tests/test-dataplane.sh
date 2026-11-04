@@ -127,6 +127,16 @@ tcp_copy() {
     ip netns exec $NSA timeout $5 $NC_SEND $2 $1 < "$3"
     wait $rp
 }
+# cap_expected <rx map>: the capacity estimate the probe samples (60-75) and
+# their count (43) call for: of the largest, the 1st with up to 4 samples, the
+# 2nd with up to 8, the 3rd with up to 12, else the 4th
+cap_expected() {
+    local n k
+    n=$(v $1 43)
+    [ "$n" -eq 0 ] && { echo 0; return; }
+    k=4; [ "$n" -le 12 ] && k=3; [ "$n" -le 8 ] && k=2; [ "$n" -le 4 ] && k=1
+    for i in $(seq 60 75); do v $1 $i; done | sort -rn | sed -n "${k}p"
+}
 csum_errors() {
     ip netns exec $1 awk '/^Tcp:/{if(!h){split($0,n);h=1}else{split($0,v);for(i in n)if(n[i]=="InCsumErrors")print v[i]}}' /proc/net/snmp
 }
@@ -171,7 +181,7 @@ A ethtool -K dpa0 tx off >/dev/null
 # connection may still carry an offloaded, unfinished checksum
 B $BPFC -m $MAPS -i dpb0 -d ingress -p 100 'match tcp; match tcp-dst 5005; calc-csum tcp V; get bytes 50 2 F; if V ne %F; calc-map add CSUMT 1 1; end-if; calc-map add CSUMT 2 1; set bytes 50 2 0x1234; recalc-tcp-csum; continue' >/dev/null
 tcp_copy 5005 10.77.0.2 $CONF/tx.bin $CONF/rx.bin 30
-check "calc-csum tcp matches every segment" [ "$(v CSUMT 1)" -eq 0 -a "$(v CSUMT 2)" -gt 100 ]
+check "calc-csum tcp matches every segment ($(v CSUMT 1) of $(v CSUMT 2) differ)" [ "$(v CSUMT 1)" -eq 0 -a "$(v CSUMT 2)" -gt 100 ]
 check "recalc-tcp-csum repairs every segment" cmp -s $CONF/tx.bin $CONF/rx.bin
 check "calc-map add counts atomically" [ "$(v CSUMT 2)" -gt 2000 ]
 B $BPFC -i dpb0 -c; A ethtool -K dpa0 tx on >/dev/null
@@ -325,6 +335,38 @@ gaps=$(v ${MP_dpb0}_rx 5)
 install $NSA dpa0
 A ping -c 100 -i 0.005 -q 10.77.0.2 >/dev/null
 check "receiver resynchronised without counting loss" [ "$(v ${MP_dpb0}_rx 36)" -ge 1 -a "$(v ${MP_dpb0}_rx 5)" -eq "$gaps" ]
+# A restart under loss: the window across the restart is empty. It used to
+# wrap to an enormous window with no loss, which replaced both averages.
+# B averages over 400 packets here, so its estimate is the 3 % before the
+# restart (not the clean traffic of the earlier sections).
+loss $NSA dpa0 300
+$BPFC -m $MAPS -w ${MP_dpb0}_cfg 17 400 >/dev/null
+A ping -c 800 -i 0.005 -q 10.77.0.2 >/dev/null
+in_before=$(( $(v ${MP_dpb0}_rx 39) / 100 ))
+install $NSA dpa0
+A ping -c 250 -i 0.005 -q 10.77.0.2 >/dev/null
+in_after=$(( $(v ${MP_dpb0}_rx 39) / 100 ))
+check "B's inbound loss estimate survives A's restart ($in_before -> $in_after bp)" [ "$in_before" -ge 150 -a "$in_after" -ge 150 -a "$in_after" -le 500 ]
+A ping -c 550 -i 0.005 -q 10.77.0.2 >/dev/null
+out_after=$(( $(v ${MP_dpa0}_tx 46) / 100 ))
+check "A's new estimate starts from B's reports, not the restart ($out_after bp)" [ "$out_after" -ge 150 -a "$out_after" -le 500 ]
+$BPFC -m $MAPS -w ${MP_dpb0}_cfg 17 0 >/dev/null
+loss $NSA dpa0 0
+
+echo "== dataplane: FEC that cannot keep up counts as congestion"
+install $NSA dpa0 && install $NSB dpb0
+loss $NSA dpa0 500
+A ping -c 1500 -i 0.01 -s 1000 -q 10.77.0.2 >/dev/null
+check "5 % loss: repaired, parity scaled to the loss (1:$(v ${MP_dpa0}_tx 6), left $(( $(v ${MP_dpa0}_tx 47) / 100 )) bp)" \
+    [ "$(v ${MP_dpa0}_tx 50)" -eq 0 -a "$(v ${MP_dpa0}_tx 16)" -eq 0 -a "$(v ${MP_dpa0}_tx 6)" -ge 3 -a "$(v ${MP_dpa0}_tx 6)" -le 7 ]
+install $NSA dpa0 && install $NSB dpb0
+loss $NSA dpa0 2500
+A ping -c 2000 -i 0.01 -s 1000 -q 10.77.0.2 >/dev/null
+check "25 % loss: the most parity still leaves loss, fixed 1:8 instead (1:$(v ${MP_dpa0}_tx 6), left $(( $(v ${MP_dpa0}_tx 47) / 100 )) bp)" \
+    [ "$(v ${MP_dpa0}_tx 50)" -eq 1 -a "$(v ${MP_dpa0}_tx 16)" -eq 1 -a "$(v ${MP_dpa0}_tx 6)" -eq 8 ]
+check "status explains it" sh -c "$STATUS -m $MAPS -c $CONF/$NSA dpa0 | grep -q 'the most parity still left loss' && $STATUS -m $MAPS -c $CONF/$NSA -1 dpa0 | grep -q 'repair_failing=1'"
+check "status: POOR" sh -c "$STATUS -m $MAPS -c $CONF/$NSA -1 dpa0 | grep -q 'health=\"POOR\"'"
+loss $NSA dpa0 0
 
 echo "== satellite: 800 ms RTT (geo profile)"
 # A <-> emulator (400 ms each way) <-> B, on a new pair of interfaces
@@ -354,6 +396,11 @@ check "2 % loss: datagrams intact ($bad corrupt), ${del}/1000 delivered" [ "$bad
 check "FEC rebuilt ($(v ${MP_dps1}_rx 6)) and ARQ recovered ($(v ${MP_dps1}_rx 7))" [ "$(v ${MP_dps1}_rx 6)" -gt 0 -a "$(v ${MP_dps1}_rx 7)" -gt 0 ]
 check "ARQ ring held every NAKed packet ($(v ${MP_dps0}_tx 14) missing)" [ "$(v ${MP_dps0}_tx 14)" -eq 0 ]
 check "gaps match the loss ($(v ${MP_dps1}_rx 5) gaps, $(v ${MP_dps1}_rx 36) resyncs)" [ "$(v ${MP_dps1}_rx 5)" -lt 300 -a "$(v ${MP_dps1}_rx 36)" -eq 0 ]
+# few probe samples at the geo profile's 10 s interval: the largest counts
+# (B measures A -> B; only A sends packets big enough to probe with)
+A ping -c 15 -i 0.1 -s 56 -q 10.77.2.2 >/dev/null     # small: a report, no new sample
+n=$(v ${MP_dps1}_rx 43); want=$(cap_expected ${MP_dps1}_rx)
+check "capacity estimate with $n samples is the sample the count calls for ($(v ${MP_dps1}_rx 19) kbit/s, want $want)" [ "$n" -ge 1 -a "$(v ${MP_dps1}_rx 19)" -eq "${want:-0}" ]
 check "status shows the profile and no sizing warning" sh -c "$STATUS -m $MAPS -c $CONF/$NSA dps0 | grep -q 'Profile     geo, sized for 20.0 Mbit/s and 800 ms' && ! $STATUS -m $MAPS -c $CONF/$NSA dps0 | grep -q Sizing"
 install $NSA dps0 && install $NSB dps1
 loss $NSA dps0 200
@@ -382,6 +429,9 @@ check "averaged loss near the 3 % on the link (out $lo bp, in $li bp)" [ "$lo" -
 check "status reports the average" sh -c "$STATUS -m $MAPS -c $CONF/$NSA dps0 | grep -q 'Loss  .*(average of'"
 ca=$(v ${MP_dps0}_rx 19); cb=$(v ${MP_dps1}_rx 19)
 check "packet pairs measure each direction: B -> A ~10 Mbit/s ($ca kbit/s), A -> B ~20 Mbit/s ($cb kbit/s)" [ "$ca" -ge 8000 -a "$ca" -le 13500 -a "$cb" -ge 16000 -a "$cb" -le 28000 ]
+B ping -c 15 -i 0.1 -s 56 -q 10.77.2.1 >/dev/null
+n=$(v ${MP_dps0}_rx 43); want=$(cap_expected ${MP_dps0}_rx)
+check "capacity estimate with $n samples is the sample the count calls for ($(v ${MP_dps0}_rx 19) kbit/s, want $want)" [ "$(v ${MP_dps0}_rx 19)" -eq "${want:-0}" ]
 check "the sender sees the peer's measurement of its direction" [ "$(v ${MP_dps0}_tx 36)" -ge 16000 -a "$(v ${MP_dps1}_tx 36)" -le 13500 ]
 
 echo
