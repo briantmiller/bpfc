@@ -108,6 +108,13 @@ Conditional matching acts as a gatekeeper. If a packet fails a match rule, the e
 .BI "match " "field value"
 Compares a specific packet header field to a value. 
 Supported fields: \fBsrc-mac\fR, \fBdst-mac\fR, \fBeth-proto\fR, \fBeth-vlan\fR, \fBmpls-label\fR, \fBmpls-bos\fR, \fBip-proto\fR, \fBip-tos\fR, \fBip-src\fR, \fBip-dst\fR, \fBtcp-src\fR, \fBtcp-dst\fR, \fBudp-src\fR, \fBudp-dst\fR.
+.TP
+.BI "match dev-type " "n | %VAR"
+.TQ
+.BI "match dev-kind " kind
+.TQ
+.BI "get dev-type " VAR
+The device type and kind of the \fB\-i\fR interface (\fBskb->dev->type\fR, which a TC program cannot read). They are looked up when compiling, so the match costs nothing: its block is entered always or never. Without \fB\-i\fR, give \fB\-s IFTYPE=\fIn\fR and \fB\-s IFKIND=\fIkind\fR.
 .SS Preprocessor
 These are expanded before compilation; \fB\-E\fR shows the result. A program that uses none of them and no \fB$\fR is compiled exactly as written.
 .TP
@@ -132,7 +139,10 @@ As above, but stop once \fI%VAR\fR <= \fB$\fII\fR (checked before each copy): th
 Leave the innermost \fBrepeat\fR, or continue with its next copy.
 .TP
 \fBwhen\fR \fIexpr\fR ; ... ; [\fBotherwise\fR ; ...] ; \fBend-when\fR
-Keep the first branch if \fIexpr\fR is not 0, else the \fBotherwise\fR branch. \fBdefined(\fINAME\fB)\fR is 1 for a defined const.
+Keep the first branch if \fIexpr\fR is not 0, else the \fBotherwise\fR branch. \fBdefined(\fINAME\fB)\fR is 1 for a defined const. \fIword\fR \fB==\fR \fIword\fR (or \fB!=\fR) compares text when a side is not a number, e.g. \fBwhen $IFKIND == gre\fR.
+.TP
+\fB$IFNAME\fR, \fB$IFINDEX\fR, \fB$IFTYPE\fR, \fB$IFKIND\fR
+Set from \fB\-i\fR: the interface's name, index, device type (ARPHRD: 1 Ethernet, 772 loopback, 778 GRE, 65534 none) and kind (as \fBip \-d link\fR shows it: veth, gre, vxlan, wireguard, ...; \fBnic\fR for a device without a kind, \fBlo\fR for loopback). \fBbpfcd\fR compiles its \fI%all%\fR and \fI%<kind>%\fR templates once per interface with these set. \fB\-s\fR overrides them.
 .TP
 \fB$\fINAME\fR, \fB$(\fIexpr\fB)\fR, \fB$$\fR
 Replaced anywhere in an instruction by a const, macro parameter or repeat counter, by the value of \fIexpr\fR, or by \fB$\fR. Expressions use C operators and precedence on 64-bit integers (\fB>>\fR is logical); names inside \fB$( )\fR need no \fB$\fR. A name ends at the first character that is not a letter, digit or \fB_\fR, so write \fB$(I)_x\fR rather than \fB$I_x\fR.

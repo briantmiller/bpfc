@@ -21,6 +21,8 @@ interfaces. It is normally started by systemd as
 .EX
 /etc/bpfc/interfaces.d/<interface>/ingress/<priority>.bpfc
 /etc/bpfc/interfaces.d/<interface>/egress/<priority>.bpfc
+/etc/bpfc/interfaces.d/%all%/{ingress,egress}/<priority>.bpfc
+/etc/bpfc/interfaces.d/%<kind>%/{ingress,egress}/<priority>.bpfc
 .EE
 .PP
 The priority is 1\-65535 without leading zeros; lower priorities run first.
@@ -83,6 +85,45 @@ and the full bpfc output (including the verifier log) is kept in
 .IR /run/bpfc/errors/ ,
 shown by
 .BR "bpfcctl show" .
+.SS All interfaces and interface kinds
+.I %all%/
+applies to every interface with an Ethernet header (device type Ethernet or
+loopback: physical NICs, veth, bridge, bond, VLAN, vxlan, gretap, ...).
+.IR %<kind>%/ ,
+for example
+.IR %veth%/ ,
+.IR %gre%/ ,
+.I %vxlan%/
+or
+.IR %wireguard%/ ,
+applies to every interface of that kind as
+.B ip -d link
+shows it;
+.I %nic%/
+is for devices without a kind (physical NICs) and
+.I %lo%/
+for loopback. Devices without an Ethernet header (gre, ipip, sit,
+wireguard, tun) get programs only from their own kind or interface
+directory, because bpfc's field offsets assume an Ethernet header.
+.PP
+For each direction and priority the most specific file wins: the
+interface's own directory, then its kind, then
+.IR %all% .
+Other priorities still apply. A file that is empty (or holds only comments)
+means nothing at that priority on that interface; the slot shows as
+.BR excluded .
+A template is compiled once per interface; bpfc sets
+.BR $IFNAME ,
+.BR $IFINDEX ,
+.B $IFTYPE
+and
+.B $IFKIND
+for it (see
+.BR bpfc (8)).
+Interfaces created later get the programs when they appear; when they are
+deleted, their template slots are dropped. Stacked devices (a bridge and its
+ports, a bond and its slaves) each run the program, so a packet can be seen
+more than once.
 .SS Interfaces
 A netlink monitor watches interfaces. When a configured interface appears
 (or is deleted and created again), its programs are installed. When it is

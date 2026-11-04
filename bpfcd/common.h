@@ -115,6 +115,7 @@ enum slot_status {
     ST_REMOVED_EXT,       /* removed by something other than bpfcd (log policy) */
     ST_REPLACED_EXT,      /* replaced by something other than bpfcd (log policy) */
     ST_DISABLED,          /* reinstall limit hit; waits for the next reload */
+    ST_EXCLUDED,          /* an empty file opts this interface out of a %all% / %<kind>% program */
     ST__COUNT
 };
 
@@ -141,6 +142,8 @@ struct slot {
     int dirty;                /* needs (re)install */
     int is_new;               /* first seen in this scan (for log wording) */
     int has_includes;         /* hash covers included files; mtime alone does not show changes */
+    int from_template;        /* comes from %all% or %<kind>% for this interface */
+    int excluded;             /* the chosen file is empty: nothing at this priority */
     time_t reinstall_window;  /* start of the current one-minute reinstall window */
     int reinstall_count;
 };
@@ -205,5 +208,29 @@ int prog_get_details(uint32_t id, int want_insns, struct prog_details *out);
 int mkdir_p(const char *path, int mode);
 /* Characters allowed in an interface directory name (Linux allows more, we are strict). */
 int valid_ifname(const char *s);
+/* "%all%" or "%<kind>%" (kind: lowercase letters, digits, '_', '-', '.'). No interface can
+ * have such a name: the kernel treats '%' in a new name as a numbering pattern. */
+int valid_template_name(const char *s);
+
+/* ---------------- links ---------------- */
+
+#define ARPHRD_ETHER_ 1
+#define ARPHRD_LOOPBACK_ 772
+
+struct link_info {
+    int index;
+    int type;               /* ARPHRD_* (dev->type) */
+    char name[IFNAMSIZ];
+    char kind[32];          /* rtnetlink kind; "lo" for loopback, "nic" without a kind */
+    int has_kind;           /* the message carried IFLA_INFO_KIND */
+};
+
+struct nlmsghdr;
+/* Parses an RTM_NEWLINK / RTM_DELLINK message. Returns 0, or -1 without a name. */
+int link_parse(const struct nlmsghdr *h, struct link_info *out);
+/* Lists every interface. Returns the count or -errno; *out is malloc'd. */
+int link_dump(struct link_info **out);
+/* Ethernet header at offset 0 (what bpfc's field offsets assume): Ethernet and loopback. */
+int link_has_eth_header(const struct link_info *l);
 
 #endif

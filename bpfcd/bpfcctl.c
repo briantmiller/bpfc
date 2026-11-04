@@ -145,7 +145,7 @@ static const char *kernel_check(const struct slot *s, const char **color) {
 static const char *status_color(int st) {
     switch (st) {
     case ST_INSTALLED: return C_GREEN;
-    case ST_PENDING: return C_DIM;
+    case ST_PENDING: case ST_EXCLUDED: return C_DIM;
     case ST_FAILED: case ST_DISABLED: return C_RED;
     default: return C_YELLOW;
     }
@@ -173,7 +173,7 @@ static int cmd_status(int show_all, int long_fmt) {
 
     int problems = 0, pending_reload = 0;
     if (n == 0) {
-        printf("No programs configured. Add files as %s/<interface>/<ingress|egress>/<priority>.bpfc\n"
+        printf("No programs configured. Add files as %s/<interface|%%all%%|%%<kind>%%>/<ingress|egress>/<priority>.bpfc\n"
                "and run: systemctl reload bpfcd\n", di.config_dir[0] ? di.config_dir : DEFAULT_CONFIG_DIR);
     } else {
         int wif = 5;

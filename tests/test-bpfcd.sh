@@ -42,6 +42,7 @@ cleanup() {
 	[ -n "$DPID" ] && kill "$DPID" 2>/dev/null && wait "$DPID" 2>/dev/null
 	ip link del $A 2>/dev/null
 	ip link del $B 2>/dev/null
+	ip netns del bpfctN 2>/dev/null
 	[ $KEEP -eq 1 ] && echo "kept $T" || rm -rf "$T"
 }
 trap cleanup EXIT
@@ -213,6 +214,82 @@ write_conf reinstall yes
 start_daemon
 stop_daemon
 check "remove_on_stop detaches everything"     eval 'no_prog $A ingress 10 && no_prog $A ingress 20 && no_prog $A egress 30'
+
+echo "templates: %all% and %<kind>% (own network namespace)"
+# In a namespace so that %all% never touches the host's real interfaces.
+NS=bpfctN
+T2=$T/ns
+CFG2=$T2/etc/interfaces.d
+nx() { ip netns exec $NS "$@"; }
+nprog_at() { nx tc filter show dev "$1" "$2" pref "$3" 2>/dev/null | sed -n 's/.* id \([0-9]*\) .*/\1/p' | head -1; }
+nfield() {   # nfield <iface> <dir> <prio> <key>: a field of the slot in the namespace's state
+	awk -v i="$1" -v d="$2" -v p="$3" -v k="$4" '$1=="slot" {
+		delete kv; for (n = 2; n <= NF; n++) { split($n, x, "="); kv[x[1]] = x[2] }
+		if (kv["iface"] == i && kv["dir"] == d && kv["prio"] == p) print kv[k] }' "$T2/run/state"
+}
+nhas()    { [ -n "$(nprog_at "$1" "$2" "$3")" ]; }
+nnone()   { [ -z "$(nprog_at "$1" "$2" "$3")" ]; }
+nfrom()   { nfield "$1" "$2" "$3" path | sed 's/%25/%/g' | grep -q -- "$4"; }   # the state file encodes %
+nstat()   { [ "$(nfield "$1" "$2" "$3" status)" = "$4" ]; }
+nslot()   { [ -n "$(nfield "$1" "$2" "$3" status)" ]; }
+nreload() { $BPFCCTL -c "$T2/etc/bpfc.conf" reload >/dev/null; }
+
+ip netns del $NS 2>/dev/null
+ip netns add $NS
+nx ip link set lo up
+nx ip link add v0 type veth peer name v1
+nx ip link add vx0 type vxlan id 7 dstport 4789
+nx ip tuntap add dev tun0 mode tun
+mkdir -p "$CFG2/%all%/ingress" "$CFG2/%all%/egress" "$T2/run"
+printf 'bpfc_path = %s\nconfig_dir = %s\nstate_dir = %s\n' "$BPFC" "$CFG2" "$T2/run" > "$T2/etc/bpfc.conf"
+printf 'match tcp; match tcp-dst 9; drop\n' > "$CFG2/%all%/ingress/100.bpfc"
+# compiled per interface: drops TCP on vxlan only (seen in the instruction count)
+printf 'when $IFKIND == vxlan; match tcp; drop; otherwise; continue; end-when\n' > "$CFG2/%all%/egress/10.bpfc"
+nx $BPFCD -c "$T2/etc/bpfc.conf" >> "$T/log" 2>&1 & NPID=$!
+eventually test -s "$T2/run/state"
+check "%all% installed on veth, vxlan and lo"    eventually eval 'nhas v0 ingress 100 && nhas v1 ingress 100 && nhas vx0 ingress 100 && nhas lo ingress 100'
+check "%all% skips a device without Ethernet header" eval 'nnone tun0 ingress 100 && ! nslot tun0 ingress 100'
+check "filter named for the interface"           eval 'nx tc filter show dev vx0 ingress | grep -q "bpfcd:vx0/ingress/100"'
+check "\$IFKIND compiled per interface"           eval '[ "$(nfield vx0 egress 10 insns)" -gt "$(nfield v0 egress 10 insns)" ]'
+check "bpfcd -t lists the expansion"             eval 'nx $BPFCD -c $T2/etc/bpfc.conf -t | grep -E "^ +vx0 +ingress +prio 100 " | grep -q "%all%"'
+
+mkdir -p "$CFG2/%tun%/ingress" "$CFG2/%veth%/ingress" "$CFG2/%vxlan%/ingress" "$CFG2/v1/ingress" "$CFG2/v0/ingress"
+printf 'continue\n' > "$CFG2/%tun%/ingress/100.bpfc"
+ID_V0=$(nprog_at v0 ingress 100); ID_VX=$(nprog_at vx0 ingress 100)
+printf 'match udp; match udp-dst 9; drop\n' > "$CFG2/%veth%/ingress/100.bpfc"; nreload
+check "%tun% applies to the tun device"          eval 'nhas tun0 ingress 100 && nfrom tun0 ingress 100 %tun%'
+check "%veth% overrides %all% on veths"          eval 'nfrom v0 ingress 100 %veth% && [ "$(nprog_at v0 ingress 100)" != "$ID_V0" ]'
+check "vxlan keeps the %all% program"            eval 'nfrom vx0 ingress 100 %all% && [ "$(nprog_at vx0 ingress 100)" = "$ID_VX" ]'
+: > "$CFG2/v1/ingress/100.bpfc"; nreload
+check "empty interface file excludes"            eval 'nstat v1 ingress 100 excluded && nnone v1 ingress 100'
+: > "$CFG2/%vxlan%/ingress/100.bpfc"; nreload
+check "empty %kind% file excludes %all%"         eval 'nstat vx0 ingress 100 excluded && nnone vx0 ingress 100 && nhas lo ingress 100'
+ID_V0=$(nprog_at v0 ingress 100)
+printf 'match icmp; drop\n' > "$CFG2/v0/ingress/100.bpfc"
+printf 'match arp; drop\n'  > "$CFG2/v0/ingress/50.bpfc"; nreload
+check "interface file overrides %kind%"          eval 'nfrom v0 ingress 100 /v0/ && [ "$(nprog_at v0 ingress 100)" != "$ID_V0" ]'
+check "other priorities coexist"                 eval 'nhas v0 ingress 50 && nhas v0 egress 10'
+rm "$CFG2/v0/ingress/100.bpfc"; nreload
+check "removing it falls back to %kind%"         eval 'nfrom v0 ingress 100 %veth% && nhas v0 ingress 100'
+rm "$CFG2/%vxlan%/ingress/100.bpfc"; nreload
+check "removing the exclusion reinstalls"        eventually eval 'nhas vx0 ingress 100 && nstat vx0 ingress 100 installed'
+check "bpfcctl status shows excluded slots"      eval '$BPFCCTL -s $T2/run status | grep -E "^v1 +ingress +100 " | grep -q excluded'
+ID_VX=$(nprog_at vx0 ingress 100); ID_TUN=$(nprog_at tun0 ingress 100)
+kill $NPID; wait $NPID 2>/dev/null
+nx $BPFCD -c "$T2/etc/bpfc.conf" >> "$T/log" 2>&1 & NPID=$!
+check "restart adopts template programs"         eventually eval '[ "$(nprog_at vx0 ingress 100)" = "$ID_VX" ] && [ "$(nprog_at tun0 ingress 100)" = "$ID_TUN" ] && nstat vx0 ingress 100 installed'
+check "...and keeps the exclusion"               eval 'nstat v1 ingress 100 excluded && nnone v1 ingress 100'
+
+nx ip link add v2 type veth peer name v3
+check "new interface gets template programs"     eventually eval 'nhas v2 ingress 100 && nfrom v2 ingress 100 %veth% && nhas v3 egress 10'
+nx ip link del v2
+check "deleted interface's slots dropped"        eventually eval '! nslot v2 ingress 100 && ! nslot v3 egress 10'
+nx ip link del v0
+check "...an interface's own file stays pending" eventually nstat v0 ingress 50 pending-iface
+nx ip link set vx0 down; nx ip link set vx0 name vx9
+check "renamed interface: programs follow"       eventually eval 'nhas vx9 ingress 100 && ! nslot vx0 ingress 100'
+kill $NPID; wait $NPID 2>/dev/null
+ip netns del $NS
 
 echo
 echo -e "bpfcd tests: ${GREEN}$PASS passed${NC}, $([ $FAIL -eq 0 ] && echo 0 || echo -e "${RED}$FAIL failed${NC}")"

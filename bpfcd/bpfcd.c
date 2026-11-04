@@ -2,6 +2,11 @@
  * bpfcd - keeps bpfc programs from /etc/bpfc/interfaces.d attached to interfaces.
  *
  * Layout: <config_dir>/<interface>/{ingress,egress}/<priority>.bpfc
+ *         <config_dir>/%all%/...      every interface with an Ethernet header
+ *         <config_dir>/%<kind>%/...   every interface of that kind (veth, gre,
+ *                                     vxlan, ...; nic = no kind, lo = loopback)
+ *   Per direction and priority the most specific file wins: <interface>, then
+ *   %<kind>%, then %all%. An empty file there means nothing at that priority.
  *
  * - On start, every file is compiled and attached with bpfc.
  * - SIGHUP rescans: new or changed files (mtime moved and SHA-256 differs) are
@@ -356,7 +361,53 @@ static int file_trusted(const char *path, const struct stat *st) {
     return 1;
 }
 
-static void scan_file(const char *iface, int dir, const char *dirpath, const char *fname) {
+/*
+ * Sources are the files in the config dir, one per (scope, direction,
+ * priority). A scope is an interface name, "%all%" or "%<kind>%". Slots are
+ * what gets installed, one per (interface, direction, priority): for each
+ * existing interface the most specific source wins, per direction and
+ * priority -- <interface>/, then %<kind>%/, then %all%/ (Ethernet-header
+ * devices only). An empty file at a more specific level means "nothing at
+ * this priority on this interface" (status excluded).
+ */
+struct source {
+    char scope[IFNAMSIZ + 24];
+    int dir, prio;
+    char path[PATH_MAX];
+    int64_t mtime_ns;
+    char sha256[65];
+    int has_includes;
+    int empty;
+    int seen;
+};
+static struct source *sources;
+static int nsources, cap_sources;
+
+static struct link_info *links;
+static int nlinks;
+
+static struct source *source_find(const char *scope, int dir, int prio) {
+    for (int i = 0; i < nsources; i++)
+        if (sources[i].dir == dir && sources[i].prio == prio && !strcmp(sources[i].scope, scope))
+            return &sources[i];
+    return NULL;
+}
+
+/* No commands: only whitespace, ';' and # comments. */
+static int file_is_empty(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int c, in_comment = 0, empty = 1;
+    while ((c = fgetc(f)) != EOF) {
+        if (in_comment) { if (c == '\n') in_comment = 0; continue; }
+        if (c == '#') { in_comment = 1; continue; }
+        if (!isspace(c) && c != ';') { empty = 0; break; }
+    }
+    fclose(f);
+    return empty;
+}
+
+static void scan_file(const char *scope, int dir, const char *dirpath, const char *fname) {
     int prio = parse_prio_name(fname);
     if (prio < 0) {
         const char *dot = strrchr(fname, '.');
@@ -375,38 +426,99 @@ static void scan_file(const char *iface, int dir, const char *dirpath, const cha
     if (!file_trusted(path, &st)) return;
 
     int64_t mtime = (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
-    struct slot *s = slot_find(iface, dir, prio);
+    struct source *src = source_find(scope, dir, prio);
+    if (!src) {
+        if (nsources == cap_sources) {
+            int nc = cap_sources ? cap_sources * 2 : 32;
+            struct source *n = realloc(sources, nc * sizeof(*sources));
+            if (!n) { logmsg(LOG_LVL_ERR, "out of memory"); return; }
+            sources = n;
+            cap_sources = nc;
+        }
+        src = &sources[nsources++];
+        memset(src, 0, sizeof(*src));
+        snprintf(src->scope, sizeof(src->scope), "%s", scope);
+        src->dir = dir;
+        src->prio = prio;
+    }
+    snprintf(src->path, sizeof(src->path), "%s", path);
+
+    /* Per bpfcd(8): only hash when the mtime moved; reload only when the hash differs too.
+     * A program with includes is always re-hashed: an included file may have changed. */
+    if (src->mtime_ns != mtime || !src->sha256[0] || src->has_includes) {
+        src->empty = file_is_empty(path);
+        char hex[65];
+        int rc;
+        if (src->empty) {
+            snprintf(hex, sizeof(hex), "%s", "empty");
+            src->has_includes = 0;
+            rc = 0;
+        } else {
+            rc = sha256_program(cfg.bpfc_path, path, cfg.compile_timeout, hex, &src->has_includes);
+        }
+        if (rc < 0) {
+            logmsg(LOG_LVL_ERR, "%s: cannot read: %s", path, strerror(-rc));
+            return; /* not seen: treated as absent rather than installing something stale */
+        }
+        snprintf(src->sha256, sizeof(src->sha256), "%s", hex);
+        src->mtime_ns = mtime;
+    }
+    src->seen = 1;
+}
+
+static const struct link_info *link_by_name(const char *name) {
+    for (int i = 0; i < nlinks; i++)
+        if (!strcmp(links[i].name, name)) return &links[i];
+    return NULL;
+}
+
+/* The slot for iface/dir/prio comes from src: create it or note a change of file. */
+static void desire(const char *iface, const struct source *src, int from_template) {
+    struct slot *s = slot_find(iface, src->dir, src->prio);
     if (!s) {
-        s = slot_add(iface, dir, prio);
+        s = slot_add(iface, src->dir, src->prio);
         if (!s) { logmsg(LOG_LVL_ERR, "out of memory"); return; }
         s->dirty = 1;
         s->is_new = 1;
         s->changed_at = time(NULL);
+    } else if (strcmp(s->path, src->path) || strcmp(s->sha256, src->sha256)) {
+        s->dirty = 1;
     }
     s->seen = 1;
-    snprintf(s->path, sizeof(s->path), "%s", path);
+    s->from_template = from_template;
+    s->excluded = src->empty;
+    s->has_includes = src->has_includes;
+    s->mtime_ns = src->mtime_ns;
+    snprintf(s->path, sizeof(s->path), "%s", src->path);
+    if (strcmp(s->sha256, src->sha256)) state_dirty = 1;
+    snprintf(s->sha256, sizeof(s->sha256), "%s", src->sha256);
+}
 
-    /* Per bpfcd(8): only hash when the mtime moved; reload only when the hash differs too.
-     * A program with includes is always re-hashed: an included file may have changed. */
-    if (s->dirty || s->mtime_ns != mtime || !s->sha256[0] || s->has_includes) {
-        char hex[65];
-        int rc = sha256_program(cfg.bpfc_path, path, cfg.compile_timeout, hex, &s->has_includes);
-        if (rc < 0) {
-            logmsg(LOG_LVL_ERR, "%s: cannot read: %s", path, strerror(-rc));
-            s->seen = 0; /* treat as absent rather than install something stale */
-            return;
+/* Rebuilds the slot set from the sources and the current interfaces. */
+static void expand(void) {
+    for (int i = 0; i < nslots; i++) slots[i].seen = 0;
+    for (int i = 0; i < nsources; i++)
+        if (sources[i].scope[0] != '%') desire(sources[i].scope, &sources[i], 0);
+    for (int l = 0; l < nlinks; l++) {
+        const struct link_info *li = &links[l];
+        char kscope[sizeof(li->kind) + 2];
+        snprintf(kscope, sizeof(kscope), "%%%s%%", li->kind);
+        int eth = link_has_eth_header(li);
+        for (int i = 0; i < nsources; i++) {
+            const struct source *t = &sources[i];
+            /* each (dir, prio) once: from the kind's entry, or from %all% when the kind has none */
+            if (!strcmp(t->scope, kscope)) {
+                if (!source_find(li->name, t->dir, t->prio)) desire(li->name, t, 1);
+            } else if (!strcmp(t->scope, "%all%") && eth) {
+                if (!source_find(li->name, t->dir, t->prio) && !source_find(kscope, t->dir, t->prio))
+                    desire(li->name, t, 1);
+            }
         }
-        if (strcmp(hex, s->sha256)) {
-            if (s->sha256[0]) s->dirty = 1;
-            snprintf(s->sha256, sizeof(s->sha256), "%s", hex);
-        }
-        s->mtime_ns = mtime;
-        state_dirty = 1;
     }
 }
 
 static void scan_dir(void) {
-    for (int i = 0; i < nslots; i++) slots[i].seen = 0;
+    for (int i = 0; i < nsources; i++) sources[i].seen = 0;
 
     DIR *top = opendir(cfg.config_dir);
     if (!top) {
@@ -414,17 +526,16 @@ static void scan_dir(void) {
             logmsg(LOG_LVL_WARN, "%s does not exist; no programs configured", cfg.config_dir);
         else
             logmsg(LOG_LVL_ERR, "cannot open %s: %s", cfg.config_dir, strerror(errno));
-        return;
     }
     struct dirent *de;
-    while ((de = readdir(top))) {
+    while (top && (de = readdir(top))) {
         if (de->d_name[0] == '.') continue;
         char ifdir[PATH_MAX];
         if ((size_t)snprintf(ifdir, sizeof(ifdir), "%s/%s", cfg.config_dir, de->d_name) >= sizeof(ifdir)) continue;
         struct stat st;
         if (stat(ifdir, &st) < 0 || !S_ISDIR(st.st_mode)) continue;
-        if (!valid_ifname(de->d_name)) {
-            logmsg(LOG_LVL_WARN, "%s: ignored, not a valid interface name", ifdir);
+        if (de->d_name[0] == '%' ? !valid_template_name(de->d_name) : !valid_ifname(de->d_name)) {
+            logmsg(LOG_LVL_WARN, "%s: ignored, not a valid interface name, %%all%% or %%<kind>%%", ifdir);
             continue;
         }
         for (int dir = DIR_INGRESS; dir <= DIR_EGRESS; dir++) {
@@ -443,7 +554,22 @@ static void scan_dir(void) {
             closedir(d);
         }
     }
-    closedir(top);
+    if (top) closedir(top);
+    for (int i = 0; i < nsources;) {
+        if (!sources[i].seen) { sources[i] = sources[--nsources]; continue; }
+        i++;
+    }
+    expand();
+}
+
+/* Re-reads the interface list (start-up, and after the monitor lost events). */
+static void load_links(void) {
+    struct link_info *l = NULL;
+    int n = link_dump(&l);
+    if (n < 0) { logmsg(LOG_LVL_ERR, "cannot list interfaces: %s", strerror(-n)); return; }
+    free(links);
+    links = l;
+    nlinks = n;
 }
 
 /* ======================= reconcile / verify ======================= */
@@ -453,8 +579,12 @@ static void apply(int is_reload) {
     /* Deleted files first, so their priorities are free before anything new lands. */
     for (int i = 0; i < nslots;) {
         if (!slots[i].seen) {
-            logmsg(LOG_LVL_INFO, "%s %s prio %d: %s was removed from the configuration",
-                   slots[i].iface, dir_name(slots[i].dir), slots[i].prio, slots[i].path);
+            if (slots[i].from_template && !link_by_name(slots[i].iface))
+                logmsg(LOG_LVL_DEBUG, "%s %s prio %d: interface gone, dropping %s",
+                       slots[i].iface, dir_name(slots[i].dir), slots[i].prio, slots[i].path);
+            else
+                logmsg(LOG_LVL_INFO, "%s %s prio %d: %s was removed from the configuration",
+                       slots[i].iface, dir_name(slots[i].dir), slots[i].prio, slots[i].path);
             uninstall_slot(&slots[i], "file deleted");
             slot_remove_at(i);
             state_dirty = 1;
@@ -466,9 +596,24 @@ static void apply(int is_reload) {
         struct slot *s = &slots[i];
         int was_new = s->is_new;
         s->is_new = 0;
+        if (s->excluded) {
+            /* An empty file at a more specific level: nothing at this priority here. */
+            if (s->status != ST_EXCLUDED) {
+                uninstall_slot(s, "excluded");
+                s->prog_id = 0;
+                s->tag[0] = '\0';
+                s->insns = 0;
+                s->ifindex = 0;
+                logmsg(LOG_LVL_INFO, "%s %s prio %d: excluded by the empty file %s",
+                       s->iface, dir_name(s->dir), s->prio, s->path);
+                set_status(s, ST_EXCLUDED, NULL);
+            }
+            s->dirty = 0;
+            continue;
+        }
         if (s->dirty) {
             install_slot(s, was_new ? "new file" : "file changed");
-        } else if (is_reload && s->status != ST_INSTALLED) {
+        } else if (s->status == ST_EXCLUDED || (is_reload && s->status != ST_INSTALLED)) {
             s->reinstall_count = 0;
             install_slot(s, "reload retry");
         }
@@ -631,13 +776,30 @@ static int open_monitor(void) {
     return s;
 }
 
-static int iface_is_managed(const char *name) {
-    for (int i = 0; i < nslots; i++)
-        if (!strcmp(slots[i].iface, name)) return 1;
-    return 0;
+static void link_upsert(const struct link_info *li) {
+    for (int i = 0; i < nlinks; i++) {
+        if (links[i].index != li->index) continue;
+        /* keep a known kind if this message did not carry one */
+        char kind[sizeof(li->kind)];
+        snprintf(kind, sizeof(kind), "%s", links[i].kind);
+        links[i] = *li;
+        if (!li->has_kind && strcmp(kind, "nic") && strcmp(kind, "lo")) snprintf(links[i].kind, sizeof(kind), "%s", kind);
+        return;
+    }
+    struct link_info *n = realloc(links, (nlinks + 1) * sizeof(*links));
+    if (!n) { logmsg(LOG_LVL_ERR, "out of memory"); return; }
+    links = n;
+    links[nlinks++] = *li;
 }
 
-static void on_link_new(int ifindex, const char *name) {
+static void link_forget(int ifindex) {
+    for (int i = 0; i < nlinks; i++)
+        if (links[i].index == ifindex) { links[i] = links[--nlinks]; return; }
+}
+
+static void on_link_new(const struct link_info *li) {
+    int ifindex = li->index;
+    const char *name = li->name;
     /* A managed slot's device was renamed away from its configured name. */
     for (int i = 0; i < nslots; i++) {
         struct slot *s = &slots[i];
@@ -655,11 +817,19 @@ static void on_link_new(int ifindex, const char *name) {
             set_status(s, ST_PENDING, NULL);
         }
     }
-    if (!iface_is_managed(name)) return;
+    const struct link_info *old = NULL;
+    for (int i = 0; i < nlinks; i++) if (links[i].index == ifindex) old = &links[i];
+    int changed = !old || strcmp(old->name, name) || old->type != li->type;
+    link_upsert(li);
+    if (changed) {
+        /* %all% / %<kind>% programs for a new (or renamed) interface */
+        expand();
+        apply(0);
+    }
     int did = 0;
     for (int i = 0; i < nslots; i++) {
         struct slot *s = &slots[i];
-        if (strcmp(s->iface, name) || s->ifindex == ifindex) continue;
+        if (strcmp(s->iface, name) || s->ifindex == ifindex || s->excluded) continue;
         if (!did) logmsg(LOG_LVL_INFO, "interface %s appeared (ifindex %d), installing its programs", name, ifindex);
         did = 1;
         s->reinstall_count = 0;
@@ -679,6 +849,9 @@ static void on_link_del(int ifindex, const char *name) {
         s->tag[0] = '\0';
         set_status(s, ST_PENDING, NULL);
     }
+    link_forget(ifindex);
+    expand();      /* drops this interface's %all% / %<kind>% slots */
+    apply(0);
 }
 
 static int ifindex_is_managed(int ifindex) {
@@ -699,9 +872,19 @@ static void handle_netlink(void) {
                 logmsg(LOG_LVL_WARN, "netlink monitor overflowed; resynchronizing");
                 for (int i = 0; i < nslots; i++) {
                     struct slot *s = &slots[i];
-                    int idx = (int)if_nametoindex(s->iface);
-                    if (!idx && s->ifindex) on_link_del(s->ifindex, s->iface);
-                    else if (idx && idx != s->ifindex) on_link_new(idx, s->iface);
+                    if (!s->ifindex || if_nametoindex(s->iface) == (unsigned)s->ifindex) continue;
+                    s->ifindex = 0;     /* gone or renamed while events were lost */
+                    s->prog_id = 0;
+                    s->tag[0] = '\0';
+                    set_status(s, ST_PENDING, NULL);
+                }
+                load_links();
+                expand();
+                apply(0);
+                for (int i = 0; i < nslots; i++) {
+                    struct slot *s = &slots[i];
+                    if (s->excluded || s->status == ST_INSTALLED) continue;
+                    if (if_nametoindex(s->iface)) install_slot(s, "interface appeared");
                 }
                 schedule_verify();
                 continue;
@@ -713,15 +896,10 @@ static void handle_netlink(void) {
             switch (h->nlmsg_type) {
             case RTM_NEWLINK:
             case RTM_DELLINK: {
-                struct ifinfomsg *ifi = NLMSG_DATA(h);
-                char name[IFNAMSIZ] = {0};
-                int alen = h->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
-                for (struct rtattr *a = IFLA_RTA(ifi); RTA_OK(a, alen); a = RTA_NEXT(a, alen))
-                    if (a->rta_type == IFLA_IFNAME)
-                        snprintf(name, sizeof(name), "%s", (char *)RTA_DATA(a));
-                if (!name[0]) break;
-                if (h->nlmsg_type == RTM_DELLINK) on_link_del(ifi->ifi_index, name);
-                else on_link_new(ifi->ifi_index, name);
+                struct link_info li;
+                if (link_parse(h, &li) < 0) break;
+                if (h->nlmsg_type == RTM_DELLINK) on_link_del(li.index, li.name);
+                else on_link_new(&li);
                 break;
             }
             case RTM_NEWTFILTER:
@@ -825,6 +1003,7 @@ static int reload_config_file(void) {
 
 static int check_only(void) {
     /* -t: validate bpfc.conf and the directory layout without touching the kernel. */
+    load_links();
     scan_dir();
     qsort(slots, nslots, sizeof(*slots), slot_cmp);
     printf("config:   %s\nprograms: %s\n", conf_path, cfg.config_dir);
@@ -832,7 +1011,8 @@ static int check_only(void) {
         struct slot *s = &slots[i];
         if (!s->seen) continue;
         printf("  %-15s %-7s prio %-5d sha256 %.12s  %s%s\n", s->iface, dir_name(s->dir), s->prio,
-               s->sha256, s->path, if_nametoindex(s->iface) ? "" : "  (interface not present)");
+               s->sha256, s->path, s->excluded ? "  (excluded: empty file)" :
+               if_nametoindex(s->iface) ? "" : "  (interface not present)");
     }
     if (!nslots) printf("  (no programs found)\n");
     return 0;
@@ -933,6 +1113,7 @@ int main(int argc, char **argv) {
     logmsg(LOG_LVL_INFO, "bpfcd %s starting%s; programs from %s, external changes: %s",
            BPFC_VERSION, is_init ? " as PID 1" : "", cfg.config_dir,
            cfg.on_external_change == EXT_LOG ? "log" : "reinstall");
+    load_links();
     scan_dir();
     adopt_previous_state();
     apply(0);

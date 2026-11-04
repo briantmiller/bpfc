@@ -45,6 +45,7 @@ static const char *const status_names[ST__COUNT] = {
     [ST_REMOVED_EXT] = "removed-externally",
     [ST_REPLACED_EXT] = "replaced-externally",
     [ST_DISABLED] = "reinstall-limit",
+    [ST_EXCLUDED] = "excluded",
 };
 
 const char *status_name(int st) {
@@ -79,6 +80,90 @@ int valid_ifname(const char *s) {
         if (c <= ' ' || c == '/' || c == ':' || c >= 0x7f) return 0;
     }
     return 1;
+}
+
+int valid_template_name(const char *s) {
+    size_t n = strlen(s);
+    if (n < 3 || n > 32 || s[0] != '%' || s[n - 1] != '%') return 0;
+    for (size_t i = 1; i < n - 1; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!(islower(c) || isdigit(c) || c == '_' || c == '-' || c == '.')) return 0;
+    }
+    return 1;
+}
+
+int link_has_eth_header(const struct link_info *l) {
+    return l->type == ARPHRD_ETHER_ || l->type == ARPHRD_LOOPBACK_;
+}
+
+/* Same rule as bpfc's $IFKIND: the rtnetlink kind, "lo" for loopback, "nic" otherwise. */
+int link_parse(const struct nlmsghdr *h, struct link_info *out) {
+    const struct ifinfomsg *ifi = NLMSG_DATA(h);
+    memset(out, 0, sizeof(*out));
+    out->index = ifi->ifi_index;
+    out->type = ifi->ifi_type;
+    int alen = h->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
+    for (struct rtattr *a = IFLA_RTA(ifi); RTA_OK(a, alen); a = RTA_NEXT(a, alen)) {
+        if (a->rta_type == IFLA_IFNAME) {
+            snprintf(out->name, sizeof(out->name), "%.*s", (int)RTA_PAYLOAD(a), (char *)RTA_DATA(a));
+        } else if (a->rta_type == IFLA_LINKINFO) {
+            int nlen = RTA_PAYLOAD(a);
+            for (struct rtattr *b = RTA_DATA(a); RTA_OK(b, nlen); b = RTA_NEXT(b, nlen))
+                if (b->rta_type == IFLA_INFO_KIND) {
+                    snprintf(out->kind, sizeof(out->kind), "%.*s", (int)RTA_PAYLOAD(b), (char *)RTA_DATA(b));
+                    out->kind[strcspn(out->kind, "\n")] = '\0';
+                    out->has_kind = out->kind[0] != '\0';
+                }
+        }
+    }
+    if (!out->kind[0]) snprintf(out->kind, sizeof(out->kind), "%s", out->type == ARPHRD_LOOPBACK_ ? "lo" : "nic");
+    return out->name[0] ? 0 : -1;
+}
+
+int link_dump(struct link_info **out) {
+    *out = NULL;
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (s < 0) return -errno;
+    struct sockaddr_nl sa = {.nl_family = AF_NETLINK};
+    struct { struct nlmsghdr n; struct ifinfomsg i; } req;
+    memset(&req, 0, sizeof(req));
+    req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+    req.n.nlmsg_type = RTM_GETLINK;
+    req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.n.nlmsg_seq = (uint32_t)time(NULL);
+    req.i.ifi_family = AF_UNSPEC;
+    if (sendto(s, &req, req.n.nlmsg_len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        int e = -errno; close(s); return e;
+    }
+    struct link_info *v = NULL;
+    int n = 0, cap = 0, rc = 0, done = 0;
+    char *buf = malloc(65536);
+    if (!buf) { close(s); return -ENOMEM; }
+    while (!done) {
+        ssize_t len = recv(s, buf, 65536, 0);
+        if (len < 0) {
+            if (errno == EINTR) continue;
+            rc = -errno; break;
+        }
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (unsigned)len); h = NLMSG_NEXT(h, len)) {
+            if (h->nlmsg_seq != req.n.nlmsg_seq) continue;
+            if (h->nlmsg_type == NLMSG_DONE) { done = 1; break; }
+            if (h->nlmsg_type == NLMSG_ERROR) { rc = ((struct nlmsgerr *)NLMSG_DATA(h))->error; done = 1; break; }
+            if (h->nlmsg_type != RTM_NEWLINK) continue;
+            if (n == cap) {
+                cap = cap ? cap * 2 : 16;
+                struct link_info *nv = realloc(v, cap * sizeof(*v));
+                if (!nv) { rc = -ENOMEM; done = 1; break; }
+                v = nv;
+            }
+            if (link_parse(h, &v[n]) == 0) n++;
+        }
+    }
+    free(buf);
+    close(s);
+    if (rc < 0) { free(v); return rc; }
+    *out = v;
+    return n;
 }
 
 static char *trim(char *s) {
