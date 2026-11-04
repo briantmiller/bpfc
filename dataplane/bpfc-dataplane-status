@@ -290,6 +290,10 @@ show() {
     # FEC state for our direction
     local K fec since high fec_txt cool_left=0
     K=$(g TX 6); since=$(g TX 22); high=$(g TX 7)
+    # last time the loss left after repair was >= 1 %, either direction
+    local poor_high=0
+    [ $out_fresh -eq 1 ] && poor_high=$(g TX 49)
+    [ $in_fresh -eq 1 ] && [ "$(g RX 49)" -gt "$poor_high" ] && poor_high=$(g RX 49)
     local floor=${SET[floor]}
     if [ "$K" -gt 0 ]; then
         fec="on"
@@ -301,7 +305,8 @@ show() {
             fi
         else
             fec_txt="ON for $(age $((now - since))), 1 parity per $K packets"
-            if [ "$o_cong" -eq 1 ]; then fec_txt+=" (fixed ratio: link looks congested)"
+            if [ "$o_cong" -eq 1 ] && [ "$(g TX 50)" -eq 1 ]; then fec_txt+=" (fixed ratio: the most parity still left loss, so the link looks full)"
+            elif [ "$o_cong" -eq 1 ]; then fec_txt+=" (fixed ratio: link looks congested)"
             else fec_txt+=" (scaled to the loss)"; fi
             if [ "$high" -gt 0 ] && [ $((now - high)) -gt $((rep_ms + rep_ms / 2)) ]; then
                 cool_left=$((SET[cooldown_ms] - (now - high)))
@@ -350,6 +355,10 @@ show() {
         health="UNKNOWN"; why="no recent traffic or reports from the peer"
         [ "$seen" -gt 0 ] && [ $((now - $(g TX 19))) -le $stale ] && { health="PEER DOWN?"; why="sending, but no reports from the peer for $(age $((now - r_last)))"; }
     elif [ "$worst_res" -ge 100 ]; then health="POOR"; why="$(pct $worst_res) loss left after repair"
+    elif [ "$worst_res" -ge 50 ] && [ "$poor_high" -gt 0 ] && [ $((now - poor_high)) -lt "${SET[cooldown_ms]}" ]; then
+        # hysteresis: stays POOR until the loss left falls to half the line
+        # or the FEC cool-down has passed (it used to flap around 1 %)
+        health="POOR"; why="$(pct $worst_res) loss left after repair (recovering)"
     elif [ "$worst_loss" -ge "${SET[fec_bp]}" ]; then health="DEGRADED"; why="$(pct $worst_loss) loss on the link, being repaired"
     elif [ "$worst_loss" -ge $(( SET[fec_bp] / 2 )) ] && [ "$high" -gt 0 ] && [ $((now - high)) -lt "${SET[cooldown_ms]}" ]; then
         # hysteresis: stays DEGRADED until the loss falls to half the threshold
@@ -358,7 +367,7 @@ show() {
     else why="loss below $(pct ${SET[fec_bp]})"; fi
 
     if [ $ONELINE -eq 1 ]; then
-        echo "$ifkv health=\"$health\" peer=$(mac $peer) peer_state=\"$peer_state\" out_loss_bp=$o_loss out_residual_bp=$o_res out_loss_window_bp=$(g TX 32) out_loss_packets=$(g TX 48) out_jitter_us=$o_jit out_queue_us=$o_owd rtt_us=$o_rtt capacity_kbps=$o_cap rate_kbps=$o_rate utilisation_pct=$o_util congested=$o_cong fec=$fec fec_k=$K parity=$(g TX 9) retransmitted=$(g TX 13) retx_unavailable=$(g TX 14) retx_suppressed=$(g TX 15) in_loss_bp=$i_loss in_residual_bp=$i_res in_loss_window_bp=$(g RX 27) in_loss_packets=$(g RX 41) in_capacity_samples=$(g RX 20) in_capacity_last_kbps=$(g RX 52) in_jitter_us=$i_jit in_queue_us=$i_owd in_capacity_kbps=$i_cap fec_rebuilt=$(g RX 6) arq_recovered=$(g RX 7) fec_failed=$(g RX 8) fec_bad=$(g RX 34) reordered=$(g RX 4) duplicates=$(g RX 3) redundant_repairs=$(( $(g RX 37) + $(g RX 38) )) peer_fec_k=$(g RX 30) bypassed=$(g TX 4) resyncs=$(g RX 36) profile=${SET[profile]} sized_rate_bps=${SET[link_rate]} sized_rtt_ms=${SET[rtt_ms]} arq_depth=${SET[arq_depth]} arq_needed=$need_arq dup_window=$(( SET[dup_words] * 64 )) dup_needed=$need_dup sizing_ok=$( [ -z "$size_warn" ] && echo 1 || echo 0 )"
+        echo "$ifkv health=\"$health\" peer=$(mac $peer) peer_state=\"$peer_state\" out_loss_bp=$o_loss out_residual_bp=$o_res out_loss_window_bp=$(g TX 32) out_loss_packets=$(g TX 48) out_jitter_us=$o_jit out_queue_us=$o_owd rtt_us=$o_rtt capacity_kbps=$o_cap rate_kbps=$o_rate utilisation_pct=$o_util congested=$o_cong repair_failing=$(g TX 50) fec=$fec fec_k=$K parity=$(g TX 9) retransmitted=$(g TX 13) retx_unavailable=$(g TX 14) retx_suppressed=$(g TX 15) in_loss_bp=$i_loss in_residual_bp=$i_res in_loss_window_bp=$(g RX 27) in_loss_packets=$(g RX 41) in_capacity_samples=$(g RX 20) in_capacity_last_kbps=$(g RX 52) in_jitter_us=$i_jit in_queue_us=$i_owd in_capacity_kbps=$i_cap fec_rebuilt=$(g RX 6) arq_recovered=$(g RX 7) fec_failed=$(g RX 8) fec_bad=$(g RX 34) reordered=$(g RX 4) duplicates=$(g RX 3) redundant_repairs=$(( $(g RX 37) + $(g RX 38) )) peer_fec_k=$(g RX 30) bypassed=$(g TX 4) resyncs=$(g RX 36) profile=${SET[profile]} sized_rate_bps=${SET[link_rate]} sized_rtt_ms=${SET[rtt_ms]} arq_depth=${SET[arq_depth]} arq_needed=$need_arq dup_window=$(( SET[dup_words] * 64 )) dup_needed=$need_dup sizing_ok=$( [ -z "$size_warn" ] && echo 1 || echo 0 )"
         return
     fi
 

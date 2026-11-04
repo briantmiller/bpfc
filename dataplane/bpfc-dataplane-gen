@@ -1442,16 +1442,13 @@ if TY eq 1;
                 end-if;
               end-if;
             end-if;
-            if M4 eq 0;
-              set val M4 %M3;
-            end-if;
-            if M4 eq 0;
-              set val M4 %M2;
-            end-if;
-            if M4 eq 0;
-              set val M4 %M1;
-            end-if;
-            set map $RX 19 %M4;
+            # The four largest of the ring (53-56); the program that sends
+            # our reports picks the estimate from them (19), out of this
+            # program's verifier budget.
+            set map $RX 53 %M1;
+            set map $RX 54 %M2;
+            set map $RX 55 %M3;
+            set map $RX 56 %M4;
             calc-map add $RX 20 1;
             free PV;
             free M4;
@@ -1543,6 +1540,13 @@ if TY eq 5;
   get bytes 94 8 V;
   set map $TX 42 %V;
   get bytes 102 8 V;
+  # A window of 2^32 packets or more is a wrapped one from a peer whose
+  # sequence restarted (older versions): leave it out of the average.
+  set val T %V;
+  calc rsh T 32;
+  if T ne 0;
+    set val V 0;
+  end-if;
   set map $TX 45 %V;
   # Loss estimate: average over the last loss-smoothing packets, weighted
   # by the packets each report covers (a report of 3 packets barely moves
@@ -1576,6 +1580,11 @@ if TY eq 5;
     calc add SR %T;
     calc div SR %SD;
     set map $TX 47 %SR;
+    # 49 = last time the loss left after repair was 1 % or more (the
+    # status tool's POOR line), for its hysteresis
+    if SR ge 10000;
+      set map $TX 49 %NOW;
+    end-if;
     set val SN %SD;
     if SN gt %SW;
       set val SN %SW;
@@ -1644,6 +1653,50 @@ if TY eq 5;
   if B ge %V;
     set val CONG 1;
   end-if;
+  # Repair failing at full strength: FEC already sends its most parity
+  # (k-min) and the loss left after FEC and ARQ is still at or above the
+  # FEC threshold. More parity cannot fix that, and on a full link it adds
+  # to the loss it repairs (seen as 20 % loss with 1:4 parity on an
+  # overloaded 10 Mbit/s link): count it as congestion, so FEC uses the
+  # fixed fec-k ratio. 50 = 1 while so; it holds until the loss left falls
+  # below half the threshold or the loss itself below the threshold, since
+  # the lighter ratio would otherwise end it at the next report.
+  decl RF 8;
+  get map $TX 50 RF;
+  get map $CFG 1 T;
+  if T eq 0;
+    set val T $FEC_BP;
+  end-if;
+  get map $TX 47 B;
+  calc div B 100;
+  if RF eq 0;
+    get map $TX 6 V;
+    if V gt 0;
+      get map $CFG 4 V2;
+      if V2 eq 0;
+        set val V2 $FEC_KMIN;
+      end-if;
+      if V le %V2;
+        if B ge %T;
+          set val RF 1;
+        end-if;
+      end-if;
+    end-if;
+  else;
+    if LOSS lt %T;
+      set val RF 0;
+    end-if;
+    calc mul B 2;
+    if B lt %T;
+      set val RF 0;
+    end-if;
+  end-if;
+  set map $TX 50 %RF;
+  if RF eq 1;
+    set val CONG 1;
+  end-if;
+  free RF;
+  free V2;
   set map $TX 16 %CONG;
   free B;
   free CAP;
@@ -2683,6 +2736,13 @@ set bytes 86 8 %T;
 get map $RX 1 G;
 get map $RX 24 RO;
 set map $RX 24 %G;
+# The peer's sequence restarted (1 starts over from its new number): the
+# window is empty. G - RO used to wrap to an enormous window with almost no
+# loss, which replaced both loss averages (here and at the peer) with ~0;
+# they then took minutes to climb back.
+if G lt %RO;
+  set val RO %G;
+end-if;
 calc sub G %RO;
 set map $RX 35 %G;
 set val T %G;
@@ -2708,6 +2768,9 @@ if G gt 0;
   calc div RAW %G;
   calc mul RES 10000;
   calc div RES %G;
+else;
+  set val RAW 0;
+  set val RES 0;
 end-if;
 set map $RX 27 %RAW;
 set map $RX 28 %RES;
@@ -2746,6 +2809,10 @@ if G gt 0;
   calc add T %G;
   calc div RES %T;
   set map $RX 40 %RES;
+  # 49 = last time the inbound loss left after repair was 1 % or more
+  if RES ge 10000;
+    set map $RX 49 %MS;
+  end-if;
   calc add RAW %G;
   get map $CFG 17 T;
   if T eq 0;
@@ -2786,7 +2853,34 @@ if V ne 0;
 end-if;
 calc hton V 64;
 set bytes 54 8 %V;
-get map $RX 19 V;
+# Capacity estimate (19) from the four largest probe samples (53-56): the
+# 4th largest of the last 16 is about the 80th percentile. With fewer
+# samples take the same share from the top: the largest of up to 4, the
+# 2nd of up to 8, the 3rd of up to 12. (The 4th was taken from the start,
+# which with 5 samples is the 2nd smallest and with fewer than 4 the
+# smallest, so a few stretched pairs at start-up set an estimate far too
+# low: 1.3 Mbit/s on a 10 Mbit/s link.)
+get map $RX 43 T;
+get map $RX 56 V;
+if T le 12;
+  get map $RX 55 V;
+end-if;
+if T le 8;
+  get map $RX 54 V;
+end-if;
+if T le 4;
+  get map $RX 53 V;
+end-if;
+if V eq 0;
+  get map $RX 55 V;
+end-if;
+if V eq 0;
+  get map $RX 54 V;
+end-if;
+if V eq 0;
+  get map $RX 53 V;
+end-if;
+set map $RX 19 %V;
 calc hton V 64;
 set bytes 62 8 %V;
 redirect %IFX egress;
