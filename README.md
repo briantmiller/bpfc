@@ -100,7 +100,9 @@ bpfc-dataplane-gen --list-profiles
 bpfc-dataplane-gen --show-profile geo --rtt 650ms   # effective settings and buffer sizes
 bpfc-dataplane-gen -i eth0 --setup-hints   # MTU / offload settings for the link
 systemctl reload bpfcd
-bpfc-dataplane-status                      # link quality and what FEC/ARQ are doing, per interface
+bpfc-dataplane-status                      # one table row per interface (FRR style)
+bpfc-dataplane-status eth0 detail          # the full report; also -d
+bpfc-dataplane-status json                 # the same data as JSON; also -j (-1: key=value lines)
 bpfc-dataplane-status set eth0 fec-threshold 2
 ```
 

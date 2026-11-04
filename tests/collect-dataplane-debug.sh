@@ -72,7 +72,8 @@ A ping -c 2 -W 3 -s 1464 -M do -q 10.77.2.2 | tail -2
 sec "dataplane status"
 for x in "$NSA dps0" "$NSB dps1"; do
     set -- $x
-    env BPFC=$BPFC dataplane/bpfc-dataplane-status -m $MAPS -c $CONF/$1 $2
+    env BPFC=$BPFC dataplane/bpfc-dataplane-status -m $MAPS -c $CONF/$1 -d $2
+    env BPFC=$BPFC dataplane/bpfc-dataplane-status -m $MAPS -c $CONF/$1 -j $2
     env BPFC=$BPFC dataplane/bpfc-dataplane-status -m $MAPS -c $CONF/$1 -1 $2
 done
 

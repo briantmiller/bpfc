@@ -285,8 +285,23 @@ check "FEC rebuilt packets ($(v ${MP_dpb0}_rx 6))" [ "$(v ${MP_dpb0}_rx 6)" -gt 
 check "ARQ retransmitted ($(v ${MP_dpa0}_tx 13))" [ "$(v ${MP_dpa0}_tx 13)" -gt 0 ]
 check "no bad rebuilds" [ "$(v ${MP_dpb0}_rx 34)" -eq 0 ]
 check "UDP loss after repair below 0.3 % (got $lost/100 %)" [ "${lost:-9999}" -lt 30 ]
-check "status shows DEGRADED and FEC ON" sh -c "$STATUS -m $MAPS -c $CONF/$NSA dpa0 | grep -q 'DEGRADED' && $STATUS -m $MAPS -c $CONF/$NSA dpa0 | grep -q 'FEC         ON'"
+check "status shows DEGRADED and FEC ON" sh -c "$STATUS -m $MAPS -c $CONF/$NSA -d dpa0 | grep -q 'DEGRADED' && $STATUS -m $MAPS -c $CONF/$NSA dpa0 detail | grep -q 'FEC         ON'"
 check "status one-line output" sh -c "$STATUS -m $MAPS -c $CONF/$NSA -1 dpa0 | grep -q 'fec=on'"
+# table (the default): a header, one row per interface, FRR style
+$STATUS -m $MAPS -c $CONF/$NSA > $CONF/status-table.txt
+check "status table: header and a DEGRADED row with FEC on" sh -c "grep -q '^ *Interface  *Peer  *State  *Health  *Out Loss' $CONF/status-table.txt && grep -Eq '^[*!S]* *dpa0 +[0-9a-f:]{17} +Up +DEGRADED +[0-9]+\.[0-9]{2}% .* 1:[0-9]+\$' $CONF/status-table.txt"
+check "status table: a missing interface is NOT RUNNING" sh -c "$STATUS -m $MAPS -c $CONF/$NSA dpa0 nosuch0 | grep -Eq '^ *nosuch0 +- +- +NOT RUNNING'"
+# JSON: valid, and the same values as -1
+$STATUS -m $MAPS -c $CONF/$NSA dpa0 nosuch0 json > $CONF/status.json
+check "status json: valid, health and FEC as in -1" python3 -I -c "
+import json, sys
+d = json.load(open('$CONF/status.json'))['interfaces']
+a = d['dpa0']
+assert a['health'] == 'DEGRADED' and a['fec']['state'] == 'on' and a['fec']['ratio'] >= 2, a['health']
+assert a['outbound']['lossBp'] > 0 and isinstance(a['outbound']['congested'], bool)
+assert d['nosuch0']['health'] == 'NOT RUNNING'
+"
+check "status -j and --json give the same document" sh -c "$STATUS -m $MAPS -c $CONF/$NSA -j dpa0 | python3 -I -c 'import json,sys; json.load(sys.stdin)' && $STATUS -m $MAPS -c $CONF/$NSA --json dpa0 | python3 -I -c 'import json,sys; json.load(sys.stdin)'"
 read del bad < <(verify $NSA 10.77.0.2 6001 6000 2000 1400)
 check "every delivered datagram intact ($bad corrupt), ${del}/1000 delivered" [ "$bad" -eq 0 -a "$del" -ge 995 ]
 read del bad < <(verify $NSA 10.77.0.2 6002 3000 2000 100)
@@ -364,7 +379,7 @@ loss $NSA dpa0 2500
 A ping -c 2000 -i 0.01 -s 1000 -q 10.77.0.2 >/dev/null
 check "25 % loss: the most parity still leaves loss, fixed 1:8 instead (1:$(v ${MP_dpa0}_tx 6), left $(( $(v ${MP_dpa0}_tx 47) / 100 )) bp)" \
     [ "$(v ${MP_dpa0}_tx 50)" -eq 1 -a "$(v ${MP_dpa0}_tx 16)" -eq 1 -a "$(v ${MP_dpa0}_tx 6)" -eq 8 ]
-check "status explains it" sh -c "$STATUS -m $MAPS -c $CONF/$NSA dpa0 | grep -q 'the most parity still left loss' && $STATUS -m $MAPS -c $CONF/$NSA -1 dpa0 | grep -q 'repair_failing=1'"
+check "status explains it" sh -c "$STATUS -m $MAPS -c $CONF/$NSA -d dpa0 | grep -q 'the most parity still left loss' && $STATUS -m $MAPS -c $CONF/$NSA dpa0 | grep -Eq '^\\*! +dpa0 ' && $STATUS -m $MAPS -c $CONF/$NSA -1 dpa0 | grep -q 'repair_failing=1'"
 check "status: POOR" sh -c "$STATUS -m $MAPS -c $CONF/$NSA -1 dpa0 | grep -q 'health=\"POOR\"'"
 loss $NSA dpa0 0
 
@@ -401,13 +416,13 @@ check "gaps match the loss ($(v ${MP_dps1}_rx 5) gaps, $(v ${MP_dps1}_rx 36) res
 A ping -c 15 -i 0.1 -s 56 -q 10.77.2.2 >/dev/null     # small: a report, no new sample
 n=$(v ${MP_dps1}_rx 43); want=$(cap_expected ${MP_dps1}_rx)
 check "capacity estimate with $n samples is the sample the count calls for ($(v ${MP_dps1}_rx 19) kbit/s, want $want)" [ "$n" -ge 1 -a "$(v ${MP_dps1}_rx 19)" -eq "${want:-0}" ]
-check "status shows the profile and no sizing warning" sh -c "$STATUS -m $MAPS -c $CONF/$NSA dps0 | grep -q 'Profile     geo, sized for 20.0 Mbit/s and 800 ms' && ! $STATUS -m $MAPS -c $CONF/$NSA dps0 | grep -q Sizing"
+check "status shows the profile and no sizing warning" sh -c "$STATUS -m $MAPS -c $CONF/$NSA -d dps0 | grep -q 'Profile     geo, sized for 20.0 Mbit/s and 800 ms' && ! $STATUS -m $MAPS -c $CONF/$NSA -d dps0 | grep -q Sizing"
 install $NSA dps0 && install $NSB dps1
 loss $NSA dps0 200
 ip netns exec $NSB iperf3 -s -p 5206 -1 -D >/dev/null 2>&1; sleep 0.5
 A iperf3 -c 10.77.2.2 -p 5206 -u -b 8M -l 1400 -t 12 >/dev/null 2>&1 & IPERF_PID=$!
 sleep 9
-check "default sizing: status warns that the ARQ ring is too small" sh -c "$STATUS -m $MAPS -c $CONF/$NSA dps0 | grep -q 'Sizing      WARNING: .*needs an ARQ ring'"
+check "default sizing: status warns that the ARQ ring is too small" sh -c "$STATUS -m $MAPS -c $CONF/$NSA -d dps0 | grep -q 'Sizing      WARNING: .*needs an ARQ ring' && $STATUS -m $MAPS -c $CONF/$NSA dps0 | grep -Eq '^[*!]*S +dps0 '"
 wait $IPERF_PID
 check "default sizing: most NAKed packets already gone ($(v ${MP_dps0}_tx 14) gone, $(v ${MP_dps0}_tx 13) retransmitted)" [ "$(v ${MP_dps0}_tx 14)" -gt "$(v ${MP_dps0}_tx 13)" ]
 
@@ -426,7 +441,7 @@ B ping -c 600 -i 0.025 -s 1200 -q 10.77.2.1 >/dev/null
 wait $PA
 lo=$(( $(v ${MP_dps0}_tx 46) / 100 )); li=$(( $(v ${MP_dps0}_rx 39) / 100 ))
 check "averaged loss near the 3 % on the link (out $lo bp, in $li bp)" [ "$lo" -ge 150 -a "$lo" -le 500 -a "$li" -ge 150 -a "$li" -le 500 ]
-check "status reports the average" sh -c "$STATUS -m $MAPS -c $CONF/$NSA dps0 | grep -q 'Loss  .*(average of'"
+check "status reports the average" sh -c "$STATUS -m $MAPS -c $CONF/$NSA -d dps0 | grep -q 'Loss  .*(average of'"
 ca=$(v ${MP_dps0}_rx 19); cb=$(v ${MP_dps1}_rx 19)
 check "packet pairs measure each direction: B -> A ~10 Mbit/s ($ca kbit/s), A -> B ~20 Mbit/s ($cb kbit/s)" [ "$ca" -ge 8000 -a "$ca" -le 13500 -a "$cb" -ge 16000 -a "$cb" -le 28000 ]
 B ping -c 15 -i 0.1 -s 56 -q 10.77.2.1 >/dev/null
