@@ -230,7 +230,6 @@ struct nlmsghdr;
 int link_parse(const struct nlmsghdr *h, struct link_info *out);
 /* Lists every interface. Returns the count or -errno; *out is malloc'd. */
 int link_dump(struct link_info **out);
-/* Ethernet header at offset 0 (what bpfc's field offsets assume): Ethernet and loopback. */
-int link_has_eth_header(const struct link_info *l);
+
 
 #endif

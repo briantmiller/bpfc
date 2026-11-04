@@ -2,7 +2,7 @@
  * bpfcd - keeps bpfc programs from /etc/bpfc/interfaces.d attached to interfaces.
  *
  * Layout: <config_dir>/<interface>/{ingress,egress}/<priority>.bpfc
- *         <config_dir>/%all%/...      every interface with an Ethernet header
+ *         <config_dir>/%all%/...      every interface
  *         <config_dir>/%<kind>%/...   every interface of that kind (veth, gre,
  *                                     vxlan, ...; nic = no kind, lo = loopback)
  *   Per direction and priority the most specific file wins: <interface>, then
@@ -503,13 +503,14 @@ static void expand(void) {
         const struct link_info *li = &links[l];
         char kscope[sizeof(li->kind) + 2];
         snprintf(kscope, sizeof(kscope), "%%%s%%", li->kind);
-        int eth = link_has_eth_header(li);
         for (int i = 0; i < nsources; i++) {
             const struct source *t = &sources[i];
             /* each (dir, prio) once: from the kind's entry, or from %all% when the kind has none */
             if (!strcmp(t->scope, kscope)) {
                 if (!source_find(li->name, t->dir, t->prio)) desire(li->name, t, 1);
-            } else if (!strcmp(t->scope, "%all%") && eth) {
+            } else if (!strcmp(t->scope, "%all%")) {
+                /* every interface: on devices without an Ethernet header bpfc
+                 * puts the IP header at offset 0 ($L3OFF) */
                 if (!source_find(li->name, t->dir, t->prio) && !source_find(kscope, t->dir, t->prio))
                     desire(li->name, t, 1);
             }

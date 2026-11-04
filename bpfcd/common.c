@@ -92,10 +92,6 @@ int valid_template_name(const char *s) {
     return 1;
 }
 
-int link_has_eth_header(const struct link_info *l) {
-    return l->type == ARPHRD_ETHER_ || l->type == ARPHRD_LOOPBACK_;
-}
-
 /* Same rule as bpfc's $IFKIND: the rtnetlink kind, "lo" for loopback, "nic" otherwise. */
 int link_parse(const struct nlmsghdr *h, struct link_info *out) {
     const struct ifinfomsg *ifi = NLMSG_DATA(h);

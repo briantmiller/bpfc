@@ -233,6 +233,32 @@ bad CC-err-dev-kind-no-iface "dev-kind needs the interface"       "match dev-kin
 bad CC-err-dev-type-value   "must be a number from 0 to 65535"    "match dev-type gre"
 bad CC-err-dev-set          "Invalid set instruction dev-type"    "set dev-type 1"
 
+# ---------------- devices without an Ethernet header (L3OFF 0) ----------------
+R="-s L3OFF=0"
+okx CC-raw-shorthands      $R "match ip; match tcp; match tcp-dst 80; match tcp-flags SYN; drop"
+okx CC-raw-ip6             $R "match ip6; match ip6-dst fd00::2; set ip6-tclass 3"
+okx CC-raw-ip-fields       $R "match udp; get ip-src S; set ip-dst 10.0.0.9; set ip-tos 4; set udp-dst 53; recalc-udp-csum"
+okx CC-raw-l4-family       $R "match tcp; get l4-off O; get payload-len P; get tcp-flags F; tcp-option 2 MO ML; get flow-key K"
+okx CC-raw-icmp-gre        $R "match icmp; set icmp-type 0; end-match; match gre; get gre-key K"
+okx CC-raw-from-iftype     -s IFTYPE=778 "match ip; match ip-proto 47; drop"
+out=$("$BPFC" -s IFTYPE=65534 -E 'debug-log $L3OFF' 2>&1); check CC-raw-l3off-tun [ "$out" == "debug-log 0;" ]
+out=$("$BPFC" -s IFTYPE=1 -E 'debug-log $L3OFF' 2>&1);     check CC-raw-l3off-eth [ "$out" == "debug-log 14;" ]
+out=$("$BPFC" -E 'debug-log $L3OFF' 2>&1);                 check CC-raw-l3off-default [ "$out" == "debug-log 14;" ]
+"$BPFC" "match tcp; match tcp-dst 80; set ip-tos 4" >/dev/null && mv output.bpf a.bpf
+"$BPFC" -s L3OFF=14 "match tcp; match tcp-dst 80; set ip-tos 4" >/dev/null
+check CC-raw-eth-unchanged cmp -s a.bpf output.bpf
+"$BPFC" $R "match tcp; match tcp-dst 80; set ip-tos 4" >/dev/null
+check CC-raw-differs       eval '! cmp -s a.bpf output.bpf'
+badx() { local n=$1 msg=$2; shift 2; local out; out=$("$BPFC" "$@" 2>&1); local rc=$?
+	if [ $rc -ne 0 ] && [ $rc -lt 128 ] && [[ "$out" == *"$msg"* ]]; then test_pass "$n"; else test_fail "$n"; echo "$out" | head -2 | sed 's/^/    /'; fi; }
+for c in "match arp" "match mpls" "match vlan" "match eth-proto 0x800" "get src-mac M" "set dst-mac 02:00:00:00:00:01" \
+         "get arp-spa A" "set mpls-label 5" "push-eth 02:00:00:00:00:01 02:00:00:00:00:02" "pop-eth" "push-vlan 5" \
+         "encap-gre ip-src 10.0.0.1 ip-dst 10.0.0.2 key 5" "decap-gre" "encap-mpls label 16 bos 1" "decap-mpls" "strip-l2 4 0x0800" \
+         "insert-l2 4" "fib-lookup 10.0.0.1" "ip-frag 500 1500"; do
+	badx "CC-raw-err-${c%% *}-$(echo "$c" | awk '{print $2}')" "needs an Ethernet header" $R "$c"
+done
+badx CC-raw-err-l3off-value "L3OFF must be 14" -s L3OFF=4 "continue"
+
 # ---------------- commands that create maps (root) ----------------
 if [ "$(id -u)" -ne 0 ]; then
 	test_skip "CC-maps (creating maps needs root)"

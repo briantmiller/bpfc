@@ -248,9 +248,15 @@ printf 'when $IFKIND == vxlan; match tcp; drop; otherwise; continue; end-when\n'
 nx $BPFCD -c "$T2/etc/bpfc.conf" >> "$T/log" 2>&1 & NPID=$!
 eventually test -s "$T2/run/state"
 check "%all% installed on veth, vxlan and lo"    eventually eval 'nhas v0 ingress 100 && nhas v1 ingress 100 && nhas vx0 ingress 100 && nhas lo ingress 100'
-check "%all% skips a device without Ethernet header" eval 'nnone tun0 ingress 100 && ! nslot tun0 ingress 100'
+check "%all% also covers a raw-IP device (tun)"   eval 'nhas tun0 ingress 100 && nfrom tun0 ingress 100 %all%'
 check "filter named for the interface"           eval 'nx tc filter show dev vx0 ingress | grep -q "bpfcd:vx0/ingress/100"'
 check "\$IFKIND compiled per interface"           eval '[ "$(nfield vx0 egress 10 insns)" -gt "$(nfield v0 egress 10 insns)" ]'
+# Ethernet fields: fails to compile on the tun only
+printf 'match arp; drop\n' > "$CFG2/%all%/egress/20.bpfc"; nreload
+check "Ethernet-only template: failed on tun only" eval 'nstat tun0 egress 20 failed && nhas v0 egress 20 && nhas vx0 egress 20'
+printf 'when $L3OFF == 14; match arp; drop; end-when\n' > "$CFG2/%all%/egress/20.bpfc"; nreload
+check "...guarded with \$L3OFF it installs everywhere" eval 'nstat tun0 egress 20 installed && nhas tun0 egress 20 && nhas v0 egress 20'
+rm "$CFG2/%all%/egress/20.bpfc"; nreload
 check "bpfcd -t lists the expansion"             eval 'nx $BPFCD -c $T2/etc/bpfc.conf -t | grep -E "^ +vx0 +ingress +prio 100 " | grep -q "%all%"'
 
 mkdir -p "$CFG2/%tun%/ingress" "$CFG2/%veth%/ingress" "$CFG2/%vxlan%/ingress" "$CFG2/v1/ingress" "$CFG2/v0/ingress"
