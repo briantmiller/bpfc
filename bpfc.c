@@ -95,6 +95,27 @@
 #define BPF_ADJ_ROOM_MAC 1 /* CRITICAL: 1 for MAC layer, 0 for NET layer */
 #define IP_CSUM_OFFSET 24
 
+/*
+ * Where the IP header starts: 14 behind an Ethernet header, 0 on devices
+ * that have none (tun, wireguard, gre, ipip, sit, ...). Set from $L3OFF,
+ * which follows the -i interface's device type (or -s L3OFF=0).
+ */
+static int l3off = 14;
+
+/* Field offsets are written as in an Ethernet frame (IP header at 14); this
+ * gives the real one. A field in the Ethernet header has none on a raw-IP
+ * device. On Ethernet devices it returns the offset unchanged, so their
+ * bytecode is what it always was. */
+static int pkt_off(int eth_off) {
+    if (l3off == 14) return eth_off;
+    if (eth_off < 14) {
+        fprintf(stderr, "Error: this program reads the Ethernet header at offset %d, but the "
+                "device has none (it starts with the IP header; L3OFF is 0)\n", eth_off);
+        exit(1);
+    }
+    return eth_off - 14 + l3off;
+}
+
 #define TC_ACT_OK 0
 #define TC_ACT_RECLASSIFY 1
 #define TC_ACT_SHOT 2
@@ -1489,7 +1510,7 @@ static void emit_ld_host(int slot, int size) {
 
 /* IPv4 check and L4 offset (14 + IHL * 4) into PS_L4; R1 = L4 offset */
 static void emit_l4_offset(jlist_t *fail) {
-    emit_ld_pkt(0, 14, 1, PS_BYTES, fail);
+    emit_ld_pkt(0, pkt_off(14), 1, PS_BYTES, fail);
     emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
     emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_1));
     emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_2, 4));
@@ -1499,7 +1520,7 @@ static void emit_l4_offset(jlist_t *fail) {
     emit(BPF_ALU64_IMM(BPF_LSH, BPF_REG_1, 2));
     jl_add(fail);
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLT|BPF_K, .dst_reg=BPF_REG_1, .imm=20}));
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 14));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, l3off));
     emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, PS_L4));
 }
 
@@ -1564,7 +1585,8 @@ void compile_get_field(int base_offset, int extract_size, const char *var) {
         emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_1));
         if (base_offset & 0xFFFF) emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, base_offset & 0xFFFF));
     }
-    int max_off = l4 ? 74 + (base_offset & 0xFFFF) : base_offset == OFF_R2 ? 86 : base_offset + 8;
+    if (!l4 && base_offset != OFF_R2) base_offset = pkt_off(base_offset);
+    int max_off = l4 ? l3off + 60 + (base_offset & 0xFFFF) : base_offset == OFF_R2 ? l3off + 72 : base_offset + 8;
 
     // 1. Load context data pointers
     // In XDP, offsetof(struct xdp_md, data) == 0, data_end == 4.
@@ -1648,7 +1670,7 @@ void compile_get_field(int base_offset, int extract_size, const char *var) {
 void compile_get_bitfield(int offset, int size, int shift, uint32_t mask, const char *var) {
     int off = allocate_var(var, 4);
     // Always allocate 4 bytes to support math operations
-    emit(BPF_MOV64_IMM(BPF_REG_2, offset));
+    emit(BPF_MOV64_IMM(BPF_REG_2, pkt_off(offset)));
     // Only evaluate VLAN shifts if the target offset is past the L2 MAC header (>= 14)
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
@@ -1843,7 +1865,7 @@ void compile_goto(const char *name) {
 
 void compile_match_core(int offset, int size, uint32_t exp, uint32_t mask, const char *var) {
     if (is_l4off(offset)) emit_l4_r2_or_nomatch(offset & 0xFFFF);
-    else if (offset != OFF_R2) emit(BPF_MOV64_IMM(BPF_REG_2, offset));
+    else if (offset != OFF_R2) emit(BPF_MOV64_IMM(BPF_REG_2, pkt_off(offset)));
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
@@ -1897,6 +1919,28 @@ void compile_match_core(int offset, int size, uint32_t exp, uint32_t mask, const
     }
 }
 
+/* Commands and fields that only exist with an Ethernet header. */
+static void require_eth(const char *what) {
+    if (l3off == 14) return;
+    fprintf(stderr, "Error: %s needs an Ethernet header; this device starts with the IP header "
+            "(L3OFF is 0). Guard it with \"when $L3OFF == 14\".\n", what);
+    exit(1);
+}
+
+/* match ip / ip6 / arp / mpls, and the IPv4 protocol shorthands: the
+ * EtherType behind an Ethernet header; the IP version on a raw-IP device. */
+static void match_l3_proto(uint16_t ethertype, const char *what) {
+    if (l3off == 14) {
+        compile_match_core(12, 2, htons(ethertype), 0xFFFFFFFF, NULL);
+        return;
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "match %s", what);
+    if (ethertype == 0x0800) compile_match_core(14, 1, 0x40, 0xF0, NULL);
+    else if (ethertype == 0x86DD) compile_match_core(14, 1, 0x60, 0xF0, NULL);
+    else require_eth(buf);
+}
+
 /*
  * match vlan / match qinq: the outer tag's TPID is <tpid> (network order).
  * The tag is either offloaded (skb->vlan_proto) or, when no tag is
@@ -1938,7 +1982,7 @@ void compile_match_ipv6(int offset, char *ip6_str, const char *var) {
         int v_off = get_var_offset(var);
         for (int i = 0; i < 4; i++) {
             emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-            emit(BPF_MOV64_IMM(BPF_REG_2, offset + i * 4));
+            emit(BPF_MOV64_IMM(BPF_REG_2, pkt_off(offset + i * 4)));
             emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
             emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, -4));
             emit(BPF_MOV64_IMM(BPF_REG_4, 4));
@@ -1968,7 +2012,7 @@ void compile_match_port_range(int off, uint16_t min_p, uint16_t max_p) {
     }
 
     if (is_l4off(off)) emit_l4_r2_or_nomatch(off & 0xFFFF);
-    else emit(BPF_MOV64_IMM(BPF_REG_2, off));
+    else emit(BPF_MOV64_IMM(BPF_REG_2, pkt_off(off)));
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
@@ -2037,7 +2081,7 @@ void compile_match_vlan_range(uint16_t min_vid, uint16_t max_vid) {
 
 void compile_match_gre_key(uint32_t exp_key, const char *var) {
     start_match_block();
-    compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL);
+    match_l3_proto(0x0800, "gre");
     compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL);
     compile_match_core(L4OFF(0), 1, 0x20, 0x20, NULL);        /* K: key present */
     emit_gre_key_r2_or_nomatch();                              /* after the checksum, if any */
@@ -2046,14 +2090,14 @@ void compile_match_gre_key(uint32_t exp_key, const char *var) {
 
 void compile_match_gre_proto(uint32_t proto, const char *var) {
     start_match_block();
-    compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL); 
+    match_l3_proto(0x0800, "gre");
     compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL); 
     compile_match_core(L4OFF(2), 2, htons(proto), 0xFFFF, var);   /* 0-1 are the flags */
 }   
 
 void compile_get_gre_key(const char *var) {
     start_match_block();
-    compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL);
+    match_l3_proto(0x0800, "gre");
     compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL);
     compile_match_core(L4OFF(0), 1, 0x20, 0x20, NULL);
     emit_gre_key_r2_or_nomatch();
@@ -2063,7 +2107,7 @@ void compile_get_gre_key(const char *var) {
 
 void compile_get_gre_proto(const char *var) {
     start_match_block();
-    compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL);
+    match_l3_proto(0x0800, "gre");
     compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL);
     compile_get_field(L4OFF(2),2,var);
     compile_end_match();
@@ -2152,6 +2196,7 @@ void compile_match_var(const char *var1_name, const char *op, const char *var2_o
  * Hardened with explicit scalar bounds to satisfy legacy verifier pointer arithmetic rules.
  */
 void compile_set_field(int base_offset, int size, uint32_t net_val, const char *var) {
+    base_offset = pkt_off(base_offset);
     // 1. Setup the Value in R1
     if (var) {
         int v_off = get_var_offset(var);
@@ -2211,6 +2256,7 @@ void compile_set_field(int base_offset, int size, uint32_t net_val, const char *
 
 
 void compile_set_mac(int offset, const char *mac_str) {
+    offset = pkt_off(offset);
     if (mac_str[0] == '%') {
         int v_off = get_var_offset(mac_str);
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
@@ -2239,7 +2285,7 @@ void compile_set_ipv6(int offset, const char *ip6_str, const char *var) {
             emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off + (i * 4)));
             emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -8));
             emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-	    emit(BPF_MOV64_IMM(BPF_REG_2, offset + (i * 4)));
+	    emit(BPF_MOV64_IMM(BPF_REG_2, pkt_off(offset + (i * 4))));
             emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
 	    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-8}));
             emit(BPF_MOV64_IMM(BPF_REG_4, 4));
@@ -2257,7 +2303,7 @@ void compile_set_ipv6(int offset, const char *ip6_str, const char *var) {
 void compile_set_ipv6_bitfield(int is_tclass, uint32_t val, const char *var) {
     
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, 14));
+    emit(BPF_MOV64_IMM(BPF_REG_2, pkt_off(14)));
 
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-4}));
@@ -2292,7 +2338,7 @@ void compile_set_ipv6_bitfield(int is_tclass, uint32_t val, const char *var) {
 
     emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -4));
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, 14));
+    emit(BPF_MOV64_IMM(BPF_REG_2, pkt_off(14)));
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-4}));
     emit(BPF_MOV64_IMM(BPF_REG_4, 4));
@@ -2438,7 +2484,7 @@ void compile_pop_eth() {
 }
 
 void compile_set_ip_addr(int is_dst, uint32_t ip, const char *var) {
-    int off = is_dst ? 30 : 26;
+    int off = pkt_off(is_dst ? 30 : 26);
     if (var) {
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, get_var_offset(var)));
 #if defined(HOST_LITTLE_ENDIAN)
@@ -2464,7 +2510,7 @@ void compile_set_ip_addr(int is_dst, uint32_t ip, const char *var) {
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, IP_CSUM_OFFSET));
+    emit(BPF_MOV64_IMM(BPF_REG_2, pkt_off(IP_CSUM_OFFSET)));
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_10, -4));
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, -8));
     emit(BPF_MOV64_IMM(BPF_REG_5, 4));
@@ -2477,7 +2523,7 @@ void compile_set_ip_addr(int is_dst, uint32_t ip, const char *var) {
      * first fragment carries the L4 header; a UDP checksum of 0 (none) stays 0. */
     const int H = -24;                       /* IPv4 header bytes 0-9, from offset 14 */
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, 14));
+    emit(BPF_MOV64_IMM(BPF_REG_2, pkt_off(14)));
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
     emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, H));
     emit(BPF_MOV64_IMM(BPF_REG_4, 10));
@@ -2502,7 +2548,7 @@ void compile_set_ip_addr(int is_dst, uint32_t ip, const char *var) {
     emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0x0F));
     emit(BPF_ALU64_IMM(BPF_LSH, BPF_REG_1, 2));
     emit(BPF_ALU64_REG(BPF_ADD, BPF_REG_2, BPF_REG_1));
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, 14));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, l3off));
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_10, -4));
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, -8));
@@ -2517,6 +2563,7 @@ void compile_set_ip_addr(int is_dst, uint32_t ip, const char *var) {
  * Aligns the 1-byte values into 16-bit words to guarantee perfect L3 Checksum recalculations.
  */
 void compile_set_ip_field8(int offset, uint8_t new_val, const char *var) {
+    offset = pkt_off(offset);
     if (var) {
         emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, get_var_offset(var)));
         emit(BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_1, -8));
@@ -2543,7 +2590,7 @@ void compile_set_ip_field8(int offset, uint8_t new_val, const char *var) {
 
     // 3. Update the L3 Checksum
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, IP_CSUM_OFFSET));
+    emit(BPF_MOV64_IMM(BPF_REG_2, pkt_off(IP_CSUM_OFFSET)));
 
     // Load OLD byte into R3
     emit(BPF_LDX_MEM(BPF_B, BPF_REG_3, BPF_REG_10, -4));
@@ -2568,6 +2615,7 @@ void compile_set_ip_field8(int offset, uint8_t new_val, const char *var) {
 
 
 void compile_set_ip_field16(int offset, uint16_t new_val, const char *var) {
+    offset = pkt_off(offset);
     if (var) {
         emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, get_var_offset(var)));
 #if defined(HOST_LITTLE_ENDIAN)
@@ -2594,7 +2642,7 @@ void compile_set_ip_field16(int offset, uint16_t new_val, const char *var) {
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, IP_CSUM_OFFSET));
+    emit(BPF_MOV64_IMM(BPF_REG_2, pkt_off(IP_CSUM_OFFSET)));
 
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_3, BPF_REG_10, -4));
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, -8));
@@ -4890,7 +4938,7 @@ static void emit_load_operand(int reg, const char *arg) {
 /* R1 = IP protocol (into PS_AUX) */
 static void emit_ip_proto(jlist_t *fail) {
     emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_AUX, 0));
-    emit_ld_pkt(0, 23, 1, PS_AUX, fail);
+    emit_ld_pkt(0, pkt_off(23), 1, PS_AUX, fail);
     emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_AUX));
 }
 
@@ -4962,7 +5010,7 @@ void compile_get_l4_field(int kind, const char *var) {
             emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_CUR));
         } else {
             /* payload length = IP total length - (payload offset - 14) */
-            emit_ld_pkt(0, 16, 2, PS_BYTES, &fail);
+            emit_ld_pkt(0, pkt_off(16), 2, PS_BYTES, &fail);
             emit_ld_host(PS_BYTES, 2);
             emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, PS_CUR));
             emit(BPF_ALU64_IMM(BPF_SUB, BPF_REG_2, 14));
@@ -5110,7 +5158,7 @@ void compile_get_flow_key(const char *var, int mode) {
     emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, v_off, 0));
     emit_l4_offset(&fail);
     emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_BYTES, 0));
-    emit_ld_pkt(0, 26, 8, PS_BYTES, &fail);
+    emit_ld_pkt(0, pkt_off(26), 8, PS_BYTES, &fail);
     emit_ip_proto(&fail);
     emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_CUR, 0));
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=6, .off=1}));
@@ -6783,6 +6831,22 @@ int process_cmd(char *cmd, const char *dir) {
 	}
 	last_cmd_terminal = 0;
 
+	if (l3off != 14) {
+		/* raw-IP device: no Ethernet header, VLAN tags, ARP or MPLS */
+		static const char *eth_cmds[] = {"push-eth", "pop-eth", "push-vlan", "pop-vlan", "push-qinq",
+			"encap-mpls", "decap-mpls", "encap-gre", "decap-gre", "strip-l2", "insert-l2",
+			"add-l2-bytes", "del-l2-bytes", "push-net-bytes", "pop-net-bytes", "fib-lookup",
+			"fib-lookup6", "ip-frag", "ip-defrag", NULL};
+		for (int k = 0; eth_cmds[k]; k++) if (!strcmp(op, eth_cmds[k])) require_eth(op);
+		if ((!strcmp(op, "get") || !strcmp(op, "set") || !strcmp(op, "match") || !strcmp(op, "if")) && t > 1 &&
+		    (!strncmp(a1, "arp-", 4) || !strncmp(a1, "mpls-", 5) || !strcmp(a1, "eth-proto") ||
+		     !strcmp(a1, "src-mac") || !strcmp(a1, "dst-mac") || !strcmp(a1, "vlan-id"))) {
+			char what[64];
+			snprintf(what, sizeof(what), "%s %s", op, a1);
+			require_eth(what);
+		}
+	}
+
 	if (strcmp(op, "tcp-option")==0) {
 		if (t < 3) { fprintf(stderr, "Error: tcp-option <kind|%%VAR> <OFF_VAR> [LEN_VAR]\n"); return 1; }
 		compile_tcp_option(tok[1], tok[2], t > 3 ? tok[3] : NULL); return 0;
@@ -6936,66 +7000,68 @@ int process_cmd(char *cmd, const char *dir) {
 	}
         else if ((strcmp(op, "if") == 0 || strcmp(op, "match")) == 0 && t == 2) {
             char *f = a1; 
-	    if (strcmp(f,"ip")==0) { start_match_block(); compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL); }
-            else if (strcmp(f,"ip6")==0) { start_match_block(); compile_match_core(12,2,htons(0x86DD),0xFFFFFFFF,NULL); }
-            else if (strcmp(f,"arp")==0) { start_match_block(); compile_match_core(12,2,htons(0x0806),0xFFFFFFFF,NULL); }
-            else if (strcmp(f,"mpls")==0) { start_match_block(); compile_match_core(12,2,htons(0x8847),0xFFFFFFFF,NULL); }
+	    if (strcmp(f,"ip")==0) { start_match_block(); match_l3_proto(0x0800, f); }
+            else if (strcmp(f,"ip6")==0) { start_match_block(); match_l3_proto(0x86DD, f); }
+            else if (strcmp(f,"arp")==0) { start_match_block(); match_l3_proto(0x0806, f); }
+            else if (strcmp(f,"mpls")==0) { start_match_block(); match_l3_proto(0x8847, f); }
             else if (strcmp(f,"icmp")==0) { 
 		start_match_block(); 
-		compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+		match_l3_proto(0x0800, f);
 	        compile_match_core(23,1,1,0xFFFFFFFF,NULL);	
 	    } else if (strcmp(f,"gre")==0) {
                 start_match_block();
-                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                match_l3_proto(0x0800, f);
                 compile_match_core(23,1,47,0xFFFFFFFF,NULL);
             } else if (strcmp(f,"tcp")==0) {
                 start_match_block();
-                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                match_l3_proto(0x0800, f);
                 compile_match_core(23,1,6,0xFFFFFFFF,NULL);
             } else if (strcmp(f,"udp")==0) {
                 start_match_block();
-                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                match_l3_proto(0x0800, f);
                 compile_match_core(23,1,17,0xFFFFFFFF,NULL);
             } else if (strcmp(f,"igmp")==0) {
                 start_match_block();
-                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                match_l3_proto(0x0800, f);
                 compile_match_core(23,1,2,0xFFFFFFFF,NULL);
             } else if (strcmp(f,"ospf")==0) {
                 start_match_block();
-                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                match_l3_proto(0x0800, f);
                 compile_match_core(23,1,89,0xFFFFFFFF,NULL);
             } else if (strcmp(f,"pim")==0) {
                 start_match_block();
-                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                match_l3_proto(0x0800, f);
                 compile_match_core(23,1,103,0xFFFFFFFF,NULL);
             } else if (strcmp(f,"esp")==0) {
                 start_match_block();
-                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                match_l3_proto(0x0800, f);
                 compile_match_core(23,1,50,0xFFFFFFFF,NULL);
             } else if (strcmp(f,"rsvp")==0) {
                 start_match_block();
-                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                match_l3_proto(0x0800, f);
                 compile_match_core(23,1,46,0xFFFFFFFF,NULL);
             } else if (strcmp(f,"l2tp")==0) {
                 start_match_block();
-                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                match_l3_proto(0x0800, f);
                 compile_match_core(23,1,115,0xFFFFFFFF,NULL);
             } else if (strcmp(f,"ip-df")==0) {
                 start_match_block();
-                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                match_l3_proto(0x0800, f);
                 compile_match_core(20,1,0x40,0x40,NULL);
             } else if (strcmp(f,"ip-ndf")==0) {
                 start_match_block();
-                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                match_l3_proto(0x0800, f);
                 compile_match_core(20,1,0x00,0x40,NULL);
             } else if (strcmp(f,"ip-mf")==0) {
                 start_match_block();
-                compile_match_core(12,2,htons(0x0800),0xFFFFFFFF,NULL);
+                match_l3_proto(0x0800, f);
                 compile_match_core(20,1,0x20,0x20,NULL);
             } else if (strcmp(f,"vlan")==0) {
+                require_eth("match vlan");
                 start_match_block();
 		compile_match_outer_tag(htons(ETH_P_8021Q));
             } else if (strcmp(f,"qinq")==0) {
+                require_eth("match qinq");
                 start_match_block();
 		compile_match_outer_tag(htons(ETH_P_8021AD));
             } else {
@@ -7146,10 +7212,10 @@ int process_cmd(char *cmd, const char *dir) {
 	//else if (strcmp(op, "del-head-bytes") == 0 && t > 1) compile_del_head_bytes(a1);
         else if (strcmp(op, "add-bytes")==0 && t>2) compile_insert_bytes(atoi(a1), atoi(a2));
         else if (strcmp(op, "del-bytes")==0 && t>2) compile_delete_bytes_buffered(atoi(a1), atoi(a2));
-	else if (strcmp(op, "recalc-tcp-csum") == 0) compile_l4_csum(0, NULL, t > 1 ? atoi(a1) : 14, t > 2 ? atoi(a2) : 9000);
-	else if (strcmp(op, "recalc-udp-csum") == 0) compile_l4_csum(1, NULL, t > 1 ? atoi(a1) : 14, t > 2 ? atoi(a2) : 9000);
+	else if (strcmp(op, "recalc-tcp-csum") == 0) compile_l4_csum(0, NULL, t > 1 ? atoi(a1) : l3off, t > 2 ? atoi(a2) : 9000);
+	else if (strcmp(op, "recalc-udp-csum") == 0) compile_l4_csum(1, NULL, t > 1 ? atoi(a1) : l3off, t > 2 ? atoi(a2) : 9000);
 	else if (strcmp(op, "calc-csum") == 0 && t > 2 && (!strcmp(a1, "tcp") || !strcmp(a1, "udp")))
-	    compile_l4_csum(!strcmp(a1, "udp"), a2, t > 3 ? atoi(a3) : 14, t > 4 ? atoi(tok[4]) : 9000);
+	    compile_l4_csum(!strcmp(a1, "udp"), a2, t > 3 ? atoi(a3) : l3off, t > 4 ? atoi(tok[4]) : 9000);
 	else if (strcmp(op, "fib-lookup") == 0 || strcmp(op, "fib-lookup6") == 0) {
             int is_ipv6 = (strcmp(op, "fib-lookup6") == 0);
             int flags = 0;
@@ -8306,6 +8372,21 @@ int main(int argc, char **argv) {
             pp_set_const("IFTYPE", num, 0, NULL);
             pp_set_const("IFKIND", kind, 0, NULL);
         }
+    }
+    /* $L3OFF: where the IP header starts. 0 on device types whose packets
+     * start with it (TC sees no link-layer header): none (tun, wireguard),
+     * GRE, IP6GRE, IPIP, IP6 tunnel, SIT, raw IP, PPP. -s L3OFF= wins. */
+    {
+        const char *ty = pp_const_value("IFTYPE");
+        int t = ty ? atoi(ty) : 1;
+        int raw = t == 65534 || t == 778 || t == 823 || t == 768 || t == 769 || t == 776 || t == 519 || t == 512;
+        pp_set_const("L3OFF", raw ? "0" : "14", 0, NULL);
+        const char *l3 = pp_const_value("L3OFF");
+        if (strcmp(l3, "0") && strcmp(l3, "14")) {
+            fprintf(stderr, "Error: L3OFF must be 14 (Ethernet header) or 0 (packets start with the IP header)\n");
+            return 1;
+        }
+        l3off = atoi(l3);
     }
 
     instr = pp_run(instr, filename);

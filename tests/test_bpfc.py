@@ -700,3 +700,111 @@ def test_match_protocol_variable():
     bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; get protocol P; match protocol %P; set ip-tos 4'")
     out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2), "udp")
     assert tos_of(out) == 4
+
+
+# =====================================================================
+# Devices without an Ethernet header (tun): the IP header is at offset 0
+# =====================================================================
+
+NS_TUN = "pyt_tun"
+TUN = "pytun0"
+CVE_PROG = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "dist", "examples", "cve-2026-98432.bpfc"))
+
+# Runs in NS_TUN as the far end of the tun device: "udp DPORT [IPOPTS_HEX]"
+# sends a UDP datagram out through the tun (its egress program runs); "raw HEX"
+# writes an IP packet into it (its ingress program runs). Then every packet the
+# kernel sends out through the tun within a second is printed as hex.
+TUN_IO = r'''
+import fcntl, os, select, socket, struct, sys, time
+fd = os.open("/dev/net/tun", os.O_RDWR)
+fcntl.ioctl(fd, 0x400454ca, struct.pack("16sH", sys.argv[1].encode(), 0x0001 | 0x1000))  # TUNSETIFF, IFF_TUN|IFF_NO_PI
+time.sleep(0.2)
+if sys.argv[2] == "udp":
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if len(sys.argv) > 4:
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_OPTIONS, bytes.fromhex(sys.argv[4]))
+    s.sendto(b"hello tun", ("10.9.0.2", int(sys.argv[3])))
+else:
+    os.write(fd, bytes.fromhex(sys.argv[3]))
+end = time.time() + 1.0
+while time.time() < end:
+    r, _, _ = select.select([fd], [], [], max(0, end - time.time()))
+    if r:
+        print(os.read(fd, 65535).hex(), flush=True)
+'''
+
+
+@pytest.fixture(scope="module")
+def tun():
+    run_cmd(f"ip netns del {NS_TUN}", check=False)
+    run_cmd(f"ip netns add {NS_TUN}")
+    ns_exec(NS_TUN, "ip link set lo up")
+    ns_exec(NS_TUN, f"ip tuntap add dev {TUN} mode tun")
+    ns_exec(NS_TUN, f"ip addr add 10.9.0.1/24 dev {TUN}")
+    ns_exec(NS_TUN, f"ip link set {TUN} up")
+    path = os.path.join(state["dir"], "tun_io.py")
+    with open(path, "w") as f:
+        f.write(TUN_IO)
+    state["tun_io"] = path
+    yield
+    run_cmd(f"ip netns del {NS_TUN}", check=False)
+
+
+def tun_io(*args):
+    """The IPv4 packets the kernel sent out through the tun (scapy IP)."""
+    out = ns_exec(NS_TUN, f"python3 {state['tun_io']} {TUN} " + " ".join(args))
+    return [IP(bytes.fromhex(line)) for line in out.split() if line and line[0] == "4"]
+
+
+def tun_bpfc(args):
+    ns_exec(NS_TUN, f"{COMPILER_BIN} -i {TUN} -c", check=False)
+    return ns_exec(NS_TUN, f"{COMPILER_BIN} -i {TUN} {args}")
+
+
+def syn(dport, options=None):
+    ip = IP(src="10.9.0.2", dst="10.9.0.1", options=options or [])
+    return bytes(ip / TCP(sport=40000, dport=dport, flags="S")).hex()
+
+
+def test_tun_constants(tun):
+    """bpfc sees the tun's type and kind and puts the IP header at 0"""
+    out = ns_exec(NS_TUN, f"{COMPILER_BIN} -i {TUN} -E 'debug-log $L3OFF $IFKIND $IFTYPE'")
+    assert out.strip() == "debug-log 0 tun 65534;"
+
+
+def test_tun_egress_fields(tun):
+    """match ip / udp / udp-dst and set ip-tos / udp-dst at L3 offset 0"""
+    tun_bpfc("-d egress 'match ip; match udp; match udp-dst 5000; set ip-tos 4; set udp-dst 6000'")
+    pkts = [p for p in tun_io("udp", "5000") if p.haslayer(UDP)]
+    assert pkts, "no UDP packet left the tun"
+    p = pkts[0]
+    assert p.tos == 4 and p[UDP].dport == 6000 and checksums_valid(p)
+
+
+def test_tun_egress_ip_options(tun):
+    """L4 fields at any IHL on a raw-IP device"""
+    tun_bpfc("-d egress 'match udp; match udp-dst 5000; get l4-off O; set ip-tos %O'")
+    pkts = [p for p in tun_io("udp", "5000", "01010100") if p.haslayer(UDP)]
+    assert pkts and pkts[0].ihl == 6 and pkts[0].tos == 24
+
+
+def test_tun_ingress_drop(tun):
+    """match tcp / tcp-dst on ingress: the SYN to port 9 is dropped (no RST), port 10 is not"""
+    tun_bpfc("-d ingress 'match tcp; match tcp-dst 9; drop'")
+    assert not [p for p in tun_io("raw", syn(9)) if p.haslayer(TCP)]
+    assert [p for p in tun_io("raw", syn(10)) if p.haslayer(TCP) and p[TCP].flags.R]
+
+
+def test_tun_cve_example(tun):
+    """the CVE-2026-98432 filter on a tun: a SYN with IP options is dropped, a plain one is not"""
+    tun_bpfc(f"-d ingress -f {CVE_PROG}")
+    opts = [IPOption(b"\x01\x01\x01\x00")]
+    assert not [p for p in tun_io("raw", syn(9, opts)) if p.haslayer(TCP)]
+    assert [p for p in tun_io("raw", syn(9)) if p.haslayer(TCP) and p[TCP].flags.R]
+
+
+def test_tun_ethernet_field_refused(tun):
+    """an Ethernet field on a tun is a compile error that names the problem"""
+    res = subprocess.run(f"ip netns exec {NS_TUN} {COMPILER_BIN} -i {TUN} 'match ip; get src-mac M'",
+                         shell=True, capture_output=True, text=True)
+    assert res.returncode != 0 and "needs an Ethernet header" in res.stderr

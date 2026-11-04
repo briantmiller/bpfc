@@ -87,8 +87,7 @@ shown by
 .BR "bpfcctl show" .
 .SS All interfaces and interface kinds
 .I %all%/
-applies to every interface with an Ethernet header (device type Ethernet or
-loopback: physical NICs, veth, bridge, bond, VLAN, vxlan, gretap, ...).
+applies to every interface.
 .IR %<kind>%/ ,
 for example
 .IR %veth%/ ,
@@ -102,9 +101,15 @@ shows it;
 .I %nic%/
 is for devices without a kind (physical NICs) and
 .I %lo%/
-for loopback. Devices without an Ethernet header (gre, ipip, sit,
-wireguard, tun) get programs only from their own kind or interface
-directory, because bpfc's field offsets assume an Ethernet header.
+for loopback. On devices without an Ethernet header (gre, ipip, sit,
+wireguard, tun) packets start with the IP header; bpfc knows this from the
+device type and reads the IP fields at offset 0. A template that uses
+Ethernet fields (MACs, VLAN, ARP, MPLS) fails to compile on such a device
+(status
+.BR failed ,
+the others still get it): guard that part with
+.B "when $L3OFF == 14"
+or put an empty file for that priority in the kind's directory.
 .PP
 For each direction and priority the most specific file wins: the
 interface's own directory, then its kind, then
