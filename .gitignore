@@ -4,4 +4,4 @@ bpfcd/bpfcctl
 output.bpf
 rpmbuild/
 bpfc-*.tar.gz
-tests/__pycache__
+**/__pycache__/
