@@ -46,7 +46,7 @@ Settings for set/unset (take effect at once, survive program reloads,
   arq-with-fec keep|off|N   report-interval MS      congestion-pct N
   congestion-delay MS       probe-interval SEC      probe-rate N/s
   probe-backoff N           probe-min-bytes N       fec-floor N|off
-  loss-smoothing PACKETS
+  loss-smoothing PACKETS    capacity-window SEC|off
 Times take ms, s or m. Buffer sizes (ARQ ring, duplicate window, FEC slots)
 are fixed when the programs are generated: regenerate to change them.
 EOF
@@ -87,7 +87,7 @@ load_settings() {   # generated settings from the program header, then runtime o
     SET=([arq_depth]=10 [arq_mode]=3 [arq_fec_depth]=3 [fec_bp]=100 [cooldown_ms]=10000
          [k]=8 [kmin]=2 [kmax]=15 [timeout_ms]=50 [fec_mode]=0 [report_ms]=1000
          [probe_ms]=10000 [backoff]=6 [probe_min]=600 [cong_pct]=85 [cong_delay_ms]=20 [loss_smooth]=2000
-         [floor]=0 [profile]=none [link_rate]=0 [rtt_ms]=0 [sizing_bytes]=1000 [dup_words]=16 [fec_slots]=16)
+         [floor]=0 [cap_window_ms]=0 [profile]=none [link_rate]=0 [rtt_ms]=0 [sizing_bytes]=1000 [dup_words]=16 [fec_slots]=16)
     if [ -r "$f" ]; then
         local line kv
         line=$(sed -n 's/^# dataplane: //p' "$f" | head -1)
@@ -111,6 +111,8 @@ load_settings() {   # generated settings from the program header, then runtime o
     c=$(g CFG 17); [ "$c" -gt 0 ] && SET[loss_smooth]=$c
     c=$(g CFG 15); [ "$c" -gt 0 ] && SET[cong_delay_ms]=$c
     c=$(g CFG 16); [ "$c" -gt 0 ] && SET[floor]=$c
+    c=$(g CFG 18); [ "$c" -gt 0 ] && SET[cap_window_ms]=$c
+    [ "${SET[cap_window_ms]}" -ge 86400000 ] && SET[cap_window_ms]=0     # "off" at runtime
     [ "${SET[floor]}" -gt 15 ] && SET[floor]=0
     [ "${SET[fec_mode]}" = 3 ] && SET[fec_mode]=0
     return 0
@@ -191,7 +193,7 @@ cfg_key() {    # setting name -> cfg map key
         arq-with-fec) echo 8 ;; report-interval) echo 10 ;; congestion-pct) echo 11 ;;
         fec-timeout) echo 12 ;; probe-min-bytes) echo 13 ;; fec-mode) echo 14 ;;
         congestion-delay) echo 15 ;; fec-floor) echo 16 ;; loss-smoothing) echo 17 ;;
-        probe-rate) echo 6 ;; *) return 1 ;;
+        probe-rate) echo 6 ;; capacity-window) echo 18 ;; *) return 1 ;;
     esac
 }
 
@@ -222,6 +224,12 @@ do_set() {     # do_set <iface> <setting> <value|unset>
                 v=$val ;;
             fec-timeout|report-interval|congestion-delay)
                 v=$(parse_dur "$val" ms) || die "$name is a time, e.g. 50ms (a bare number is milliseconds)" ;;
+            capacity-window)
+                case "$val" in
+                    off|0) v=86400000 ;;      # no window: the last 16 samples, however old
+                    *) v=$(parse_dur "$val" s) || die "$name is a time, e.g. 15s (a bare number is seconds), or off"
+                       [ "$v" -ge 100 ] || die "capacity-window must be at least 100 ms (or off)" ;;
+                esac ;;
             fec-floor)
                 case "$val" in off|0) v=16 ;;
                     *) [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ] && [ "$val" -le 15 ] || die "fec-floor is 1-15 or off"; v=$val ;;
@@ -472,7 +480,11 @@ show() {
         printf "    Loss        %s on the link, %s after repair (%s; last report window: %s)\n" "$(pct $i_loss)" "$(pct $i_res)" \
             "$(averaged $(g RX 41))" "$(pct $(g RX 27))"
         printf "    Delay       queueing +%s, jitter %s\n" "$(dur_us $i_owd)" "$(dur_us $i_jit)"
-        [ "$i_cap" -gt 0 ] && printf "    Capacity    ~%s (%d probe pairs, last %s)\n" "$(rate $i_cap)" "$(g RX 20)" "$(rate $(g RX 52))"
+        if [ "$i_cap" -gt 0 ]; then
+            printf "    Capacity    ~%s (%d probe pairs, last %s" "$(rate $i_cap)" "$(g RX 20)" "$(rate $(g RX 52))"
+            [ "${SET[cap_window_ms]}" -gt 0 ] && printf "; %d in the last %s" "$(g RX 57)" "$(age ${SET[cap_window_ms]})"
+            echo ")"
+        fi
         printf "    Repaired    %d rebuilt by FEC, %d by ARQ; %d blocks could not be rebuilt%s\n" "$(g RX 6)" "$(g RX 7)" "$(g RX 8)" \
             "$( [ "$(g RX 34)" -gt 0 ] && echo ", $(g RX 34) rebuilds failed checks" )"
         printf "    Seen        %d packets, %d reordered, %d duplicated on the link, %d NAKs sent\n" "$(g RX 2)" "$(g RX 4)" "$(g RX 3)" "$(g RX 10)"
@@ -570,7 +582,7 @@ emit_json() {
     j+="\"unprotected\": {\"packets\": $byp, \"pct\": $bpct}, "
     j+="\"inbound\": {\"current\": $(jbool $fresh_i), \"lossBp\": $i_loss, \"residualBp\": $i_res, \"lossWindowBp\": $(g RX 27), "
     j+="\"lossPackets\": $(g RX 41), \"queueUsec\": $i_owd, \"jitterUsec\": $i_jit, \"capacityKbps\": $i_cap, "
-    j+="\"capacitySamples\": $(g RX 20), \"capacityLastKbps\": $(g RX 52), \"fecRebuilt\": $(g RX 6), \"arqRecovered\": $(g RX 7), "
+    j+="\"capacitySamples\": $(g RX 20), \"capacityLastKbps\": $(g RX 52), \"capacityWindowMsec\": ${SET[cap_window_ms]}, \"capacitySamplesUsed\": $(g RX 57), \"fecRebuilt\": $(g RX 6), \"arqRecovered\": $(g RX 7), "
     j+="\"fecFailed\": $(g RX 8), \"fecBad\": $(g RX 34), \"packets\": $(g RX 2), \"reordered\": $(g RX 4), "
     j+="\"duplicates\": $(g RX 3), \"naksSent\": $(g RX 10), \"lateRepairs\": $(( $(g RX 37) + $(g RX 38) )), "
     j+="\"peerFecRatio\": $(g RX 30), \"resyncs\": $(g RX 36)}, "

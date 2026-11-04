@@ -92,7 +92,7 @@ See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)`. Build an RPM (RHEL 9/10) with `
 
 The two scripts are plain bash and are not part of the RPM; copy them to e.g. `/usr/local/sbin`.
 
-Profiles set the defaults for a kind of link (`direct`, `wan`, `geo` built in; your own in `/etc/bpfc/dataplane/profiles.d/`), and `--link-rate` / `--rtt` size the retransmit ring and windows.
+Profiles set the defaults for a kind of link (`direct`, `wan`, `geo`, `leo` built in; your own in `/etc/bpfc/dataplane/profiles.d/`), and `--link-rate` / `--rtt` size the retransmit ring and windows.
 
 ```bash
 bpfc-dataplane-gen -i eth0 --profile geo   # writes /etc/bpfc/interfaces.d/eth0/{egress,ingress}/*.bpfc
