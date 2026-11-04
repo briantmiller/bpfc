@@ -1442,9 +1442,129 @@ void compile_fib_lookup6(int flags, const char *dst_ip_arg, const char *src_ip_a
  * Uses strict DPA to support both TC and XDP seamlessly.
  * Dynamically shifts the target offset by +4 or +8 bytes if 802.1Q or 802.1ad VLAN tags are detected.
  */
+#define PS_BYTES (-16)
+#define PS_L4    (-24)
+#define PS_CUR   (-32)
+#define PS_AUX   (-40)
+#define PS_AUX2  (-48)
+#define PS_FILL  (-128)
+
+typedef struct { int idx[512]; int n; } jlist_t;
+static void jl_add(jlist_t *l) {
+    if (l->n >= 512) { fprintf(stderr, "Error: internal jump list full\n"); exit(1); }
+    l->idx[l->n++] = prog_idx;
+}
+static void jl_patch(jlist_t *l, int target) {
+    for (int i = 0; i < l->n; i++) prog[l->idx[i]].off = target - l->idx[i] - 1;
+    l->n = 0;
+}
+
+/* R0 = bpf_skb_load_bytes(skb, off, fp + dst, size), off = add, or the
+ * 64-bit value at fp + offslot plus add. Jumps to fail if R0 != 0. */
+static void emit_ld_pkt(int offslot, int add, int size, int dst, jlist_t *fail) {
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    if (offslot) {
+        emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, offslot));
+        if (add) emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, add));
+    } else {
+        emit(BPF_MOV64_IMM(BPF_REG_2, add));
+    }
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, dst));
+    emit(BPF_MOV64_IMM(BPF_REG_4, size));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    jl_add(fail);
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+}
+
+/* R1 = the value read at fp + slot (1, 2 or 4 bytes), in host order */
+static void emit_ld_host(int slot, int size) {
+    if (size == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, slot));
+    else if (size == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, slot));
+    else emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, slot));
+#if defined(HOST_LITTLE_ENDIAN)
+    if (size > 1) emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=size*8}));
+#endif
+}
+
+/* IPv4 check and L4 offset (14 + IHL * 4) into PS_L4; R1 = L4 offset */
+static void emit_l4_offset(jlist_t *fail) {
+    emit_ld_pkt(0, 14, 1, PS_BYTES, fail);
+    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_1));
+    emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_2, 4));
+    jl_add(fail);
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_2, .imm=4}));
+    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0x0F));
+    emit(BPF_ALU64_IMM(BPF_LSH, BPF_REG_1, 2));
+    jl_add(fail);
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLT|BPF_K, .dst_reg=BPF_REG_1, .imm=20}));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 14));
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, PS_L4));
+}
+
+/*
+ * IPv4 L4 fields (ports, TCP flags, ICMP type, GRE) used to be read at fixed
+ * offsets that assume a 20-byte IPv4 header (no options), so a packet with
+ * IP options had the wrong bytes read or rewritten. An offset written
+ * L4OFF(n) is n bytes into the L4 header, found from the real IHL at run
+ * time; OFF_R2 means "already computed into R2".
+ */
+#define L4OFF_FLAG 0x10000
+#define L4OFF(n)   (L4OFF_FLAG | (n))
+#define OFF_R2     0x20000
+static int is_l4off(int off) { return (off & L4OFF_FLAG) != 0; }
+
+void add_block_jump();
+void add_safety_jump();
+
+/* R2 = L4 header offset + rel, or (not IPv4, short packet) a block jump:
+ * the enclosing match does not match. */
+static void emit_l4_r2_or_nomatch(int rel) {
+    jlist_t fail = {0};
+    emit_l4_offset(&fail);
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_1));
+    if (rel) emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, rel));
+    int j_ok = prog_idx;
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    jl_patch(&fail, prog_idx);
+    add_block_jump();
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    prog[j_ok].off = prog_idx - j_ok - 1;
+}
+
+/* R2 = offset of the GRE key (L4 + 4, + 4 more when the checksum bit is
+ * set), or a block jump. Expects the key-present bit already matched. */
+static void emit_gre_key_r2_or_nomatch(void) {
+    jlist_t fail = {0};
+    emit_l4_offset(&fail);
+    emit_ld_pkt(PS_L4, 0, 1, PS_BYTES, &fail);
+    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0x80));            /* C: checksum present */
+    emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 5));               /* 4 or 0 */
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, PS_L4));
+    emit(BPF_ALU64_REG(BPF_ADD, BPF_REG_2, BPF_REG_1));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, 4));
+    int j_ok = prog_idx;
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    jl_patch(&fail, prog_idx);
+    add_block_jump();
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    prog[j_ok].off = prog_idx - j_ok - 1;
+}
+
 void compile_get_field(int base_offset, int extract_size, const char *var) {
     int v_off = allocate_var(var, extract_size==6?8:extract_size); 
     int v_sz = get_var_size(var); 
+    /* L4OFF: 0 into VAR when the packet is not IPv4 (like get tcp-seq) */
+    int l4 = is_l4off(base_offset);
+    jlist_t l4fail = {0};
+    if (l4) {
+        emit_l4_offset(&l4fail);
+        emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_1));
+        if (base_offset & 0xFFFF) emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, base_offset & 0xFFFF));
+    }
+    int max_off = l4 ? 74 + (base_offset & 0xFFFF) : base_offset == OFF_R2 ? 86 : base_offset + 8;
 
     // 1. Load context data pointers
     // In XDP, offsetof(struct xdp_md, data) == 0, data_end == 4.
@@ -1455,13 +1575,13 @@ void compile_get_field(int base_offset, int extract_size, const char *var) {
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_1, is_xdp ? 4 : offsetof(struct __sk_buff, data_end))); 
 
     // R2 = dynamic offset accumulator (starts with the requested base offset)
-    emit(BPF_MOV64_IMM(BPF_REG_2, base_offset));
+    if (!l4 && base_offset != OFF_R2) emit(BPF_MOV64_IMM(BPF_REG_2, base_offset));
 
     // --- VERIFIER FIX: Explicit Scalar Bounding ---
     // Prove to the verifier that the dynamic offset accumulator (R2) will never 
     // exceed the maximum mathematically possible offset for this field!
     add_safety_jump();
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_2, .imm=base_offset + 8}));
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_2, .imm=max_off}));
 
     // 2. R8 (Pointer) = data + dynamic_offset (R2)
     emit(BPF_ALU64_REG(BPF_ADD, BPF_REG_8, BPF_REG_2));
@@ -1511,6 +1631,17 @@ void compile_get_field(int base_offset, int extract_size, const char *var) {
     else if (v_sz == 2) emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, v_off));
     else if (v_sz == 4) emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, v_off));
     else emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, v_off));
+    if (l4) {
+        int j_end = prog_idx;
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+        jl_patch(&l4fail, prog_idx);
+        emit(BPF_MOV64_IMM(BPF_REG_1, 0));
+        if (v_sz == 1) emit(BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_1, v_off));
+        else if (v_sz == 2) emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, v_off));
+        else if (v_sz == 4) emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, v_off));
+        else emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, v_off));
+        prog[j_end].off = prog_idx - j_end - 1;
+    }
 }
 
 //TOOD: Account for getting eth-proto at offset 12
@@ -1711,7 +1842,8 @@ void compile_goto(const char *name) {
 }
 
 void compile_match_core(int offset, int size, uint32_t exp, uint32_t mask, const char *var) {
-    emit(BPF_MOV64_IMM(BPF_REG_2, offset));
+    if (is_l4off(offset)) emit_l4_r2_or_nomatch(offset & 0xFFFF);
+    else if (offset != OFF_R2) emit(BPF_MOV64_IMM(BPF_REG_2, offset));
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
@@ -1835,7 +1967,8 @@ void compile_match_port_range(int off, uint16_t min_p, uint16_t max_p) {
         return;
     }
 
-    emit(BPF_MOV64_IMM(BPF_REG_2, off));
+    if (is_l4off(off)) emit_l4_r2_or_nomatch(off & 0xFFFF);
+    else emit(BPF_MOV64_IMM(BPF_REG_2, off));
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
@@ -1906,23 +2039,25 @@ void compile_match_gre_key(uint32_t exp_key, const char *var) {
     start_match_block();
     compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL);
     compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL);
-    compile_match_core(34, 1, 0x20, 0x20, NULL);
-    compile_match_core(38, 4, htonl(exp_key), 0xFFFFFFFF, var);
+    compile_match_core(L4OFF(0), 1, 0x20, 0x20, NULL);        /* K: key present */
+    emit_gre_key_r2_or_nomatch();                              /* after the checksum, if any */
+    compile_match_core(OFF_R2, 4, htonl(exp_key), 0xFFFFFFFF, var);
 }
 
 void compile_match_gre_proto(uint32_t proto, const char *var) {
     start_match_block();
     compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL); 
     compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL); 
-    compile_match_core(36, 2, htons(proto), 0xFFFF, var);   /* 34-35 are the flags */
+    compile_match_core(L4OFF(2), 2, htons(proto), 0xFFFF, var);   /* 0-1 are the flags */
 }   
 
 void compile_get_gre_key(const char *var) {
     start_match_block();
     compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL);
     compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL);
-    compile_match_core(34, 1, 0x20, 0x20, NULL);
-    compile_get_field(38,4,var);
+    compile_match_core(L4OFF(0), 1, 0x20, 0x20, NULL);
+    emit_gre_key_r2_or_nomatch();
+    compile_get_field(OFF_R2,4,var);
     compile_end_match();
 }
 
@@ -1930,7 +2065,7 @@ void compile_get_gre_proto(const char *var) {
     start_match_block();
     compile_match_core(12, 2, htons(0x0800), 0xFFFFFFFF, NULL);
     compile_match_core(23, 1, 47, 0xFFFFFFFF, NULL);
-    compile_get_field(36,2,var);
+    compile_get_field(L4OFF(2),2,var);
     compile_end_match();
 }
 
@@ -2480,14 +2615,10 @@ void compile_set_ip_field16(int offset, uint16_t new_val, const char *var) {
  * message got a wrong checksum.) Stack scratch: -4 old word, -8 new word.
  */
 void compile_set_icmp_type(uint8_t type, const char *var) {
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, 34));
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, -4));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 2));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
-    int j_err = prog_idx;
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+    /* type/code word and checksum in the ICMP header, at any IHL; not IPv4: unchanged */
+    jlist_t skip = {0};
+    emit_l4_offset(&skip);
+    emit_ld_pkt(PS_L4, 0, 2, -4, &skip);
 
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, -4));
     emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, -8));            /* keeps the code byte */
@@ -2499,7 +2630,7 @@ void compile_set_icmp_type(uint8_t type, const char *var) {
     }
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, 34));
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, PS_L4));
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
     emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, -8));
     emit(BPF_MOV64_IMM(BPF_REG_4, 2));
@@ -2507,12 +2638,13 @@ void compile_set_icmp_type(uint8_t type, const char *var) {
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, 36));                              /* ICMP checksum */
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, PS_L4));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, 2));                      /* ICMP checksum */
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_3, BPF_REG_10, -4));
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, -8));
     emit(BPF_MOV64_IMM(BPF_REG_5, 2));
     emit(BPF_CALL_FUNC(BPF_FUNC_l4_csum_replace));
-    prog[j_err].off = prog_idx - j_err - 1;
+    jl_patch(&skip, prog_idx);
 }
 
 /*
@@ -2523,7 +2655,10 @@ void compile_recalculate_l4_csum(int is_udp);
 void compile_l4_csum(int is_udp, const char *var, int l3off, int maxlen);
 
 void compile_set_l4_port(int is_udp, int is_dst, uint16_t p, const char *var) {
-    int off = 34 + (is_dst?2:0), coff = 34 + (is_udp?6:16);
+    /* offsets into the L4 header (any IHL); not IPv4: nothing is changed */
+    int off = is_dst ? 2 : 0, coff = is_udp ? 6 : 16;
+    jlist_t skip = {0};
+    emit_l4_offset(&skip);                                         /* PS_L4 */
     if (var) {
         emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, get_var_offset(var)));
 #if defined(HOST_LITTLE_ENDIAN)
@@ -2532,16 +2667,11 @@ void compile_set_l4_port(int is_udp, int is_dst, uint16_t p, const char *var) {
         emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, -8));
     } else emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -8, htons(p)));
 
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, off));
-
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-4}));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 2));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    emit_ld_pkt(PS_L4, off, 2, -4, &skip);                         /* old port */
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, off));
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, PS_L4));
+    if (off) emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, off));
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_3, .imm=-8}));
     emit(BPF_MOV64_IMM(BPF_REG_4, 2));
@@ -2549,11 +2679,13 @@ void compile_set_l4_port(int is_udp, int is_dst, uint16_t p, const char *var) {
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, coff));
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, PS_L4));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, coff));
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_3, BPF_REG_10, -4));
     emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, -8));
     emit(BPF_MOV64_IMM(BPF_REG_5, 2));
     emit(BPF_CALL_FUNC(BPF_FUNC_l4_csum_replace));
+    jl_patch(&skip, prog_idx);
 }
 
 void compile_set_queue(uint32_t q_id, const char *var) {
@@ -3633,6 +3765,19 @@ void compile_set_skb_proto(const char *val_str) {
  * Emits bytecode to match a 32-bit __sk_buff context field (mark, hash, or cb element).
  * Registers 2 jumps (Load Failure & Comparison) under the active logical match block.
  */
+/* match protocol %VAR: skb->protocol is network order, variables host order
+ * (get protocol stores it swapped); the raw value used to be compared. */
+void compile_match_skb_proto_var(const char *var) {
+    start_match_block();
+    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, protocol)));
+    emit(((struct bpf_insn){.code = BPF_END | BPF_ALU | BPF_TO_BE, .dst_reg = BPF_REG_1, .imm = 16}));
+    int v_off = get_var_offset(var), v_sz = get_var_size(var);
+    emit(BPF_LDX_MEM(v_sz == 1 ? BPF_B : v_sz == 2 ? BPF_H : BPF_W, BPF_REG_2, BPF_REG_10, v_off));
+    if (v_sz > 2) emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_2, 0xFFFF));
+    add_block_jump();
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JNE | BPF_X, .dst_reg = BPF_REG_1, .src_reg = BPF_REG_2}));
+}
+
 void compile_match_skb_field(size_t field_offset, uint32_t expected, uint32_t mask, const char *var) {
     // Start a new logical block for the conditional branching check
     start_match_block();
@@ -4742,67 +4887,6 @@ static void emit_load_operand(int reg, const char *arg) {
  * live inside one instruction: -16 bytes read, -24 L4 offset, -32 cursor,
  * -40 / -48 aux; fill-bytes uses -128..-65 for its pattern.
  * ---------------------------------------------------------------------- */
-#define PS_BYTES (-16)
-#define PS_L4    (-24)
-#define PS_CUR   (-32)
-#define PS_AUX   (-40)
-#define PS_AUX2  (-48)
-#define PS_FILL  (-128)
-
-typedef struct { int idx[512]; int n; } jlist_t;
-static void jl_add(jlist_t *l) {
-    if (l->n >= 512) { fprintf(stderr, "Error: internal jump list full\n"); exit(1); }
-    l->idx[l->n++] = prog_idx;
-}
-static void jl_patch(jlist_t *l, int target) {
-    for (int i = 0; i < l->n; i++) prog[l->idx[i]].off = target - l->idx[i] - 1;
-    l->n = 0;
-}
-
-/* R0 = bpf_skb_load_bytes(skb, off, fp + dst, size), off = add, or the
- * 64-bit value at fp + offslot plus add. Jumps to fail if R0 != 0. */
-static void emit_ld_pkt(int offslot, int add, int size, int dst, jlist_t *fail) {
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    if (offslot) {
-        emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, offslot));
-        if (add) emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, add));
-    } else {
-        emit(BPF_MOV64_IMM(BPF_REG_2, add));
-    }
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, dst));
-    emit(BPF_MOV64_IMM(BPF_REG_4, size));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
-    jl_add(fail);
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
-}
-
-/* R1 = the value read at fp + slot (1, 2 or 4 bytes), in host order */
-static void emit_ld_host(int slot, int size) {
-    if (size == 1) emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, slot));
-    else if (size == 2) emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, slot));
-    else emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, slot));
-#if defined(HOST_LITTLE_ENDIAN)
-    if (size > 1) emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=size*8}));
-#endif
-}
-
-/* IPv4 check and L4 offset (14 + IHL * 4) into PS_L4; R1 = L4 offset */
-static void emit_l4_offset(jlist_t *fail) {
-    emit_ld_pkt(0, 14, 1, PS_BYTES, fail);
-    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
-    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_1));
-    emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_2, 4));
-    jl_add(fail);
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_2, .imm=4}));
-    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0x0F));
-    emit(BPF_ALU64_IMM(BPF_LSH, BPF_REG_1, 2));
-    jl_add(fail);
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLT|BPF_K, .dst_reg=BPF_REG_1, .imm=20}));
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 14));
-    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, PS_L4));
-}
-
 /* R1 = IP protocol (into PS_AUX) */
 static void emit_ip_proto(jlist_t *fail) {
     emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_AUX, 0));
@@ -6713,8 +6797,8 @@ int process_cmd(char *cmd, const char *dir) {
             else if (strcmp(f,"bytes")==0 && t > 3) compile_get_raw_bytes(atoi(tok[2]), atoi(tok[3]), tok[4]);
 	    else if (strcmp(f,"ip-src")==0) compile_get_field(26,4,var);
             else if (strcmp(f,"ip-dst")==0) compile_get_field(30,4,var);
-            else if (strcmp(f,"tcp-src")==0 || strcmp(f,"udp-src")==0) compile_get_field(34,2,var);
-            else if (strcmp(f,"tcp-dst")==0 || strcmp(f,"udp-dst")==0) compile_get_field(36,2,var);
+            else if (strcmp(f,"tcp-src")==0 || strcmp(f,"udp-src")==0) compile_get_field(L4OFF(0),2,var);
+            else if (strcmp(f,"tcp-dst")==0 || strcmp(f,"udp-dst")==0) compile_get_field(L4OFF(2),2,var);
 	    else if (strcmp(f,"tcp-seq")==0) compile_get_l4_field(L4F_SEQ, var);
 	    else if (strcmp(f,"tcp-ack")==0) compile_get_l4_field(L4F_ACK, var);
 	    else if (strcmp(f,"tcp-flags")==0) compile_get_l4_field(L4F_FLAGS, var);
@@ -6935,8 +7019,8 @@ int process_cmd(char *cmd, const char *dir) {
             else if (strcmp(f,"ip-len")==0) { start_match_block(); compile_match_core(16,2,htons(atoi(val)),0xFFFFFFFF,mv); }
             else if (strcmp(f,"ip-src")==0) { start_match_block(); uint32_t ip,mk; parse_ip_cidr(val,&ip,&mk); compile_match_core(26,4,ip,mk,mv); }
             else if (strcmp(f,"ip-dst")==0) { start_match_block(); uint32_t ip,mk; parse_ip_cidr(val,&ip,&mk); compile_match_core(30,4,ip,mk,mv); }
-            else if (strcmp(f,"tcp-src")==0 || strcmp(f,"udp-src")==0) { uint16_t mn,mx; parse_port_range(val,&mn,&mx); compile_match_port_range(34,mn,mx); }
-            else if (strcmp(f,"tcp-dst")==0 || strcmp(f,"udp-dst")==0) { uint16_t mn,mx; parse_port_range(val,&mn,&mx); compile_match_port_range(36,mn,mx); }
+            else if (strcmp(f,"tcp-src")==0 || strcmp(f,"udp-src")==0) { uint16_t mn,mx; parse_port_range(val,&mn,&mx); compile_match_port_range(L4OFF(0),mn,mx); }
+            else if (strcmp(f,"tcp-dst")==0 || strcmp(f,"udp-dst")==0) { uint16_t mn,mx; parse_port_range(val,&mn,&mx); compile_match_port_range(L4OFF(2),mn,mx); }
             else if (strcmp(f,"gre-key")==0) compile_match_gre_key((uint32_t)atoi(val), mv);
             else if (strcmp(f,"gre-proto")==0) compile_match_gre_proto((uint32_t)atoi(val), mv);
             else if (strcmp(f,"arp-htype")==0) { start_match_block(); compile_match_core(14,2,htons(atoi(val)),0xFFFFFFFF,mv); }
@@ -6953,9 +7037,10 @@ int process_cmd(char *cmd, const char *dir) {
             else if (strcmp(f,"ip6-proto")==0) { start_match_block(); compile_match_core(20, 1, atoi(val), 0xFF, mv); }
             else if (strcmp(f,"ip6-tclass")==0) { start_match_block(); compile_match_core(14, 4, htonl(atoi(val) << 20), htonl(0x0FF00000), mv); }
             else if (strcmp(f,"ip6-flow")==0) { start_match_block(); compile_match_core(14, 4, htonl(atoi(val)), htonl(0x000FFFFF), mv); }
-            else if (strcmp(f,"icmp-type")==0) { start_match_block(); compile_match_core(34,1,atoi(val),0xFFFFFFFF,mv); }
+            else if (strcmp(f,"icmp-type")==0) { start_match_block(); compile_match_core(L4OFF(0),1,atoi(val),0xFFFFFFFF,mv); }
 	    else if (strcmp(a1,"len")==0) compile_match_skb_field(offsetof(struct __sk_buff, len), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
 	    else if (strcmp(a1,"queue")==0) compile_match_skb_field(offsetof(struct __sk_buff, queue_mapping), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
+	    else if (strcmp(a1,"protocol")==0 && mv) compile_match_skb_proto_var(mv);
 	    else if (strcmp(a1,"protocol")==0) compile_match_skb_field(offsetof(struct __sk_buff, protocol), htons(strtoul(val, NULL, 0)), 0xFFFFFFFF, mv);
 	    else if (strcmp(a1,"skb-mark")==0) compile_match_skb_field(offsetof(struct __sk_buff, mark), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-hash")==0) compile_match_skb_field(offsetof(struct __sk_buff, hash), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
@@ -6989,9 +7074,10 @@ int process_cmd(char *cmd, const char *dir) {
                     else if (strcmp(tok[k], "URG") == 0) flags_mask |= 0x20;
                     else fprintf(stderr, "Warning: Unknown TCP flag '%s'\n", tok[k]);
                 }
-                // Offset 47 is the TCP Flags byte (14 Eth + 20 IP + 13 TCP offset).
+                // The TCP flags byte is 13 bytes into the TCP header (any IHL; it
+                // was read at offset 47, wrong for packets with IP options).
                 // We mask the byte with our flags, and expect the result to equal our flags.
-                compile_match_core(47, 1, flags_mask, flags_mask, NULL);
+                compile_match_core(L4OFF(13), 1, flags_mask, flags_mask, NULL);
             }
 	    else if (strcmp(f, "val") == 0 && t > 4) {
 		 if (strcmp(tok[3],"gt") && strcmp(tok[3],"ge") && strcmp(tok[3],"lt") && strcmp(tok[3],"le") && strcmp(tok[3],"eq") && strcmp(tok[3],"ne") &&

@@ -19,7 +19,7 @@ import tempfile
 import pytest
 
 scapy_all = pytest.importorskip("scapy.all")
-from scapy.all import Ether, IP, IPv6, ICMP, ICMPv6EchoRequest, TCP, UDP, GRE, Dot1Q, Dot1AD, ARP, Raw, rdpcap, wrpcap  # noqa: E402
+from scapy.all import IPOption, Ether, IP, IPv6, ICMP, ICMPv6EchoRequest, TCP, UDP, GRE, Dot1Q, Dot1AD, ARP, Raw, rdpcap, wrpcap  # noqa: E402
 from scapy.contrib.mpls import MPLS  # noqa: E402
 
 if os.geteuid() != 0:
@@ -527,15 +527,15 @@ def test_match_ip_proto_len_frag():
 
 
 def test_get_tcp_win_and_offsets():
-    """get tcp-win, l4-off and payload-off (TCP options; the IPv4 offsets assume a 20-byte header)"""
+    """get tcp-win, l4-off and payload-off (IP and TCP options)"""
     bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match tcp; get tcp-win W; set tcp-dst %W; get l4-off O; set ip-tos %O; "
                 f"get payload-off P; set tcp-src %P'")
-    pkt = eth() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP(sport=1, dport=2, window=4321, options=[("NOP", None)] * 4)
+    pkt = eth() / opt_ip() / TCP(sport=1, dport=2, window=4321, options=[("NOP", None)] * 4)
     out = send_and_capture(pkt, "tcp")
     assert out is not None
     assert out[TCP].dport == 4321
-    assert out[IP].tos == 14 + 20
-    assert out[TCP].sport == 14 + 20 + 24          # TCP header 24 bytes with options
+    assert out[IP].tos == 14 + 24                  # IHL 6
+    assert out[TCP].sport == 14 + 24 + 24          # TCP header 24 bytes with options
 
 
 def test_gre_key_and_proto():
@@ -632,3 +632,71 @@ def test_ifkind_preprocessor_and_get_dev_type():
                 f"otherwise; set ip-tos 3; end-when'")
     out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2), "udp")
     assert tos_of(out) == 10
+
+
+# ---- IPv4 headers with options: L4 fields follow the real IHL ----
+
+IPOPT4 = [IPOption(b"\x01\x01\x01\x01")]          # 4 bytes of NOP: IHL 6
+IPOPT40 = [IPOption(b"\x01" * 40)]                 # IHL 15, the largest header
+
+
+def opt_ip(opts=IPOPT4, **kw):
+    return IP(src="10.0.0.1", dst="10.0.0.2", options=opts, **kw)
+
+
+@pytest.mark.parametrize("opts", [IPOPT4, IPOPT40], ids=["ihl6", "ihl15"])
+def test_ip_options_match_and_get_ports(opts):
+    """match tcp-dst / port range / tcp-flags and get tcp-src with IP options"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match tcp; match tcp-dst 4321; match tcp-src 1000-2000; "
+                f"match tcp-flags SYN; get tcp-src S; calc sub S 1200; set ip-tos %S'")
+    out = send_and_capture(eth() / opt_ip(opts) / TCP(sport=1234, dport=4321, flags="S"), "tcp")
+    assert out is not None and out[IP].ihl == 5 + sum(len(bytes(o)) for o in opts) // 4
+    assert out[IP].tos == 34
+
+
+def test_ip_options_no_false_match():
+    """with options, the fixed offset used to read option bytes as the port"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match tcp; match tcp-dst 257; set ip-tos 4'")
+    # bytes 36-37 (the old fixed tcp-dst) are 0x0101 = 257 here: option NOPs
+    out = send_and_capture(eth() / opt_ip() / TCP(sport=1234, dport=80), "tcp")
+    assert tos_of(out) == 0
+
+
+def test_ip_options_set_ports_keeps_checksum():
+    """set tcp-dst / udp-src with IP options: right bytes, valid L4 checksum"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress -p 100 'match tcp; set tcp-dst 8080'")
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress -p 200 'match udp; set udp-src 5353'")
+    out = send_and_capture(eth() / opt_ip() / TCP(sport=1234, dport=80) / b"hello", "tcp")
+    assert out is not None and out[TCP].dport == 8080 and out[IP].ihl == 6 and checksums_valid(out)
+    out = send_and_capture(eth() / opt_ip(IPOPT40) / UDP(sport=1, dport=2) / b"hello", "udp")
+    assert out is not None and out[UDP].sport == 5353 and out[UDP].dport == 2 and checksums_valid(out)
+
+
+def test_ip_options_icmp_type():
+    """match / set icmp-type with IP options"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match icmp; match icmp-type 8; set icmp-type 13'")
+    out = send_and_capture(eth() / opt_ip() / ICMP(type=8) / (b"x" * 40), "icmp")
+    assert out is not None and out[ICMP].type == 13 and checksums_valid(out)
+
+
+def test_ip_options_gre_key_and_checksum_bit():
+    """get/match gre-key with IP options and with the GRE checksum bit set"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match gre; match gre-proto 0x0800; match gre-key 77; get gre-key K; set ip-tos %K'")
+    for pkt in (eth() / opt_ip() / GRE(key_present=1, key=77, proto=0x0800) / IP(dst="1.2.3.4") / ICMP(),
+                eth() / IP(src="10.0.0.1", dst="10.0.0.2") / GRE(chksum_present=1, key_present=1, key=77, proto=0x0800) / IP(dst="1.2.3.4") / ICMP()):
+        out = send_and_capture(pkt, "ip proto gre")
+        assert tos_of(out) == 77
+
+
+def test_get_port_not_ipv4_is_zero():
+    """get tcp-dst on a non-IPv4 frame stores 0 (like get tcp-seq)"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match arp; decl P 2; set val P 9; get tcp-dst P; set arp-oper %P'")
+    out = send_and_capture(arp_request(), "arp")
+    assert out is not None and out[ARP].op == 0
+
+
+def test_match_protocol_variable():
+    """match protocol %VAR against the host-order value get protocol stores"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; get protocol P; match protocol %P; set ip-tos 4'")
+    out = send_and_capture(eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2), "udp")
+    assert tos_of(out) == 4
