@@ -47,6 +47,7 @@ mount -t bpf bpffs "$MAPS" || { echo "verifier-budget (cannot mount bpffs) SKIP"
 CASES="direct|--profile direct
 geo|--profile geo
 wan|--profile wan
+leo|--profile leo
 geo-largest|--profile geo --arq-depth 16384 --dup-window 16384 --fec-slots 64
 direct-smallest|--profile direct --arq-depth 1 --dup-window 1024 --fec-slots 16"
 

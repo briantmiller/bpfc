@@ -160,6 +160,8 @@ check "invalid value is an error" sh -c "$GEN --show-profile geo --fec-k 20 2>&1
 $GEN --profile-dir $PD --save-profile ship2 --profile ship --rtt 700ms >/dev/null
 check "save-profile round trip" sh -c "grep -q '^inherit = ship' $PD/ship2.profile && $GEN --profile-dir $PD --show-profile ship2 | grep -q '^rtt *= 700ms *# profile ship2'"
 check "plain numbers keep their old units" sh -c "$GEN -i x0 -o - --fec-cooldown 5 --report-interval 750 | grep -q 'cooldown_ms=5000 .*report_ms=750'"
+check "leo profile: 5 s probes, no backoff, 15 s capacity window" sh -c "$GEN --list-profiles | grep -q '^leo ' && $GEN -i x0 -o - --profile leo | grep -q 'probe_ms=5000 backoff=1 .*cap_window_ms=15000'"
+check "capacity-window: off by default, checked" sh -c "$GEN -i x0 -o - | grep -q 'cap_window_ms=0' && $GEN -i x0 -o - --capacity-window 50ms 2>&1 | grep -q 'capacity-window must be'"
 
 echo "== bpfc helpers"
 A $BPFC -m $MAPS -i dpa0 -d egress -p 100 'match ip; insert-l2 8 0x88B5; set bytes 14 8 0x0102030405060708; continue' >/dev/null
@@ -447,6 +449,22 @@ check "packet pairs measure each direction: B -> A ~10 Mbit/s ($ca kbit/s), A ->
 B ping -c 15 -i 0.1 -s 56 -q 10.77.2.1 >/dev/null
 n=$(v ${MP_dps0}_rx 43); want=$(cap_expected ${MP_dps0}_rx)
 check "capacity estimate with $n samples is the sample the count calls for ($(v ${MP_dps0}_rx 19) kbit/s, want $want)" [ "$(v ${MP_dps0}_rx 19)" -eq "${want:-0}" ]
+# capacity-window: after B -> A drops from 10 to 5 Mbit/s, A's estimate
+# follows within the window; the 16-sample ring alone would keep 10 Mbit/s
+# until 13 new samples are in
+$STATUS -m $MAPS -c $CONF/$NSA set dps0 capacity-window 2s >/dev/null
+kill $EMU_PID 2>/dev/null; wait $EMU_PID 2>/dev/null
+for i in $(seq 25); do pgrep -f "^python3 -I tests/link-emulator.py dpm0 dpm1" >/dev/null || break; sleep 0.2; done
+ip netns exec $NSM python3 -I tests/link-emulator.py dpm0 dpm1 50 --a2b rate=20m,jitter=5 --b2a rate=5m,jitter=5 2> $CONF/emulator.log & EMU_PID=$!
+sleep 0.5
+A ping -c 160 -i 0.025 -s 1200 -q 10.77.2.2 >/dev/null & PA=$!
+B ping -c 160 -i 0.025 -s 1200 -q 10.77.2.1 >/dev/null
+wait $PA
+B ping -c 15 -i 0.1 -s 56 -q 10.77.2.1 >/dev/null      # a report, no new sample
+ca5=$(v ${MP_dps0}_rx 19); used=$(v ${MP_dps0}_rx 57)
+check "capacity-window 2s: B -> A estimate follows 10 -> 5 Mbit/s ($ca5 kbit/s from $used samples)" [ "$ca5" -ge 3500 -a "$ca5" -le 7000 ]
+check "status shows the window" sh -c "$STATUS -m $MAPS -c $CONF/$NSA -d dps0 | grep -q 'in the last 2.0 s)' && $STATUS -m $MAPS -c $CONF/$NSA -j dps0 | grep -q '\"capacityWindowMsec\": 2000'"
+$STATUS -m $MAPS -c $CONF/$NSA unset dps0 capacity-window >/dev/null
 check "the sender sees the peer's measurement of its direction" [ "$(v ${MP_dps0}_tx 36)" -ge 16000 -a "$(v ${MP_dps1}_tx 36)" -le 13500 ]
 
 echo

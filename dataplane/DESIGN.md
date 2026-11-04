@@ -21,14 +21,16 @@ reports back, and the sender adapts:
   probes per second) the sender sends one packet twice back to back. The
   receiver turns the gap between the copies, and the bytes that arrived in
   it, into a capacity sample for that direction; the estimate is a high
-  percentile of the last 16 samples. Probes are sent less often (×6) while
-  FEC is on. The estimate,
+  percentile of the last 16 samples, or of those taken in the last
+  `capacity-window` (for links whose capacity changes on a schedule, such as
+  a LEO terminal moving to another satellite). Probes are sent less often
+  (×6, `probe-backoff`) while FEC is on. The estimate,
   together with the queueing delay, tells loss caused by congestion apart
   from loss on the line. When the link is congested, FEC uses a fixed ratio
   instead of scaling up and adding more traffic.
 
 Each interface has its own maps (`<prefix>_*`, see [Map names](#map-names)),
-so several links run independently. Profiles (`direct`, `wan`, `geo`, or your own) set the
+so several links run independently. Profiles (`direct`, `wan`, `geo`, `leo`, or your own) set the
 defaults for a kind of link; see [Profiles and sizing](#profiles-and-sizing).
 
 ## Files
@@ -162,6 +164,7 @@ and every effective value in their header, and the status script shows them.
 | `direct` | 1 Gbit/s, 1 ms | FEC on at 1 % loss, ARQ for the last 3 packets while FEC is on |
 | `wan` | 1 Gbit/s, 30 ms | FEC on at 1 %, ARQ for the last 50 ms while FEC is on |
 | `geo` | 20 Mbit/s, 800 ms | FEC always on, at least 1:15, up to 1:4; ARQ answers everything it holds; reports every 500 ms; congestion delay 150 ms |
+| `leo` | 100 Mbit/s, 60 ms | FEC on at 1 %, off after 30 s; reports every 250 ms; congestion delay 50 ms; probes every 5 s, not slowed while FEC is on; capacity from the last 15 s of samples (a satellite handover about every 15 s) |
 
 Carrier, interleaving and DSCP-aware ARQ (from the profile discussion) are
 not built yet; the profiles use the L2 carrier for now.
@@ -337,8 +340,13 @@ starts again.
 - Duplicates are caught with a test-and-set bitmap covering 1024 sequences:
   one word per 64 sequences in the `_dup` array map (window sized as above),
   atomic `calc-map or`.
-- A forward jump over 4096, or a backward jump on a sequence flagged as
-  restarted, resynchronises without counting loss (peer reboot). The report
+- A forward jump over 16,384, or a backward jump on a sequence flagged as
+  restarted (by 64 or more, or below the sequence this receiver started at,
+  `_rx` 58), resynchronises without counting loss (peer reboot). The second
+  case is a peer reinstalled while its old instance's packets were still in
+  flight: the receiver started on one of those, and the new instance's first
+  packets looked late, which took them off the raw loss and hid the gaps
+  among them (about 1 % less loss on a 3 % link). The report
   window across a resync is empty: it used to wrap to an enormous window
   with no loss, which replaced both loss estimates with ~0 for minutes
   (the sender also ignores a window of 2^32 packets or more from an older
@@ -411,6 +419,19 @@ shrinks one, so the estimate is right while at least 4 of 16 pairs got
 through cleanly and no more than 3 were squeezed. A pair open for more than
 1 s is abandoned. The old estimator (an average of single samples) settled
 near half the rate on a link where half the pairs were stretched by jitter.
+
+**Capacity window.** The 16 samples span 160 s at the default probe
+interval, so after the capacity changes the estimate keeps the old value
+for minutes (longer while FEC slows the probes). With `capacity-window`
+set, each sample's time is kept too (`_rx` 76–91), and the probe program
+clears every sample older than the window before counting the rest
+(`_rx` 57); the report program then takes the same share from the top of
+those. The `leo` profile probes every 5 s with a 15 s window, so the
+estimate follows each satellite after two or three probes and never mixes
+in the previous one. With no sample in the window the last estimate stays.
+A window shorter than the probe interval is allowed (the generator warns):
+then only the newest sample counts. Runtime: `bpfc-dataplane-status set
+capacity-window 15s` (or `off`).
 
 **Reports.** Sent every `report-interval` while data arrives. Each report
 covers the last window:
@@ -489,8 +510,8 @@ status script decodes them with `bpfc -r`.
 | 39 / 40 | loss / residual loss estimate, 1/100 bp | 41 | packets in the loss estimate |
 | 42 / 43 | bytes in the open pair / pairs measured | 52 | last capacity sample, kbit/s |
 | 49 | last time the inbound residual estimate was ≥ 1 % (ms) | 53–56 | four largest capacity samples |
-| 60–75 | last 16 capacity samples, kbit/s | | |
-| | | | |
+| 57 | capacity samples in use (in the window) | 58 | sequence this receiver started or resynced at |
+| 60–75 | last 16 capacity samples, kbit/s | 76–91 | when each was taken (ms) |
 
 `<prefix>_cfg` holds runtime overrides; 0 or missing means the generated
 value. Use `bpfc-dataplane-status set`, or `bpfc -w <prefix>_cfg <key> <value>`.
@@ -504,6 +525,7 @@ value. Use `bpfc-dataplane-status set`, or `bpfc -w <prefix>_cfg <key> <value>`.
 | 8 | ARQ with FEC: 1 keep, 2 off, 3 last N | 13 | minimum probe size, bytes |
 | 14 | FEC mode: 1 off, 2 on, 3 auto | 15 | congestion: queueing delay, ms |
 | 16 | FEC floor: 1–15, or 16 for none | 17 | loss-smoothing, packets |
+| 18 | capacity window, ms (≥ 1 day: off) | | |
 
 Also: `<prefix>_pcpu` (FEC block per CPU), `<prefix>_arq` (ring × 1504
 bytes), `<prefix>_ftx` (per-CPU 1504 bytes), `<prefix>_frx` (slots × 1504
