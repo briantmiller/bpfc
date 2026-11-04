@@ -2,7 +2,7 @@
 # bpfc-dataplane-status - link quality and what the FEC / ARQ / INT dataplane
 # is doing about it, per interface. Reads the dataplane maps with "bpfc -r".
 #
-#   bpfc-dataplane-status [options] [interface...]
+#   bpfc-dataplane-status [options] [interface...] [detail] [json]
 #   bpfc-dataplane-status set <interface> <setting> <value>
 #   bpfc-dataplane-status unset <interface> <setting>
 #
@@ -13,21 +13,31 @@ CONF=/etc/bpfc/bpfc.conf
 CONFIG_DIR=""
 MAP_DIR=""
 ONELINE=0
+MODE=table     # table (default), detail, json, kv (-1)
+ROWS=()        # table rows, tab-separated
+JSON_IF=()     # "name": {...} per interface
 
 usage() {
 cat <<EOF
-Usage: $(basename "$0") [-m map_dir] [-c config_dir] [-1] [interface...]
+Usage: $(basename "$0") [-m map_dir] [-c config_dir] [-d|-j|-1] [interface...] [detail] [json]
        $(basename "$0") set <interface> <setting> <value>
        $(basename "$0") unset <interface> <setting>
 
 Shows, for each interface running the dataplane (all of them by default):
 the peer, the quality of the link in each direction, and what FEC, ARQ and
-probing are doing.
+probing are doing. By default one table row per interface; "detail" gives
+the full report, "json" the same data as JSON (as in FRR's show commands).
 
   -m DIR   pinned map directory (default: map_dir in $CONF, else /sys/fs/bpf)
   -c DIR   program directory (default: config_dir in $CONF, else /etc/bpfc/interfaces.d)
+  -d       detailed report per interface (also: the word "detail" or --detail)
+  -j       JSON (also: the word "json" or --json)
   -1       one line of key=value per interface, for monitoring
   -h       help
+
+Table columns: loss is the average over the last loss-smoothing packets;
+"Left" is what is still lost after FEC and ARQ repaired it; Out is this
+interface's sending direction (measured by the peer), In the receiving one.
 
 Settings for set/unset (take effect at once, survive program reloads,
 "unset" returns to the generated value):
@@ -138,6 +148,32 @@ mac() {        # MAC stored as the 6 packet bytes in a little-endian u64
     for i in 0 1 2 3 4 5; do out+=$(printf "%02x" $(((v >> (8 * i)) & 255))); [ $i -lt 5 ] && out+=":"; done
     echo "$out"
 }
+
+# compact forms for the table
+cpct() { printf "%d.%02d%%" $(($1 / 100)) $(($1 % 100)); }        # bp -> "3.53%"
+crate() {      # kbit/s -> "20.3M" / "950k" / "1.2G", "-" when 0
+    local k=$1
+    if   [ "$k" -le 0 ];       then echo "-"
+    elif [ "$k" -ge 1000000 ]; then printf "%d.%dG" $((k / 1000000)) $((k % 1000000 / 100000))
+    elif [ "$k" -ge 1000 ];    then printf "%d.%dM" $((k / 1000)) $((k % 1000 / 100))
+    else printf "%dk" "$k"; fi
+}
+cdur() {       # microseconds -> "712ms" / "4.1ms" / "250us" / "12s", "-" when 0
+    local u=$1
+    if   [ "$u" -le 0 ];        then echo "-"
+    elif [ "$u" -ge 10000000 ]; then printf "%ds" $((u / 1000000))
+    elif [ "$u" -ge 10000 ];    then printf "%dms" $((u / 1000))
+    elif [ "$u" -ge 1000 ];     then printf "%d.%dms" $((u / 1000)) $((u % 1000 / 100))
+    else printf "%dus" "$u"; fi
+}
+
+# JSON helpers
+jstr() {       # a JSON string
+    local s=$1
+    s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\t'/\\t}; s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}
+    printf '"%s"' "$s"
+}
+jbool() { [ "$1" -ne 0 ] && echo true || echo false; }
 
 # ---------------------------------------------------------------- set / unset
 
@@ -256,13 +292,11 @@ show() {
     now=$(now_ms)
 
     if [ ! -e "$MAP_DIR/${prefix}_tx" ]; then
-        if [ $ONELINE -eq 1 ]; then echo "$ifkv health=\"NOT RUNNING\""
-        else echo "$ifc  NOT RUNNING - no map ${prefix}_tx in $MAP_DIR (programs not installed?)"; echo; fi
+        not_up "NOT RUNNING" "no map ${prefix}_tx in $MAP_DIR (programs not installed?)"
         return
     fi
     if [ ${#TX[@]} -eq 0 ] && [ ${#RX[@]} -eq 0 ]; then
-        if [ $ONELINE -eq 1 ]; then echo "$ifkv health=\"IDLE\""
-        else echo "$ifc  IDLE - installed, no traffic yet"; echo; fi
+        not_up "IDLE" "installed, no traffic yet"
         return
     fi
 
@@ -366,6 +400,10 @@ show() {
         health="DEGRADED"; why="$(pct $worst_loss) loss on the link, being repaired (recovering)"
     else why="loss below $(pct ${SET[fec_bp]})"; fi
 
+    case $MODE in
+        table) emit_row; return ;;
+        json)  emit_json; return ;;
+    esac
     if [ $ONELINE -eq 1 ]; then
         echo "$ifkv health=\"$health\" peer=$(mac $peer) peer_state=\"$peer_state\" out_loss_bp=$o_loss out_residual_bp=$o_res out_loss_window_bp=$(g TX 32) out_loss_packets=$(g TX 48) out_jitter_us=$o_jit out_queue_us=$o_owd rtt_us=$o_rtt capacity_kbps=$o_cap rate_kbps=$o_rate utilisation_pct=$o_util congested=$o_cong repair_failing=$(g TX 50) fec=$fec fec_k=$K parity=$(g TX 9) retransmitted=$(g TX 13) retx_unavailable=$(g TX 14) retx_suppressed=$(g TX 15) in_loss_bp=$i_loss in_residual_bp=$i_res in_loss_window_bp=$(g RX 27) in_loss_packets=$(g RX 41) in_capacity_samples=$(g RX 20) in_capacity_last_kbps=$(g RX 52) in_jitter_us=$i_jit in_queue_us=$i_owd in_capacity_kbps=$i_cap fec_rebuilt=$(g RX 6) arq_recovered=$(g RX 7) fec_failed=$(g RX 8) fec_bad=$(g RX 34) reordered=$(g RX 4) duplicates=$(g RX 3) redundant_repairs=$(( $(g RX 37) + $(g RX 38) )) peer_fec_k=$(g RX 30) bypassed=$(g TX 4) resyncs=$(g RX 36) profile=${SET[profile]} sized_rate_bps=${SET[link_rate]} sized_rtt_ms=${SET[rtt_ms]} arq_depth=${SET[arq_depth]} arq_needed=$need_arq dup_window=$(( SET[dup_words] * 64 )) dup_needed=$need_dup sizing_ok=$( [ -z "$size_warn" ] && echo 1 || echo 0 )"
         return
@@ -447,22 +485,147 @@ show() {
     echo
 }
 
+# An interface without a running dataplane, in every format.
+not_up() {     # not_up <health> <why>   (uses show's ifc, ifkv, prefix)
+    case $MODE in
+        kv)     echo "$ifkv health=\"$1\"" ;;
+        table)  ROWS+=($'\t'"$ifc"$'\t-\t-\t'"$1"$'\t-\t-\t-\t-\t-\t-\t-\t-\t-') ;;
+        json)   JSON_IF+=("$(jstr "$ifc"): {\"maps\": $(jstr "$prefix"), \"health\": $(jstr "$1"), \"healthReason\": $(jstr "$2")}") ;;
+        *)      echo "$ifc  $1 - $2"; echo ;;
+    esac
+}
+
+# One table row (uses show's locals: bash functions see their caller's).
+emit_row() {
+    local flags="" st oL oR iL iR fecc pm="-"
+    [ "$K" -gt 0 ] && [ "$o_cong" -eq 1 ] && flags+="*"
+    [ "$(g TX 50)" -eq 1 ] && flags+="!"
+    [ -n "$size_warn" ] && flags+="S"
+    case "$peer_state" in
+        up) st=Up ;;
+        "never seen") st=Never ;;
+        *) st="Silent $(age $((now - seen)))"; st=${st// /}; st=${st/Silent/Silent } ;;
+    esac
+    [ "$peer" -ne 0 ] && pm=$(mac $peer)
+    if [ "$r_last" -gt 0 ]; then oL=$(cpct $o_loss); oR=$(cpct $o_res); else oL=-; oR=-; fi
+    if [ "$d_last" -gt 0 ]; then iL=$(cpct $i_loss); iR=$(cpct $i_res); else iL=-; iR=-; fi
+    if [ "$K" -gt 0 ]; then fecc="1:$K"; else fecc=off; fi
+    local IFS=$'\t'
+    ROWS+=("$flags	$ifc	$pm	$st	$health	$oL	$oR	$iL	$iR	$(cdur $o_rtt)	$(crate $o_cap)	$(crate $i_cap)	$(crate $o_rate)	$fecc")
+}
+
+print_table() {
+    [ ${#ROWS[@]} -gt 0 ] || return
+    echo "Codes: * - fixed FEC ratio, the link looks congested"
+    echo "       ! - the most parity still leaves loss (the link looks full)"
+    echo "       S - buffers too small for the measured RTT and rate (see detail)"
+    echo
+    { printf '\tInterface\tPeer\tState\tHealth\tOut Loss\tOut Left\tIn Loss\tIn Left\tRTT\tOut Cap\tIn Cap\tSending\tFEC\n'
+      printf '%s\n' "${ROWS[@]}"; } |
+    awk -F'\t' '
+        { n = NF; for (i = 1; i <= NF; i++) { c[NR, i] = $i; if (length($i) > w[i]) w[i] = length($i) } }
+        END {
+            for (r = 1; r <= NR; r++) {
+                line = ""
+                for (i = 1; i <= n; i++) {
+                    if (i == 1 && w[1] == 0) continue          # no flags at all: no column
+                    if (i < n) line = line sprintf("%-*s  ", w[i], c[r, i]); else line = line c[r, i]
+                }
+                sub(/ +$/, "", line); print line
+            }
+        }'
+}
+
+# One interface as JSON (uses show's locals). Names follow FRR's JSON style:
+# camelCase, units in the name.
+emit_json() {
+    local j fresh_o=$out_fresh fresh_i=$in_fresh warn="null" plast=$(g TX 10) piv=${SET[probe_ms]}
+    [ "$K" -gt 0 ] && piv=$((piv * SET[backoff]))
+    [ -n "$size_warn" ] && warn=$(jstr "$size_warn")
+    local fmode=auto; [ "${SET[fec_mode]}" = 1 ] && fmode=off; [ "${SET[fec_mode]}" = 2 ] && fmode=on
+    local amode=limited; [ "${SET[arq_mode]}" = 1 ] && amode=keep; [ "${SET[arq_mode]}" = 2 ] && amode=off
+    local byp=$(g TX 4) sent=$(g TX 2) bpct=0
+    [ $((byp + sent)) -gt 0 ] && bpct=$(( byp * 100 / (byp + sent) ))
+    j="$(jstr "$ifc"): {"
+    j+="\"maps\": $(jstr "$prefix"), \"health\": $(jstr "$health"), \"healthReason\": $(jstr "$why"), "
+    j+="\"profile\": {\"name\": $(jstr "${SET[profile]}"), \"sizedRateBps\": ${SET[link_rate]}, \"sizedRttMsec\": ${SET[rtt_ms]}, "
+    j+="\"arqDepth\": ${SET[arq_depth]}, \"dupWindow\": $(( SET[dup_words] * 64 )), \"fecSlots\": ${SET[fec_slots]}}, "
+    j+="\"peer\": {\"mac\": $( [ "$peer" -ne 0 ] && jstr "$(mac $peer)" || echo null ), \"state\": $(jstr "$peer_state"), "
+    j+="\"lastSeenMsec\": $( [ "$seen" -gt 0 ] && echo $((now - seen)) || echo null ), "
+    j+="\"lastReportMsec\": $( [ "$r_last" -gt 0 ] && echo $((now - r_last)) || echo null ), \"reportsReceived\": $r_cnt}, "
+    j+="\"outbound\": {\"current\": $(jbool $fresh_o), \"lossBp\": $o_loss, \"residualBp\": $o_res, \"lossWindowBp\": $(g TX 32), "
+    j+="\"lossPackets\": $(g TX 48), \"rttUsec\": $o_rtt, \"queueUsec\": $o_owd, \"jitterUsec\": $o_jit, "
+    j+="\"capacityKbps\": $o_cap, \"rateKbps\": $o_rate, \"utilisationPct\": $o_util, \"congested\": $(jbool $o_cong), "
+    j+="\"repairFailing\": $(jbool $(g TX 50)), \"fecRebuilt\": $(g TX 39), \"arqRecovered\": $(g TX 40), "
+    j+="\"lost\": $(g TX 41), \"packets\": $(g TX 31)}, "
+    j+="\"fec\": {\"state\": $(jstr $fec), \"mode\": $(jstr $fmode), \"ratio\": $K, \"thresholdBp\": ${SET[fec_bp]}, "
+    j+="\"onSinceMsec\": $( [ "$K" -gt 0 ] && [ "$since" -gt 0 ] && echo $((now - since)) || echo null ), "
+    j+="\"cooldownMsec\": ${SET[cooldown_ms]}, \"cooldownLeftMsec\": $( [ "$cool_left" -gt 0 ] && echo $cool_left || echo null ), "
+    j+="\"floor\": ${SET[floor]}, \"paritySent\": $(g TX 9), \"protectedPackets\": $(g TX 24), \"sentEarly\": $(g TX 23), "
+    j+="\"summary\": $(jstr "$fec_txt")}, "
+    j+="\"arq\": {\"withFec\": $(jstr $amode), \"depth\": ${SET[arq_depth]}, \"depthWithFec\": ${SET[arq_fec_depth]}, "
+    j+="\"retransmitted\": $(g TX 13), \"noLongerHeld\": $(g TX 14), \"suppressedByFec\": $(g TX 15), \"naksReceived\": $(g TX 12)}, "
+    j+="\"probing\": {\"intervalMsec\": $piv, \"lastMsec\": $( [ "$plast" -gt 0 ] && echo $((now - plast)) || echo null ), "
+    j+="\"sent\": $(g TX 11), \"minBytes\": ${SET[probe_min]}}, "
+    j+="\"unprotected\": {\"packets\": $byp, \"pct\": $bpct}, "
+    j+="\"inbound\": {\"current\": $(jbool $fresh_i), \"lossBp\": $i_loss, \"residualBp\": $i_res, \"lossWindowBp\": $(g RX 27), "
+    j+="\"lossPackets\": $(g RX 41), \"queueUsec\": $i_owd, \"jitterUsec\": $i_jit, \"capacityKbps\": $i_cap, "
+    j+="\"capacitySamples\": $(g RX 20), \"capacityLastKbps\": $(g RX 52), \"fecRebuilt\": $(g RX 6), \"arqRecovered\": $(g RX 7), "
+    j+="\"fecFailed\": $(g RX 8), \"fecBad\": $(g RX 34), \"packets\": $(g RX 2), \"reordered\": $(g RX 4), "
+    j+="\"duplicates\": $(g RX 3), \"naksSent\": $(g RX 10), \"lateRepairs\": $(( $(g RX 37) + $(g RX 38) )), "
+    j+="\"peerFecRatio\": $(g RX 30), \"resyncs\": $(g RX 36)}, "
+    j+="\"sizing\": {\"ok\": $( [ -z "$size_warn" ] && echo true || echo false ), \"warning\": $warn, "
+    j+="\"arqNeeded\": $need_arq, \"dupNeeded\": $need_dup}}"
+    JSON_IF+=("$j")
+}
+
+print_json() {   # pretty-printed like FRR (2-space indent), no jq needed
+    local i sep=""
+    { printf '{"interfaces": {'
+      for i in "${JSON_IF[@]}"; do printf '%s%s' "$sep" "$i"; sep=", "; done
+      printf '}}'; } |
+    awk 'BEGIN { RS = "\001" }
+        function nl() { out = out "\n" sprintf("%*s", 2 * d, "") }
+        {
+            n = length($0); out = ""; d = 0; instr = 0
+            for (i = 1; i <= n; i++) {
+                c = substr($0, i, 1)
+                if (instr) { out = out c; if (c == "\\") { i++; out = out substr($0, i, 1) } else if (c == "\"") instr = 0; continue }
+                if (c == "\"") { instr = 1; out = out c }
+                else if (c == "{") { if (substr($0, i + 1, 1) == "}") { out = out "{}"; i++ } else { d++; out = out c; nl() } }
+                else if (c == "}") { d--; nl(); out = out c }
+                else if (c == ",") { out = out c; nl(); if (substr($0, i + 1, 1) == " ") i++ }
+                else if (c == ":") { out = out ": "; if (substr($0, i + 1, 1) == " ") i++ }
+                else if (c != "\n") out = out c
+            }
+            print out
+        }'
+}
+
 # ---------------------------------------------------------------- main
 
 cmd=show
 parse_opts() {
     local o OPTIND=1
-    while getopts "m:c:1h" o; do
+    while getopts "m:c:1djh" o; do
         case "$o" in
             m) MAP_DIR="$OPTARG" ;;
             c) CONFIG_DIR="$OPTARG" ;;
-            1) ONELINE=1 ;;
+            1) ONELINE=1; MODE=kv ;;
+            d) MODE=detail ;;
+            j) MODE=json ;;
             h) usage; exit 0 ;;
             *) usage >&2; exit 2 ;;
         esac
     done
     SHIFT=$((OPTIND - 1))
 }
+# long forms
+args=()
+for a in "$@"; do
+    case "$a" in --detail) args+=(-d) ;; --json) args+=(-j) ;; --help) args+=(-h) ;; *) args+=("$a") ;; esac
+done
+set -- "${args[@]}"
 # options may come before or after set/unset
 parse_opts "$@"; shift $SHIFT
 if [ "$1" = set ] || [ "$1" = unset ]; then
@@ -480,8 +643,22 @@ case "$cmd" in
     set)   [ $# -eq 3 ] || { usage >&2; exit 2; }; do_set "$1" "$2" "$3" ;;
     unset) [ $# -eq 2 ] || { usage >&2; exit 2; }; do_set "$1" "$2" unset ;;
     show)
-        ifaces=("$@")
+        # FRR style: "detail" and "json" may follow the interface names
+        ifaces=()
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                detail) MODE=detail ;;
+                json)   MODE=json ;;
+                -*)     parse_opts "$@"; shift $SHIFT; continue ;;
+                *)      ifaces+=("$1") ;;
+            esac
+            shift
+        done
         [ ${#ifaces[@]} -gt 0 ] || mapfile -t ifaces < <(list_ifaces)
         [ ${#ifaces[@]} -gt 0 ] || die "no dataplane programs found in $CONFIG_DIR (give interface names)"
-        for i in "${ifaces[@]}"; do show "$i"; done ;;
+        for i in "${ifaces[@]}"; do show "$i"; done
+        case $MODE in
+            table) print_table ;;
+            json)  print_json ;;
+        esac ;;
 esac

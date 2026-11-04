@@ -47,9 +47,30 @@ bpfc-dataplane-gen --list-profiles
 bpfc-dataplane-gen --show-profile geo --rtt 650ms     # effective settings and sizes
 bpfc-dataplane-gen -i eth0 --setup-hints              # link settings, below
 systemctl reload bpfcd
-bpfc-dataplane-status [-1] [eth0 ...]
+bpfc-dataplane-status [eth0 ...] [detail|json]       # or -d / -j; -1 for key=value lines
 bpfc-dataplane-status set eth0 fec-threshold 2      # unset eth0 fec-threshold
 ```
+
+The default output is a table, one row per interface, in the style of FRR's
+`show ... neighbor`:
+
+```
+Codes: * - fixed FEC ratio, the link looks congested
+       ! - the most parity still leaves loss (the link looks full)
+       S - buffers too small for the measured RTT and rate (see detail)
+
+Interface  Peer               State  Health    Out Loss  Out Left  In Loss  In Left  RTT    Out Cap  In Cap  Sending  FEC
+wan1.100   9e:d0:51:82:ba:0f  Up     DEGRADED  3.53%     0.42%     4.06%    0.48%    712ms  20.3M    10.0M   8.0M     1:7
+```
+
+Loss is the average over the last `loss-smoothing` packets, Left what is
+still lost after FEC and ARQ; Out is the interface's sending direction (as
+the peer measured it), In the receiving one. The flags column appears only
+when a row has a flag. `detail` (or `-d`) gives the full report per
+interface; `json` (or `-j`) the same data as one JSON document,
+`{"interfaces": {"<name>": {...}}}`, with FRR-style camelCase names and the
+unit in the name (`lossBp`, `rttUsec`, `capacityKbps`, `lastReportMsec`).
+`-1` prints the older key=value line per interface, unchanged.
 
 Health, from the loss estimates (averages over `loss-smoothing` packets,
 not single report windows) of both directions: **POOR** when 1 % or more
