@@ -160,7 +160,8 @@ check "invalid value is an error" sh -c "$GEN --show-profile geo --fec-k 20 2>&1
 $GEN --profile-dir $PD --save-profile ship2 --profile ship --rtt 700ms >/dev/null
 check "save-profile round trip" sh -c "grep -q '^inherit = ship' $PD/ship2.profile && $GEN --profile-dir $PD --show-profile ship2 | grep -q '^rtt *= 700ms *# profile ship2'"
 check "plain numbers keep their old units" sh -c "$GEN -i x0 -o - --fec-cooldown 5 --report-interval 750 | grep -q 'cooldown_ms=5000 .*report_ms=750'"
-check "leo profile: 5 s probes, no backoff, 15 s capacity window" sh -c "$GEN --list-profiles | grep -q '^leo ' && $GEN -i x0 -o - --profile leo | grep -q 'probe_ms=5000 backoff=1 .*cap_window_ms=15000'"
+check "leo profile: 3 s probes, no backoff, 20 ms trains, median of 15 s" sh -c "$GEN --list-profiles | grep -q '^leo ' && $GEN -i x0 -o - --profile leo | grep -q 'probe_ms=3000 backoff=1 .*cap_window_ms=15000 train_ms=20 train_max=256 train_skip=10 cap_pct=50'"
+check "probe-train: pairs by default, checked" sh -c "$GEN -i x0 -o - | grep -q 'train_ms=0 ' && $GEN -i x0 -o - --probe-train 1ms 2>&1 | grep -q 'probe-train must be'"
 check "capacity-window: off by default, checked" sh -c "$GEN -i x0 -o - | grep -q 'cap_window_ms=0' && $GEN -i x0 -o - --capacity-window 50ms 2>&1 | grep -q 'capacity-window must be'"
 
 echo "== bpfc helpers"
@@ -466,6 +467,61 @@ check "capacity-window 2s: B -> A estimate follows 10 -> 5 Mbit/s ($ca5 kbit/s f
 check "status shows the window" sh -c "$STATUS -m $MAPS -c $CONF/$NSA -d dps0 | grep -q 'in the last 2.0 s)' && $STATUS -m $MAPS -c $CONF/$NSA -j dps0 | grep -q '\"capacityWindowMsec\": 2000'"
 $STATUS -m $MAPS -c $CONF/$NSA unset dps0 capacity-window >/dev/null
 check "the sender sees the peer's measurement of its direction" [ "$(v ${MP_dps0}_tx 36)" -ge 16000 -a "$(v ${MP_dps1}_tx 36)" -le 13500 ]
+
+echo "== framed link (Starlink-like): trains vs pairs"
+# As FRR's satrelay test bed: traffic leaves in 1.33 ms frames; every 15 s
+# (at :12, :27, :42, :57) the rate is drawn again, +/- 40 %, and 30 % of the
+# packets are lost for 200 ms. A -> B 40 Mbit/s ("down"), B -> A 15 Mbit/s
+# ("up"), 20 ms each way. The estimate's median over the run is compared
+# with the median of the true rates at the same moments.
+FRAMED="frame=1.33,redraw=15,vary=40,burst=30:200"
+# framed_run <seconds> [generator options]: traffic both ways, A's and B's
+# estimate (of the direction they receive) sampled every 0.5 s after 9 s
+framed_run() {
+    local secs=$1; shift
+    kill $EMU_PID 2>/dev/null
+    pkill -f "^python3 -I tests/link-emulator.py dpm0 dpm1" 2>/dev/null
+    for i in $(seq 25); do pgrep -f "^python3 -I tests/link-emulator.py dpm0 dpm1" >/dev/null || break; sleep 0.2; done
+    pkill -9 -f "^python3 -I tests/link-emulator.py dpm0 dpm1" 2>/dev/null
+    wait $EMU_PID 2>/dev/null
+    rm -f $CONF/rate-ab $CONF/rate-ba $CONF/est-a $CONF/est-b
+    ip netns exec $NSM python3 -I tests/link-emulator.py dpm0 dpm1 20 \
+        --a2b rate=40m,$FRAMED,ratelog=$CONF/rate-ab --b2a rate=15m,$FRAMED,ratelog=$CONF/rate-ba 2> $CONF/emulator.log & EMU_PID=$!
+    sleep 0.5
+    install $NSA dps0 --profile leo "$@" && install $NSB dps1 --profile leo "$@" || { check "framed: install" false; return 1; }
+    A ping -c $((secs * 50)) -i 0.02 -s 1200 -q 10.77.2.2 >/dev/null & local PA=$!
+    B ping -c $((secs * 50)) -i 0.02 -s 1200 -q 10.77.2.1 >/dev/null & local PB=$!
+    sleep 9
+    local end=$(( $(date +%s) + secs - 10 ))
+    while [ "$(date +%s)" -lt $end ]; do
+        echo "$(date +%s.%N) $(v ${MP_dps1}_rx 19)" >> $CONF/est-b     # A -> B, measured by B
+        echo "$(date +%s.%N) $(v ${MP_dps0}_rx 19)" >> $CONF/est-a     # B -> A, measured by A
+        sleep 0.5
+    done
+    wait $PA $PB
+}
+# framed_ratio <estimates> <rate log>: median estimate * 100 / median true rate
+framed_ratio() {
+    awk 'NR == FNR { t[NR] = $1; r[NR] = $2 / 1000; n = NR; next }
+         $2 > 0 { rate = 0; for (i = 1; i <= n; i++) if (t[i] <= $1) rate = r[i]
+                  if (rate > 0) { e[++m] = $2; q[m] = rate } }
+         function med(a, k,   i, j, x) { for (i = 2; i <= k; i++) { x = a[i]; for (j = i - 1; j > 0 && a[j] > x; j--) a[j + 1] = a[j]; a[j + 1] = x } return a[int((k + 1) / 2)] }
+         END { if (m < 5) { print 0; exit } me = med(e, m); mq = med(q, m); printf "%d %d %d\n", me * 100 / mq, me, mq }' "$2" "$1"
+}
+framed_run 50 --probe-train 0 --capacity-percentile 0
+read pr_b pe_b pq_b < <(framed_ratio $CONF/est-b $CONF/rate-ab)
+read pr_a pe_a pq_a < <(framed_ratio $CONF/est-a $CONF/rate-ba)
+check "pairs on a framed link read too fast: down ${pe_b:-0} for ${pq_b:-0} kbit/s ($pr_b %), up ${pe_a:-0} for ${pq_a:-0} ($pr_a %)" [ "${pr_a:-0}" -ge 140 ]
+framed_run 50
+read tr_b te_b tq_b < <(framed_ratio $CONF/est-b $CONF/rate-ab)
+read tr_a te_a tq_a < <(framed_ratio $CONF/est-a $CONF/rate-ba)
+check "leo profile (20 ms trains, median): down ${te_b:-0} for ${tq_b:-0} kbit/s ($tr_b %)" [ "${tr_b:-0}" -ge 80 -a "${tr_b:-0}" -le 125 ]
+check "leo profile (20 ms trains, median): up ${te_a:-0} for ${tq_a:-0} kbit/s ($tr_a %)" [ "${tr_a:-0}" -ge 80 -a "${tr_a:-0}" -le 125 ]
+check "train length follows the rate (A sent $(v ${MP_dps0}_tx 69) train packets in $(v ${MP_dps0}_tx 11) trains)" \
+    [ "$(v ${MP_dps0}_tx 11)" -gt 0 -a $(( $(v ${MP_dps0}_tx 69) / ($(v ${MP_dps0}_tx 11) + 1) )) -ge 30 ]
+check "fillers are not duplicates (B: $(v ${MP_dps1}_rx 96) fillers, $(v ${MP_dps1}_rx 3) duplicates)" \
+    [ "$(v ${MP_dps1}_rx 96)" -gt 100 -a "$(v ${MP_dps1}_rx 3)" -lt 10 ]
+check "status shows trains and the percentile" sh -c "$STATUS -m $MAPS -c $CONF/$NSA -d dps0 | grep -q 'trains of 20 ms' && $STATUS -m $MAPS -c $CONF/$NSA -d dps0 | grep -q 'percentile 50'"
 
 echo
 echo "$PASSES passed, $FAILS failed"

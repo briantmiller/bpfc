@@ -25,7 +25,10 @@ the sender adapts:
   it, into a capacity sample for that direction; the estimate is a high
   percentile of the last 16 samples, or of those taken in the last
   `capacity-window` (for links whose capacity changes on a schedule, such as
-  a LEO terminal moving to another satellite). Probes are sent less often
+  a LEO terminal moving to another satellite). On links that deliver in
+  frames (Starlink, cellular, DOCSIS) a pair reads far too fast, so
+  `probe-train` sends a train instead and `capacity-percentile` takes the
+  median ([Probe trains](#probe-trains)). Probes are sent less often
   (×6, `probe-backoff`) while FEC is on. The estimate,
   together with the queueing delay, tells loss caused by congestion apart
   from loss on the line. When the link is congested, FEC uses a fixed ratio
@@ -239,7 +242,7 @@ and every effective value in their header, and the status script shows them.
 | `direct` | 1 Gbit/s, 1 ms | FEC on at 1 % loss, ARQ for the last 3 packets while FEC is on |
 | `wan` | 1 Gbit/s, 30 ms | FEC on at 1 %, ARQ for the last 50 ms while FEC is on |
 | `geo` | 20 Mbit/s, 800 ms | FEC always on, at least 1:15, up to 1:4; ARQ answers everything it holds; reports every 500 ms; congestion delay 150 ms |
-| `leo` | 100 Mbit/s, 60 ms | FEC on at 1 %, off after 30 s; reports every 250 ms; congestion delay 50 ms; probes every 5 s, not slowed while FEC is on; capacity from the last 15 s of samples (a satellite handover about every 15 s) |
+| `leo` | 100 Mbit/s, 60 ms | FEC on at 1 %, off after 30 s; reports every 250 ms; congestion delay 50 ms; 20 ms probe trains (up to 256 packets, timed from 10 % in) every 3 s, not slowed while FEC is on; capacity the median of the last 15 s of samples (a satellite handover about every 15 s) |
 
 Carrier, interleaving and DSCP-aware ARQ (from the profile discussion) are
 not built yet; the profiles use the L2 carrier for now.
@@ -283,7 +286,9 @@ REPORT        type:3 0:5     | 0 ...                                       then 
 - **type:** 1 DATA, 2 PARITY, 3 RETX (retransmission), 4 NAK, 5 REPORT, 6 KEEPALIVE (carrier udp)
 - **flags:**
   - 0x10: member of FEC block `block`, index `idx`, block size `k`
-  - 0x08 / 0x04: probe copy 1 / 2
+  - 0x08 / 0x04: probe copy 1 / 2 (head and tail of a train); both: a
+    train filler, whose `ts` field carries `S << 12 | index` (S: the index
+    the receiver starts timing at)
   - 0x02: the sender has FEC on
   - 0x01: the sequence restarted (first 1024 packets after the maps were created)
 - **ts:** the sender's monotonic clock in 4 µs units, modulo 2^24 (it wraps after 67 s).
@@ -508,6 +513,31 @@ A window shorter than the probe interval is allowed (the generator warns):
 then only the newest sample counts. Runtime: `bpfc-dataplane-status set
 capacity-window 15s` (or `off`).
 
+<a id="probe-trains"></a>**Probe trains.** On a link that delivers in frames
+(Starlink releases traffic every 1.33 ms) the two copies of a pair usually
+leave in the same frame and arrive together, which reads far too fast; split
+across frames they read one packet per frame, whatever the rate. FRR's
+packet-pair work (ospfd/nhrpd) measured 243 Mbit/s with pairs on an emulated
+15 Mbit/s Starlink uplink, and 16.6 with trains and a median. The same holds
+here (tests: pairs 590–760 % of the true rate, trains about 100 %).
+With `probe-train` (ms) the sender clones the probe packet into a train in
+one pass: head (probe 1), fillers, tail (the packet itself, probe 2), as
+many as cross the link in that long at the rate the peer measured for this
+direction (`_tx` 36; 16 until there is one), 3 to `probe-train-max` (≤ 256).
+The receiver counts the bytes of every frame from the first filler at
+`probe-train-skip` percent into the train (so the first frame and a
+scheduler's grant ramp-up are left out) to the tail, and divides by the
+time; fillers are dropped there, not counted as duplicates (`_rx` 96). A
+train whose tail is lost gives no sample. `capacity-percentile` (50 in
+`leo`) replaces the pair rule (the high share from the top, right for pairs
+stretched by jitter, wrong for trains): the K-th largest sample in the ring
+(or window), found bit by bit without branches in the report program. The
+`leo` profile's 20 ms trains every 3 s cost about 0.7 % of the link; at most
+256 packets per train. Runtime: `set eth0 probe-train 20ms|off`,
+`probe-train-max`, `probe-train-skip`, `capacity-percentile 50|off`.
+Not done yet: a schedule that keeps probes away from the 15 s boundaries
+(needs a synchronised clock), and passive samples from the data itself.
+
 **Reports.** Sent every `report-interval` while data arrives. Each report
 covers the last window:
 - raw loss = (gaps − late arrivals) / sequences expected
@@ -567,6 +597,7 @@ status script decodes them with `bpfc -r`.
 | 62 | udp: our address (learned) | 64 | udp-inline: addresses of the last packet sent (src << 32 \| dst) |
 | 65 | udp: not sent, no peer or local address yet | 66 | udp: peer address changes learned |
 | 67 | udp: last frame sent to the peer (ms) | 68 | udp: keepalives sent |
+| 69 | probe packets sent (all trains) | | |
 
 `<prefix>_rx` — receiver side:
 
@@ -591,7 +622,8 @@ status script decodes them with `bpfc -r`.
 | 57 | capacity samples in use (in the window) | 58 | sequence this receiver started or resynced at |
 | 60–75 | last 16 capacity samples, kbit/s | 76–91 | when each was taken (ms) |
 | 92 | udp-inline: addresses of the last packet received | 93 / 94 | UDP carriers: frames received / refused |
-| 95 | udp: keepalives received | | |
+| 95 | udp: keepalives received | 96 | train fillers received |
+| 59 | train: timing restarted at the head-skip filler | | |
 
 `<prefix>_cfg` holds runtime overrides; 0 or missing means the generated
 value. Use `bpfc-dataplane-status set`, or `bpfc -w <prefix>_cfg <key> <value>`.
@@ -607,6 +639,8 @@ value. Use `bpfc-dataplane-status set`, or `bpfc -w <prefix>_cfg <key> <value>`.
 | 16 | FEC floor: 1–15, or 16 for none | 17 | loss-smoothing, packets |
 | 18 | capacity window, ms (≥ 1 day: off) | 19 / 20 | udp: peer address / port |
 | 21 | udp: local address | 22 | udp: keepalive, ms (≥ 1 day: off) |
+| 23 | probe train, ms (≥ 1 day: pairs) | 24 | probe train, most packets |
+| 25 | probe train skip, percent + 1 | 26 | capacity percentile (> 100: the pair rule) |
 
 Also: `<prefix>_pcpu` (FEC block per CPU), `<prefix>_arq` (ring × 1504
 bytes), `<prefix>_ftx` (per-CPU 1504 bytes), `<prefix>_frx` (slots × 1504
