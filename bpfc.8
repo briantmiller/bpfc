@@ -270,6 +270,9 @@ Compute the correct checksum without changing the packet (the current checksum f
 .BI "insert-l2 " "len [ethertype]"
 Insert \fIlen\fR zero bytes (1\-64) after the Ethernet header with \fBbpf_skb_adjust_room\fR and optionally set the EtherType. Network and transport headers keep their place in memory, so checksum offload still works. Only for IPv4/IPv6 packets.
 .TP
+.BI "remove-l2 " "len [ethertype]"
+The counterpart of \fBinsert-l2\fR: remove \fIlen\fR bytes (1\-64) after the Ethernet header with \fBbpf_skb_adjust_room\fR and optionally set the EtherType. skb->protocol stays IPv4/IPv6, so the packet can be grown again with \fBinsert-l2\fR later (for example after it was cloned or redirected); network and transport headers keep their place in memory. Only for IPv4/IPv6 packets.
+.TP
 .BI "strip-l2 " "len ethertype"
 Remove \fIlen\fR bytes (a multiple of 4, 4\-56) after the Ethernet header and set the EtherType, whatever the packet's protocol (\fBbpf_skb_adjust_room\fR refuses non-IP packets). Uses the VLAN helpers; the payload is not copied, and skb->protocol is updated so the stack accepts the packet directly.
 .SS Other

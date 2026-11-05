@@ -47,6 +47,7 @@ Settings for set/unset (take effect at once, survive program reloads,
   congestion-delay MS       probe-interval SEC      probe-rate N/s
   probe-backoff N           probe-min-bytes N       fec-floor N|off
   loss-smoothing PACKETS    capacity-window SEC|off
+  peer IP[:PORT]            local-address IP        keepalive SEC|off  (carrier udp)
 Times take ms, s or m. Buffer sizes (ARQ ring, duplicate window, FEC slots)
 are fixed when the programs are generated: regenerate to change them.
 EOF
@@ -87,7 +88,8 @@ load_settings() {   # generated settings from the program header, then runtime o
     SET=([arq_depth]=10 [arq_mode]=3 [arq_fec_depth]=3 [fec_bp]=100 [cooldown_ms]=10000
          [k]=8 [kmin]=2 [kmax]=15 [timeout_ms]=50 [fec_mode]=0 [report_ms]=1000
          [probe_ms]=10000 [backoff]=6 [probe_min]=600 [cong_pct]=85 [cong_delay_ms]=20 [loss_smooth]=2000
-         [floor]=0 [cap_window_ms]=0 [profile]=none [link_rate]=0 [rtt_ms]=0 [sizing_bytes]=1000 [dup_words]=16 [fec_slots]=16)
+         [floor]=0 [cap_window_ms]=0 [profile]=none [link_rate]=0 [rtt_ms]=0 [sizing_bytes]=1000 [dup_words]=16 [fec_slots]=16
+         [carrier]=ethernet [udp_port]=0 [peer]=- [local]=0.0.0.0 [protect]=all [ip_max]=1492)
     if [ -r "$f" ]; then
         local line kv
         line=$(sed -n 's/^# dataplane: //p' "$f" | head -1)
@@ -145,6 +147,7 @@ age() {        # milliseconds -> "0.4 s" / "12 s" / "5 min" / "2 h"
     elif [ "$m" -lt 7200000 ]; then printf "%d min" $((m / 60000))
     else printf "%d h" $((m / 3600000)); fi
 }
+ip4() { echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"; }
 mac() {        # MAC stored as the 6 packet bytes in a little-endian u64
     local v=$1 i out=""
     for i in 0 1 2 3 4 5; do out+=$(printf "%02x" $(((v >> (8 * i)) & 255))); [ $i -lt 5 ] && out+=":"; done
@@ -193,7 +196,7 @@ cfg_key() {    # setting name -> cfg map key
         arq-with-fec) echo 8 ;; report-interval) echo 10 ;; congestion-pct) echo 11 ;;
         fec-timeout) echo 12 ;; probe-min-bytes) echo 13 ;; fec-mode) echo 14 ;;
         congestion-delay) echo 15 ;; fec-floor) echo 16 ;; loss-smoothing) echo 17 ;;
-        probe-rate) echo 6 ;; capacity-window) echo 18 ;; *) return 1 ;;
+        probe-rate) echo 6 ;; capacity-window) echo 18 ;; peer) echo 19 ;; local-address) echo 21 ;; keepalive) echo 22 ;; *) return 1 ;;
     esac
 }
 
@@ -205,6 +208,7 @@ do_set() {     # do_set <iface> <setting> <value|unset>
     if [ "$val" = "unset" ]; then
         v=0
         [ "$name" = arq-with-fec ] && "$BPFC" -m "$MAP_DIR" -w "$map" 9 0 >/dev/null
+        [ "$name" = peer ] && "$BPFC" -m "$MAP_DIR" -w "$map" 20 0 >/dev/null
     else
         case "$name" in
             fec-threshold)
@@ -224,6 +228,12 @@ do_set() {     # do_set <iface> <setting> <value|unset>
                 v=$val ;;
             fec-timeout|report-interval|congestion-delay)
                 v=$(parse_dur "$val" ms) || die "$name is a time, e.g. 50ms (a bare number is milliseconds)" ;;
+            keepalive)
+                case "$val" in
+                    off|0) v=86400000 ;;
+                    *) v=$(parse_dur "$val" s) || die "$name is a time, e.g. 25s (a bare number is seconds), or off"
+                       [ "$v" -ge 100 ] || die "keepalive must be at least 100 ms (or off)" ;;
+                esac ;;
             capacity-window)
                 case "$val" in
                     off|0) v=86400000 ;;      # no window: the last 16 samples, however old
@@ -236,6 +246,18 @@ do_set() {     # do_set <iface> <setting> <value|unset>
                 esac ;;
             fec-mode)
                 case "$val" in auto) v=3 ;; off) v=1 ;; on) v=2 ;; *) die "fec-mode is auto, on or off" ;; esac ;;
+            peer|local-address)
+                local a=${val%%:*} port=0
+                [[ "$a" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] &&
+                    [ "${BASH_REMATCH[1]}" -le 255 ] && [ "${BASH_REMATCH[2]}" -le 255 ] && [ "${BASH_REMATCH[3]}" -le 255 ] && [ "${BASH_REMATCH[4]}" -le 255 ] ||
+                    die "$name is an IPv4 address$( [ "$name" = peer ] && echo "[:port]")"
+                v=$(( (10#${BASH_REMATCH[1]} << 24) | (10#${BASH_REMATCH[2]} << 16) | (10#${BASH_REMATCH[3]} << 8) | 10#${BASH_REMATCH[4]} ))
+                if [[ "$val" == *:* ]]; then
+                    [ "$name" = peer ] || die "local-address takes no port"
+                    port=${val#*:}
+                    [[ "$port" =~ ^[0-9]{1,5}$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "the port must be 1-65535"
+                fi
+                [ "$name" = peer ] && { "$BPFC" -m "$MAP_DIR" -w "$map" 20 "$port" >/dev/null || exit 1; } ;;
             arq-with-fec)
                 case "$val" in
                     keep) v=1 ;; off) v=2 ;;
@@ -317,6 +339,27 @@ show() {
     if [ "$seen" -eq 0 ]; then peer_state="never seen"
     elif [ $((now - seen)) -le $stale ]; then peer_state="up"
     else peer_state="silent for $(age $((now - seen)))"; fi
+
+    # UDP carriers: the peer's address (runtime setting, else learned, else
+    # generated), ours, and what the carrier programs counted
+    local carrier=${SET[carrier]} c_peer="" c_how="" c_local=""
+    if [ "$carrier" = udp ]; then
+        local pi pp
+        pi=$(g CFG 19); pp=$(g CFG 20); c_how=set
+        [ "$pi" -eq 0 ] && { pi=$(g TX 60); c_how=learned; }
+        [ "$pp" -eq 0 ] && pp=$(g TX 61)
+        if [ "$pi" -eq 0 ] && [ "${SET[peer]}" != learn ]; then
+            c_peer=${SET[peer]}; c_how=configured
+        elif [ "$pi" -eq 0 ]; then
+            c_peer=""; c_how="not learned yet"
+        else
+            [ "$pp" -eq 0 ] && pp=${SET[peer]##*:}
+            [[ "$pp" =~ ^[0-9]+$ ]] || pp=${SET[udp_port]}
+            c_peer="$(ip4 $pi):$pp"
+        fi
+        local li; li=$(g CFG 21); [ "$li" -eq 0 ] && li=$(g TX 62)
+        if [ "$li" -ne 0 ]; then c_local=$(ip4 $li); else c_local=${SET[local]}; fi
+    fi
 
     # outbound (measured by the peer) and inbound (measured here)
     local o_loss o_res o_jit o_owd o_rtt o_cap o_rate o_util o_cong
@@ -413,12 +456,13 @@ show() {
         json)  emit_json; return ;;
     esac
     if [ $ONELINE -eq 1 ]; then
-        echo "$ifkv health=\"$health\" peer=$(mac $peer) peer_state=\"$peer_state\" out_loss_bp=$o_loss out_residual_bp=$o_res out_loss_window_bp=$(g TX 32) out_loss_packets=$(g TX 48) out_jitter_us=$o_jit out_queue_us=$o_owd rtt_us=$o_rtt capacity_kbps=$o_cap rate_kbps=$o_rate utilisation_pct=$o_util congested=$o_cong repair_failing=$(g TX 50) fec=$fec fec_k=$K parity=$(g TX 9) retransmitted=$(g TX 13) retx_unavailable=$(g TX 14) retx_suppressed=$(g TX 15) in_loss_bp=$i_loss in_residual_bp=$i_res in_loss_window_bp=$(g RX 27) in_loss_packets=$(g RX 41) in_capacity_samples=$(g RX 20) in_capacity_last_kbps=$(g RX 52) in_jitter_us=$i_jit in_queue_us=$i_owd in_capacity_kbps=$i_cap fec_rebuilt=$(g RX 6) arq_recovered=$(g RX 7) fec_failed=$(g RX 8) fec_bad=$(g RX 34) reordered=$(g RX 4) duplicates=$(g RX 3) redundant_repairs=$(( $(g RX 37) + $(g RX 38) )) peer_fec_k=$(g RX 30) bypassed=$(g TX 4) resyncs=$(g RX 36) profile=${SET[profile]} sized_rate_bps=${SET[link_rate]} sized_rtt_ms=${SET[rtt_ms]} arq_depth=${SET[arq_depth]} arq_needed=$need_arq dup_window=$(( SET[dup_words] * 64 )) dup_needed=$need_dup sizing_ok=$( [ -z "$size_warn" ] && echo 1 || echo 0 )"
+        echo "$ifkv health=\"$health\" peer=$(mac $peer) peer_state=\"$peer_state\" out_loss_bp=$o_loss out_residual_bp=$o_res out_loss_window_bp=$(g TX 32) out_loss_packets=$(g TX 48) out_jitter_us=$o_jit out_queue_us=$o_owd rtt_us=$o_rtt capacity_kbps=$o_cap rate_kbps=$o_rate utilisation_pct=$o_util congested=$o_cong repair_failing=$(g TX 50) fec=$fec fec_k=$K parity=$(g TX 9) retransmitted=$(g TX 13) retx_unavailable=$(g TX 14) retx_suppressed=$(g TX 15) in_loss_bp=$i_loss in_residual_bp=$i_res in_loss_window_bp=$(g RX 27) in_loss_packets=$(g RX 41) in_capacity_samples=$(g RX 20) in_capacity_last_kbps=$(g RX 52) in_jitter_us=$i_jit in_queue_us=$i_owd in_capacity_kbps=$i_cap fec_rebuilt=$(g RX 6) arq_recovered=$(g RX 7) fec_failed=$(g RX 8) fec_bad=$(g RX 34) reordered=$(g RX 4) duplicates=$(g RX 3) redundant_repairs=$(( $(g RX 37) + $(g RX 38) )) peer_fec_k=$(g RX 30) bypassed=$(g TX 4) resyncs=$(g RX 36) carrier=$carrier carrier_peer=${c_peer:--} carrier_local=${c_local:--} carrier_received=$(g RX 93) carrier_refused=$(g RX 94) carrier_unsent=$(g TX 65) profile=${SET[profile]} sized_rate_bps=${SET[link_rate]} sized_rtt_ms=${SET[rtt_ms]} arq_depth=${SET[arq_depth]} arq_needed=$need_arq dup_window=$(( SET[dup_words] * 64 )) dup_needed=$need_dup sizing_ok=$( [ -z "$size_warn" ] && echo 1 || echo 0 )"
         return
     fi
 
     printf "%s  %s - %s\n" "$ifc" "$health" "$why"
-    if [ "$peer" -ne 0 ]; then printf "  Peer        %s, %s" "$(mac $peer)" "$peer_state"
+    if [ "$carrier" = udp ] && [ -n "$c_peer" ]; then printf "  Peer        %s, %s" "$c_peer" "$peer_state"
+    elif [ "$carrier" = ethernet ] && [ "$peer" -ne 0 ]; then printf "  Peer        %s, %s" "$(mac $peer)" "$peer_state"
     else printf "  Peer        %s" "$peer_state"; fi
     [ "$r_last" -gt 0 ] && printf ", last report %s ago (%d received)" "$(age $((now - r_last)))" "$r_cnt"
     echo
@@ -426,6 +470,16 @@ show() {
         printf "  Profile     %s" "${SET[profile]}"
         [ "${SET[link_rate]}" -gt 0 ] && printf ", sized for %s and %d ms RTT" "$(rate $(( SET[link_rate] / 1000 )))" "${SET[rtt_ms]}"
         printf " (ARQ %d, duplicate window %d, FEC slots %d)\n" "${SET[arq_depth]}" $(( SET[dup_words] * 64 )) "${SET[fec_slots]}"
+    fi
+    if [ "$carrier" = udp ]; then
+        printf "  Carrier     udp, port %s: peer %s (%s%s), from %s; protects %s (IP up to %s bytes)\n" "${SET[udp_port]}" \
+            "${c_peer:--}" "$c_how" "$( [ "$(g TX 66)" -gt 0 ] && echo ", $(g TX 66) changes")" "$c_local" "${SET[protect]}" "${SET[ip_max]}"
+        local ka=${SET[keepalive_ms]:-0} kc; kc=$(g CFG 22); [ "$kc" -gt 0 ] && ka=$kc
+        printf "              received %d, refused %d (not from the peer), not sent (no address yet) %d; keepalive %s (%d sent, %d received)\n" \
+            "$(g RX 93)" "$(g RX 94)" "$(g TX 65)" "$( [ "$ka" -gt 0 ] && [ "$ka" -lt 86400000 ] && age "$ka" || echo off)" "$(g TX 68)" "$(g RX 95)"
+    elif [ "$carrier" = udp-inline ]; then
+        printf "  Carrier     udp-inline, port %s: protects %s (IP up to %s bytes); received %d, refused %d\n" "${SET[udp_port]}" \
+            "${SET[protect]}" "${SET[ip_max]}" "$(g RX 93)" "$(g RX 94)"
     fi
     printf "  Maps        %s_* in %s\n" "$prefix" "$MAP_DIR"
     [ -n "$size_warn" ] && printf "  Sizing      WARNING: %s\n" "$size_warn"
@@ -560,6 +614,12 @@ emit_json() {
     [ $((byp + sent)) -gt 0 ] && bpct=$(( byp * 100 / (byp + sent) ))
     j="$(jstr "$ifc"): {"
     j+="\"maps\": $(jstr "$prefix"), \"health\": $(jstr "$health"), \"healthReason\": $(jstr "$why"), "
+    j+="\"carrier\": $(jstr "$carrier"), "
+    if [ "$carrier" != ethernet ]; then
+        j+="\"udp\": {\"port\": ${SET[udp_port]}, \"protect\": $(jstr "${SET[protect]}"), \"ipMax\": ${SET[ip_max]}, "
+        [ "$carrier" = udp ] && j+="\"peer\": $( [ -n "$c_peer" ] && jstr "$c_peer" || echo null ), \"peerSource\": $(jstr "$c_how"), \"peerChanges\": $(g TX 66), \"local\": $(jstr "$c_local"), \"notSentNoAddress\": $(g TX 65), "
+        j+="\"received\": $(g RX 93), \"refused\": $(g RX 94)}, "
+    fi
     j+="\"profile\": {\"name\": $(jstr "${SET[profile]}"), \"sizedRateBps\": ${SET[link_rate]}, \"sizedRttMsec\": ${SET[rtt_ms]}, "
     j+="\"arqDepth\": ${SET[arq_depth]}, \"dupWindow\": $(( SET[dup_words] * 64 )), \"fecSlots\": ${SET[fec_slots]}}, "
     j+="\"peer\": {\"mac\": $( [ "$peer" -ne 0 ] && jstr "$(mac $peer)" || echo null ), \"state\": $(jstr "$peer_state"), "
