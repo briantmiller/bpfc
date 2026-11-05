@@ -19,6 +19,15 @@ kernels without sch_netem): SPEC is comma-separated key=value with
   order=1      with jitter but no rate, keep packets in order (netem would
                reorder them); for a kernel shaper (tbf) after the emulator
 
+A Starlink-like link (as FRR's satrelay test bed models it) adds:
+  frame=1.33   deliver in frames: what is due within a frame (ms) leaves
+               together at its end, back to back
+  redraw=15    every 15 s (wall clock, from second `offset`) the rate is
+  vary=40      drawn again, +/- vary percent of rate=
+  offset=12    first boundary second (12: :12, :27, :42, :57 past the minute)
+  burst=30:200 after each redraw, lose 30 % of packets for 200 ms
+  ratelog=F    append "<unix time> <bit/s>" to file F at start and at each redraw
+
 A veth hands over frames whose TCP/UDP checksum the kernel left for the NIC
 to finish. A real link only ever carries finished frames, so those checksums
 are completed here (IPv4 directly after Ethernet, or after the dataplane's
@@ -100,7 +109,8 @@ def open_if(name):
 
 
 def parse_spec(spec, delay):
-    cfg = {"rate": 0.0, "delay": delay, "jitter": 0.0, "loss": 0.0, "limit": 1000, "order": 0}
+    cfg = {"rate": 0.0, "delay": delay, "jitter": 0.0, "loss": 0.0, "limit": 1000, "order": 0,
+           "frame": 0.0, "redraw": 0.0, "vary": 0.0, "offset": 12.0, "burst": (0.0, 0.0), "ratelog": None}
     for item in filter(None, (spec or "").split(",")):
         k, v = item.split("=", 1)
         if k == "rate":
@@ -112,9 +122,40 @@ def parse_spec(spec, delay):
             cfg["loss"] = float(v) / 100.0
         elif k in ("limit", "order"):
             cfg[k] = int(v)
+        elif k == "frame":
+            cfg["frame"] = float(v) / 1000.0
+        elif k in ("redraw", "offset"):
+            cfg[k] = float(v)
+        elif k == "vary":
+            cfg["vary"] = float(v) / 100.0
+        elif k == "burst":
+            pct, ms = v.split(":")
+            cfg["burst"] = (float(pct) / 100.0, float(ms) / 1000.0)
+        elif k == "ratelog":
+            cfg["ratelog"] = v
         else:
             raise SystemExit("unknown key %r in %r" % (k, spec))
+    cfg["base"] = cfg["rate"]
+    cfg["epoch"] = None
+    cfg["since"] = -1e9
     return cfg
+
+
+def redraw(cfg):
+    """Starlink-like: a new rate at each wall-clock boundary."""
+    if not cfg["redraw"]:
+        return
+    epoch = int((time.time() - cfg["offset"]) // cfg["redraw"])
+    if epoch == cfg["epoch"]:
+        return
+    first = cfg["epoch"] is None
+    cfg["epoch"] = epoch
+    cfg["rate"] = cfg["base"] * (1 + random.uniform(-cfg["vary"], cfg["vary"]))
+    if not first:
+        cfg["since"] = time.monotonic()
+    if cfg["ratelog"]:
+        with open(cfg["ratelog"], "a") as f:
+            f.write("%.3f %d\n" % (time.time(), cfg["rate"]))
 
 
 def forward(rx, tx, cfg):
@@ -131,7 +172,7 @@ def forward(rx, tx, cfg):
                 while not queue:
                     cv.wait()
                 due, _, frame = queue[0]
-                if cfg["rate"]:
+                if cfg["rate"] and not cfg["frame"]:
                     # A shaped link needs a frame's serialization time after
                     # the one before it. When this thread wakes late, two due
                     # frames would otherwise go out back to back, and the
@@ -141,7 +182,7 @@ def forward(rx, tx, cfg):
                 wait = due - time.monotonic()
                 # Shaped: sleep until 2 ms before, then spin (yielding the
                 # GIL), so the gap is not stretched by a late wake-up either.
-                early = 0.002 if cfg["rate"] else 0.0
+                early = 0.002 if cfg["rate"] and not cfg["frame"] else 0.0
                 if wait > early:
                     cv.wait(wait - early)
                     continue
@@ -177,7 +218,10 @@ def forward(rx, tx, cfg):
                     frame = finish_checksum(frame)
         if cfg["loss"] and random.random() < cfg["loss"]:
             continue
+        redraw(cfg)
         now = time.monotonic()
+        if cfg["burst"][0] and now - cfg["since"] < cfg["burst"][1] and random.random() < cfg["burst"][0]:
+            continue
         delay = cfg["delay"]
         if cfg["jitter"]:
             delay += random.uniform(-cfg["jitter"], cfg["jitter"])
@@ -195,6 +239,9 @@ def forward(rx, tx, cfg):
             if cfg["order"] and queue and due < last[0]:
                 due = last[0]
             last[0] = due
+            if cfg["frame"]:
+                # leaves with the frame it falls in, at that frame's end
+                due = (int(due / cfg["frame"]) + 1) * cfg["frame"]
             order[0] += 1
             heapq.heappush(queue, (due, order[0], frame))
             cv.notify()

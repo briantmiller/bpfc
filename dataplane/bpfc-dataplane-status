@@ -47,6 +47,8 @@ Settings for set/unset (take effect at once, survive program reloads,
   congestion-delay MS       probe-interval SEC      probe-rate N/s
   probe-backoff N           probe-min-bytes N       fec-floor N|off
   loss-smoothing PACKETS    capacity-window SEC|off
+  probe-train MS|off        probe-train-max N       probe-train-skip PCT
+  capacity-percentile P|off
   peer IP[:PORT]            local-address IP        keepalive SEC|off  (carrier udp)
 Times take ms, s or m. Buffer sizes (ARQ ring, duplicate window, FEC slots)
 are fixed when the programs are generated: regenerate to change them.
@@ -89,6 +91,7 @@ load_settings() {   # generated settings from the program header, then runtime o
          [k]=8 [kmin]=2 [kmax]=15 [timeout_ms]=50 [fec_mode]=0 [report_ms]=1000
          [probe_ms]=10000 [backoff]=6 [probe_min]=600 [cong_pct]=85 [cong_delay_ms]=20 [loss_smooth]=2000
          [floor]=0 [cap_window_ms]=0 [profile]=none [link_rate]=0 [rtt_ms]=0 [sizing_bytes]=1000 [dup_words]=16 [fec_slots]=16
+         [train_ms]=0 [train_max]=64 [train_skip]=10 [cap_pct]=0
          [carrier]=ethernet [udp_port]=0 [peer]=- [local]=0.0.0.0 [protect]=all [ip_max]=1492)
     if [ -r "$f" ]; then
         local line kv
@@ -113,6 +116,10 @@ load_settings() {   # generated settings from the program header, then runtime o
     c=$(g CFG 17); [ "$c" -gt 0 ] && SET[loss_smooth]=$c
     c=$(g CFG 15); [ "$c" -gt 0 ] && SET[cong_delay_ms]=$c
     c=$(g CFG 16); [ "$c" -gt 0 ] && SET[floor]=$c
+    c=$(g CFG 23); [ "$c" -gt 0 ] && SET[train_ms]=$c; [ "${SET[train_ms]}" -ge 86400000 ] && SET[train_ms]=0
+    c=$(g CFG 24); [ "$c" -gt 0 ] && SET[train_max]=$c
+    c=$(g CFG 25); [ "$c" -gt 0 ] && SET[train_skip]=$((c - 1))
+    c=$(g CFG 26); [ "$c" -gt 0 ] && SET[cap_pct]=$c; [ "${SET[cap_pct]}" -gt 100 ] && SET[cap_pct]=0
     c=$(g CFG 18); [ "$c" -gt 0 ] && SET[cap_window_ms]=$c
     [ "${SET[cap_window_ms]}" -ge 86400000 ] && SET[cap_window_ms]=0     # "off" at runtime
     [ "${SET[floor]}" -gt 15 ] && SET[floor]=0
@@ -196,7 +203,8 @@ cfg_key() {    # setting name -> cfg map key
         arq-with-fec) echo 8 ;; report-interval) echo 10 ;; congestion-pct) echo 11 ;;
         fec-timeout) echo 12 ;; probe-min-bytes) echo 13 ;; fec-mode) echo 14 ;;
         congestion-delay) echo 15 ;; fec-floor) echo 16 ;; loss-smoothing) echo 17 ;;
-        probe-rate) echo 6 ;; capacity-window) echo 18 ;; peer) echo 19 ;; local-address) echo 21 ;; keepalive) echo 22 ;; *) return 1 ;;
+        probe-rate) echo 6 ;; capacity-window) echo 18 ;; peer) echo 19 ;; local-address) echo 21 ;; keepalive) echo 22 ;;
+        probe-train) echo 23 ;; probe-train-max) echo 24 ;; probe-train-skip) echo 25 ;; capacity-percentile) echo 26 ;; *) return 1 ;;
     esac
 }
 
@@ -233,6 +241,21 @@ do_set() {     # do_set <iface> <setting> <value|unset>
                     off|0) v=86400000 ;;
                     *) v=$(parse_dur "$val" s) || die "$name is a time, e.g. 25s (a bare number is seconds), or off"
                        [ "$v" -ge 100 ] || die "keepalive must be at least 100 ms (or off)" ;;
+                esac ;;
+            probe-train)
+                case "$val" in
+                    off|0) v=86400000 ;;      # pairs
+                    *) v=$(parse_dur "$val" ms) || die "$name is a time, e.g. 20ms, or off (pairs)"
+                       [ "$v" -ge 2 ] && [ "$v" -le 1000 ] || die "probe-train is 2 ms - 1 s (or off)" ;;
+                esac ;;
+            probe-train-max)
+                [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 3 ] && [ "$val" -le 256 ] || die "probe-train-max is 3-256"; v=$val ;;
+            probe-train-skip)
+                [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -le 50 ] || die "probe-train-skip is 0-50 (percent)"; v=$((val + 1)) ;;
+            capacity-percentile)
+                case "$val" in
+                    off|0) v=101 ;;           # the rule for pairs
+                    *) [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ] && [ "$val" -le 100 ] || die "capacity-percentile is 1-100 or off"; v=$val ;;
                 esac ;;
             capacity-window)
                 case "$val" in
@@ -518,6 +541,10 @@ show() {
     printf "    Probing     every %s%s" "$(age $piv)" "$( [ "$K" -gt 0 ] && [ "${SET[backoff]}" -gt 1 ] && echo " (backed off x${SET[backoff]} while FEC is on)")"
     if [ "$plast" -gt 0 ]; then printf ", last %s ago, %d sent\n" "$(age $((now - plast)))" "$(g TX 11)"
     else printf ", none sent yet (needs packets of %d bytes or more)\n" "${SET[probe_min]}"; fi
+    if [ "${SET[train_ms]}" -gt 0 ]; then
+        printf "                trains of %d ms (at most %d packets, timed from %d %% in), %d packets sent\n" \
+            "${SET[train_ms]}" "${SET[train_max]}" "${SET[train_skip]}" "$(g TX 69)"
+    fi
     local byp=$(g TX 4) sent=$(g TX 2)
     if [ "$byp" -gt 0 ]; then
         printf "    Unprotected %d packets too large to encapsulate (GSO/GRO or IP > 1492), %d %% of all sent\n" \
@@ -535,7 +562,7 @@ show() {
             "$(averaged $(g RX 41))" "$(pct $(g RX 27))"
         printf "    Delay       queueing +%s, jitter %s\n" "$(dur_us $i_owd)" "$(dur_us $i_jit)"
         if [ "$i_cap" -gt 0 ]; then
-            printf "    Capacity    ~%s (%d probe pairs, last %s" "$(rate $i_cap)" "$(g RX 20)" "$(rate $(g RX 52))"
+            printf "    Capacity    ~%s (%d probes, %s; last %s" "$(rate $i_cap)" "$(g RX 20)" "$( [ "${SET[cap_pct]}" -gt 0 ] && echo "percentile ${SET[cap_pct]}" || echo "pair rule")" "$(rate $(g RX 52))"
             [ "${SET[cap_window_ms]}" -gt 0 ] && printf "; %d in the last %s" "$(g RX 57)" "$(age ${SET[cap_window_ms]})"
             echo ")"
         fi
@@ -642,7 +669,7 @@ emit_json() {
     j+="\"unprotected\": {\"packets\": $byp, \"pct\": $bpct}, "
     j+="\"inbound\": {\"current\": $(jbool $fresh_i), \"lossBp\": $i_loss, \"residualBp\": $i_res, \"lossWindowBp\": $(g RX 27), "
     j+="\"lossPackets\": $(g RX 41), \"queueUsec\": $i_owd, \"jitterUsec\": $i_jit, \"capacityKbps\": $i_cap, "
-    j+="\"capacitySamples\": $(g RX 20), \"capacityLastKbps\": $(g RX 52), \"capacityWindowMsec\": ${SET[cap_window_ms]}, \"capacitySamplesUsed\": $(g RX 57), \"fecRebuilt\": $(g RX 6), \"arqRecovered\": $(g RX 7), "
+    j+="\"capacitySamples\": $(g RX 20), \"capacityLastKbps\": $(g RX 52), \"capacityWindowMsec\": ${SET[cap_window_ms]}, \"capacitySamplesUsed\": $(g RX 57), \"capacityPercentile\": ${SET[cap_pct]}, \"probeTrainMsec\": ${SET[train_ms]}, \"fecRebuilt\": $(g RX 6), \"arqRecovered\": $(g RX 7), "
     j+="\"fecFailed\": $(g RX 8), \"fecBad\": $(g RX 34), \"packets\": $(g RX 2), \"reordered\": $(g RX 4), "
     j+="\"duplicates\": $(g RX 3), \"naksSent\": $(g RX 10), \"lateRepairs\": $(( $(g RX 37) + $(g RX 38) )), "
     j+="\"peerFecRatio\": $(g RX 30), \"resyncs\": $(g RX 36)}, "
