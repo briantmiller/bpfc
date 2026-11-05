@@ -49,7 +49,10 @@ geo|--profile geo
 wan|--profile wan
 leo|--profile leo
 geo-largest|--profile geo --arq-depth 16384 --dup-window 16384 --fec-slots 64
-direct-smallest|--profile direct --arq-depth 1 --dup-window 1024 --fec-slots 16"
+direct-smallest|--profile direct --arq-depth 1 --dup-window 1024 --fec-slots 16
+udp|--profile leo --carrier udp --peer 192.0.2.1 --protect 10.2.0.0/16,10.3.0.0/16 --local-address 192.0.2.9
+udp-learn|--profile wan --carrier udp --peer learn --peer-learn-from 198.51.100.0/24 --protect 0.0.0.0/0 --local-address 192.0.2.9
+udp-inline|--profile geo --carrier udp-inline --protect 10.2.0.0/16"
 
 worst=0 worst_name=
 while IFS='|' read -r name args; do

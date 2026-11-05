@@ -1,5 +1,5 @@
 VERSION   ?= 0.1.1
-RELEASE   ?= 2
+RELEASE   ?= 4
 
 CC        ?= gcc
 CFLAGS    ?= -O2 -g
@@ -19,8 +19,10 @@ endif
 PREFIX    ?= /usr
 SBINDIR   ?= $(PREFIX)/sbin
 MANDIR    ?= $(PREFIX)/share/man
+DATADIR   ?= $(PREFIX)/share
 DOCDIR    ?= $(PREFIX)/share/doc/bpfc
 CONTAINER_DOCDIR ?= $(PREFIX)/share/doc/bpfc-container
+SCRIPTS_DOCDIR ?= $(PREFIX)/share/doc/bpfc-scripts
 SYSCONFDIR ?= /etc
 UNITDIR   ?= $(PREFIX)/lib/systemd/system
 DESTDIR   ?=
@@ -40,7 +42,7 @@ RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
 TARBALL    = bpfc-$(VERSION).tar.gz
 
-.PHONY: check-compile check-dataplane check-all all clean install dist rpm srpm check
+.PHONY: check-compile check-dataplane check-all all clean install install-scripts dist rpm srpm check
 
 all: $(TARGET) $(DAEMON) $(CTL)
 
@@ -53,7 +55,7 @@ $(DAEMON): bpfcd/bpfcd.c $(COMMON_SRC) $(COMMON_HDR)
 $(CTL): bpfcd/bpfcctl.c $(COMMON_SRC) $(COMMON_HDR)
 	$(CC) $(CFLAGS) $(DAEMON_CFLAGS) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfcd/bpfcctl.c $(COMMON_SRC)
 
-install: all
+install: all install-scripts
 	install -D -m 0755 $(TARGET) $(DESTDIR)$(SBINDIR)/bpfc
 	install -D -m 0755 $(DAEMON) $(DESTDIR)$(SBINDIR)/bpfcd
 	install -D -m 0755 $(CTL) $(DESTDIR)$(SBINDIR)/bpfcctl
@@ -74,6 +76,24 @@ install: all
 	install -D -m 0755 dist/container/bpfcd-entrypoint $(DESTDIR)$(SBINDIR)/bpfcd-entrypoint
 	install -D -m 0644 dist/container/README.md $(DESTDIR)$(CONTAINER_DOCDIR)/README.md
 	install -D -m 0644 dist/container/Containerfile $(DESTDIR)$(CONTAINER_DOCDIR)/Containerfile
+
+# The bpfc-scripts package: the dataplane generator and status tool, the
+# built-in profiles, design notes and examples. Plain bash and text.
+# The generator looks for the built-in profiles in DATADIR.
+install-scripts:
+	install -d -m 0755 $(DESTDIR)$(SBINDIR)
+	sed 's,/usr/share/bpfc/dataplane/profiles,$(DATADIR)/bpfc/dataplane/profiles,' \
+	    dataplane/bpfc-dataplane-gen > $(DESTDIR)$(SBINDIR)/bpfc-dataplane-gen
+	chmod 0755 $(DESTDIR)$(SBINDIR)/bpfc-dataplane-gen
+	install -D -m 0755 dataplane/bpfc-dataplane-status $(DESTDIR)$(SBINDIR)/bpfc-dataplane-status
+	install -d -m 0755 $(DESTDIR)$(DATADIR)/bpfc/dataplane/profiles
+	install -m 0644 dataplane/profiles/*.profile $(DESTDIR)$(DATADIR)/bpfc/dataplane/profiles/
+	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/dataplane/profiles.d
+	install -D -m 0644 dataplane/DESIGN.md $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/DESIGN.md
+	install -d -m 0755 $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/examples/interfaces.d/eth0/ingress
+	install -d -m 0755 $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/examples/interfaces.d/eth0/egress
+	install -m 0644 dataplane/examples/interfaces.d/eth0/ingress/*.bpfc $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/examples/interfaces.d/eth0/ingress/
+	install -m 0644 dataplane/examples/interfaces.d/eth0/egress/*.bpfc $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/examples/interfaces.d/eth0/egress/
 
 dist: $(TARBALL)
 
@@ -104,7 +124,7 @@ srpm: $(TARBALL)
 TESTFLAGS ?=
 
 check: all
-	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd container
+	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd container install
 
 # Compile-only checks of every field and command and of the error messages;
 # needs no root (the few commands that create maps are skipped without it).
@@ -112,7 +132,7 @@ check-compile: $(TARGET)
 	bash tests/run-tests.sh $(TESTFLAGS) compile
 
 check-dataplane: $(TARGET)
-	bash tests/run-tests.sh $(TESTFLAGS) verifier-budget dataplane
+	bash tests/run-tests.sh $(TESTFLAGS) verifier-budget dataplane dataplane-udp
 
 # Every suite, including the network suites and pytest (root; about an hour).
 check-all: all

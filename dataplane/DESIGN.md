@@ -1,10 +1,12 @@
 # FEC / INT / ARQ / probing dataplane for bpfc
 
-A dataplane for a point-to-point Layer-2 link, written as bpfc programs. Both
-ends run the same programs, and each end is the sender for its own direction.
-Every IPv4 packet sent on the link carries an 8-byte shim (EtherType 0x88B5)
-with a sequence number and a timestamp. The receiver measures the link and
-reports back, and the sender adapts:
+A dataplane for a point-to-point link, written as bpfc programs. Both ends
+run the same programs, and each end is the sender for its own direction.
+Every IPv4 packet sent on the link carries an 8-byte shim with a sequence
+number and a timestamp: after the Ethernet header (EtherType 0x88B5) on a
+Layer-2 link, or inside UDP across a routed path, the internet or NAT (see
+[Carriers](#carriers)). The receiver measures the link and reports back, and
+the sender adapts:
 
 - **INT (in-band telemetry).** The receiver measures loss, reordering,
   duplicates, jitter and queueing delay. No clock synchronisation is needed.
@@ -41,6 +43,7 @@ defaults for a kind of link; see [Profiles and sizing](#profiles-and-sizing).
 | `bpfc-dataplane-status` | Shows link quality and what FEC/ARQ/probing are doing; changes settings at runtime |
 | `profiles/*.profile` | Built-in profiles (installed in `/usr/share/bpfc/dataplane/profiles/`) |
 | `../tests/test-dataplane.sh` | End-to-end tests (network namespaces, an 800 ms link emulator, content checks; `make check-dataplane`) |
+| `../tests/test-dataplane-udp.sh` | The UDP carriers: a routed path with carrier-grade NAT, and a private routed WAN |
 | `../tests/link-emulator.py`, `../tests/udp-verify.py` | Test helpers: delayed link, datagrams with checked contents |
 
 ```
@@ -83,6 +86,76 @@ under 1 %; it stays DEGRADED until the loss falls to half the threshold or
 the cool-down passes. **GOOD** otherwise. Status tools older than the loss
 estimate (no `out_loss_window_bp` in `-1` output) judge single report
 windows and swing between states on a steady lossy link.
+
+## Carriers
+
+`carrier` (structural) says how dataplane frames cross the link. Inside the
+dataplane every frame is Ethernet + shim (+ the IP packet), whatever the
+carrier: with a UDP carrier one more program at the end of egress (priority
+N+40) wraps each frame in UDP, and one at the start of ingress (N-10)
+unwraps it, so the other programs are the same for every carrier.
+
+| Carrier | Frame | Overhead | For |
+|---|---|---|---|
+| `ethernet` (default) | Ethernet, 0x88B5 \| shim \| IP packet | 8 | one Layer-2 segment: cable, VLAN, L2 circuit |
+| `udp` | Ethernet \| IPv4 us → peer \| UDP \| shim \| IP packet | 36 | routed paths, the internet, NAT (satellite terminals, CGNAT) |
+| `udp-inline` | Ethernet \| the packet's IP header, protocol UDP \| UDP (source port 0xB500 + protocol) \| shim \| L4 | 16 (36 on parity, NAK, report) | a private routed WAN (MPLS L3VPN) where QoS and policy on the path should see the site addresses and TOS |
+
+Settings:
+- `protect` (required with UDP): the remote prefixes carried to the peer,
+  comma-separated (`10.2.0.0/16,10.3.0.0/16`, or `0.0.0.0/0`). Other
+  packets leave untouched: not sequenced, not counted. It also works with
+  the Ethernet carrier.
+- `udp-port` (47810): the port this end sends from and receives on. Nothing
+  listens on it; the ingress program takes the packets before the stack.
+- `peer` (udp): `IPv4[:port]`, or `learn`: the address and port are taken
+  from the peer's packets (latest wins, so a NAT that moves the mapping is
+  followed), only from `peer-learn-from` (default `0.0.0.0/0`). Use `learn`
+  on the end that faces a peer behind NAT; that peer sets this end's
+  public address. Runtime: `bpfc-dataplane-status set eth0 peer A.B.C.D[:port]`.
+- `local-address` (udp): the outer source. `auto` (default) takes the
+  interface's address when generating, then the address the peer's packets
+  are sent to (behind NAT, the one the interface has, so a DHCP change
+  heals once the peer sends).
+- `keepalive` (udp, 25 s): when nothing went to the peer for this long, the
+  next IPv4 packet leaving the interface (any packet, not only protected
+  ones) is cloned into a 60-byte keepalive (shim type 6), so the NAT
+  mapping in front of this end stays open. The peer drops it (after
+  learning from it). A link with no traffic at all sends none: keep
+  something flowing (`ping -i 15` to a protected address).
+- `path-mtu` (1500): the largest IP packet the path carries. Packets larger
+  than `path-mtu` - overhead (1492, or 1464 for both UDP carriers) go out unprotected; set
+  `mtu lock` on the routes to the protected prefixes (`--setup-hints`
+  prints them).
+
+Receiving (udp): IPv4 without options, not a fragment, UDP to `udp-port`,
+a valid shim type, from the peer (static) or `peer-learn-from` (learn);
+anything else to the port is dropped and counted (`refused`). Sending: DF,
+TTL 64, the DSCP of the packet carried (QoS on the path still applies), no
+UDP checksum (the payload is checked end to end), Ethernet header from a
+route lookup of the peer (`fib-lookup`). Before a learned peer is known,
+protected packets go out unprotected (counted, `not sent`).
+
+udp-inline keeps the packet's IP header (addresses, TOS, TTL, ID) as the
+outer one with protocol UDP, and puts the original protocol in the UDP
+source port (0xB500 + protocol; the destination port is `udp-port`), so the
+path classifies on the real addresses and DSCP. The receiver delivers the
+header as it arrived: TTL lowered by the routers, DSCP as the path left it
+(remarking, ECN CE). Because those fields change on the way, FEC leaves them
+out: both ends fold members into parity with TOS, TTL and header checksum
+zeroed, a parity frame travels with the TOS and TTL of the packet it was
+made from (so it is queued with its traffic), and a rebuilt packet gets the
+parity frame's TOS and TTL as it arrived and a new header checksum (its
+TCP/UDP checksum is still checked). IP options and fragments go out
+unprotected. A firewall on the path must pass UDP to `udp-port` from source
+ports 46336–46591. NAKs and reports carry the addresses of the last packet
+received, swapped, and parity those of the last packet sent, so both ends
+must be on the routed path between the sites. No NAT.
+
+Netfilter runs before the egress programs: do not masquerade traffic to the
+protected prefixes on the interface. On ingress the carrier program runs
+before netfilter, so no firewall rule is needed for the port on this host
+(one on the path must pass it).
 
 ## Link requirements
 
@@ -133,6 +206,8 @@ windows and swing between states on a steady lossy link.
 | ingress | 110 | parity | Rebuilds a missing packet from parity |
 | ingress | 120 | receiver | Sequence, duplicates, gaps, reordering, jitter, delay; hands over to 130 |
 | ingress | 130 | deliver | Folds FEC members into their block, decapsulates, delivers; sends NAKs and reports |
+| egress | 140 | carrier | UDP carriers only: wraps every dataplane frame in UDP |
+| ingress | 90 | carrier | UDP carriers only: unwraps the peer's UDP, learns its address |
 
 The work is split across priorities to keep each program well inside the
 verifier's 1,000,000-instruction budget. On kernel 6.18 (`bpfc -I` prints
@@ -205,7 +280,7 @@ NAK           type:3 flags:5 | count:8   | first_seq:16 | 0:24
 REPORT        type:3 0:5     | 0 ...                                       then 11 x 8-byte values
 ```
 
-- **type:** 1 DATA, 2 PARITY, 3 RETX (retransmission), 4 NAK, 5 REPORT
+- **type:** 1 DATA, 2 PARITY, 3 RETX (retransmission), 4 NAK, 5 REPORT, 6 KEEPALIVE (carrier udp)
 - **flags:**
   - 0x10: member of FEC block `block`, index `idx`, block size `k`
   - 0x08 / 0x04: probe copy 1 / 2
@@ -233,7 +308,7 @@ REPORT        type:3 0:5     | 0 ...                                       then 
   10. gaps (total)
   11. packets expected this window
 
-Overhead: 8 bytes per packet, plus parity (1/K of the packets while FEC is
+Overhead: 8 bytes per packet (36 or 20 with a UDP carrier), plus parity (1/K of the packets while FEC is
 on), plus one 110-byte report per second per direction while traffic flows,
 plus 60-byte NAKs.
 
@@ -488,7 +563,10 @@ status script decodes them with `bpfc -r`.
 | 16 / 17 / 18 | congested / utilisation % / send rate kbit/s | 45 | peer: expected packets, last window |
 | 19 / 20 | rate sample time / bytes | 46 / 47 | loss / residual loss estimate, 1/100 bp |
 | 49 | last time the residual estimate was ≥ 1 % (ms) | 48 | packets in the loss estimate |
-| 50 | repair failing (counts as congestion) | | |
+| 50 | repair failing (counts as congestion) | 60 / 61 | udp: learned peer address / port |
+| 62 | udp: our address (learned) | 64 | udp-inline: addresses of the last packet sent (src << 32 \| dst) |
+| 65 | udp: not sent, no peer or local address yet | 66 | udp: peer address changes learned |
+| 67 | udp: last frame sent to the peer (ms) | 68 | udp: keepalives sent |
 
 `<prefix>_rx` — receiver side:
 
@@ -512,6 +590,8 @@ status script decodes them with `bpfc -r`.
 | 49 | last time the inbound residual estimate was ≥ 1 % (ms) | 53–56 | four largest capacity samples |
 | 57 | capacity samples in use (in the window) | 58 | sequence this receiver started or resynced at |
 | 60–75 | last 16 capacity samples, kbit/s | 76–91 | when each was taken (ms) |
+| 92 | udp-inline: addresses of the last packet received | 93 / 94 | UDP carriers: frames received / refused |
+| 95 | udp: keepalives received | | |
 
 `<prefix>_cfg` holds runtime overrides; 0 or missing means the generated
 value. Use `bpfc-dataplane-status set`, or `bpfc -w <prefix>_cfg <key> <value>`.
@@ -525,7 +605,8 @@ value. Use `bpfc-dataplane-status set`, or `bpfc -w <prefix>_cfg <key> <value>`.
 | 8 | ARQ with FEC: 1 keep, 2 off, 3 last N | 13 | minimum probe size, bytes |
 | 14 | FEC mode: 1 off, 2 on, 3 auto | 15 | congestion: queueing delay, ms |
 | 16 | FEC floor: 1–15, or 16 for none | 17 | loss-smoothing, packets |
-| 18 | capacity window, ms (≥ 1 day: off) | | |
+| 18 | capacity window, ms (≥ 1 day: off) | 19 / 20 | udp: peer address / port |
+| 21 | udp: local address | 22 | udp: keepalive, ms (≥ 1 day: off) |
 
 Also: `<prefix>_pcpu` (FEC block per CPU), `<prefix>_arq` (ring × 1504
 bytes), `<prefix>_ftx` (per-CPU 1504 bytes), `<prefix>_frx` (slots × 1504
@@ -541,7 +622,7 @@ New general-purpose instructions:
 - `calc-map` (atomic add/or/and/xor/xchg)
 - `xor-packet[-keyed]` and `zero-buffer[-keyed]`
 - sized `buffer-map` / `shared-buffer-map`
-- `calc-csum`, `insert-l2`, `strip-l2`
+- `calc-csum`, `insert-l2`, `remove-l2`, `strip-l2`
 - `get cpu`, `calc hton/ntoh`
 - `array-map NAME entries` (64-bit values, keys 0..entries-1, never evicted;
   works with `get map`, `set map`, `calc-map`, `bpfc -r` and `-w`)
@@ -571,9 +652,14 @@ The existing tests give the same results before and after these changes.
 
 ## Limits
 
-- IPv4 only. IPv6 passes through unprotected. Later, the same shim could ride
+- IPv4 only, also as the UDP carriers' outer protocol. IPv6 passes through unprotected. Later, the same shim could ride
   in IPv4 (protocol 253): receiver offsets move by 20 bytes and decap becomes
   `bpf_skb_adjust_room` at the network layer.
+- UDP carriers: one peer per interface (point-to-point); peer learning has
+  no authentication, so a host that can send to the port from inside
+  `peer-learn-from` can take the peer's place (narrow it to the peer's ISP
+  ranges, or filter the port upstream). The keepalive needs some IPv4
+  traffic on the interface to ride on.
 - XOR parity repairs one loss per block. With K = 2500 / loss_bp, about 3 %
   of blocks have two losses at 3 % loss. ARQ covers those when the RTT is
   short compared with the ARQ window.

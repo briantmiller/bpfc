@@ -28,7 +28,9 @@ WARNINGS=()
 # ---------------------------------------------------------------- settings
 # key | kind | class | default | help
 #   kind:  rate, dur:<default unit>, int:<min>:<max>, auto-int:<min>:<max>,
-#          pct, enum:<a>,<b>..., arqfec, prate (per second, decimals allowed)
+#          pct, enum:<a>,<b>..., arqfec, prate (per second, decimals allowed),
+#          peer (IPv4[:port] or learn), prefix, prefixes (comma list),
+#          ipv4-auto (IPv4 or auto)
 #   class: sizing / structural (needs regenerating), runtime (also changeable
 #          with "bpfc-dataplane-status set")
 SETTINGS='link-rate|rate|sizing||link rate, e.g. 20m, 1g (sizes the buffers below)
@@ -54,7 +56,15 @@ probe-backoff|int:1:1000|runtime|6|multiply the probe interval by N while FEC is
 probe-min-bytes|int:64:1500|runtime|600|only probe with packets of at least N bytes
 capacity-window|dur:s|runtime|0|capacity from probe samples of the last N only, e.g. 15s for a LEO terminal that changes satellite every 15 s (0: the last 16 samples, however old)
 congestion-pct|int:1:100|runtime|85|utilisation above which loss counts as congestion (FEC not scaled up)
-congestion-delay|dur:ms|runtime|20ms|queueing delay above which loss counts as congestion'
+congestion-delay|dur:ms|runtime|20ms|queueing delay above which loss counts as congestion
+carrier|enum:ethernet,udp,udp-inline|structural|ethernet|how frames cross the link: ethernet (one Layer-2 segment), udp (outer IPv4/UDP to the peer: routed paths, the internet, NAT), udp-inline (UDP after the original IP header, addresses and TOS kept for QoS on the path: a private routed WAN)
+udp-port|int:1:65535|structural|47810|UDP carriers: the port this end sends from and receives on
+protect|prefixes|structural||UDP carriers: remote prefixes carried to the peer, e.g. 10.2.0.0/16,10.3.0.0/16 (0.0.0.0/0 for all); other traffic is left alone
+peer|peer|runtime||carrier udp: the peer, IPv4[:port] (port default udp-port), or learn: from its packets (the end facing a peer behind NAT)
+peer-learn-from|prefix|structural|0.0.0.0/0|carrier udp, peer = learn: only learn a peer whose address is in this prefix
+local-address|ipv4-auto|runtime|auto|carrier udp: the outer source address (auto: the interface address at generation, then the address the peer sends to)
+keepalive|dur:s|runtime|25s|carrier udp: send to the peer at least this often, so a NAT mapping stays open; rides on other IPv4 traffic leaving the interface (0: off)
+path-mtu|int:576:1500|sizing|1500|largest IP packet the link or path carries; packets that would not fit with the dataplane headers go out unprotected'
 
 declare -A KIND CLASS DEF HELP VAL SRC CLI
 KEYS=()
@@ -81,7 +91,8 @@ Writes <outdir>/<interface>/egress/*.bpfc and ingress/*.bpfc.
       --remove-maps        delete the interface's pinned maps from --map-dir
                            (also those of generator v2, dp_<interface>_*);
                            remove its programs first
-  -b, --priority N         first TC priority, default 100 (uses N..N+30)
+  -b, --priority N         first TC priority, default 100 (uses N..N+30;
+                           the UDP carriers also N-10 on ingress, N+40 on egress)
   -p, --profile NAME       start from a profile (see --list-profiles)
       --profile-dir DIR    also look for profiles in DIR (searched first)
       --list-profiles      list the available profiles
@@ -103,9 +114,11 @@ cat <<EOF
 Durations take us, ms, s or m (a bare number is in the unit shown by the
 default); rates take k, m or g (bits per second).
 
-The interface must carry 1514-byte frames (MTU 1500) while IP uses 1492:
-set "mtu lock 1492" on the routes through it. Turn off TSO/GSO/GRO on it
-and set gso_max_segs 1; see --setup-hints.
+With carrier ethernet the interface must carry 1514-byte frames (MTU 1500)
+while IP uses 1492: set "mtu lock 1492" on the routes through it. The UDP
+carriers need 1464 on the routes to the
+protected prefixes. Turn off TSO/GSO/GRO on it and set gso_max_segs 1; see
+--setup-hints (with the profile and settings, for the carrier).
 EOF
 }
 
@@ -126,6 +139,21 @@ parse_dur() {
     local u=${BASH_REMATCH[3]:-$2}
     awk -v n="${BASH_REMATCH[1]}" -v u="$u" \
         'BEGIN{f = (u=="us")?0.001:(u=="ms")?1:(u=="s")?1000:60000; x = n*f; if (x > 0 && x < 1) x = 1; printf "%.0f\n", x}'
+}
+# IPv4 helpers: ip_ok <a.b.c.d>, ip2int <a.b.c.d>, int2ip <n>, prefix_ok <a.b.c.d/n>
+ip_ok() {
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    local i; for i in 1 2 3 4; do [ "${BASH_REMATCH[$i]}" -le 255 ] || return 1; done
+}
+port_ok() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+ip2int() { local IFS=.; set -- $1; echo $(( (10#$1 << 24) | (10#$2 << 16) | (10#$3 << 8) | 10#$4 )); }
+int2ip() { echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"; }
+prefix_ok() { [[ "$1" == */* ]] && ip_ok "${1%/*}" && [[ "${1#*/}" =~ ^[0-9]{1,2}$ ]] && [ "${1#*/}" -le 32 ]; }
+# prefix_net_mask <a.b.c.d/n>: "net mask" as numbers (net with host bits cleared)
+prefix_net_mask() {
+    local n=${1#*/} m
+    m=$(( n == 0 ? 0 : (0xFFFFFFFF << (32 - n)) & 0xFFFFFFFF ))
+    echo "$(( $(ip2int "${1%/*}") & m )) $m"
 }
 pow2_up() { local n=$1 p=1; while [ $p -lt "$n" ]; do p=$((p * 2)); done; echo $p; }
 human_rate() {
@@ -150,6 +178,11 @@ check_value() {
         prate) [ -z "$v" ] || { [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v r="$v" 'BEGIN{exit !(r >= 0.00002 && r <= 100)}'; } ||
                 die "$where: must be 0.00002-100 probes per second" ;;
         arqfec) [[ "$v" =~ ^(keep|off|[1-9][0-9]*|[0-9]+(\.[0-9]+)?(us|ms|s))$ ]] || die "$where: must be keep, off, a number or a time" ;;
+        peer) [ -z "$v" ] || [ "$v" = learn ] || { ip_ok "${v%%:*}" && { [[ "$v" != *:* ]] || port_ok "${v#*:}"; }; } ||
+                die "$where: must be an IPv4 address, IPv4:port or learn" ;;
+        prefix) prefix_ok "$v" || die "$where: must be a prefix like 198.51.100.0/24" ;;
+        prefixes) [ -z "$v" ] || { local x; IFS=, read -ra x <<< "$v"; for v in "${x[@]}"; do prefix_ok "$v" || die "$where: '$v' is not a prefix like 10.2.0.0/16"; done; } ;;
+        ipv4-auto) [ "$v" = auto ] || ip_ok "$v" || die "$where: must be an IPv4 address or auto" ;;
     esac
 }
 
@@ -306,26 +339,7 @@ if [ $REMOVE_MAPS -eq 1 ]; then
     exit 0
 fi
 
-if [ $HINTS -eq 1 ]; then
-    [ -n "$IFACE" ] || die "--setup-hints needs -i <interface>"
-    IFQ=$(printf %q "$IFACE")
-cat <<EOF
-# Frames grow by 8 bytes: keep the link MTU at 1500 and use 1492 for IP.
-ip link set dev $IFQ mtu 1500
-# For every route through $IFQ (example for the connected subnet):
-#   ip route change <subnet> dev $IFQ ... mtu lock 1492
-# One TCP segment per packet, so every packet can be protected:
-ip link set dev $IFQ gso_max_segs 1
-ethtool -K $IFQ tso off gso off gro off
-# Packets forwarded into $IFQ from other interfaces must not be GRO-merged
-# (merged packets are sent unprotected): ethtool -K <lan-if> gro off
-# Hosts or containers attached by veth pass their TSO/GSO packets through
-# unchanged: on them, ethtool -K <if> tso off gso off
-# On a VLAN subinterface, instead of route locks: ip link set dev $IFQ mtu 1492
-# (the parent stays at 1500; set the same on the peer)
-EOF
-    exit 0
-fi
+[ $HINTS -eq 0 ] || [ -n "$IFACE" ] || die "--setup-hints needs -i <interface>"
 
 # ---------------------------------------------------------------- resolve
 
@@ -420,6 +434,7 @@ PROBE_MS=$(parse_dur "${VAL[probe-interval]}" s)
 [ -n "${VAL[probe-rate]}" ] && PROBE_MS=$(awk -v r="${VAL[probe-rate]}" 'BEGIN{printf "%d", 1000 / r + 0.5}')
 LOSS_SMOOTH=${VAL[loss-smoothing]}
 CAP_WIN_MS=$(parse_dur "${VAL[capacity-window]:-0}" s)
+KEEPALIVE_MS=$(parse_dur "${VAL[keepalive]:-0}" s)
 CONG_DELAY_MS=$(parse_dur "${VAL[congestion-delay]}" ms)
 FEC_K=${VAL[fec-k]}; FEC_KMIN=${VAL[fec-k-min]}; FEC_KMAX=${VAL[fec-k-max]}; FEC_FLOOR=${VAL[fec-floor]}
 PROBE_BACKOFF=${VAL[probe-backoff]}; PROBE_MIN=${VAL[probe-min-bytes]}; CONG_PCT=${VAL[congestion-pct]}
@@ -430,6 +445,7 @@ case "${VAL[fec-mode]}" in auto) FEC_FORCE=0 ;; off) FEC_FORCE=1 ;; on) FEC_FORC
 [ "$REPORT_MS" -ge 100 ] && [ "$REPORT_MS" -le 60000 ] || die "report-interval must be 100 ms - 60 s"
 [ "$PROBE_MS" -ge 10 ] && [ "$PROBE_MS" -le 86400000 ] || die "probe interval must be 10 ms - 1 day (probe-rate 0.00002-100)"
 [ "$CONG_DELAY_MS" -ge 1 ] && [ "$CONG_DELAY_MS" -le 10000 ] || die "congestion-delay must be 1 ms - 10 s"
+[ "$KEEPALIVE_MS" -eq 0 ] || { [ "$KEEPALIVE_MS" -ge 100 ] && [ "$KEEPALIVE_MS" -le 86400000 ]; } || die "keepalive must be 0 (off) or 100 ms - 1 day"
 [ "$CAP_WIN_MS" -eq 0 ] || { [ "$CAP_WIN_MS" -ge 100 ] && [ "$CAP_WIN_MS" -le 86400000 ]; } || die "capacity-window must be 0 (off) or 100 ms - 1 day"
 [ "$CAP_WIN_MS" -eq 0 ] || [ "$CAP_WIN_MS" -ge "$PROBE_MS" ] || warn "capacity-window ${VAL[capacity-window]} is shorter than the probe interval: at most one sample counts"
 case "${VAL[arq-with-fec]}" in
@@ -444,6 +460,110 @@ case "${VAL[arq-with-fec]}" in
 esac
 [ "$ARQ_FEC_DEPTH" -le "$ARQ_DEPTH" ] || ARQ_FEC_DEPTH=$ARQ_DEPTH
 MEM_KB=$(( (ARQ_DEPTH * 1504 + FEC_SLOTS * 1504 + ARQ_DEPTH * 8 + FEC_SLOTS * 32 + DUP_WORDS * 8) / 1024 ))
+
+# Carrier. Inside the dataplane every frame is Ethernet + 8-byte shim (+ the
+# IP packet); with a UDP carrier one program at the end of egress turns it
+# into a UDP packet and one at the start of ingress turns it back, so all the
+# other programs are the same for every carrier.
+#   ethernet    Ethernet | shim | IP                          +8 bytes
+#   udp         Ethernet | IPv4 to peer | UDP | shim | IP      +36
+#   udp-inline  Ethernet | IP (protocol UDP) | UDP (source port 0xB500 +
+#               the protocol) | shim | L4                    +16 (+36 on
+#               frames that carry no IP packet: parity, NAKs, reports)
+CARRIER=${VAL[carrier]}
+UDP_PORT=${VAL[udp-port]}
+PATH_MTU=${VAL[path-mtu]}
+case "$CARRIER" in
+    ethernet)   C_OVH=8 ;;
+    udp)        C_OVH=36 ;;
+    udp-inline) C_OVH=36 ;;   # data 16; parity frames 36 + the longest member
+esac
+IP_MAX=$((PATH_MTU - C_OVH))
+PROT_LIST=()
+if [ -n "${VAL[protect]}" ]; then
+    IFS=, read -ra PROT_LIST <<< "${VAL[protect]}"
+fi
+PEER_IP=0; PEER_PORT=$UDP_PORT; PEER_LEARN=0; LOCAL_IP=0; LOCAL_AUTO=0; LEARN_NET=0; LEARN_MASK=0
+if [ "$CARRIER" != ethernet ]; then
+    [ ${#PROT_LIST[@]} -gt 0 ] || die "carrier $CARRIER needs protect: the remote prefixes to carry (e.g. --protect 10.2.0.0/16, or 0.0.0.0/0 for all)"
+    [ "$PRIO" -gt 10 ] 2>/dev/null || die "carrier $CARRIER needs --priority above 10 (it also uses N-10 on ingress)"
+fi
+if [ "$CARRIER" = udp ]; then
+    case "${VAL[peer]}" in
+        "") die "carrier udp needs peer: the peer's IPv4 address[:port], or learn" ;;
+        learn) PEER_LEARN=1
+               read -r LEARN_NET LEARN_MASK <<< "$(prefix_net_mask "${VAL[peer-learn-from]}")" ;;
+        *:*) PEER_IP=$(ip2int "${VAL[peer]%%:*}"); PEER_PORT=${VAL[peer]#*:} ;;
+        *)   PEER_IP=$(ip2int "${VAL[peer]}") ;;
+    esac
+    if [ "${VAL[local-address]}" = auto ]; then
+        LOCAL_AUTO=1
+        a=""
+        [ -n "$IFACE" ] && a=$(ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}')
+        if [ -n "$a" ]; then
+            LOCAL_IP=$(ip2int "$a")
+        elif [ -z "$SHOW" ] && [ $HINTS -eq 0 ]; then
+            die "local-address auto: ${IFACE:-the interface} has no IPv4 address here; give --local-address (the address the interface sends from)"
+        fi
+    else
+        LOCAL_IP=$(ip2int "${VAL[local-address]}")
+    fi
+else
+    for k in peer local-address; do
+        [ "${SRC[$k]}" = default ] || [ -z "${VAL[$k]}" ] || [ "${VAL[$k]}" = auto ] || warn "$k is only used with carrier udp"
+    done
+fi
+
+if [ $HINTS -eq 1 ]; then
+    IFQ=$(printf %q "$IFACE")
+    if [ "$CARRIER" = ethernet ]; then
+cat <<EOF
+# Frames grow by 8 bytes: keep the link MTU at $PATH_MTU and use $IP_MAX for IP.
+ip link set dev $IFQ mtu $PATH_MTU
+# For every route through $IFQ (example for the connected subnet):
+#   ip route change <subnet> dev $IFQ ... mtu lock $IP_MAX
+EOF
+    else
+        echo "# Carrier $CARRIER: packets to the protected prefixes grow by $( [ "$CARRIER" = udp ] && echo "36 bytes (outer IPv4 + UDP + shim)" || echo "16 bytes (UDP + shim; parity frames 36)"),"
+        echo "# so with a path MTU of $PATH_MTU they may be at most $IP_MAX bytes. For each prefix:"
+        for p in "${PROT_LIST[@]}"; do
+            echo "ip route replace $p via <gateway> dev $IFQ mtu lock $IP_MAX"
+        done
+        echo "# Traffic this host sends itself from a protected-site address (on lo or a LAN"
+        echo "# interface) makes ARP ask the gateway with that address, which a gateway with"
+        echo "# strict reverse-path filtering ignores; announce the interface address instead:"
+        echo "sysctl -w net.ipv4.conf.$IFQ.arp_announce=2"
+        echo "# UDP port $UDP_PORT carries the dataplane both ways: nothing listens on it, but a"
+        echo "# firewall on the path must pass it. Programs run after netfilter on egress:"
+        echo "# do not masquerade (SNAT) traffic to the protected prefixes on $IFQ."
+        if [ "$CARRIER" = udp ]; then
+            if [ $PEER_LEARN -eq 1 ]; then
+                echo "# peer = learn: the peer's address and port are taken from its packets, so the"
+                echo "# peer must send first (its NAT mapping is what this end answers to)."
+            else
+                echo "# Behind NAT, the mapping only stays open while this end sends. Keep something"
+                echo "# flowing to the peer, e.g.: ping -i 15 <an address in a protected prefix>"
+            fi
+        else
+            echo "# The routed WAN must carry the protected prefixes between the two ends, and both"
+            echo "# ends must be on the path (control frames use the addresses of the traffic)."
+        fi
+    fi
+cat <<EOF
+# One TCP segment per packet, so every packet can be protected:
+ip link set dev $IFQ gso_max_segs 1
+ethtool -K $IFQ tso off gso off gro off
+# Packets forwarded into $IFQ from other interfaces must not be GRO-merged
+# (merged packets are sent unprotected): ethtool -K <lan-if> gro off
+# Hosts or containers attached by veth pass their TSO/GSO packets through
+# unchanged: on them, ethtool -K <if> tso off gso off
+EOF
+    if [ "$CARRIER" = ethernet ]; then
+        echo "# On a VLAN subinterface, instead of route locks: ip link set dev $IFQ mtu $IP_MAX"
+        echo "# (the parent stays at $PATH_MTU; set the same on the peer)"
+    fi
+    exit 0
+fi
 
 # ---------------------------------------------------------------- show / save
 
@@ -467,6 +587,7 @@ show_settings() {
     echo "#   FEC slots       $FEC_SLOTS"
     [ -n "$SEQ_MS" ] && echo "#   sequence space  $SEQ_MS ms (outages longer than this count as a resync, not loss)"
     echo "#   map memory      about $MEM_KB KiB per interface"
+    echo "#   carrier         $CARRIER: IP packets up to $IP_MAX bytes are protected (path MTU $PATH_MTU)$( [ "$CARRIER" != ethernet ] && echo ", UDP port $UDP_PORT")"
     local w; for w in "${WARNINGS[@]}"; do echo "#   warning: $w"; done
 }
 
@@ -535,13 +656,236 @@ emit() {   # emit <dir> <prio> <name>; reads the program on stdin
     fi
 }
 
+# Switching back to the Ethernet carrier: remove the UDP carrier programs of
+# an earlier run (only files this generator wrote).
+if [ "$OUTDIR" != "-" ] && [ "$CARRIER" = ethernet ]; then
+    for f in "$OUTDIR/$IFACE/ingress/$((PRIO - 10)).bpfc" "$OUTDIR/$IFACE/egress/$((PRIO + 40)).bpfc"; do
+        if [ -f "$f" ] && head -1 "$f" | grep -q '^# Generated by bpfc-dataplane-gen'; then
+            rm -f -- "$f" && echo "removed $f (carrier program of an earlier run)"
+        fi
+    done
+fi
+
 PNAME=${PROFILE:-none}
 SETTINGS_LINE=""
 for k in "${KEYS[@]}"; do [ -n "${VAL[$k]}" ] && SETTINGS_LINE+=" $k=${VAL[$k]}"; done
 HEADER="# Generated by bpfc-dataplane-gen v$VERSION for $IFACE_ENC (profile $PNAME) - regenerate, do not edit.
-# dataplane: version=$VERSION iface=$IFACE_ENC prefix=$PREFIX profile=$PNAME link_rate=${RATE_BPS:-0} rtt_ms=${RTT_MS:-0} sizing_bytes=$SIZING arq_depth=$ARQ_DEPTH dup_words=$DUP_WORDS fec_slots=$FEC_SLOTS nak_max=$NAK_MAX arq_mode=$ARQ_MODE arq_fec_depth=$ARQ_FEC_DEPTH fec_bp=$FEC_BP cooldown_ms=$COOLDOWN_MS k=$FEC_K kmin=$FEC_KMIN kmax=$FEC_KMAX floor=$FEC_FLOOR timeout_ms=$FEC_TIMEOUT fec_mode=$FEC_FORCE report_ms=$REPORT_MS probe_ms=$PROBE_MS backoff=$PROBE_BACKOFF probe_min=$PROBE_MIN cong_pct=$CONG_PCT cong_delay_ms=$CONG_DELAY_MS loss_smooth=$LOSS_SMOOTH cap_window_ms=$CAP_WIN_MS
+# dataplane: version=$VERSION iface=$IFACE_ENC prefix=$PREFIX profile=$PNAME link_rate=${RATE_BPS:-0} rtt_ms=${RTT_MS:-0} sizing_bytes=$SIZING arq_depth=$ARQ_DEPTH dup_words=$DUP_WORDS fec_slots=$FEC_SLOTS nak_max=$NAK_MAX arq_mode=$ARQ_MODE arq_fec_depth=$ARQ_FEC_DEPTH fec_bp=$FEC_BP cooldown_ms=$COOLDOWN_MS k=$FEC_K kmin=$FEC_KMIN kmax=$FEC_KMAX floor=$FEC_FLOOR timeout_ms=$FEC_TIMEOUT fec_mode=$FEC_FORCE report_ms=$REPORT_MS probe_ms=$PROBE_MS backoff=$PROBE_BACKOFF probe_min=$PROBE_MIN cong_pct=$CONG_PCT cong_delay_ms=$CONG_DELAY_MS loss_smooth=$LOSS_SMOOTH cap_window_ms=$CAP_WIN_MS keepalive_ms=$KEEPALIVE_MS carrier=$CARRIER udp_port=$UDP_PORT ip_max=$IP_MAX peer=$( [ $PEER_LEARN -eq 1 ] && echo learn || echo "$(int2ip $PEER_IP):$PEER_PORT") local=$(int2ip $LOCAL_IP) protect=$(IFS=,; echo "${PROT_LIST[*]:-all}")
 # maps: $TX $RX $PC $CFG $ARQ $ATAG $ACC $FRX $FSL $DUP
 # settings:$SETTINGS_LINE"
+
+# ---------------------------------------------------------------- carrier code
+
+# carrier_select_code: in the first egress program, after "match ip": leave
+# alone what is not for the peer (not in protect), and send unprotected what
+# the carrier cannot take (no peer or local address yet; for udp-inline,
+# IP options or fragments).
+carrier_select_code() {
+    local p net mask
+    if [ ${#PROT_LIST[@]} -gt 0 ]; then
+        echo "# Only packets to the protected prefixes ($(IFS=,; echo "${PROT_LIST[*]}"))."
+        echo "get ip-dst PD;"
+        echo "decl PDV 8;"
+        echo "set val PDV %PD;"
+        echo "free PD;"
+        echo "decl PSEL 8;"
+        echo "decl PT 8;"
+        echo "decl PN 8;"
+        for p in "${PROT_LIST[@]}"; do
+            read -r net mask <<< "$(prefix_net_mask "$p")"
+            if [ "$mask" -eq 0 ]; then
+                echo "set val PSEL 1;"
+            else
+                echo "set val PT %PDV;"
+                echo "set val PN $mask;"
+                echo "calc and PT %PN;"
+                echo "set val PN $net;"
+                echo "if PT eq %PN;"
+                echo "  set val PSEL 1;"
+                echo "end-if;"
+            fi
+        done
+        echo "free PN;"
+        echo "free PT;"
+        echo "free PDV;"
+        echo "if PSEL eq 0;"
+        echo "  set skb-cb 0 0;"
+        echo "  continue;"
+        echo "end-if;"
+        echo "free PSEL;"
+    fi
+    case "$CARRIER" in
+        udp)
+cat <<EOC
+# The peer's address and ours (runtime setting, else learned, else generated);
+# without them the packet goes out unprotected.
+get map $CFG 19 PI;
+if PI eq 0;
+  get map $TX 60 PI;
+end-if;
+if PI eq 0;
+  set val PI $PEER_IP;
+end-if;
+get map $CFG 21 LI;
+if LI eq 0;
+  get map $TX 62 LI;
+end-if;
+if LI eq 0;
+  set val LI $LOCAL_IP;
+end-if;
+calc mul PI %LI;
+if PI eq 0;
+  calc-map add $TX 65 1;
+  set skb-cb 0 0;
+  continue;
+end-if;
+free LI;
+free PI;
+EOC
+            ;;
+        udp-inline)
+cat <<EOC
+# The IP header becomes the outer header: 20 bytes, not a fragment.
+get bytes 14 1 VH;
+get bytes 20 2 FR;
+calc and FR 0x3FFF;
+if VH ne 0x45;
+  set val FR 1;
+end-if;
+if FR ne 0;
+  calc-map add $TX 4 1;
+  set skb-cb 0 0;
+  continue;
+end-if;
+free FR;
+free VH;
+EOC
+            ;;
+    esac
+}
+
+# keepalive_code (carrier udp): when nothing went to the peer for keepalive
+# ms (cfg 22; TX 67 = last frame the carrier sent), send it a keepalive
+# (type 6) made from a clone of this packet: the clone gets EtherType 0x88B5
+# and a type 6 shim, then the original's bytes are put back. The carrier
+# program cuts the clone to 60 bytes, so none of the packet leaves with it.
+keepalive_code() {
+    [ "$CARRIER" = udp ] || return 0
+cat <<EOC
+# Keepalive for a NAT on the path (see keepalive).
+get map $CFG 22 KA;
+if KA eq 0;
+  set val KA $KEEPALIVE_MS;
+end-if;
+if KA gt 0;
+  if KA lt 86400000;
+    get time KN;
+    calc div KN 1000000;
+    get map $TX 67 KL;
+    calc sub KL %KN;
+    calc add KL %KA;
+    # KL = last + interval - now: negative (top bit set) when one is due
+    calc rsh KL 63;
+    # not from a GSO packet (it could not be cut down)
+    get len KZ;
+    if KZ gt 1514;
+      set val KL 0;
+    end-if;
+    free KZ;
+    if KL eq 1;
+      set map $TX 67 %KN;
+      get bytes 12 2 KE;
+      get bytes 14 8 KB;
+      set eth-proto 0x88B5;
+      decl KW 8;
+      set val KW 6;
+      calc lsh KW 61;
+      calc hton KW 64;
+      set bytes 14 8 %KW;
+      free KW;
+      get skb-ifindex KI;
+      clone %KI egress;
+      free KI;
+      calc hton KB 64;
+      set bytes 14 8 %KB;
+      calc hton KE 16;
+      set bytes 12 2 %KE;
+      calc-map add $TX 68 1;
+      free KB;
+      free KE;
+    end-if;
+    free KL;
+    free KN;
+  end-if;
+end-if;
+free KA;
+EOC
+}
+
+# udp-inline: routers on the path lower the TTL and may rewrite the TOS
+# (DSCP remarking, ECN CE), and the receiver delivers them as they arrive. So
+# FEC leaves them out: members are folded with TOS, TTL and header checksum
+# zeroed (fec_norm_code before the fold, fec_restore_code after), and a
+# rebuilt packet takes TOS and TTL from its parity frame, which travels with
+# those of the packet it was made from (skb->cb 3: 0xB5A1 << 16 | TTL << 8 | TOS).
+fec_norm_code() {
+    [ "$CARRIER" = udp-inline ] || return 0
+cat <<EOC
+# udp-inline: fold without TOS, TTL and header checksum
+get bytes 22 8 NA;
+get bytes 30 4 NB;
+decl NZ 8;
+set val NZ %NA;
+decl NM 8;
+set val NM 0xFF;
+calc lsh NM 48;
+calc not NM;
+calc and NZ %NM;
+calc hton NZ 64;
+set bytes 22 8 %NZ;
+decl NY 4;
+set val NY %NB;
+calc and NY 0x00FF0000;
+calc hton NY 32;
+set bytes 30 4 %NY;
+free NY;
+free NZ;
+EOC
+}
+fec_restore_code() {
+    [ "$CARRIER" = udp-inline ] || return 0
+cat <<EOC
+calc hton NA 64;
+set bytes 22 8 %NA;
+calc hton NB 32;
+set bytes 30 4 %NB;
+free NM;
+free NB;
+free NA;
+EOC
+}
+
+# csum_add <var> <bits>: add the 16-bit words of a big-endian header value
+# to CS (CT is scratch). csum_fold: CS becomes the IPv4 header checksum.
+csum_add() {
+    local v=$1 b=$2 sh
+    for ((sh = b - 16; sh >= 0; sh -= 16)); do
+        echo "set val CT %$v;"
+        [ $sh -gt 0 ] && echo "calc rsh CT $sh;"
+        echo "calc and CT 0xFFFF;"
+        echo "calc add CS %CT;"
+    done
+}
+csum_fold() {
+    local i
+    for i in 1 2; do
+        echo "set val CT %CS;"
+        echo "calc rsh CT 16;"
+        echo "calc and CS 0xFFFF;"
+        echo "calc add CS %CT;"
+    done
+    echo "calc xor CS 0xFFFF;"
+}
 
 ########################################################################
 # Egress, first: encapsulate every IPv4 packet (sequence number, timestamp)
@@ -564,10 +908,11 @@ match eth-proto 0x88B5;
   continue;
 end-match;
 match ip;
+$(keepalive_code)$(carrier_select_code)
 
-# Packets that do not fit (GSO, or IP longer than 1492) go out unprotected.
+# Packets that do not fit (GSO, or IP longer than $IP_MAX) go out unprotected.
 get len FLEN;
-if FLEN gt 1506;
+if FLEN gt $((14 + IP_MAX));
   calc-map add $TX 4 1;
   set skb-cb 0 0;
   continue;
@@ -851,7 +1196,9 @@ if ACT eq 1;
     set bytes 48 2 %TV;
   end-if;
   free TV;
+$(fec_norm_code)
   xor-packet $ACC %IPL 22 0;
+$(fec_restore_code)
   calc hton CS 16;
   if CO eq 58;
     set bytes 58 2 %CS;
@@ -892,17 +1239,31 @@ if ACT ge 2;
   set map $PC %PK 0;
   get skb-ifindex IFX;
   clone %IFX egress;
-  # parity length = OR of member lengths, 38..1492
+  # parity length = OR of member lengths, 38..$IP_MAX
   decl PL 8;
   set val PL %ST;
   calc rsh PL 32;
   calc and PL 0xFFF;
-  if PL gt 1492;
-    set val PL 1492;
+  if PL gt $IP_MAX;
+    set val PL $IP_MAX;
   end-if;
   if PL lt 38;
     set val PL 38;
   end-if;
+$( [ "$CARRIER" = udp-inline ] && cat <<EOC
+  # udp-inline: the parity frame travels with this packet's TOS and TTL
+  get bytes 23 1 QT;
+  get bytes 30 1 QL;
+  set val T 0xB5A1;
+  calc lsh T 8;
+  calc or T %QL;
+  calc lsh T 8;
+  calc or T %QT;
+  set skb-cb 3 %T;
+  free QL;
+  free QT;
+EOC
+)
   set val T %PL;
   calc add T 22;
   set len %T;
@@ -1079,7 +1440,7 @@ if PT ne 0;
     decl PB 8;
     set val PB %PL4;
     free PL4;
-    calc add PB 24;
+    calc add PB 24;$( [ "$CARRIER" != ethernet ] && printf '\n    # the UDP carrier headers the first program removed\n    get bytes 12 2 PET;\n    if PET eq 0x88B5;\n      calc add PB %d;\n    end-if;\n    free PET;' $( [ "$CARRIER" = udp ] && echo 28 || echo 12))
     calc-map add $RX 42 %PB;
     free PB;
   end-if;
@@ -1092,6 +1453,7 @@ get bytes 14 8 W;
 decl TY 8;
 set val TY %W;
 calc rsh TY 61;
+$( [ "$CARRIER" = udp ] && printf '%s\n' '# keepalive (carrier udp): only there to keep a NAT mapping open' 'if TY eq 6;' "  calc-map add $RX 95 1;" '  drop;' 'end-if;')
 
 if TY eq 1;
   decl PF 8;
@@ -2132,6 +2494,55 @@ xor-packet-keyed $FRX %SL %PL 22 0;
 load-packet-keyed $FRX %SL %PL 0 22;
 zero-buffer-keyed $FRX %SL 1504 0;
 free SL;
+$( [ "$CARRIER" = udp-inline ] && cat <<EOC
+# udp-inline: the members were folded without TOS, TTL and checksum; take
+# TOS and TTL from the parity frame (as it arrived) and compute the checksum.
+get skb-cb 3 QC;
+decl QV 8;
+set val QV %QC;
+free QC;
+decl QM 8;
+set val QM %QV;
+calc rsh QM 16;
+if QM ne 0xB5A1;
+  set val QV 64;
+  calc lsh QV 8;
+end-if;
+get bytes 22 8 RA;
+get bytes 30 8 RB;
+get bytes 38 4 RC;
+decl CS 8;
+decl CT 8;
+decl QX 8;
+set val QX %QV;
+calc and QX 0xFF;
+calc lsh QX 48;
+calc or RA %QX;
+set val QX %QV;
+calc rsh QX 8;
+calc and QX 0xFF;
+calc lsh QX 56;
+calc or RB %QX;
+$(csum_add RA 64)
+$(csum_add RB 64)
+$(csum_add RC 32)
+$(csum_fold)
+calc lsh CS 32;
+calc or RB %CS;
+calc hton RA 64;
+calc hton RB 64;
+set bytes 22 8 %RA;
+set bytes 30 8 %RB;
+free QX;
+free CT;
+free CS;
+free RC;
+free RB;
+free RA;
+free QM;
+free QV;
+EOC
+)
 
 # Check it is a sane IPv4 header with a valid header checksum.
 get bytes 22 1 VI;
@@ -2649,6 +3060,7 @@ if TY eq 1;
     # Fold in the packet's true TCP/UDP checksum, as the sender did: virtual
     # NICs (veth, virtio) can deliver packets whose checksum field still holds
     # the unfinished value.
+$(fec_norm_code)
     get bytes 24 2 IPL;
     get bytes 28 2 FR;
     calc and FR 0x3FFF;
@@ -2682,6 +3094,7 @@ if TY eq 1;
       xor-packet-keyed $FRX %T %IPL 22 0;
     end-if;
     free DONE;
+$(fec_restore_code)
     free TV;
     free CS;
     free PR;
@@ -2953,3 +3366,518 @@ set bytes 62 8 %V;
 redirect %IFX egress;
 EOF
 } | emit ingress $P_DELIVER "deliver"
+
+########################################################################
+# UDP carriers: the last egress program wraps every dataplane frame
+# (Ethernet | shim | ...) in UDP, the first ingress program unwraps it, so
+# the programs above see the same frames as with the Ethernet carrier.
+# Both keep skb->protocol IPv4 (insert-l2 / remove-l2), so a frame can be
+# wrapped again after it was cloned or redirected (NAKs, retransmissions).
+########################################################################
+P_CARRIER_OUT=$((PRIO + 40))
+P_CARRIER_IN=$((PRIO - 10))
+
+# udp_addr_code: PI, PP, LI = peer address, peer port, our address
+udp_addr_code() {
+cat <<EOC
+get map $CFG 19 PI;
+if PI eq 0;
+  get map $TX 60 PI;
+end-if;
+if PI eq 0;
+  set val PI $PEER_IP;
+end-if;
+get map $CFG 20 PP;
+if PP eq 0;
+  get map $TX 61 PP;
+end-if;
+if PP eq 0;
+  set val PP $PEER_PORT;
+end-if;
+get map $CFG 21 LI;
+if LI eq 0;
+  get map $TX 62 LI;
+end-if;
+if LI eq 0;
+  set val LI $LOCAL_IP;
+end-if;
+EOC
+}
+
+# udp_in_check_code: the first checks of a received frame: IPv4 without
+# options, not a fragment, UDP to our port, at least <min> bytes long.
+udp_in_check_code() {
+cat <<EOC
+match eth-proto 0x0800;
+get bytes 14 1 VH;
+if VH ne 0x45;
+  continue;
+end-if;
+free VH;
+get bytes 23 1 PR;
+if PR ne 17;
+  continue;
+end-if;
+free PR;
+get bytes 36 2 DP;
+if DP ne $UDP_PORT;
+  continue;
+end-if;
+free DP;
+get bytes 20 2 FR;
+calc and FR 0x3FFF;
+if FR ne 0;
+  continue;
+end-if;
+free FR;
+get len FL;
+if FL lt $1;
+  continue;
+end-if;
+free FL;
+EOC
+}
+
+if [ "$CARRIER" = udp ]; then
+{
+cat <<EOF
+$HEADER
+#
+# Carrier udp, sending: Ethernet | IPv4 (us -> peer, DF, TTL 64, the DSCP of
+# the packet carried) | UDP ($UDP_PORT -> the peer's port, no checksum) |
+# shim | ... ; the Ethernet header from a route lookup of the peer.
+match eth-proto 0x88B5;
+get bytes 14 1 TB;
+decl TY 8;
+set val TY %TB;
+free TB;
+calc rsh TY 5;
+# a keepalive is a clone of some packet: 60 bytes are enough
+if TY eq 6;
+  set len 60;
+end-if;
+get len FL;
+decl L 8;
+set val L %FL;
+calc add L 14;
+free FL;
+get bytes 23 1 IT;
+decl TOS 8;
+if TY eq 1;
+  set val TOS %IT;
+end-if;
+if TY eq 3;
+  set val TOS %IT;
+end-if;
+free IT;
+calc and TOS 0xFC;
+$(udp_addr_code)
+decl Z 8;
+set val Z %PI;
+calc mul Z %LI;
+if Z eq 0;
+  # (a keepalive before the peer is known is not counted)
+  if TY ne 6;
+    calc-map add $TX 65 1;
+  end-if;
+  drop;
+end-if;
+free Z;
+get time KN;
+calc div KN 1000000;
+set map $TX 67 %KN;
+free KN;
+insert-l2 28 0x0800;
+decl CS 8;
+decl CT 8;
+decl W 8;
+set val W 0x45;
+calc lsh W 8;
+calc or W %TOS;
+calc lsh W 16;
+calc or W %L;
+calc lsh W 32;
+calc or W 0x4000;
+$(csum_add W 64)
+decl W2 8;
+set val W2 0x4011;
+calc lsh W2 48;
+calc or W2 %LI;
+$(csum_add W2 64)
+$(csum_add PI 32)
+$(csum_fold)
+set val CT %CS;
+calc lsh CT 32;
+calc or W2 %CT;
+decl W3 8;
+set val W3 %PI;
+calc lsh W3 16;
+calc or W3 $UDP_PORT;
+calc lsh W3 16;
+calc or W3 %PP;
+decl U 4;
+set val CT %L;
+calc sub CT 20;
+calc lsh CT 16;
+set val U %CT;
+calc hton W 64;
+calc hton W2 64;
+calc hton W3 64;
+calc hton U 32;
+set bytes 14 8 %W;
+set bytes 22 8 %W2;
+set bytes 30 8 %W3;
+set bytes 38 4 %U;
+fib-lookup output;
+if FIB_RESULT eq 0;
+  set dst-mac %FIB_DMAC;
+  set src-mac %FIB_SMAC;
+end-if;
+continue;
+EOF
+} | emit egress $P_CARRIER_OUT "carrier"
+
+{
+cat <<EOF
+$HEADER
+#
+# Carrier udp, receiving: a UDP packet to port $UDP_PORT from the peer loses
+# its outer IPv4 + UDP header (28 bytes) and goes on as a dataplane frame.
+$(udp_in_check_code 50)
+get bytes 26 4 SA;
+decl SAV 8;
+set val SAV %SA;
+free SA;
+get bytes 42 1 TB;
+decl TY 8;
+set val TY %TB;
+free TB;
+calc rsh TY 5;
+if TY eq 0;
+  calc-map add $RX 94 1;
+  drop;
+end-if;
+if TY gt 6;
+  calc-map add $RX 94 1;
+  drop;
+end-if;
+EOF
+if [ $PEER_LEARN -eq 0 ]; then
+cat <<EOF
+# from the peer only
+get map $CFG 19 PI;
+if PI eq 0;
+  set val PI $PEER_IP;
+end-if;
+if SAV ne %PI;
+  calc-map add $RX 94 1;
+  drop;
+end-if;
+free PI;
+EOF
+else
+cat <<EOF
+# peer = learn: from ${VAL[peer-learn-from]}; its address and port are
+# where this end sends (the latest, so a NAT that moves it is followed)
+decl T 8;
+decl M 8;
+set val T %SAV;
+set val M $LEARN_MASK;
+calc and T %M;
+set val M $LEARN_NET;
+if T ne %M;
+  calc-map add $RX 94 1;
+  drop;
+end-if;
+free M;
+free T;
+get bytes 34 2 SP;
+decl SPV 8;
+set val SPV %SP;
+free SP;
+get map $TX 60 OP;
+get map $TX 61 OQ;
+decl CH 8;
+if OP ne %SAV;
+  set val CH 1;
+end-if;
+if OQ ne %SPV;
+  set val CH 1;
+end-if;
+if CH eq 1;
+  set map $TX 60 %SAV;
+  set map $TX 61 %SPV;
+  calc-map add $TX 66 1;
+end-if;
+EOF
+fi
+if [ $LOCAL_AUTO -eq 1 ]; then
+cat <<EOF
+# local-address auto: the address the peer sends to (behind NAT, the one
+# this interface has) is the source from now on
+get bytes 30 4 DA;
+decl DAV 8;
+set val DAV %DA;
+free DA;
+get map $TX 62 OL;
+if OL ne %DAV;
+  set map $TX 62 %DAV;
+end-if;
+EOF
+fi
+cat <<EOF
+calc-map add $RX 93 1;
+remove-l2 28 0x88B5;
+continue;
+EOF
+} | emit ingress $P_CARRIER_IN "carrier"
+fi
+
+if [ "$CARRIER" = udp-inline ]; then
+{
+cat <<EOF
+$HEADER
+#
+# Carrier udp-inline, sending. A frame that carries an IP packet (data,
+# retransmission) keeps its IP header as the outer one, as it is (addresses,
+# TOS, TTL, ID), with protocol UDP:
+#   Ethernet | IP | UDP (0xB500 + the protocol -> $UDP_PORT) | shim | L4 ...
+# 16 bytes. Other frames (parity, NAK, report) get an IP header of the
+# traffic they belong to (36 bytes): parity the addresses of the last packet
+# sent and the TOS and TTL of the packet it was made from, NAKs and reports
+# those of the last packet received, swapped.
+match eth-proto 0x88B5;
+get bytes 14 8 SW;
+decl TY 8;
+set val TY %SW;
+calc rsh TY 61;
+decl D 8;
+if TY eq 1;
+  set val D 1;
+end-if;
+if TY eq 3;
+  set val D 1;
+end-if;
+get len FL;
+decl H0 8;
+decl H2 8;
+decl SD 8;
+decl SP 8;
+decl L 8;
+decl T 8;
+set val SP 0xB5;
+calc lsh SP 8;
+if D eq 1;
+  get bytes 22 8 HA;
+  get bytes 30 4 HB;
+  get bytes 34 8 HC;
+  set map $TX 64 %HC;
+  set val SD %HC;
+  set val H0 %HA;
+  set val T 16;
+  calc lsh T 32;
+  calc add H0 %T;
+  set val L %HA;
+  calc rsh L 32;
+  calc and L 0xFFFF;
+  calc add L 16;
+  # the protocol goes in the source port
+  set val T %HB;
+  calc rsh T 16;
+  calc and T 0xFF;
+  calc or SP %T;
+  set val H2 %HB;
+  calc rsh H2 24;
+  calc lsh H2 8;
+  calc or H2 17;
+  free HC;
+  free HB;
+  free HA;
+else;
+  if TY eq 2;
+    get map $TX 64 SD;
+  else;
+    get map $RX 92 RV;
+    set val SD %RV;
+    calc lsh SD 32;
+    set val T %RV;
+    calc rsh T 32;
+    calc or SD %T;
+    free RV;
+  end-if;
+  if SD eq 0;
+    drop;
+  end-if;
+  # TOS and TTL: of the packet a parity frame was made from, else 0 and 64
+  get skb-cb 3 QC;
+  decl QV 8;
+  set val QV %QC;
+  free QC;
+  set val T %QV;
+  calc rsh T 16;
+  if T ne 0xB5A1;
+    set val QV 64;
+    calc lsh QV 8;
+  end-if;
+  set skb-cb 3 0;
+  set val L %FL;
+  calc add L 14;
+  set val H0 0x45;
+  calc lsh H0 8;
+  set val T %QV;
+  calc and T 0xFF;
+  calc or H0 %T;
+  calc lsh H0 16;
+  calc or H0 %L;
+  calc lsh H0 32;
+  calc or H0 0x4000;
+  set val H2 %QV;
+  calc rsh H2 8;
+  calc and H2 0xFF;
+  calc lsh H2 8;
+  calc or H2 17;
+  free QV;
+end-if;
+free FL;
+if D eq 1;
+  insert-l2 8 0x0800;
+else;
+  insert-l2 28 0x0800;
+end-if;
+decl CS 8;
+decl CT 8;
+$(csum_add H0 64)
+$(csum_add H2 16)
+$(csum_add SD 64)
+$(csum_fold)
+# 22: TTL, UDP, checksum, source; 30: destination, ports; 38: UDP length
+calc lsh H2 16;
+calc or H2 %CS;
+calc lsh H2 32;
+set val T %SD;
+calc rsh T 32;
+calc or H2 %T;
+calc lsh SD 32;
+set val T %SP;
+calc lsh T 16;
+calc or T $UDP_PORT;
+calc or SD %T;
+decl U 4;
+set val T %L;
+calc sub T 20;
+calc lsh T 16;
+set val U %T;
+calc hton H0 64;
+calc hton H2 64;
+calc hton SD 64;
+calc hton U 32;
+set bytes 14 8 %H0;
+set bytes 22 8 %H2;
+set bytes 30 8 %SD;
+set bytes 38 4 %U;
+if D eq 1;
+  # the shim moved with the 8 inserted bytes: put it after the UDP header
+  calc hton SW 64;
+  set bytes 42 8 %SW;
+end-if;
+continue;
+EOF
+} | emit egress $P_CARRIER_OUT "carrier"
+
+{
+cat <<EOF
+$HEADER
+#
+# Carrier udp-inline, receiving: UDP from a source port 0xB5xx to port
+# $UDP_PORT becomes a dataplane frame again. A data packet gets its IP header
+# back as it arrived (TOS and TTL as the path left them), with the protocol
+# from the source port; other frames lose the 28 bytes, and a parity frame
+# hands its TOS and TTL on in skb->cb 3 (for the packet it rebuilds).
+$(udp_in_check_code 50)
+get bytes 34 2 SPB;
+decl SP 8;
+set val SP %SPB;
+free SPB;
+decl T 8;
+set val T %SP;
+calc rsh T 8;
+if T ne 0xB5;
+  continue;
+end-if;
+get bytes 42 8 SW;
+decl TY 8;
+set val TY %SW;
+calc rsh TY 61;
+if TY eq 0;
+  calc-map add $RX 94 1;
+  drop;
+end-if;
+if TY gt 5;
+  calc-map add $RX 94 1;
+  drop;
+end-if;
+calc-map add $RX 93 1;
+decl D 8;
+if TY eq 1;
+  set val D 1;
+end-if;
+if TY eq 3;
+  set val D 1;
+end-if;
+if D eq 1;
+  get bytes 14 8 H0;
+  get bytes 22 4 HB;
+  decl H2 8;
+  set val H2 %HB;
+  free HB;
+  get bytes 26 8 SD;
+  set map $RX 92 %SD;
+  # length - 16; protocol from the source port
+  set val T 16;
+  calc lsh T 32;
+  calc sub H0 %T;
+  calc rsh H2 24;
+  calc lsh H2 8;
+  calc and SP 0xFF;
+  calc or H2 %SP;
+  decl CS 8;
+  decl CT 8;
+$(csum_add H0 64)
+$(csum_add H2 16)
+$(csum_add SD 64)
+$(csum_fold)
+  calc lsh H2 16;
+  calc or H2 %CS;
+  calc lsh H2 32;
+  set val T %SD;
+  calc rsh T 32;
+  calc or H2 %T;
+  decl D4 4;
+  set val D4 %SD;
+  calc hton H0 64;
+  calc hton H2 64;
+  calc hton D4 32;
+  calc hton SW 64;
+  # shim at 22, IP header at 30: after removing 8 bytes, 14 and 22
+  set bytes 22 8 %SW;
+  set bytes 30 8 %H0;
+  set bytes 38 8 %H2;
+  set bytes 46 4 %D4;
+  remove-l2 8 0x88B5;
+  continue;
+end-if;
+if TY eq 2;
+  get bytes 15 1 QT;
+  get bytes 22 1 QL;
+  set val T 0xB5A1;
+  calc lsh T 8;
+  calc or T %QL;
+  calc lsh T 8;
+  calc or T %QT;
+  set skb-cb 3 %T;
+end-if;
+remove-l2 28 0x88B5;
+continue;
+EOF
+} | emit ingress $P_CARRIER_IN "carrier"
+fi

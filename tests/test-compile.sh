@@ -128,6 +128,8 @@ ok CC-add-bytes          "add-bytes 42 8"
 ok CC-add-l2-bytes       "add-l2-bytes 4"
 ok CC-insert-l2          "insert-l2 8 0x88b5"
 ok CC-strip-l2           "strip-l2 8 0x0800"
+ok CC-remove-l2          "remove-l2 28 0x88b5"
+ok CC-remove-l2-noproto  "remove-l2 12"
 ok CC-recalc-tcp-csum    "recalc-tcp-csum"
 ok CC-recalc-udp-csum    "recalc-udp-csum 14 1500"
 ok CC-calc-csum          "calc-csum tcp C"
@@ -203,6 +205,7 @@ bad CC-err-fib-ip           "not a valid IPv4 address"            "fib-lookup ba
 bad CC-err-ip-frag-small    "ip-frag needs a fragment size"       "ip-frag 20 3000"
 bad CC-err-ip6-var-size     "needs a 16-byte variable"            "decl V 4; match ip6-dst %V"
 bad CC-err-insert-l2        "insert-l2 length must be 1-64"       "insert-l2 100"
+bad CC-err-remove-l2        "remove-l2 length must be 1-64"       "remove-l2 0"
 bad CC-err-strip-l2         "strip-l2 length must be a multiple of 4" "strip-l2 3 0x800"
 bad CC-err-fill-bytes       "fill-bytes length must be 1-64"      "fill-bytes 14 100 0"
 bad CC-err-get-bytes-len    "get bytes length must be 1, 2, 4, or 8" "get bytes 14 3 V"
@@ -254,7 +257,7 @@ badx() { local n=$1 msg=$2; shift 2; local out; out=$("$BPFC" "$@" 2>&1); local 
 for c in "match arp" "match mpls" "match vlan" "match eth-proto 0x800" "get src-mac M" "set dst-mac 02:00:00:00:00:01" \
          "get arp-spa A" "set mpls-label 5" "push-eth 02:00:00:00:00:01 02:00:00:00:00:02" "pop-eth" "push-vlan 5" \
          "encap-gre ip-src 10.0.0.1 ip-dst 10.0.0.2 key 5" "decap-gre" "encap-mpls label 16 bos 1" "decap-mpls" "strip-l2 4 0x0800" \
-         "insert-l2 4" "fib-lookup 10.0.0.1" "ip-frag 500 1500"; do
+         "insert-l2 4" "remove-l2 4" "fib-lookup 10.0.0.1" "ip-frag 500 1500"; do
 	badx "CC-raw-err-${c%% *}-$(echo "$c" | awk '{print $2}')" "needs an Ethernet header" $R "$c"
 done
 badx CC-raw-err-l3off-value "L3OFF must be 14" -s L3OFF=4 "continue"

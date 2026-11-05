@@ -5577,6 +5577,37 @@ void compile_insert_l2(int len, const char *etype) {
     }
 }
 
+/*
+ * remove-l2 <len> [ethertype]
+ * The counterpart of insert-l2: removes <len> bytes (1-64) after the
+ * Ethernet header (bpf_skb_adjust_room, MAC mode) and optionally sets the
+ * EtherType. skb->protocol stays IPv4/IPv6 (unlike strip-l2), so the packet
+ * can be grown again with insert-l2 later, and the network and transport
+ * headers keep their place in memory. The packet must be IPv4 or IPv6
+ * (skb->protocol); if the kernel refuses, the program ends (continue) with
+ * the packet unchanged.
+ */
+void compile_remove_l2(int len, const char *etype) {
+    if (len <= 0 || len > 64) { fprintf(stderr, "Error: remove-l2 length must be 1-64\n"); exit(1); }
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, -len));
+    emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_MAC));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));
+    add_safety_jump();
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+    if (etype) {
+        emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -8, htons((uint16_t)strtoul(etype, NULL, 0))));
+        emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+        emit(BPF_MOV64_IMM(BPF_REG_2, 12));
+        emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, -8));
+        emit(BPF_MOV64_IMM(BPF_REG_4, 2));
+        emit(BPF_MOV64_IMM(BPF_REG_5, 0));
+        emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+    }
+}
+
 /* get cpu <VAR>: number of the CPU running the program (4 bytes). */
 void compile_get_cpu(const char *var) {
     int off = allocate_var(var, 4);
@@ -6407,6 +6438,7 @@ void help(const char *arg0) {
 	"calc-csum <tcp|udp> <VAR> [l3 [max]]"	,"compute the correct TCP/UDP checksum of the IPv4 packet at offset l3 into VAR, without changing it",
 	"recalc-tcp-csum [l3 [max]]"		,"recompute and write the TCP checksum (any IHL, length from the IP header); also recalc-udp-csum",
 	"insert-l2 <len> [ethertype]"		,"insert len zero bytes after the Ethernet header (IPv4/IPv6 packets); checksum offload still works",
+	"remove-l2 <len> [ethertype]"		,"remove len bytes after the Ethernet header (IPv4/IPv6 packets; skb->protocol unchanged)",
 	"strip-l2 <len> <ethertype>"		,"remove len bytes (multiple of 4) after the Ethernet header and set the EtherType, any protocol",
 	"get cpu <VAR>"				,"number of the CPU running the program",
 	"calc hton|ntoh <VAR> [bits]"		,"convert VAR between host and network byte order (before set bytes / after get bytes)",
@@ -6835,7 +6867,7 @@ int process_cmd(char *cmd, const char *dir) {
 		/* raw-IP device: no Ethernet header, VLAN tags, ARP or MPLS */
 		static const char *eth_cmds[] = {"push-eth", "pop-eth", "push-vlan", "pop-vlan", "push-qinq",
 			"encap-mpls", "decap-mpls", "encap-gre", "decap-gre", "strip-l2", "insert-l2",
-			"add-l2-bytes", "del-l2-bytes", "push-net-bytes", "pop-net-bytes", "fib-lookup",
+			"remove-l2", "add-l2-bytes", "del-l2-bytes", "push-net-bytes", "pop-net-bytes", "fib-lookup",
 			"fib-lookup6", "ip-frag", "ip-defrag", NULL};
 		for (int k = 0; eth_cmds[k]; k++) if (!strcmp(op, eth_cmds[k])) require_eth(op);
 		if ((!strcmp(op, "get") || !strcmp(op, "set") || !strcmp(op, "match") || !strcmp(op, "if")) && t > 1 &&
@@ -7290,6 +7322,8 @@ int process_cmd(char *cmd, const char *dir) {
             compile_strip_l2(atoi(a1), (uint16_t)strtoul(a2, NULL, 0));
 	} else if (strcmp(op, "insert-l2")==0 && t > 1) {
             compile_insert_l2(atoi(a1), t > 2 ? a2 : NULL);
+	} else if (strcmp(op, "remove-l2")==0 && t > 1) {
+            compile_remove_l2(atoi(a1), t > 2 ? a2 : NULL);
 	} else if (strcmp(op, "save-packet") == 0 && t > 2) {
             // Syntax: save-packet <MAP_NAME> <len> [src_off] [dst_off]
             int map_fd = get_or_create_buffer_map(a1,1,1);
@@ -7426,7 +7460,7 @@ static const char *pp_reserved[] = {
     "free", "get", "goto", "if", "insert-l2", "ip-defrag", "ip-frag", "label", "load-packet",
     "load-packet-keyed", "loop", "loop-reg", "match", "pop-eth", "pop-mac-bytes", "pop-net-bytes",
     "pop-vlan", "push-eth", "push-mac-bytes", "push-net-bytes", "push-qinq", "push-vlan",
-    "recalc-tcp-csum", "recalc-udp-csum", "reclassify", "redirect",
+    "recalc-tcp-csum", "recalc-udp-csum", "reclassify", "redirect", "remove-l2",
     "redirect-neigh", "save-packet", "save-packet-keyed", "set", "set-reg-loop",
     "shared-buffer-map", "start-loop", "strip-l2", "tcp-option", "xor-packet", "xor-packet-keyed",
     "zero-buffer", "zero-buffer-keyed",
