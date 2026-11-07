@@ -208,6 +208,7 @@ static int bpfc_delete(const struct slot *s) {
     snprintf(prio, sizeof(prio), "%d", s->prio);
     char *argv[] = {cfg.bpfc_path, "-i", (char *)s->iface, "-d", (char *)dir_name(s->dir),
                     "-p", prio, "-D", NULL};
+    if (s->dir == DIR_XDP) { argv[5] = "-D"; argv[6] = NULL; } /* one program per interface */
     struct run_result r;
     int rc = run_capture(argv, &r, cfg.compile_timeout, cfg.state_dir);
     if (rc < 0 || r.exit_code != 0) {
@@ -247,12 +248,16 @@ static void warn_if_foreign(const struct slot *s, int ifindex) {
     int n = tc_dump_filters(ifindex, s->dir, &f);
     char mine[300];
     filter_name(s, mine, sizeof(mine));
+    /* XDP programs have no filter name: compare the kernel program name bpfc
+     * derives from it ("bpfcd:eth0/xdp/0" -> "eth0_xdp_0") */
+    if (s->dir == DIR_XDP) kernel_prog_name(mine, mine, sizeof(mine));
     for (int i = 0; i < n; i++) {
         if (f[i].prio != s->prio) continue;
         if (!strcmp(f[i].name, mine)) break;
         char extra[64] = "";
         if (f[i].prog_id) snprintf(extra, sizeof(extra), " (prog id %u)", f[i].prog_id);
-        logmsg(LOG_LVL_WARN, "%s %s prio %d: replacing a %s filter%s not installed by bpfcd",
+        logmsg(LOG_LVL_WARN, s->dir == DIR_XDP ? "%s %s prio %d: replacing an %s program%s not installed by bpfcd"
+                                               : "%s %s prio %d: replacing a %s filter%s not installed by bpfcd",
                s->iface, dir_name(s->dir), s->prio, f[i].kind, extra);
         break;
     }
@@ -282,7 +287,7 @@ static void install_slot(struct slot *s, const char *why) {
     argv[a++] = cfg.bpfc_path;
     argv[a++] = "-i"; argv[a++] = s->iface;
     argv[a++] = "-d"; argv[a++] = (char *)dir_name(s->dir);
-    argv[a++] = "-p"; argv[a++] = prio;
+    if (s->dir != DIR_XDP) { argv[a++] = "-p"; argv[a++] = prio; }
     argv[a++] = "-n"; argv[a++] = name;
     argv[a++] = "-I";
     if (cfg.map_dir[0]) { argv[a++] = "-m"; argv[a++] = cfg.map_dir; }
@@ -326,9 +331,19 @@ static void install_slot(struct slot *s, const char *why) {
            s->iface, dir_name(s->dir), s->prio, s->path, summary, s->iface, dir_name(s->dir), s->prio);
 }
 
+/* XDP: is our program still the one attached? (bpfc -D -d xdp removes whichever is.) */
+static int xdp_still_ours(const struct slot *s) {
+    struct tc_filter *f = NULL;
+    int n = tc_dump_filters(s->ifindex, DIR_XDP, &f);
+    int ours = n > 0 && f[0].prog_id == s->prog_id;
+    free(f);
+    return ours;
+}
+
 static void uninstall_slot(struct slot *s, const char *why) {
     /* Only our own program is removed; a filter someone else put in its place is left alone. */
-    if (s->ifindex && if_nametoindex(s->iface) == (unsigned)s->ifindex && s->status == ST_INSTALLED) {
+    if (s->ifindex && if_nametoindex(s->iface) == (unsigned)s->ifindex && s->status == ST_INSTALLED &&
+        (s->dir != DIR_XDP || xdp_still_ours(s))) {
         if (bpfc_delete(s) == 0)
             logmsg(LOG_LVL_INFO, "%s %s prio %d: removed (%s)", s->iface, dir_name(s->dir), s->prio, why);
     }
@@ -408,7 +423,7 @@ static int file_is_empty(const char *path) {
 }
 
 static void scan_file(const char *scope, int dir, const char *dirpath, const char *fname) {
-    int prio = parse_prio_name(fname);
+    int prio = dir == DIR_XDP ? 0 : parse_prio_name(fname);
     if (prio < 0) {
         const char *dot = strrchr(fname, '.');
         if (dot && !strcmp(dot, ".bpfc"))
@@ -554,6 +569,11 @@ static void scan_dir(void) {
             }
             closedir(d);
         }
+        /* <if>/xdp.bpfc: the interface's XDP program */
+        char xpath[PATH_MAX];
+        struct stat xst;
+        if ((size_t)snprintf(xpath, sizeof(xpath), "%s/xdp.bpfc", ifdir) < sizeof(xpath) && lstat(xpath, &xst) == 0)
+            scan_file(de->d_name, DIR_XDP, ifdir, "xdp.bpfc");
     }
     if (top) closedir(top);
     for (int i = 0; i < nsources;) {
@@ -663,8 +683,9 @@ static void verify_iface_dir(int ifindex, int dir) {
         if (removed)
             snprintf(what, sizeof(what), "program (id %u) was removed by something other than bpfcd", s->prog_id);
         else
-            snprintf(what, sizeof(what), "program (id %u) was replaced by a %s filter%s not installed by bpfcd",
-                     s->prog_id, hit->kind, hit->prog_id ? " with another program" : "");
+            snprintf(what, sizeof(what), s->dir == DIR_XDP ? "program (id %u) was replaced by an %s program%s not installed by bpfcd"
+                                                            : "program (id %u) was replaced by a %s filter%s not installed by bpfcd",
+                     s->prog_id, hit->kind, hit->prog_id && s->dir != DIR_XDP ? " with another program" : "");
 
         if (cfg.on_external_change == EXT_LOG) {
             logmsg(LOG_LVL_WARN, "%s %s prio %d: %s; on_external_change=log, leaving it",
@@ -900,7 +921,11 @@ static void handle_netlink(void) {
                 struct link_info li;
                 if (link_parse(h, &li) < 0) break;
                 if (h->nlmsg_type == RTM_DELLINK) on_link_del(li.index, li.name);
-                else on_link_new(&li);
+                else {
+                    on_link_new(&li);
+                    /* an XDP program attached or removed by someone else shows up here */
+                    if (ifindex_is_managed(li.index)) schedule_verify();
+                }
                 break;
             }
             case RTM_NEWTFILTER:

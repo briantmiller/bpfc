@@ -9,6 +9,7 @@ Designed to be a deployable eBPF dataplane and networking swiss army knife.  Use
 ## Requirements
 * Linux kernel 4.18+ (Includes native RHEL 8 / CentOS 8 verifier compatability)
 * Root privileges (`CAP_NET_ADMIN` / `CAP_SYS_ADMIN`)
+* XDP programs (`-d xdp`): kernel 5.18+ or RHEL 9.2+
 
 ---
 
@@ -20,17 +21,21 @@ sudo ./bpfc -i <interface> [-d ingress|egress] [-p <priority>] [-m <map_dir>] [-
 
 # Clean / Detach from an interface
 sudo ./bpfc -i <interface> -c
+
+# XDP: the interface's XDP program (generic mode), and removing it
+sudo ./bpfc -i <interface> -d xdp "match udp; match udp-dst 9; drop"
+sudo ./bpfc -i <interface> -d xdp -D
 ```
 
 | Flag | Description |
 | :--- | :--- |
 | `-i <iface>` | Target network interface (e.g., `eth0`). If omitted, compiles to `output.bpf` locally. |
-| `-d <dir>` | Hook direction: `ingress` (default) or `egress`. |
+| `-d <dir>` | Hook direction: `ingress` (default), `egress`, or `xdp` (see [XDP](#xdp)). |
 | `-p <prio>` | TC filter execution priority (e.g., `1`). Allows multiple stacked programs to execute sequentially. Re-running with the same priority replaces the program atomically. |
 | `-m <dir>` | Path to store pinned eBPF maps (e.g., `/sys/fs/bpf/my_ns/`). Crucial for network namespaces. |
 | `-f <file>` | Read instructions from a file (`-` for stdin). `#` comments run to the end of the line. |
-| `-c` | Cleanup mode. Atomically deletes the `clsact` qdisc, detaching all filters from the interface. |
-| `-D` | Delete only the program at `-p <prio>` on `-d <dir>`. |
+| `-c` | Cleanup mode. Atomically deletes the `clsact` qdisc, detaching all filters from the interface. With `-d xdp`: removes the XDP program. |
+| `-D` | Delete only the program at `-p <prio>` on `-d <dir>` (`-d xdp`: the XDP program, no `-p`). |
 | `-n <name>` | Name the TC filter and the kernel program (shown by `tc filter show` and `bpftool prog`). |
 | `-I` | Print a `BPFC_INFO id=... tag=...` line after attaching. |
 | `-r <map>` | Dump the contents of a pinned map. |
@@ -52,6 +57,7 @@ sudo ./bpfc -i <interface> -c
 /etc/bpfc/interfaces.d/<interface>/egress/<priority>.bpfc
 /etc/bpfc/interfaces.d/%all%/{ingress,egress}/<priority>.bpfc      every interface
 /etc/bpfc/interfaces.d/%<kind>%/{ingress,egress}/<priority>.bpfc   every interface of that kind
+/etc/bpfc/interfaces.d/{<interface>,%all%,%<kind>%}/xdp.bpfc       the interface's XDP program
 ```
 
 ```bash
@@ -66,7 +72,8 @@ bpfcctl show eth0 ingress 100 --bytecode
 * **Failures**: if a file does not compile or the verifier rejects it, its priority is left empty rather than running the old version; `bpfcctl show` prints the verifier log.
 * **Interfaces**: programs are installed when a configured interface appears and re-installed when it is re-created.
 * **All interfaces, or all of a kind**: `%all%/` applies to every interface; `%<kind>%/` to every interface of that kind as `ip -d link` shows it (`%veth%`, `%gre%`, `%vxlan%`, `%wireguard%`, `%tun%`, ...), `%nic%` to devices without a kind (physical NICs) and `%lo%` to loopback. On devices without an Ethernet header (gre, ipip, sit, wireguard, tun) packets start with the IP header and bpfc reads the IP fields there (see `$L3OFF`); a template that uses Ethernet fields (MACs, VLAN, ARP, MPLS) fails to compile on them (status `failed`, the other interfaces still get it), so guard that part with `when $L3OFF == 14` or put an empty file for that priority in `%gre%/`, `%wireguard%/`, ... For each direction and priority the most specific file wins: `<interface>/`, then `%<kind>%/`, then `%all%/`; other priorities still apply. An empty file (only comments) at a more specific level means nothing at that priority there: `eth1/ingress/100.bpfc` empty exempts eth1 from `%all%/ingress/100.bpfc` (status `excluded`). New interfaces get the programs when they appear; a template is compiled once per interface, with `$IFNAME`, `$IFINDEX`, `$IFTYPE` and `$IFKIND` set for it. Programs on stacked devices (a bridge and its ports, a bond and its slaves) see the same packet more than once. Only the default network namespace is managed.
-* **tc ingress runs after GRO**: a filter here covers bugs in TCP/IP processing, not in GRO or the driver (that needs XDP).
+* **tc ingress runs after GRO**: a filter here covers bugs in TCP/IP processing, not in GRO or the driver; for those use `xdp.bpfc`.
+* **XDP**: `xdp.bpfc` in an interface's (or template's) directory is its XDP program, attached in generic mode, one per interface (no priority; `bpfcctl show eth0 xdp`). Templates, empty files, reloads, failures, adoption and external changes work as for TC. It runs before TC ingress.
 * **External changes**: if something else removes or replaces a managed program, bpfcd reinstalls it or only logs it, per `on_external_change` in `/etc/bpfc/bpfc.conf`.
 * **Tracking**: each program's id and tag are recorded with its file path and hash in `/run/bpfc/state`; filters are named `bpfcd:<iface>/<dir>/<prio>`.
 
@@ -74,9 +81,21 @@ See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)`. Build an RPM (RHEL 9/10) with `
 
 ---
 
+## XDP
+
+`-d xdp` compiles the same language into an XDP program and attaches it as the interface's XDP program, in generic (skb) mode for now (native/driver mode later). It runs before GRO, TC and the stack. One program per interface; attaching replaces it atomically.
+
+* `accept` and `continue` pass the packet on (XDP_PASS), `drop` is XDP_DROP, `redirect <iface>` sends it out of that interface, and `tx` (XDP only) sends it back out of the interface it came in on.
+* Checksum-aware rewrites (`set ip-src`, ports, `ip-tos`, ...) update the IP and TCP/UDP checksums incrementally, as on TC. XDP sees complete checksums; a packet a local socket sent through a veth pair may carry a partial one (CHECKSUM_PARTIAL), which an L4 rewrite corrupts once the packet is forwarded: turn tx checksum offload off on such senders (`ethtool -K <dev> tx off`).
+* VLAN tags are in the packet: `match vlan`/`qinq` and `get vlan-id` read them there. A NIC that strips tags (`rxvlan` offload) may hand generic XDP packets without them.
+* Commands that need an skb are a compile error naming the command: resizing (`add-bytes`, `del-bytes`, encap/decap, VLAN push/pop, `ip-frag`, `set len`), `clone`, `redirect-neigh`, `reclassify`, and the skb fields (`skb-mark`, `skb-hash`, `skb-cb`, `protocol`, `tstamp`, `set queue`). `get len`, `skb-ingress`/`skb-ifindex` (the ingress interface) and `queue` (the receive queue) work.
+* `$XDP` (1 in an XDP program) and `$HOOK` (`ingress`, `egress`, `xdp`) let one file serve several hooks: `when $XDP == 0; set skb-mark 5; end-when`.
+
+---
+
 ## Tests
 
-**Tests.** `./test.sh` runs every suite (root; about an hour) and ends with pass/fail/skip totals per suite; it exits non-zero if anything failed. Name suites to run only those (`./test.sh bpfc nat`), add `-f` to print failures only, or `-v` for each suite's full output; logs are kept under `/tmp/bpfc-tests.*`. `make check` (compile, preprocessor, stack, bpfcd, container, install), `make check-dataplane` (the dataplane suites and the verifier budget) and `make check-all` use the same runner; the `verifier-budget` suite loads every generated dataplane program (each profile, and the extremes of the structural settings) and fails if one uses more than `BUDGET_PCT` percent (default 85) of the verifier's 1,000,000-instruction limit (kernel 5.16+; it skips on older kernels); `make check-compile` needs no root and checks that every field and command compiles, that hex and decimal values give the same code, and that invalid programs are refused with a clear message; the `install` suite checks what `make install` and, when `rpmbuild` is present, the RPMs put where (binaries in bpfc; dataplane tools, every built-in profile and docs in bpfc-scripts) and runs the installed generator against the installed profiles; pass flags with `make check TESTFLAGS=-f`. Suites skip (rather than fail) when they are not run as root or need something the system lacks: a tool (tcpdump, ncat, iperf), kernel MPLS routing (`mpls_router`), or scapy for `tests/test_bpfc.py`. The fragmentation suites check each fragment size with three ordinary pings and, separately, the loss under load (100 parallel pings), which must stay below `STRESS_MAX_LOSS` hundredths of a percent (default 100, i.e. 1 %). New shell suites should `source tests/lib.sh` for `test_pass`/`test_fail`/`test_skip`, `check` and `tests_exit`.
+**Tests.** `./test.sh` runs every suite (root; about an hour) and ends with pass/fail/skip totals per suite; it exits non-zero if anything failed. Name suites to run only those (`./test.sh bpfc nat`), add `-f` to print failures only, or `-v` for each suite's full output; logs are kept under `/tmp/bpfc-tests.*`. `make check` (compile, preprocessor, stack, bpfcd, xdp, container, install), `make check-dataplane` (the dataplane suites and the verifier budget) and `make check-all` use the same runner; the `verifier-budget` suite loads every generated dataplane program (each profile, and the extremes of the structural settings) and fails if one uses more than `BUDGET_PCT` percent (default 85) of the verifier's 1,000,000-instruction limit (kernel 5.16+; it skips on older kernels); `make check-compile` needs no root and checks that every field and command compiles, that hex and decimal values give the same code, and that invalid programs are refused with a clear message; the `install` suite checks what `make install` and, when `rpmbuild` is present, the RPMs put where (binaries in bpfc; dataplane tools, every built-in profile and docs in bpfc-scripts) and runs the installed generator against the installed profiles; pass flags with `make check TESTFLAGS=-f`. Suites skip (rather than fail) when they are not run as root or need something the system lacks: a tool (tcpdump, ncat, iperf), kernel MPLS routing (`mpls_router`), or scapy for `tests/test_bpfc.py`. The fragmentation suites check each fragment size with three ordinary pings and, separately, the loss under load (100 parallel pings), which must stay below `STRESS_MAX_LOSS` hundredths of a percent (default 100, i.e. 1 %). New shell suites should `source tests/lib.sh` for `test_pass`/`test_fail`/`test_skip`, `check` and `tests_exit`.
 
 ---
 

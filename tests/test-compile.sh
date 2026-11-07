@@ -14,19 +14,33 @@ trap 'rm -rf "$TMP"; rm -f "$TESTS_FAILED_FILE"' EXIT
 cd "$TMP" || exit 1
 
 # ok <name> <program>: compiles (exit 0)
+# With XDP_SWEEP_IF=<interface> (test-xdp.sh) each program is instead loaded
+# as an XDP program there: it must load, or be refused at compile time with
+# the "not available in XDP programs" error, never by the kernel verifier.
 ok() {
 	local out
+	if [ -n "$XDP_SWEEP_IF" ]; then
+		out=$("$BPFC" $XDP_SWEEP_OPTS -i "$XDP_SWEEP_IF" -d xdp "$2" 2>&1)
+		local rc=$?
+		if [ $rc -eq 0 ]; then echo "XDP-LOADS $1"; test_pass "XDP-$1"
+		elif [[ "$out" == *"not available in XDP programs"* ]]; then echo "XDP-REFUSED $1"; test_pass "XDP-$1"
+		elif [[ "$out" == *"VERIFIER"* || $rc -ge 128 ]]; then test_fail "XDP-$1 (kernel rejected it)"; echo "    $2"; echo "$out" | grep -v "^ *$" | tail -4 | sed 's/^/    /'
+		else echo "XDP-OTHER $1: $(echo "$out" | head -1)"; test_pass "XDP-$1"; fi
+		return
+	fi
 	if out=$("$BPFC" "$2" 2>&1); then test_pass "$1"; else test_fail "$1"; echo "    $2"; echo "$out" | head -3 | sed 's/^/    /'; fi
 }
 # bad <name> <message substring> <program>: refused (exit != 0, not a crash) with the message
 bad() {
 	local out rc
+	[ -n "$XDP_SWEEP_IF" ] && return
 	out=$("$BPFC" "$3" 2>&1); rc=$?
 	if [ $rc -ne 0 ] && [ $rc -lt 128 ] && [[ "$out" == *"$2"* ]]; then test_pass "$1"
 	else test_fail "$1"; echo "    $3"; echo "    want exit 1-127 and '$2'; got exit $rc:"; echo "$out" | head -3 | sed 's/^/    /'; fi
 }
 # same <name> <program A> <program B>: both compile to identical bytecode
 same() {
+	[ -n "$XDP_SWEEP_IF" ] && return
 	if "$BPFC" "$2" >/dev/null 2>&1 && mv output.bpf a.bpf && "$BPFC" "$3" >/dev/null 2>&1 && cmp -s a.bpf output.bpf
 	then test_pass "$1"; else test_fail "$1"; echo "    '$2' vs '$3'"; fi
 }
@@ -273,6 +287,7 @@ for p in "set map M 1 5" "get map M 1 V" "calc-map add M 1 1" "calc-map xchg M 1
          "shared-buffer-map S 4 512; xor-packet-keyed S 0 64 42 0; zero-buffer-keyed S 0 64" "del-bytes 42 8" "del-l2-bytes 4" \
          "ip-frag 500 3000" "ip-defrag"; do
 	n=$(echo "$p" | awk '{print $1}')
+	if [ -n "$XDP_SWEEP_IF" ]; then XDP_SWEEP_OPTS=$M ok "CC-map-$n ($p)" "$p"; continue; fi
 	if out=$("$BPFC" $M "$p" 2>&1) && [[ "$out" == *Compiled* ]]; then test_pass "CC-map-$n ($p)"
 	else test_fail "CC-map-$n ($p)"; echo "$out" | grep -v -i pin | head -3 | sed 's/^/    /'; fi
 done

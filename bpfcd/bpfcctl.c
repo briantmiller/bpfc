@@ -12,6 +12,8 @@
 #define _GNU_SOURCE
 #include "common.h"
 
+#include <ctype.h>
+
 #include <errno.h>
 #include <getopt.h>
 #include <signal.h>
@@ -87,9 +89,25 @@ static int load_state(struct daemon_info *di, struct slot **slots) {
 
 /* Has the file on disk (or a file it includes) changed since bpfcd last read it?
  * Always hashes: the program's own mtime does not show changes to its includes. */
+/* No commands: only whitespace, ';' and # comments (bpfcd's file_is_empty()). */
+static int file_is_empty(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int c, in_comment = 0, empty = 1;
+    while ((c = fgetc(f)) != EOF) {
+        if (in_comment) { if (c == '\n') in_comment = 0; continue; }
+        if (c == '#') { in_comment = 1; continue; }
+        if (!isspace(c) && c != ';') { empty = 0; break; }
+    }
+    fclose(f);
+    return empty;
+}
+
 static int file_state(const struct slot *s) {
     struct stat st;
     if (stat(s->path, &st) < 0) return -1; /* deleted */
+    /* bpfcd records an empty (opt-out) file as "empty", not as its hash */
+    if (!strcmp(s->sha256, "empty")) return file_is_empty(s->path) ? 0 : 1;
     char hex[65];
     int has_includes;
     if (sha256_program(daemon_bpfc[0] ? daemon_bpfc : cfg.bpfc_path, s->path, cfg.compile_timeout,
@@ -173,8 +191,9 @@ static int cmd_status(int show_all, int long_fmt) {
 
     int problems = 0, pending_reload = 0;
     if (n == 0) {
+        const char *cd = di.config_dir[0] ? di.config_dir : DEFAULT_CONFIG_DIR;
         printf("No programs configured. Add files as %s/<interface|%%all%%|%%<kind>%%>/<ingress|egress>/<priority>.bpfc\n"
-               "and run: systemctl reload bpfcd\n", di.config_dir[0] ? di.config_dir : DEFAULT_CONFIG_DIR);
+               "or %s/<interface|%%all%%|%%<kind>%%>/xdp.bpfc and run: systemctl reload bpfcd\n", cd, cd);
     } else {
         int wif = 5;
         for (int i = 0; i < n; i++) if ((int)strlen(slots[i].iface) > wif) wif = (int)strlen(slots[i].iface);
@@ -189,8 +208,10 @@ static int cmd_status(int show_all, int long_fmt) {
             int fs = file_state(s);
             const char *mark = fs == 1 ? " (modified, reload pending)" : fs < 0 ? " (deleted, reload pending)" : "";
             if (fs != 0) pending_reload = 1;
-            printf("%-*s  %-7s  %5d  %s%-19s%s  %6s  %-16s  %s%-8s%s  %s%s%s%s\n", wif, s->iface,
-                   dir_name(s->dir), s->prio, status_color(s->status), status_name(s->status), C_OFF,
+            char pr[8] = "-";
+            if (s->dir != DIR_XDP) snprintf(pr, sizeof(pr), "%d", s->prio);
+            printf("%-*s  %-7s  %5s  %s%-19s%s  %6s  %-16s  %s%-8s%s  %s%s%s%s\n", wif, s->iface,
+                   dir_name(s->dir), pr, status_color(s->status), status_name(s->status), C_OFF,
                    prog, s->tag[0] ? s->tag : "-", kc, kw, C_OFF,
                    short_path(s->path, di.config_dir), C_YELLOW, mark, C_OFF);
             if (s->error[0])
@@ -213,7 +234,7 @@ static int cmd_status(int show_all, int long_fmt) {
         struct if_nameindex *ifs = if_nameindex();
         int shown = 0;
         for (struct if_nameindex *p = ifs; p && p->if_index; p++) {
-            for (int dir = DIR_INGRESS; dir <= DIR_EGRESS; dir++) {
+            for (int dir = DIR_INGRESS; dir <= DIR_XDP; dir++) {
                 const struct kview *v = kernel_view((int)p->if_index, dir);
                 if (!v || v->n <= 0) continue;
                 for (int j = 0; j < v->n; j++) {
@@ -233,7 +254,9 @@ static int cmd_status(int show_all, int long_fmt) {
                         struct prog_details d;
                         if (prog_get_details(f->prog_id, 0, &d) == 0) snprintf(tag, sizeof(tag), "%s", d.tag);
                     }
-                    printf("%-15s  %-7s  %5d  %-6s  %6s  %-16s  %s\n", p->if_name, dir_name(dir), f->prio,
+                    char pr[8] = "-";
+                    if (dir != DIR_XDP) snprintf(pr, sizeof(pr), "%d", f->prio);
+                    printf("%-15s  %-7s  %5s  %-6s  %6s  %-16s  %s\n", p->if_name, dir_name(dir), pr,
                            f->kind, prog, tag, f->name[0] ? f->name : "-");
                 }
             }
@@ -382,23 +405,25 @@ static int print_file(const char *path, const char *heading) {
 }
 
 static int cmd_show(int argc, char **argv, int bytecode) {
-    /* Accepts "iface dir prio" or "iface/dir/prio". */
+    /* Accepts "iface dir prio" or "iface/dir/prio"; "iface xdp" or "iface/xdp". */
+    static const char usage[] = "Usage: bpfcctl show <iface> <ingress|egress> <prio> [--bytecode]\n"
+                                "       bpfcctl show <iface> xdp [--bytecode]\n";
     char ifbuf[IFNAMSIZ + 64], *iface, *dirs, *prios;
     if (argc == 1 && strchr(argv[0], '/')) {
         snprintf(ifbuf, sizeof(ifbuf), "%s", argv[0]);
         iface = strtok(ifbuf, "/");
         dirs = strtok(NULL, "/");
         prios = strtok(NULL, "/");
-    } else if (argc == 3) {
-        iface = argv[0]; dirs = argv[1]; prios = argv[2];
+    } else if (argc == 3 || argc == 2) {
+        iface = argv[0]; dirs = argv[1]; prios = argc == 3 ? argv[2] : NULL;
     } else {
-        fprintf(stderr, "Usage: bpfcctl show <iface> <ingress|egress> <prio> [--bytecode]\n");
+        fputs(usage, stderr);
         return 1;
     }
     int dir = dirs ? dir_parse(dirs) : -1;
     int prio = prios ? atoi(prios) : 0;
-    if (!iface || dir < 0 || prio <= 0) {
-        fprintf(stderr, "Usage: bpfcctl show <iface> <ingress|egress> <prio> [--bytecode]\n");
+    if (!iface || dir < 0 || (dir == DIR_XDP ? prio != 0 : prio <= 0)) {
+        fputs(usage, stderr);
         return 1;
     }
 
@@ -424,7 +449,8 @@ static int cmd_show(int argc, char **argv, int bytecode) {
     const char *kc;
     const char *kw = kernel_check(s, &kc);
     int fs = file_state(s);
-    printf("%s%s %s priority %d%s\n", C_BOLD, s->iface, dir_name(s->dir), s->prio, C_OFF);
+    if (s->dir == DIR_XDP) printf("%s%s xdp%s\n", C_BOLD, s->iface, C_OFF);
+    else printf("%s%s %s priority %d%s\n", C_BOLD, s->iface, dir_name(s->dir), s->prio, C_OFF);
     printf("  status:     %s%s%s%s%s\n", status_color(s->status), status_name(s->status), C_OFF,
            s->error[0] ? " -- " : "", s->error);
     printf("  file:       %s%s\n", s->path,
@@ -542,9 +568,10 @@ static void usage(void) {
     printf("Usage: bpfcctl [options] [command]\n\n"
            "Commands:\n"
            "  status [-a] [-l]               programs managed by bpfcd (default command)\n"
-           "      -a, --all                  also list TC filters bpfcd does not manage\n"
+           "      -a, --all                  also list TC filters and XDP programs bpfcd does not manage\n"
            "      -l, --long                 include install time, size and hash\n"
            "  show <iface> <dir> <prio>      details, source and failure output for one program\n"
+           "  show <iface> xdp               the same for the interface's XDP program\n"
            "      -b, --bytecode             also print the kernel's translated bytecode\n"
            "  reload [--no-wait]             make bpfcd rescan and report the result\n\n"
            "Options:\n"

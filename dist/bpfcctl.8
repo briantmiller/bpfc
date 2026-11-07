@@ -16,6 +16,13 @@ bpfcctl \- show and inspect programs managed by bpfcd
 .br
 .B bpfcctl
 .RI [ options ]
+.B show
+.I iface
+.B xdp
+.RB [ \-\-bytecode ]
+.br
+.B bpfcctl
+.RI [ options ]
 .B reload
 .RB [ \-\-no\-wait ]
 .SH DESCRIPTION
@@ -90,7 +97,7 @@ or deleted since the last reload is marked
 .RS
 .TP
 .BR \-a ", " \-\-all
-Also list TC filters on any interface that bpfcd does not manage.
+Also list TC filters and XDP programs on any interface that bpfcd does not manage.
 .TP
 .BR \-l ", " \-\-long
 Add install time, instruction count, hash and ifindex.
@@ -99,6 +106,10 @@ Add install time, instruction count, hash and ifindex.
 .BI show " iface direction priority"
 Also accepted as
 .IR iface / direction / priority .
+An interface's XDP program is
+.IB iface " xdp"
+or
+.IR iface /xdp.
 Prints the record, the source file with line numbers and, for a failed
 program, the saved bpfc output including the verifier log.
 .RS

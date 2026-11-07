@@ -14,8 +14,8 @@ compiles the program files under
 .I /etc/bpfc/interfaces.d
 with
 .BR bpfc (8)
-and keeps them attached to the TC ingress and egress hooks of the matching
-interfaces. It is normally started by systemd as
+and keeps them attached to the TC ingress and egress hooks, and the XDP
+hook, of the matching interfaces. It is normally started by systemd as
 .BR bpfcd.service .
 .SS File layout
 .EX
@@ -23,6 +23,7 @@ interfaces. It is normally started by systemd as
 /etc/bpfc/interfaces.d/<interface>/egress/<priority>.bpfc
 /etc/bpfc/interfaces.d/%all%/{ingress,egress}/<priority>.bpfc
 /etc/bpfc/interfaces.d/%<kind>%/{ingress,egress}/<priority>.bpfc
+/etc/bpfc/interfaces.d/{<interface>,%all%,%<kind>%}/xdp.bpfc
 .EE
 .PP
 The priority is 1\-65535 without leading zeros; lower priorities run first.
@@ -30,6 +31,28 @@ Each file holds bpfc instructions separated by \(oq;\(cq. A \(oq#\(cq at the sta
 an instruction begins a comment that ends at the end of the line. Files that
 do not follow this naming are ignored with a warning; world-writable files are
 refused, since a program can drop or redirect any traffic.
+.SS XDP
+.I xdp.bpfc
+in an interface's directory is that interface's XDP program, compiled with
+.B "bpfc \-d xdp"
+and attached in generic mode. There is one per interface, so it has no
+priority (shown as
+.B xdp
+with priority
+.B \-
+by
+.BR bpfcctl ).
+It runs before TC ingress: a packet it passes goes on to the ingress
+programs. Templates, empty files, reloads, failures, adoption and external
+changes work as for TC priorities; the kernel program is named
+.IB iface _xdp_0 .
+Commands that need an skb are refused at compile time (see
+.BR bpfc (8)),
+so a template shared between TC and XDP guards them with
+.BR "when $XDP == 0" .
+bpfcd notices an XDP program removed or replaced by something else from the
+link notification, which the kernel sends only while the interface is up; a
+change made while it is down is seen when it comes up or at the next reload.
 .SS Start-up
 Every file is compiled and attached. If the previous run's state is still in
 .I /run/bpfc
