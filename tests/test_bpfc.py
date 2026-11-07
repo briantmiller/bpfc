@@ -242,6 +242,17 @@ def test_vlan_set_id_from_variable():
     assert out[Dot1Q].prio == 5
 
 
+def test_vlan_match_id_from_variable():
+    """match vlan-id %VAR compares with the variable (it used to compare with 0)"""
+    for v, dst in ((100, "10.0.0.9"), (101, "10.0.0.2")):
+        bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match ip-tos 20; push-vlan 100 5; decl V 2; set val V {v}; "
+                    f"match vlan-id %V; set ip-dst 10.0.0.9; end-match; continue'")
+        pkt = Ether(src=state["tx_mac"], dst=state["rx_mac"]) / IP(src="10.0.0.1", dst="10.0.0.2", tos=20) / ICMP()
+        out = send_and_capture(pkt, "vlan")
+        assert out is not None and out.haslayer(Dot1Q)
+        assert out[IP].dst == dst, f"V={v}"
+
+
 def test_gre_encap():
     """encap-gre keeps the inner packet"""
     bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp-dst 53; encap-gre ip-src 1.1.1.1 ip-dst 2.2.2.2 key 7777'")

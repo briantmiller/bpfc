@@ -319,13 +319,16 @@ Out of \fIinterface\fR (XDP_REDIRECT); \fBingress\fR is refused.
 \fBset ip-src\fR, ports, \fBip-tos\fR and the other checksum-aware fields update the IP and TCP/UDP checksums incrementally, as on TC (a UDP checksum of 0 stays 0). XDP sees complete checksums from the wire. A packet a local socket sent through a veth pair can still carry a partial checksum (CHECKSUM_PARTIAL), which an L4 rewrite would corrupt: turn tx checksum offload off on such senders (\fBethtool \-K\fR \fIdev\fR \fBtx off\fR).
 .TP
 .B VLAN
-The tag is in the packet: \fBmatch vlan\fR and \fBqinq\fR check the EtherType at offset 12 and \fBget vlan\-id\fR reads it from there. A device that strips tags in hardware (\fBrxvlan\fR offload) may hand generic XDP packets without them.
+The tag is in the packet: \fBmatch vlan\fR and \fBqinq\fR check the EtherType at offset 12, \fBget\fR/\fBmatch vlan\-id\fR read the TCI at 14, and \fBset vlan\-id\fR rewrites its 12 id bits (priority and DEI stay) or, without a tag, pushes an 802.1Q tag. A device that strips tags in hardware (\fBrxvlan\fR offload) may hand generic XDP packets without them.
 .TP
 .B get len
 The packet length, from \fBbpf_xdp_get_buff_len\fR. \fBget skb\-ingress\fR and \fBskb\-ifindex\fR give the ingress interface, \fBget queue\fR the receive queue.
 .TP
+.B Resizing
+\fBadd\-head\-bytes\fR, \fBadd\-bytes\fR, \fBdel\-bytes\fR, \fBadd\-l2\-bytes\fR, \fBdel\-l2\-bytes\fR, \fBpush\-\fR/\fBpop\-eth\fR, \fBpush\-\fR/\fBpop\-vlan\fR, \fBpush\-qinq\fR, \fBencap\-\fR/\fBdecap\-mpls\fR, \fBencap\-\fR/\fBdecap\-gre\fR, \fBinsert\-l2\fR, \fBremove\-l2\fR, \fBstrip\-l2\fR and \fBset len\fR work, so the MPLS pseudowire examples do too. They grow or shrink the packet at the front with \fBbpf_xdp_adjust_head\fR (at most 255 bytes at a time; generic mode has 256 bytes of headroom) and at the end with \fBbpf_xdp_adjust_tail\fR. Inserted bytes are zero, as on TC. With an offset up to 64, \fBadd\-bytes\fR and \fBdel\-bytes\fR move only the bytes in front of it; growing at the end needs tailroom, which generic mode may not have. VLAN tags are pushed into and popped from the packet (4 bytes at offset 12, the MAC addresses moved in front).
+.TP
 .B Refused
-Commands that need an skb are a compile error naming the command: resizing (\fBadd\-bytes\fR, \fBdel\-bytes\fR, encapsulation, \fBpush\-\fR/\fBpop\-vlan\fR, \fBip\-frag\fR, \fBset len\fR, ...), \fBclone\fR, \fBredirect\-neigh\fR, \fBreclassify\fR, and the skb fields (\fBskb\-mark\fR, \fBskb\-hash\fR, \fBskb\-cb\fR, \fBprotocol\fR, \fBtstamp\fR, \fBset queue\fR). Maps, buffer maps, \fBxor\-packet\fR, \fBcalc\-csum\fR, \fBfib\-lookup\fR and the rest work.
+Commands that need an skb are a compile error naming the command: \fBip\-frag\fR, \fBip\-defrag\fR, \fBclone\fR, \fBredirect\-neigh\fR, \fBreclassify\fR, and the skb fields (\fBskb\-mark\fR, \fBskb\-hash\fR, \fBskb\-cb\fR, \fBprotocol\fR, \fBtstamp\fR, \fBset queue\fR). Maps, buffer maps, \fBxor\-packet\fR, \fBcalc\-csum\fR, \fBfib\-lookup\fR and the rest work.
 .PP
 The constants \fB$XDP\fR (1 in an XDP program, else 0) and \fB$HOOK\fR (\fBingress\fR, \fBegress\fR or \fBxdp\fR) let one file serve several hooks: \fBwhen $XDP == 0\fR ... \fBend\-when\fR.
 .SH EXAMPLES

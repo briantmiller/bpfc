@@ -84,7 +84,6 @@ echo "compile"
 bad_msg() { local out; out=$("$BPFC" "${@:3}" 2>&1); local rc=$?
 	if [ $rc -ne 0 ] && [ $rc -lt 128 ] && [[ "$out" == *"$2"* ]]; then test_pass "$1"; else test_fail "$1"; echo "$out" | head -2 | sed 's/^/    /'; fi; }
 bad_msg XDP-err-skb-mark   "'set skb-mark' is not available in XDP programs" -d xdp "set skb-mark 5"
-bad_msg XDP-err-push-vlan  "'push-vlan' is not available in XDP programs"    -d xdp "push-vlan 5"
 bad_msg XDP-err-reclassify "'reclassify' is not available in XDP programs"   -d xdp "reclassify"
 bad_msg XDP-err-clone      "XDP cannot clone packets"                        -d xdp "clone lo"
 bad_msg XDP-err-redir-in   "can only redirect out of an interface"          -d xdp "redirect lo ingress"
@@ -101,6 +100,7 @@ check XDP-compile-only eval '"$BPFC" -d xdp "match tcp; drop" | grep -q "Compile
 
 echo "every compile-suite command: loads as XDP or is refused at compile time"
 XDP_SWEEP_IF=va $A bash tests/test-compile.sh > "$T/sweep" 2>&1
+$A "$BPFC" -i va -d xdp -D   # the sweep leaves its last program attached
 nl=$(grep -c "^XDP-LOADS" "$T/sweep"); nr=$(grep -c "^XDP-REFUSED" "$T/sweep")
 if grep -q "FAIL" "$T/sweep"; then test_fail "XDP-sweep ($nl load, $nr refused)"; grep -A4 "FAIL" "$T/sweep" | head -30 | sed 's/^/    /'
 else test_pass "XDP-sweep ($nl load, $nr refused, none rejected by the verifier)"; fi
@@ -179,6 +179,55 @@ from scapy.all import Ether, Dot1Q, IP, ICMP, sendp
 sendp(Ether(dst="'"$VA_MAC"'")/Dot1Q(vlan=100)/IP(dst="10.100.0.1")/ICMP(), iface="vb", count=3, verbose=0)' 2>/dev/null
 check XDP-match-vlan eval '"$BPFC" -m "$T/m" -r VL 2>/dev/null | grep -q "Key: 0x0*1 -> Value: 0x0*3$"'
 $A "$BPFC" -i va -d xdp -D; umount "$T/m"
+
+echo "resizing (bpf_xdp_adjust_head / adjust_tail), frames checked byte for byte"
+RZ="python3 $TOP/tests/xdp-resize.py"
+rz() { # rz <case> <program>: the program changes XB's frame and redirects it to XC
+	local c=$1; shift
+	if ! load "$* ; redirect vc"; then test_fail "XDP-resize-$c (load)"; return; fi
+	rm -f "$T/rz.out" "$T/rz.ready"
+	$C $RZ sniff vd "$T/rz.out" "$T/rz.ready" & local s=$!
+	for _ in $(seq 80); do [ -e "$T/rz.ready" ] && break; sleep 0.1; done
+	$B $RZ send vb "$c"
+	wait $s
+	check "XDP-resize-$c" $RZ check "$c" "$T/rz.out"
+}
+mpls_words() { # the README / test-mpls.sh label arithmetic: next-hop label 20, PW label 16, TTL 225
+	echo "decl MPLS1 4; decl MPLS2 4;
+	set val MPLS1 20; calc lsh MPLS1 3; calc or MPLS1 0; calc lsh MPLS1 1; calc or MPLS1 0; calc lsh MPLS1 8; calc or MPLS1 225; calc bswap MPLS1;
+	set val MPLS2 16; calc lsh MPLS2 3; calc or MPLS2 0; calc lsh MPLS2 1; calc or MPLS2 1; calc lsh MPLS2 8; calc or MPLS2 225; calc bswap MPLS2;" | tr -d '\n\t'
+}
+NS_MAC=02:00:00:00:00:aa; ND_MAC=02:00:00:00:00:bb
+rz encap-mpls     "match ip; encap-mpls label 16 bos 1"
+rz decap-mpls     "match mpls; decap-mpls"
+rz decap-mpls-cw  "match mpls; decap-mpls"
+rz pw-encap       "$(mpls_words) add-head-bytes 22; set bytes 14 4 %MPLS1; set bytes 18 4 %MPLS2; set eth-proto 0x8847; set dst-mac $ND_MAC; set src-mac $NS_MAC"
+rz pw-encap-cw    "$(mpls_words) add-head-bytes 26; set bytes 14 4 %MPLS1; set bytes 18 4 %MPLS2; set eth-proto 0x8847; set dst-mac $ND_MAC; set src-mac $NS_MAC"
+rz pw-decap       "match mpls; match mpls-label 16; del-bytes 0 18"
+rz pw-decap-cw    "match mpls; match mpls-label 16; del-bytes 0 22"
+rz add-l2-bytes   "add-l2-bytes 20"
+rz del-l2-bytes   "del-l2-bytes 4"
+rz add-bytes-near "add-bytes 20 6"
+rz del-bytes-near "del-bytes 20 6"
+rz add-bytes-far  "add-bytes 100 4"
+rz del-bytes-far  "del-bytes 100 4"
+rz push-vlan      "push-vlan 100 3"
+rz pop-vlan       "pop-vlan"
+rz push-qinq      "push-qinq 10 20"
+rz push-eth       "push-eth $ND_MAC $NS_MAC"
+rz pop-eth        "pop-eth"
+rz set-len        "set len 80"
+rz decap-gre      "decap-gre"
+rz set-vlan-id            "set vlan-id 200"
+rz set-vlan-id-var        "decl V 2; set val V 201; set vlan-id %V"
+rz set-vlan-id-qinq       "set vlan-id 200"
+rz set-vlan-id-untagged   "set vlan-id 200"
+rz match-vlan-id          "match vlan-id 100; set vlan-id 300; end-match"
+rz match-vlan-id-miss     "match vlan-id 100; set vlan-id 300; end-match"
+rz match-vlan-id-var      "decl V 2; set val V 100; match vlan-id %V; set vlan-id 300; end-match"
+rz match-vlan-id-range    "match vlan-id 10-20; set vlan-id 300; end-match"
+rz match-vlan-id-untagged "match vlan-id 0; set vlan-id 300; end-match"
+$A "$BPFC" -i va -d xdp -D
 
 echo "XDP and TC together"
 load "match udp; match udp-dst 6003; drop; end-match; end-match"
