@@ -4,7 +4,7 @@
 #
 #   tests/run-tests.sh [-f] [-v] [-l DIR] [-t SECS] [suite ...]
 #
-#   suite   compile, preprocessor, stack, bpfc, util, loops, nat, mpls, frag,
+#   suite   compile, preprocessor, stack, bpfc, util, loops, nat, mpls, mpls-xdp, frag,
 #           mpls-frag, throttle, cve-2026-98432, bpfcd, container, install,
 #           verifier-budget, xdp, dataplane, dataplane-udp or pytest
 #           (default: all of them, in that order)
@@ -22,7 +22,7 @@
 
 cd "$(dirname "$0")/.." || exit 1
 
-ALL="compile preprocessor stack bpfc util loops nat mpls frag mpls-frag throttle cve-2026-98432 bpfcd container install verifier-budget xdp dataplane dataplane-udp pytest"
+ALL="compile preprocessor stack bpfc util loops nat mpls mpls-xdp frag mpls-frag throttle cve-2026-98432 bpfcd container install verifier-budget xdp dataplane dataplane-udp pytest"
 FAILURES_ONLY=0
 VERBOSE=0
 LOGDIR=
@@ -53,6 +53,7 @@ mkdir -p "$LOGDIR" || exit 1
 suite_cmd() {
 	case $1 in
 	pytest) echo "env PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -v -p no:cacheprovider tests/test_bpfc.py" ;;
+	mpls-xdp) echo "bash tests/test-mpls.sh -x" ;;
 	*)      [ -f "tests/test-$1.sh" ] && echo "bash tests/test-$1.sh" ;;
 	esac
 }

@@ -316,9 +316,35 @@ void reset() {
 #define XDP_ACT_PASS     2
 #define XDP_ACT_TX       3
 
-#define MAX_XDP_CSUM_CALLS 4096
-static int xdp_csum_calls[MAX_XDP_CSUM_CALLS];
-static int num_xdp_csum_calls = 0;
+/* Helper calls turned into calls to an appended subprogram (xdp_finish). */
+enum { XSUB_CSUM, XSUB_ROOM, XSUB_HEAD, XSUB_VPUSH, XSUB_VPOP, XSUB_TAIL, XSUB_N };
+#define MAX_XDP_SUB_CALLS 4096
+static struct { int idx, sub; } xdp_sub_calls[MAX_XDP_SUB_CALLS];
+static int num_xdp_sub_calls = 0;
+
+static struct bpf_insn xdp_sub_call(struct bpf_insn in, int sub) {
+    if (num_xdp_sub_calls >= MAX_XDP_SUB_CALLS) {
+        fprintf(stderr, "Error: too many emulated helper calls (%d)\n", MAX_XDP_SUB_CALLS);
+        exit(1);
+    }
+    xdp_sub_calls[num_xdp_sub_calls].idx = prog_idx;
+    xdp_sub_calls[num_xdp_sub_calls++].sub = sub;
+    in.src_reg = BPF_PSEUDO_CALL;
+    in.imm = 0; /* set by xdp_finish() */
+    return in;
+}
+
+/* The constant a command put in R3 just before this call (the adjust_room mode), or -1. */
+static int xdp_r3_const(void) {
+    for (int i = prog_idx - 1; i >= 0 && i >= prog_idx - 4; i--) {
+        if (prog[i].code == (BPF_JMP | BPF_CALL)) break;
+        if (prog[i].dst_reg == BPF_REG_3) {
+            if (prog[i].code == (BPF_ALU64 | BPF_MOV | BPF_K)) return prog[i].imm;
+            return -1;
+        }
+    }
+    return -1;
+}
 
 static void xdp_unsupported(const char *what) {
     fprintf(stderr, "Error: '%s' is not available in XDP programs: %s. "
@@ -331,15 +357,18 @@ static struct bpf_insn xdp_call(struct bpf_insn in) {
     case BPF_FUNC_skb_load_bytes:  in.imm = BPF_FUNC_xdp_load_bytes; return in;
     case BPF_FUNC_skb_store_bytes: in.imm = BPF_FUNC_xdp_store_bytes; return in;
     case BPF_FUNC_l3_csum_replace:
-    case BPF_FUNC_l4_csum_replace:
-        if (num_xdp_csum_calls >= MAX_XDP_CSUM_CALLS) {
-            fprintf(stderr, "Error: too many checksum updates (%d)\n", MAX_XDP_CSUM_CALLS);
-            exit(1);
-        }
-        xdp_csum_calls[num_xdp_csum_calls++] = prog_idx;
-        in.src_reg = BPF_PSEUDO_CALL;
-        in.imm = 0; /* set by xdp_finish() */
-        return in;
+    case BPF_FUNC_l4_csum_replace: return xdp_sub_call(in, XSUB_CSUM);
+    case BPF_FUNC_skb_change_head: return xdp_sub_call(in, XSUB_HEAD);
+    case BPF_FUNC_skb_change_tail: return xdp_sub_call(in, XSUB_TAIL);
+    case BPF_FUNC_skb_vlan_push:   return xdp_sub_call(in, XSUB_VPUSH);
+    case BPF_FUNC_skb_vlan_pop:    return xdp_sub_call(in, XSUB_VPOP);
+    case BPF_FUNC_skb_adjust_room:
+        /* MAC mode only: bytes after the Ethernet header */
+        if (xdp_r3_const() != BPF_ADJ_ROOM_MAC)
+            xdp_unsupported("it resizes the packet behind the network header (skb helpers)");
+        return xdp_sub_call(in, XSUB_ROOM);
+    case 39: /* skb_pull_data: XDP data is always linear */
+        { struct bpf_insn z = BPF_MOV64_IMM(BPF_REG_0, 0); return z; }
     case 1: case 2: case 3:          /* map lookup/update/delete */
     case 5: case 6: case 7: case 8:  /* ktime, trace_printk, prandom, cpu */
     case 12:                         /* tail_call */
@@ -350,10 +379,6 @@ static struct bpf_insn xdp_call(struct bpf_insn in) {
     }
     const char *why;
     switch (in.imm) {
-    case BPF_FUNC_skb_adjust_room: case BPF_FUNC_skb_change_tail: case BPF_FUNC_skb_change_head:
-    case 39: why = "it resizes the packet (skb helpers)"; break;
-    case BPF_FUNC_skb_vlan_push: case BPF_FUNC_skb_vlan_pop:
-        why = "XDP has no VLAN offload (the tag is in the packet)"; break;
     case BPF_FUNC_clone_redirect: why = "XDP cannot clone packets"; break;
     case BPF_FUNC_redirect_neigh: why = "XDP has no neighbour redirect"; break;
     case BPF_FUNC_set_hash: case BPF_FUNC_change_proto: why = "XDP has no skb"; break;
@@ -418,10 +443,195 @@ static void tc_only_ctx_store(const char *what) {
     if (is_xdp) xdp_unsupported(what);
 }
 
+/* Mini assembler for the emulation subprograms: labels instead of counted offsets. */
+static struct bpf_insn xa_buf[256];
+static int xa_n, xa_lab[16], xa_fix[64][2], xa_nfix;
+static void xa(struct bpf_insn i) { xa_buf[xa_n++] = i; }
+static void xa_j(struct bpf_insn i, int label) { xa_fix[xa_nfix][0] = xa_n; xa_fix[xa_nfix++][1] = label; xa(i); }
+static void xa_label(int l) { xa_lab[l] = xa_n; }
+static void xa_begin(void) { xa_n = 0; xa_nfix = 0; for (int i = 0; i < 16; i++) xa_lab[i] = -1; }
+static void xa_end(void) {
+    for (int i = 0; i < xa_nfix; i++) xa_buf[xa_fix[i][0]].off = xa_lab[xa_fix[i][1]] - xa_fix[i][0] - 1;
+    for (int i = 0; i < xa_n; i++) emit(xa_buf[i]);
+}
+#define XJ(OP, R, IMM)  ((struct bpf_insn){.code=BPF_JMP|BPF_OP(OP)|BPF_K, .dst_reg=R, .imm=IMM})
+#define XJX(OP, R, S)   ((struct bpf_insn){.code=BPF_JMP|BPF_OP(OP)|BPF_X, .dst_reg=R, .src_reg=S})
+#define XJA             ((struct bpf_insn){.code=BPF_JMP|BPF_JA})
+#define XMOV32(D, S)    ((struct bpf_insn){.code=BPF_ALU|BPF_MOV|BPF_X, .dst_reg=D, .src_reg=S})
+#define XNEG(D)         ((struct bpf_insn){.code=BPF_ALU64|BPF_NEG, .dst_reg=D})
+
+/* R0 = data, R9 = data_end (from the context in R6) */
+static void xa_ptrs(void) {
+    xa(BPF_LDX_MEM(BPF_W, BPF_REG_0, BPF_REG_6, 0));
+    xa(BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_6, 4));
+}
+/* jump to label unless R<p> + n <= data_end (R9); uses R1 */
+static void xa_need(int p, int n, int label) {
+    xa(BPF_MOV64_REG(BPF_REG_1, p));
+    xa(BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, n));
+    xa_j(XJX(BPF_JGT, BPF_REG_1, BPF_REG_9), label);
+}
+enum { L_FAIL, L_OK, L_A, L_B, L_C };
+static void xa_tail(void) {      /* L_OK: return 0, L_FAIL: return -EINVAL (only if used: */
+    int fail = 0;                /* the verifier refuses unreachable instructions) */
+    for (int i = 0; i < xa_nfix; i++) if (xa_fix[i][1] == L_FAIL) fail = 1;
+    xa_label(L_OK);   xa(BPF_MOV64_IMM(BPF_REG_0, 0));   xa(BPF_EXIT_INSN());
+    if (fail) { xa_label(L_FAIL); xa(BPF_MOV64_IMM(BPF_REG_0, -22)); xa(BPF_EXIT_INSN()); }
+}
+
 /*
- * Appends the checksum subprogram if any l3/l4_csum_replace call was turned
- * into a call to it. Same arguments and semantics as the helpers on a
- * packet with a complete checksum (which is what XDP sees):
+ * skb_adjust_room(ctx, n, BPF_ADJ_ROOM_MAC, flags): n bytes (-255..255) in
+ * or out right after the 14-byte Ethernet header. Grow: head down by n,
+ * header moved to the new front (the gap keeps old bytes, as the helper).
+ * Shrink: header moved up by n, then head up by n.
+ */
+static void xsub_room(void) {
+    xa_begin();
+    xa(BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
+    xa(BPF_MOV64_REG(BPF_REG_7, BPF_REG_2));
+    xa(BPF_ALU64_IMM(BPF_LSH, BPF_REG_7, 32));           /* sign-extend the 32-bit argument */
+    xa(BPF_ALU64_IMM(BPF_ARSH, BPF_REG_7, 32));
+    xa_j(XJ(BPF_JEQ, BPF_REG_7, 0), L_OK);
+    xa_j(XJ(BPF_JSGT, BPF_REG_7, 0), L_A);
+    /* shrink by m = -n */
+    xa(XNEG(BPF_REG_7));
+    xa_j(XJ(BPF_JGT, BPF_REG_7, 255), L_FAIL);
+    xa_ptrs();
+    xa(BPF_MOV64_REG(BPF_REG_8, BPF_REG_0));
+    xa(BPF_ALU64_REG(BPF_ADD, BPF_REG_8, BPF_REG_7));    /* R8 = data + m */
+    xa_need(BPF_REG_8, 14, L_FAIL);
+    xa_need(BPF_REG_0, 14, L_FAIL);
+    xa(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_0, 0));
+    xa(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_0, 8));
+    xa(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_0, 12));
+    xa(BPF_STX_MEM(BPF_DW, BPF_REG_8, BPF_REG_2, 0));
+    xa(BPF_STX_MEM(BPF_W, BPF_REG_8, BPF_REG_3, 8));
+    xa(BPF_STX_MEM(BPF_H, BPF_REG_8, BPF_REG_4, 12));
+    xa(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    xa(BPF_MOV64_REG(BPF_REG_2, BPF_REG_7));
+    xa(BPF_CALL_FUNC(44));                                /* xdp_adjust_head(+m) */
+    xa(BPF_EXIT_INSN());
+    /* grow by n */
+    xa_label(L_A);
+    xa_j(XJ(BPF_JGT, BPF_REG_7, 255), L_FAIL);
+    xa(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    xa(BPF_MOV64_IMM(BPF_REG_2, 0));
+    xa(BPF_ALU64_REG(BPF_SUB, BPF_REG_2, BPF_REG_7));
+    xa(BPF_CALL_FUNC(44));                                /* xdp_adjust_head(-n) */
+    xa_j(XJ(BPF_JNE, BPF_REG_0, 0), L_B);
+    xa_ptrs();
+    xa(BPF_MOV64_REG(BPF_REG_8, BPF_REG_0));
+    xa(BPF_ALU64_REG(BPF_ADD, BPF_REG_8, BPF_REG_7));    /* old header at data + n */
+    xa_need(BPF_REG_8, 14, L_FAIL);
+    xa_need(BPF_REG_0, 14, L_FAIL);
+    xa(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_8, 0));
+    xa(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_8, 8));
+    xa(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_8, 12));
+    xa(BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_2, 0));
+    xa(BPF_STX_MEM(BPF_W, BPF_REG_0, BPF_REG_3, 8));
+    xa(BPF_STX_MEM(BPF_H, BPF_REG_0, BPF_REG_4, 12));
+    xa_j(XJA, L_OK);
+    xa_label(L_B);
+    xa(BPF_EXIT_INSN());                                  /* adjust_head's error */
+    xa_tail();
+    xa_end();
+}
+
+/* skb_change_head(ctx, len, flags): len (0-255) zero bytes at the front. */
+static void xsub_head(void) {
+    xa_begin();
+    xa(BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
+    xa(XMOV32(BPF_REG_7, BPF_REG_2));
+    xa_j(XJ(BPF_JEQ, BPF_REG_7, 0), L_OK);
+    xa_j(XJ(BPF_JGT, BPF_REG_7, 255), L_FAIL);
+    xa(BPF_MOV64_IMM(BPF_REG_2, 0));
+    xa(BPF_ALU64_REG(BPF_SUB, BPF_REG_2, BPF_REG_7));
+    xa(BPF_CALL_FUNC(44));                                /* R1 is still the context */
+    xa_j(XJ(BPF_JNE, BPF_REG_0, 0), L_B);
+    xa_ptrs();
+    xa(BPF_MOV64_IMM(BPF_REG_3, 0));
+    xa_label(L_A);                                        /* zero byte R3, R3 < len */
+    xa_j(XJX(BPF_JGE, BPF_REG_3, BPF_REG_7), L_OK);
+    xa(BPF_MOV64_REG(BPF_REG_8, BPF_REG_0));
+    xa(BPF_ALU64_REG(BPF_ADD, BPF_REG_8, BPF_REG_3));
+    xa_need(BPF_REG_8, 1, L_OK);
+    xa(BPF_ST_MEM(BPF_B, BPF_REG_8, 0, 0));
+    xa(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, 1));
+    xa_j(XJA, L_A);
+    xa_label(L_B);
+    xa(BPF_EXIT_INSN());
+    xa_tail();
+    xa_end();
+}
+
+/* skb_vlan_push(ctx, tpid (network order), tci): a tag at offset 12, outermost. */
+static void xsub_vpush(void) {
+    xa_begin();
+    xa(BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
+    xa(BPF_MOV64_REG(BPF_REG_7, BPF_REG_2));
+    xa(BPF_MOV64_REG(BPF_REG_8, BPF_REG_3));
+    xa(BPF_MOV64_IMM(BPF_REG_2, -4));
+    xa(BPF_CALL_FUNC(44));
+    xa_j(XJ(BPF_JNE, BPF_REG_0, 0), L_B);
+    xa_ptrs();
+    xa_need(BPF_REG_0, 16, L_FAIL);
+    xa(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_0, 4));     /* MACs from 4..15 to 0..11 */
+    xa(BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_2, 0));
+    xa(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_0, 12));
+    xa(BPF_STX_MEM(BPF_W, BPF_REG_0, BPF_REG_2, 8));
+    xa(BPF_STX_MEM(BPF_H, BPF_REG_0, BPF_REG_7, 12));
+#if defined(HOST_LITTLE_ENDIAN)
+    xa(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_8, .imm=16}));
+#endif
+    xa(BPF_STX_MEM(BPF_H, BPF_REG_0, BPF_REG_8, 14));
+    xa_j(XJA, L_OK);
+    xa_label(L_B);
+    xa(BPF_EXIT_INSN());
+    xa_tail();
+    xa_end();
+}
+
+/* skb_vlan_pop(ctx): removes the outer 802.1Q/802.1ad tag; none is not an error. */
+static void xsub_vpop(void) {
+    xa_begin();
+    xa(BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
+    xa_ptrs();
+    xa_need(BPF_REG_0, 18, L_OK);
+    xa(BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_0, 12));
+    xa_j(XJ(BPF_JEQ, BPF_REG_2, htons(ETH_P_8021Q)), L_A);
+    xa_j(XJ(BPF_JNE, BPF_REG_2, htons(ETH_P_8021AD)), L_OK);
+    xa_label(L_A);
+    xa(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_0, 0));     /* MACs from 0..11 to 4..15 */
+    xa(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_0, 8));
+    xa(BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_2, 4));
+    xa(BPF_STX_MEM(BPF_W, BPF_REG_0, BPF_REG_3, 12));
+    xa(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    xa(BPF_MOV64_IMM(BPF_REG_2, 4));
+    xa(BPF_CALL_FUNC(44));
+    xa(BPF_EXIT_INSN());
+    xa_tail();
+    xa_end();
+}
+
+/* skb_change_tail(ctx, len, flags): xdp_adjust_tail(len - current length). */
+static void xsub_tail(void) {
+    xa_begin();
+    xa(BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
+    xa(XMOV32(BPF_REG_7, BPF_REG_2));
+    xa(BPF_CALL_FUNC(BPF_FUNC_xdp_get_buff_len));
+    xa(BPF_MOV64_REG(BPF_REG_2, BPF_REG_7));
+    xa(BPF_ALU64_REG(BPF_SUB, BPF_REG_2, BPF_REG_0));
+    xa(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    xa(BPF_CALL_FUNC(65));
+    xa(BPF_EXIT_INSN());
+    xa_end();
+}
+
+/*
+ * Appends the subprograms the program calls instead of skb helpers and
+ * points each call at its subprogram. The checksum one, for
+ * l3/l4_csum_replace, has the same arguments and semantics as the helpers on
+ * a packet with a complete checksum (which is what XDP sees):
  *   R1 ctx, R2 offset of the 16-bit checksum, R3 from, R4 to,
  *   R5 flags: size 2 or 4 (from/to are the old/new raw words) or 0 (R4 is a
  *   32-bit checksum difference, from csum_diff); BPF_F_MARK_MANGLED_0 (0x20):
@@ -429,10 +639,30 @@ static void tc_only_ctx_store(const char *what) {
  *   written as 0xffff (UDP). BPF_F_PSEUDO_HDR makes no difference here.
  * Returns 0, or -EFAULT when the checksum is outside the packet. The values
  * are added in the packet's byte order (one's complement sums do not depend
- * on it), like the helpers do. It uses no stack.
+ * on it), like the helpers do. None of them uses the stack.
  */
+static void xsub_csum(void);
 void xdp_finish(void) {
-    if (!num_xdp_csum_calls) return;
+    if (!num_xdp_sub_calls) return;
+    int start[XSUB_N];
+    for (int k = 0; k < XSUB_N; k++) {
+        start[k] = -1;
+        for (int i = 0; i < num_xdp_sub_calls; i++) if (xdp_sub_calls[i].sub == k) { start[k] = prog_idx; break; }
+        if (start[k] < 0) continue;
+        switch (k) {
+        case XSUB_CSUM:  xsub_csum(); break;
+        case XSUB_ROOM:  xsub_room(); break;
+        case XSUB_HEAD:  xsub_head(); break;
+        case XSUB_VPUSH: xsub_vpush(); break;
+        case XSUB_VPOP:  xsub_vpop(); break;
+        case XSUB_TAIL:  xsub_tail(); break;
+        }
+    }
+    for (int i = 0; i < num_xdp_sub_calls; i++)
+        prog[xdp_sub_calls[i].idx].imm = start[xdp_sub_calls[i].sub] - xdp_sub_calls[i].idx - 1;
+}
+
+static void xsub_csum(void) {
 #define J(OP, R, IMM, OFF) ((struct bpf_insn){.code=BPF_JMP|BPF_OP(OP)|BPF_K, .dst_reg=R, .off=OFF, .imm=IMM})
 #define JX(OP, R, S, OFF) ((struct bpf_insn){.code=BPF_JMP|BPF_OP(OP)|BPF_X, .dst_reg=R, .src_reg=S, .off=OFF})
 #define MOV32(D, S) ((struct bpf_insn){.code=BPF_ALU|BPF_MOV|BPF_X, .dst_reg=D, .src_reg=S})
@@ -496,10 +726,7 @@ void xdp_finish(void) {
 #undef J
 #undef JX
 #undef MOV32
-    int start = prog_idx;
     for (size_t i = 0; i < sizeof(sub) / sizeof(sub[0]); i++) emit(sub[i]);
-    for (int i = 0; i < num_xdp_csum_calls; i++)
-        prog[xdp_csum_calls[i]].imm = start - xdp_csum_calls[i] - 1;
 }
 
 /*
@@ -2261,41 +2488,65 @@ void compile_match_port_range(int off, uint16_t min_p, uint16_t max_p) {
  * Emits bytecode to match an existing outer VLAN ID against a range (inclusive).
  * Automatically verifies that the EtherType at offset 12 represents a valid VLAN tag.
  */
-void compile_match_vlan_range(uint16_t min_vid, uint16_t max_vid) {
+/* R<dst> = the 1-8 byte variable var, zero-extended */
+static void emit_load_var(int dst, const char *var) {
+    int v_off = get_var_offset(var), v_sz = get_var_size(var);
+    if (v_sz == 1) emit(BPF_LDX_MEM(BPF_B, dst, BPF_REG_10, v_off));
+    else if (v_sz == 2) emit(BPF_LDX_MEM(BPF_H, dst, BPF_REG_10, v_off));
+    else if (v_sz == 4) emit(BPF_LDX_MEM(BPF_W, dst, BPF_REG_10, v_off));
+    else emit(BPF_LDX_MEM(BPF_DW, dst, BPF_REG_10, v_off));
+}
+
+/*
+ * match vlan-id <vid | min-max | %VAR>: the VLAN id of the outer tag (802.1Q
+ * or 802.1ad). TC reads the offloaded tag; XDP reads the tag in the frame
+ * (TPID at 12, TCI at 14). (A %VAR used to be read as the number 0.)
+ */
+void compile_match_vlan_range(uint16_t min_vid, uint16_t max_vid, const char *var) {
     start_match_block();
+    int buf = 0;
+    if (is_xdp) {
+        buf = stack_scratch(8, "match vlan-id");
+        emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+        emit(BPF_MOV64_IMM(BPF_REG_2, 12));
+        emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, buf));
+        emit(BPF_MOV64_IMM(BPF_REG_4, 4));
+        emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+        add_block_jump();
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+        emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, buf));
+    } else {
+        emit_ctx_ld(BPF_H, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto));
+    }
 
-
-    // 1. Load VLAN EtherType into R1
-    emit_ctx_ld(BPF_H, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto));
-
-    // Jump 2: Verify it is 0x8100 (802.1Q) or 0x88A8 (QinQ).
-    // If it is neither, jump to the epilogue (this packet has no VLAN tags!)
+    // 0x8100 (802.1Q) or 0x88A8 (802.1ad), else no tag: no match
     int j_is_8100 = prog_idx;
-    //emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=htons(0x8100)}));
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=htons(ETH_P_8021Q)}));
-
     add_block_jump();
-    //emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=htons(0x88A8)}));
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=htons(ETH_P_8021AD)}));
-
-    // Backpatch the 8100 success jump
     prog[j_is_8100].off = prog_idx - j_is_8100 - 1;
 
-    // 3. Load the 2-byte TCI from stack into R1
-    emit_ctx_ld(BPF_H, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_tci));
-
-    // 5. Convert R1 from Network Byte Order to Host Byte Order (16-bit)
-    //emit(((struct bpf_insn){.code=BPF_ALU|BPF_END|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
-
-    // 6. Apply the mask to isolate the lower 12 bits (VLAN ID)
+    // the TCI, host order, and its 12-bit VLAN id
+    if (is_xdp) {
+        emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, buf + 2));
+#if defined(HOST_LITTLE_ENDIAN)
+        emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
+#endif
+    } else {
+        emit_ctx_ld(BPF_H, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_tci));
+    }
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=0x0FFF}));
 
-    // 7. Evaluate Range using 32-bit jumps
-    // Jump 4: Check Lower Bound
+    if (var) {
+        emit_load_var(BPF_REG_2, var);
+        emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_2, 0x0FFF));
+        add_block_jump();
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2}));
+        return;
+    }
     add_block_jump();
     emit(((struct bpf_insn){.code=BPF_JMP32|BPF_JLT|BPF_K, .dst_reg=BPF_REG_1, .imm=min_vid}));
-
-    // Jump 5: Check Upper Bound
     add_block_jump();
     emit(((struct bpf_insn){.code=BPF_JMP32|BPF_JGT|BPF_K, .dst_reg=BPF_REG_1, .imm=max_vid}));
 }
@@ -3053,7 +3304,80 @@ void compile_set_mpls_field(int is_bos, uint32_t val, const char *var) {
  * manually shifts the data before 'offset' forward into the new headroom.
  * This is exponentially faster than shifting the tail backward for early-packet insertions.
  */
+
+/*
+ * XDP fast paths for add-bytes / del-bytes (and the l2 variants) when the
+ * offset is small: only the bytes in front of it move, and the head moves
+ * with bpf_xdp_adjust_head (up to 255 bytes, the generic-mode headroom is
+ * 256). Larger offsets use the general algorithm on the emulated helpers.
+ */
+#define XDP_FRONT_MAX 64
+static void xdp_copy_front(int from, int to, int n, int buf) {
+    /* n bytes at 'from' to 'to' through the stack; a failed load ends the program (continue) */
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, from));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, buf));
+    emit(BPF_MOV64_IMM(BPF_REG_4, n));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    add_safety_jump();
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, to));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, buf));
+    emit(BPF_MOV64_IMM(BPF_REG_4, n));
+    emit(BPF_MOV64_IMM(BPF_REG_5, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+}
+
+static void xdp_adjust_head_k(int delta) {
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, delta));
+    emit(BPF_CALL_FUNC(44));
+    add_safety_jump();
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+}
+
+/* del: a packet shorter than offset+dlen (or than dlen + 14) is left unchanged */
+static void xdp_delete_front(int offset, int dlen) {
+    int buf = stack_scratch(XDP_FRONT_MAX, "del-bytes");
+    int need = offset + dlen > dlen + 14 ? offset + dlen : dlen + 14;
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));            /* length check: the last byte needed */
+    emit(BPF_MOV64_IMM(BPF_REG_2, need - 1));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, buf));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 1));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    add_safety_jump();
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+    if (offset > 0) xdp_copy_front(0, dlen, offset, buf);
+    xdp_adjust_head_k(dlen);
+}
+
+/* add: ilen zero bytes at offset */
+static void xdp_insert_front(int offset, int ilen) {
+    int buf = stack_scratch(XDP_FRONT_MAX, "add-bytes");
+    xdp_adjust_head_k(-ilen);
+    if (offset > 0) xdp_copy_front(ilen, 0, offset, buf);
+    for (int i = 0; i < XDP_FRONT_MAX; i += 8) emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, buf + i, 0));
+    for (int done = 0; done < ilen; done += XDP_FRONT_MAX) {
+        int n = ilen - done < XDP_FRONT_MAX ? ilen - done : XDP_FRONT_MAX;
+        emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+        emit(BPF_MOV64_IMM(BPF_REG_2, offset + done));
+        emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, buf));
+        emit(BPF_MOV64_IMM(BPF_REG_4, n));
+        emit(BPF_MOV64_IMM(BPF_REG_5, 0));
+        emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+    }
+}
+
 void compile_insert_bytes(int offset, int ilen) {
+    if (is_xdp && offset >= 0 && offset <= XDP_FRONT_MAX && ilen > 0 && ilen <= 255) {
+        xdp_insert_front(offset, ilen);
+        return;
+    }
 
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     emit(BPF_MOV64_IMM(BPF_REG_2, 0));
@@ -3291,6 +3615,62 @@ void compile_push_vlan(const char *vid_arg, const char *pcp_arg) {
  * Stack scratch: -8 TPID, -16 new TCI.
  */
 void compile_set_vlan_id(const char *vid_arg) {
+    if (is_xdp) {
+        /*
+         * XDP: the tag is in the frame. With an 802.1Q/802.1ad tag at 12,
+         * rewrite the 12 VLAN id bits of its TCI (priority and DEI stay);
+         * without one, push an 802.1Q tag (as TC does).
+         * Scratch: [buf] TPID, [buf+2] TCI, [buf+4] new id.
+         */
+        int buf = stack_scratch(8, "set vlan-id");
+        if (vid_arg[0] == '%') emit_load_var(BPF_REG_3, vid_arg);
+        else emit(BPF_MOV64_IMM(BPF_REG_3, (int)(strtoul(vid_arg, NULL, 0) & 0x0FFF)));
+        emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_3, 0x0FFF));
+        emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_3, buf + 4));
+        emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+        emit(BPF_MOV64_IMM(BPF_REG_2, 12));
+        emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, buf));
+        emit(BPF_MOV64_IMM(BPF_REG_4, 4));
+        emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+        add_safety_jump();
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+        emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, buf));
+        int j_q = prog_idx;
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=htons(ETH_P_8021Q)}));
+        int j_push = prog_idx;
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=htons(ETH_P_8021AD)}));
+        prog[j_q].off = prog_idx - j_q - 1;
+        /* tagged: TCI = (TCI & 0xF000) | id */
+        emit(BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_10, buf + 2));
+#if defined(HOST_LITTLE_ENDIAN)
+        emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_2, .imm=16}));
+#endif
+        emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_2, 0xF000));
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_10, buf + 4));
+        emit(BPF_ALU64_REG(BPF_OR, BPF_REG_2, BPF_REG_3));
+#if defined(HOST_LITTLE_ENDIAN)
+        emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_2, .imm=16}));
+#endif
+        emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_2, buf + 2));
+        emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+        emit(BPF_MOV64_IMM(BPF_REG_2, 14));
+        emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, buf + 2));
+        emit(BPF_MOV64_IMM(BPF_REG_4, 2));
+        emit(BPF_MOV64_IMM(BPF_REG_5, 0));
+        emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+        int j_end = prog_idx;
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JA}));
+        /* untagged: push 802.1Q with this id, priority 0 */
+        prog[j_push].off = prog_idx - j_push - 1;
+        emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+        emit(BPF_MOV32_IMM(BPF_REG_2, htons(ETH_P_8021Q)));
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_10, buf + 4));
+        emit(BPF_CALL_FUNC(BPF_FUNC_skb_vlan_push));
+        prog[j_end].off = prog_idx - j_end - 1;
+        return;
+    }
     emit_ctx_ld(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto));
     int j_have = prog_idx;
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_2, .imm=0}));
@@ -3481,7 +3861,6 @@ void emit_drop_if_r0_error(void) {
 }
 
 void compile_set_length(const char *len_arg) {
-    tc_only_ctx_store("it resizes the packet (skb helpers)");
     if (len_arg[0] == '%') {
         int v_off = get_var_offset(len_arg);
         int v_sz = get_var_size(len_arg);
@@ -5068,6 +5447,10 @@ void compile_delete_bytes_buffered(int offset, int dlen) {
         fprintf(stderr, "Error: del-bytes needs an offset >= 0 and a length > 0 that end within 9000 bytes\n");
         exit(1);
     }
+    if (is_xdp && offset <= XDP_FRONT_MAX && dlen <= 255) {
+        xdp_delete_front(offset, dlen);
+        return;
+    }
     int map_fd = get_or_create_buffer_map("__DEL_B_BUF__",1,0);
     if (map_fd < 0) {
         compile_delete_bytes(offset,dlen);
@@ -5714,6 +6097,26 @@ void compile_buffer_op(int map_fd, const char *key, const char *len_arg, const c
  */
 void compile_strip_l2(int len, uint16_t ethertype) {
     if (len < 4 || len > 56 || len % 4) { fprintf(stderr, "Error: strip-l2 length must be a multiple of 4 between 4 and 56\n"); exit(1); }
+    if (is_xdp) {
+        /* XDP: no skb->protocol to work around; remove the bytes after the
+         * Ethernet header (emulated adjust_room, MAC mode) and set the EtherType */
+        emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+        emit(BPF_MOV64_IMM(BPF_REG_2, -len));
+        emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_MAC));
+        emit(BPF_MOV64_IMM(BPF_REG_4, 0));
+        emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));
+        add_safety_jump();
+        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+        emit(BPF_ST_MEM(BPF_H, BPF_REG_10, -8, htons(ethertype)));
+        emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+        emit(BPF_MOV64_IMM(BPF_REG_2, 12));
+        emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, -8));
+        emit(BPF_MOV64_IMM(BPF_REG_4, 2));
+        emit(BPF_MOV64_IMM(BPF_REG_5, 0));
+        emit(BPF_CALL_FUNC(BPF_FUNC_skb_store_bytes));
+        return;
+    }
     int tags = (len + 4) / 4;          /* rewritten region: 4*tags + 2 bytes from offset 12 */
     int region = 4 * tags + 2;
     int base = -112;                   /* stack scratch for the rewritten bytes */
@@ -6846,6 +7249,8 @@ void help(const char *arg0) {
 }
 
 void compile_ip_defrag(const char *dir) {
+    /* XDP has no room to grow a fragment into the whole datagram (tailroom) */
+    if (is_xdp) xdp_unsupported("reassembly grows the packet beyond what XDP can (use TC ingress)");
     char instr[] = 
 	"match ip;"
 		"decl IPFRAG 2;"
@@ -7407,7 +7812,8 @@ static int process_cmd_1(char *cmd, const char *dir) {
             if (strcmp(f,"src-mac")==0) compile_match_mac(6, val);
             else if (strcmp(f,"dst-mac")==0) compile_match_mac(0, val);
             else if (strcmp(f,"eth-proto")==0) { start_match_block(); compile_match_core(12,2,htons(strtol(val,NULL,0)),0xFFFFFFFF,mv); }
-            else if (strcmp(f,"vlan-id")==0) { uint16_t mn,mx; parse_port_range(val,&mn,&mx); compile_match_vlan_range(mn,mx); }
+            else if (strcmp(f,"vlan-id")==0 && mv) compile_match_vlan_range(0, 0, mv);
+            else if (strcmp(f,"vlan-id")==0) { uint16_t mn,mx; parse_port_range(val,&mn,&mx); compile_match_vlan_range(mn,mx,NULL); }
             else if (strcmp(f,"mpls-label")==0) { start_match_block(); compile_match_core(14,4,htonl(atoi(val)<<12),htonl(0xFFFFF000),mv); }
             else if (strcmp(f,"mpls-bos")==0) { start_match_block(); compile_match_core(14,4,htonl((atoi(val)&1)<<8),htonl(0x00000100),mv); }
             else if (strcmp(f,"ip-proto")==0) { start_match_block(); compile_match_core(23,1,atoi(val),0xFFFFFFFF,mv); }

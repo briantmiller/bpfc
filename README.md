@@ -87,8 +87,9 @@ See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)`. Build an RPM (RHEL 9/10) with `
 
 * `accept` and `continue` pass the packet on (XDP_PASS), `drop` is XDP_DROP, `redirect <iface>` sends it out of that interface, and `tx` (XDP only) sends it back out of the interface it came in on.
 * Checksum-aware rewrites (`set ip-src`, ports, `ip-tos`, ...) update the IP and TCP/UDP checksums incrementally, as on TC. XDP sees complete checksums; a packet a local socket sent through a veth pair may carry a partial one (CHECKSUM_PARTIAL), which an L4 rewrite corrupts once the packet is forwarded: turn tx checksum offload off on such senders (`ethtool -K <dev> tx off`).
-* VLAN tags are in the packet: `match vlan`/`qinq` and `get vlan-id` read them there. A NIC that strips tags (`rxvlan` offload) may hand generic XDP packets without them.
-* Commands that need an skb are a compile error naming the command: resizing (`add-bytes`, `del-bytes`, encap/decap, VLAN push/pop, `ip-frag`, `set len`), `clone`, `redirect-neigh`, `reclassify`, and the skb fields (`skb-mark`, `skb-hash`, `skb-cb`, `protocol`, `tstamp`, `set queue`). `get len`, `skb-ingress`/`skb-ifindex` (the ingress interface) and `queue` (the receive queue) work.
+* VLAN tags are in the packet: `match vlan`/`qinq`, `get`/`match vlan-id` read them there, `set vlan-id` rewrites the id in the tag (keeping priority and DEI; pushes an 802.1Q tag when there is none), and `push-`/`pop-vlan` insert or remove the 4-byte tag after the MAC addresses. A NIC that strips tags (`rxvlan` offload) may hand generic XDP packets without them.
+* Resizing works: `add-head-bytes`, `add-bytes`/`del-bytes`, `add-l2-bytes`/`del-l2-bytes`, `push-`/`pop-eth`, `push-`/`pop-vlan`, `push-qinq`, `encap-`/`decap-mpls`, `encap-`/`decap-gre`, `insert-l2`/`remove-l2`/`strip-l2` and `set len`, so the [MPLS pseudowire](#3-mpls-pseudowires) examples run as XDP programs too. The packet grows or shrinks at the front with `bpf_xdp_adjust_head` (up to 255 bytes at a time; generic mode has 256 bytes of headroom) and at the end with `bpf_xdp_adjust_tail`; inserted bytes are zero, as on TC. Growing at the end needs tailroom, which generic mode may not have.
+* Commands that need an skb are a compile error naming the command: `ip-frag`, `ip-defrag`, `clone`, `redirect-neigh`, `reclassify`, and the skb fields (`skb-mark`, `skb-hash`, `skb-cb`, `protocol`, `tstamp`, `set queue`). `get len`, `skb-ingress`/`skb-ifindex` (the ingress interface) and `queue` (the receive queue) work.
 * `$XDP` (1 in an XDP program) and `$HOOK` (`ingress`, `egress`, `xdp`) let one file serve several hooks: `when $XDP == 0; set skb-mark 5; end-when`.
 
 ---
@@ -348,6 +349,8 @@ Decapsulate pseudowire packets and send to interface eth2 - assume next-hop labe
 ```
 
 If control-words are desired, change `add-head-bytes 22` to `add-head-bytes 26` and `del-bytes 0 18` to `del-bytes 0 22` to account for the 4-byte control word.
+
+The same programs work as XDP programs: use `-d xdp` instead of `-d ingress` (`./test.sh mpls-xdp` runs the pseudowire test that way).
 
 Note: The above MPLS encapsulation is not compatible with TCP Generic Receive Offload (GRO) or TCP Segmentation Offload (TSO). This is due to the behavior of combining multiple TCP segments into a single sk_buff and then processing that single sk_buff for all segments.  When this occurs, the large chunk of segments is encapsulated into the single MPLS packet often resulting in a packet larger than the interface MTU.  To overcome this, disable GRO and TSO on the interface using `ethtool -K eth1 tso off gro off`.
 
