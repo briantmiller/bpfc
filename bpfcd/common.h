@@ -28,10 +28,11 @@
 /* Prefix of TC filter names owned by bpfcd: "bpfcd:<iface>/<dir>/<prio>". */
 #define FILTER_NAME_PREFIX  "bpfcd:"
 
-enum direction { DIR_INGRESS = 0, DIR_EGRESS = 1 };
+/* DIR_XDP: interfaces.d/<if>/xdp.bpfc, one program per interface (priority 0). */
+enum direction { DIR_INGRESS = 0, DIR_EGRESS = 1, DIR_XDP = 2 };
 
 const char *dir_name(int dir);
-int dir_parse(const char *s); /* returns -1 when not "ingress"/"egress" */
+int dir_parse(const char *s); /* returns -1 when not "ingress"/"egress"/"xdp" */
 
 /* ---------------- logging ---------------- */
 
@@ -181,7 +182,9 @@ struct tc_filter {
 };
 
 /*
- * Lists the filters attached to one clsact hook of an interface. Only real
+ * Lists the filters attached to one clsact hook of an interface. For DIR_XDP
+ * it lists the XDP program, if any, as one entry at priority 0: kind
+ * "xdpgeneric", "xdpdrv" or "xdpoffload", and the kernel program name as name. Only real
  * filter entries are returned (the per-priority chain headers are skipped).
  * Returns the number of filters (an interface without clsact returns 0), or
  * -errno. *out is malloc'd and must be freed by the caller.
@@ -204,6 +207,11 @@ struct prog_details {
 int prog_get_details(uint32_t id, int want_insns, struct prog_details *out);
 
 /* ---------------- misc ---------------- */
+
+/* The kernel program name bpfc -n gives a filter name (bpfc's set_prog_name()):
+ * the part after the last ':', its last 15 characters, others than
+ * [A-Za-z0-9_.] as '_', no leading '_'. out may be name. */
+void kernel_prog_name(const char *name, char *out, size_t outlen);
 
 int mkdir_p(const char *path, int mode);
 /* Characters allowed in an interface directory name (Linux allows more, we are strict). */

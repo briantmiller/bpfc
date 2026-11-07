@@ -30,11 +30,12 @@
 
 /* ======================= small helpers ======================= */
 
-const char *dir_name(int dir) { return dir == DIR_EGRESS ? "egress" : "ingress"; }
+const char *dir_name(int dir) { return dir == DIR_XDP ? "xdp" : dir == DIR_EGRESS ? "egress" : "ingress"; }
 
 int dir_parse(const char *s) {
     if (!strcmp(s, "ingress")) return DIR_INGRESS;
     if (!strcmp(s, "egress")) return DIR_EGRESS;
+    if (!strcmp(s, "xdp")) return DIR_XDP;
     return -1;
 }
 
@@ -694,7 +695,7 @@ int state_read(const char *path, struct daemon_info *di, struct slot **slots_out
                 continue;
             }
             if (!strcmp(k, "iface")) snprintf(s->iface, sizeof(s->iface), "%s", val);
-            else if (!strcmp(k, "dir")) s->dir = dir_parse(val) == DIR_EGRESS ? DIR_EGRESS : DIR_INGRESS;
+            else if (!strcmp(k, "dir")) { int d = dir_parse(val); s->dir = d < 0 ? DIR_INGRESS : d; }
             else if (!strcmp(k, "prio")) s->prio = atoi(val);
             else if (!strcmp(k, "path")) snprintf(s->path, sizeof(s->path), "%s", val);
             else if (!strcmp(k, "mtime_ns")) s->mtime_ns = atoll(val);
@@ -709,7 +710,7 @@ int state_read(const char *path, struct daemon_info *di, struct slot **slots_out
             else if (!strcmp(k, "error")) snprintf(s->error, sizeof(s->error), "%s", val);
         }
         /* Drop records missing their identity rather than guessing. */
-        if (s && (!s->iface[0] || s->prio <= 0 || s->status < 0)) n--;
+        if (s && (!s->iface[0] || (s->dir == DIR_XDP ? s->prio != 0 : s->prio <= 0) || s->status < 0)) n--;
     }
     free(line);
     fclose(f);
@@ -724,8 +725,11 @@ void error_log_path(char *out, size_t outlen, const char *state_dir,
 
 /* ======================= TC filter dump ======================= */
 
+static int xdp_dump(int ifindex, struct tc_filter **out);
+
 int tc_dump_filters(int ifindex, int dir, struct tc_filter **out) {
     *out = NULL;
+    if (dir == DIR_XDP) return xdp_dump(ifindex, out);
     int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     if (s < 0) return -errno;
     struct sockaddr_nl sa = {.nl_family = AF_NETLINK};
@@ -801,6 +805,91 @@ int tc_dump_filters(int ifindex, int dir, struct tc_filter **out) {
     if (rc < 0) { free(v); return rc; }
     *out = v;
     return n;
+}
+
+/* The XDP program of an interface (RTM_GETLINK, IFLA_XDP). */
+static int xdp_dump(int ifindex, struct tc_filter **out) {
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (s < 0) return -errno;
+    struct sockaddr_nl sa = {.nl_family = AF_NETLINK};
+    if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) < 0) { int e = -errno; close(s); return e; }
+    struct { struct nlmsghdr n; struct ifinfomsg i; } req;
+    memset(&req, 0, sizeof(req));
+    req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+    req.n.nlmsg_type = RTM_GETLINK;
+    req.n.nlmsg_flags = NLM_F_REQUEST;
+    req.n.nlmsg_seq = (uint32_t)time(NULL) ^ 0x7d;
+    req.i.ifi_family = AF_UNSPEC;
+    req.i.ifi_index = ifindex;
+    if (sendto(s, &req, req.n.nlmsg_len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        int e = -errno; close(s); return e;
+    }
+    char *buf = malloc(65536);
+    if (!buf) { close(s); return -ENOMEM; }
+    int rc = 0, done = 0, mode = 0;
+    uint32_t id = 0, skb_id = 0;
+    while (!done) {
+        ssize_t len = recv(s, buf, 65536, 0);
+        if (len < 0) {
+            if (errno == EINTR) continue;
+            rc = -errno; break;
+        }
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (unsigned)len); h = NLMSG_NEXT(h, len)) {
+            if (h->nlmsg_seq != req.n.nlmsg_seq) continue;
+            if (h->nlmsg_type == NLMSG_ERROR) {
+                int e = ((struct nlmsgerr *)NLMSG_DATA(h))->error;
+                if (e) rc = e;
+                done = 1; break;
+            }
+            if (h->nlmsg_type != RTM_NEWLINK) continue;
+            done = 1;
+            struct ifinfomsg *ifi = NLMSG_DATA(h);
+            int alen = h->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
+            for (struct rtattr *a = IFLA_RTA(ifi); RTA_OK(a, alen); a = RTA_NEXT(a, alen)) {
+                if (a->rta_type != IFLA_XDP) continue;
+                int xlen = RTA_PAYLOAD(a);
+                for (struct rtattr *x = RTA_DATA(a); RTA_OK(x, xlen); x = RTA_NEXT(x, xlen)) {
+                    if (x->rta_type == IFLA_XDP_ATTACHED && RTA_PAYLOAD(x) >= 1) mode = *(uint8_t *)RTA_DATA(x);
+                    else if (x->rta_type == IFLA_XDP_PROG_ID && RTA_PAYLOAD(x) >= 4) memcpy(&id, RTA_DATA(x), 4);
+                    else if (x->rta_type == IFLA_XDP_SKB_PROG_ID && RTA_PAYLOAD(x) >= 4) memcpy(&skb_id, RTA_DATA(x), 4);
+                }
+            }
+            break;
+        }
+    }
+    free(buf);
+    close(s);
+    if (rc < 0) return rc;
+    if (mode == XDP_ATTACHED_NONE) return 0;
+    struct tc_filter *f = calloc(1, sizeof(*f));
+    if (!f) return -ENOMEM;
+    /* With programs in several modes (XDP_ATTACHED_MULTI), the generic one is bpfcd's. */
+    f->prog_id = mode == XDP_ATTACHED_MULTI ? skb_id : id;
+    snprintf(f->kind, sizeof(f->kind), "%s", mode == XDP_ATTACHED_SKB ? "xdpgeneric" :
+             mode == XDP_ATTACHED_DRV ? "xdpdrv" : mode == XDP_ATTACHED_HW ? "xdpoffload" : "xdpmulti");
+    struct prog_details d;
+    if (f->prog_id && prog_get_details(f->prog_id, 0, &d) == 0) {
+        snprintf(f->name, sizeof(f->name), "%s", d.name);
+        free(d.xlated);
+    }
+    *out = f;
+    return 1;
+}
+
+void kernel_prog_name(const char *name, char *out, size_t outlen) {
+    char tmp[16];
+    const char *colon = strrchr(name, ':');
+    if (colon && colon[1]) name = colon + 1;
+    size_t len = strlen(name), i = 0;
+    const char *src = len > 15 ? name + (len - 15) : name;
+    for (; *src && i < 15; src++) {
+        char c = *src;
+        if (!isalnum((unsigned char)c) && c != '_' && c != '.') c = '_';
+        if (i == 0 && c == '_') continue;
+        tmp[i++] = c;
+    }
+    tmp[i] = '\0';
+    snprintf(out, outlen, "%s", tmp);
 }
 
 /* ======================= bpf program info ======================= */

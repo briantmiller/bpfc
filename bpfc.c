@@ -261,7 +261,10 @@ int safety_jump_indices[MAX_SAFETY_JUMPS];
 int num_safety_jumps = 0;
 int verbose_mode = 0; // Tracks if -v was passed
 
-int is_xdp = 0; // Global flag activated by -x
+int is_xdp = 0; // XDP program (-d xdp): xdp_md context, XDP_* return codes
+
+/* The command being compiled, for error messages. */
+static const char *cur_op = "";
 
 #define MAX_LABELS 1024
 struct {
@@ -281,7 +284,6 @@ void reset() {
     prog_idx = 0;
     num_labels = 0;
     num_unresolved_gotos = 0;
-    is_xdp = 0;
     num_safety_jumps = 0;
     num_blocks = 0;
     num_jumps = 0;
@@ -292,6 +294,79 @@ void reset() {
     next_var_offset = VAR_TOP;
 }
 
+/*
+ * XDP programs (-d xdp).
+ *
+ * The commands are compiled as for TC; emit() then adapts each helper call:
+ *  - skb_load_bytes / skb_store_bytes become xdp_load_bytes / xdp_store_bytes
+ *    (same arguments; kernel 5.18, RHEL 9.2). The store flags in R5 are ignored.
+ *  - l3_csum_replace / l4_csum_replace, which XDP lacks, become a bpf-to-bpf
+ *    call to a subprogram with the same arguments, appended once at the end
+ *    (xdp_finish). One instruction either way, so the fixed jump offsets the
+ *    command compilers use stay valid.
+ *  - helpers XDP does not have (they need an skb: resizing, VLAN offload,
+ *    clone, hash, protocol, neighbour redirect) are a compile error naming the
+ *    command. The context fields go through emit_ctx_ld().
+ */
+#define BPF_FUNC_xdp_get_buff_len 188
+#define BPF_FUNC_xdp_load_bytes   189
+#define BPF_FUNC_xdp_store_bytes  190
+#define XDP_ACT_ABORTED  0
+#define XDP_ACT_DROP     1
+#define XDP_ACT_PASS     2
+#define XDP_ACT_TX       3
+
+#define MAX_XDP_CSUM_CALLS 4096
+static int xdp_csum_calls[MAX_XDP_CSUM_CALLS];
+static int num_xdp_csum_calls = 0;
+
+static void xdp_unsupported(const char *what) {
+    fprintf(stderr, "Error: '%s' is not available in XDP programs: %s. "
+            "Guard it with \"when $XDP == 0\" if the file is shared with TC.\n", cur_op, what);
+    exit(1);
+}
+
+static struct bpf_insn xdp_call(struct bpf_insn in) {
+    switch (in.imm) {
+    case BPF_FUNC_skb_load_bytes:  in.imm = BPF_FUNC_xdp_load_bytes; return in;
+    case BPF_FUNC_skb_store_bytes: in.imm = BPF_FUNC_xdp_store_bytes; return in;
+    case BPF_FUNC_l3_csum_replace:
+    case BPF_FUNC_l4_csum_replace:
+        if (num_xdp_csum_calls >= MAX_XDP_CSUM_CALLS) {
+            fprintf(stderr, "Error: too many checksum updates (%d)\n", MAX_XDP_CSUM_CALLS);
+            exit(1);
+        }
+        xdp_csum_calls[num_xdp_csum_calls++] = prog_idx;
+        in.src_reg = BPF_PSEUDO_CALL;
+        in.imm = 0; /* set by xdp_finish() */
+        return in;
+    case 1: case 2: case 3:          /* map lookup/update/delete */
+    case 5: case 6: case 7: case 8:  /* ktime, trace_printk, prandom, cpu */
+    case 12:                         /* tail_call */
+    case BPF_FUNC_redirect: case BPF_FUNC_csum_diff: case BPF_FUNC_fib_lookup:
+    case 44: case 51: case 54: case 65: /* xdp_adjust_head, redirect_map, adjust_meta, adjust_tail */
+    case BPF_FUNC_xdp_get_buff_len: case BPF_FUNC_xdp_load_bytes: case BPF_FUNC_xdp_store_bytes:
+        return in;
+    }
+    const char *why;
+    switch (in.imm) {
+    case BPF_FUNC_skb_adjust_room: case BPF_FUNC_skb_change_tail: case BPF_FUNC_skb_change_head:
+    case 39: why = "it resizes the packet (skb helpers)"; break;
+    case BPF_FUNC_skb_vlan_push: case BPF_FUNC_skb_vlan_pop:
+        why = "XDP has no VLAN offload (the tag is in the packet)"; break;
+    case BPF_FUNC_clone_redirect: why = "XDP cannot clone packets"; break;
+    case BPF_FUNC_redirect_neigh: why = "XDP has no neighbour redirect"; break;
+    case BPF_FUNC_set_hash: case BPF_FUNC_change_proto: why = "XDP has no skb"; break;
+    default: {
+        static char b[64];
+        snprintf(b, sizeof(b), "it needs helper %d", in.imm);
+        why = b;
+    }
+    }
+    xdp_unsupported(why);
+    return in;
+}
+
 void emit(struct bpf_insn insn) {
         /* Instructions past the end used to be dropped silently, leaving a
          * truncated program; unrolled repeats make that easy to reach. */
@@ -299,7 +374,132 @@ void emit(struct bpf_insn insn) {
                 fprintf(stderr, "Error: program exceeds %d instructions\n", MAX_INSNS);
                 exit(1);
         }
+        if (is_xdp && insn.code == (BPF_JMP | BPF_CALL) && insn.src_reg == 0)
+                insn = xdp_call(insn);
         prog[prog_idx++] = insn;
+}
+
+/*
+ * Loads a context field into dst: the __sk_buff field for TC, its xdp_md
+ * equivalent for XDP (data, data_end, ingress_ifindex for both ifindex
+ * fields, rx_queue_index for queue_mapping). len is bpf_xdp_get_buff_len()
+ * there, which clobbers R0-R5. Other skb fields are a compile error.
+ */
+void emit_ctx_ld(int size, int dst, int ctx, size_t off) {
+    if (!is_xdp) {
+        emit(BPF_LDX_MEM(size, dst, ctx, off));
+        return;
+    }
+    int x = -1;
+    const char *name = "an skb field";
+    if (off == offsetof(struct __sk_buff, data)) x = 0;
+    else if (off == offsetof(struct __sk_buff, data_end)) x = 4;
+    else if (off == offsetof(struct __sk_buff, ingress_ifindex) || off == offsetof(struct __sk_buff, ifindex)) x = 12;
+    else if (off == offsetof(struct __sk_buff, queue_mapping)) x = 16;
+    else if (off == offsetof(struct __sk_buff, len)) {
+        if (ctx != BPF_REG_1) emit(BPF_MOV64_REG(BPF_REG_1, ctx));
+        emit(BPF_CALL_FUNC(BPF_FUNC_xdp_get_buff_len));
+        if (dst != BPF_REG_0) emit(BPF_MOV64_REG(dst, BPF_REG_0));
+        return;
+    }
+    else if (off == offsetof(struct __sk_buff, mark)) name = "XDP has no skb mark";
+    else if (off == offsetof(struct __sk_buff, hash)) name = "XDP has no skb hash";
+    else if (off == offsetof(struct __sk_buff, protocol)) name = "XDP has no skb protocol (match the EtherType)";
+    else if (off == offsetof(struct __sk_buff, tstamp)) name = "XDP has no skb timestamp";
+    else if (off >= offsetof(struct __sk_buff, cb) && off < offsetof(struct __sk_buff, cb) + 20) name = "XDP has no skb control block";
+    else if (off == offsetof(struct __sk_buff, vlan_tci) || off == offsetof(struct __sk_buff, vlan_proto) ||
+             off == offsetof(struct __sk_buff, vlan_present)) name = "XDP has no VLAN offload (the tag is in the packet)";
+    if (x < 0) xdp_unsupported(name);
+    emit(BPF_LDX_MEM(BPF_W, dst, ctx, x));
+}
+
+/* Stores into an skb context field: none of them exist in XDP. */
+static void tc_only_ctx_store(const char *what) {
+    if (is_xdp) xdp_unsupported(what);
+}
+
+/*
+ * Appends the checksum subprogram if any l3/l4_csum_replace call was turned
+ * into a call to it. Same arguments and semantics as the helpers on a
+ * packet with a complete checksum (which is what XDP sees):
+ *   R1 ctx, R2 offset of the 16-bit checksum, R3 from, R4 to,
+ *   R5 flags: size 2 or 4 (from/to are the old/new raw words) or 0 (R4 is a
+ *   32-bit checksum difference, from csum_diff); BPF_F_MARK_MANGLED_0 (0x20):
+ *   a checksum of 0 means "none" and is left alone, and a result of 0 is
+ *   written as 0xffff (UDP). BPF_F_PSEUDO_HDR makes no difference here.
+ * Returns 0, or -EFAULT when the checksum is outside the packet. The values
+ * are added in the packet's byte order (one's complement sums do not depend
+ * on it), like the helpers do. It uses no stack.
+ */
+void xdp_finish(void) {
+    if (!num_xdp_csum_calls) return;
+#define J(OP, R, IMM, OFF) ((struct bpf_insn){.code=BPF_JMP|BPF_OP(OP)|BPF_K, .dst_reg=R, .off=OFF, .imm=IMM})
+#define JX(OP, R, S, OFF) ((struct bpf_insn){.code=BPF_JMP|BPF_OP(OP)|BPF_X, .dst_reg=R, .src_reg=S, .off=OFF})
+#define MOV32(D, S) ((struct bpf_insn){.code=BPF_ALU|BPF_MOV|BPF_X, .dst_reg=D, .src_reg=S})
+    static const struct bpf_insn sub[] = {
+        BPF_MOV64_REG(BPF_REG_6, BPF_REG_5),          /* 0  flags */
+        MOV32(BPF_REG_7, BPF_REG_3),                  /* 1  from */
+        MOV32(BPF_REG_8, BPF_REG_4),                  /* 2  to */
+        BPF_ALU64_IMM(BPF_AND, BPF_REG_2, 0xFFFF),    /* 3 */
+        BPF_LDX_MEM(BPF_W, BPF_REG_0, BPF_REG_1, 0),  /* 4  data */
+        BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_1, 4),  /* 5  data_end */
+        BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_2), /* 6  R0 = checksum */
+        BPF_MOV64_REG(BPF_REG_1, BPF_REG_0),          /* 7 */
+        BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 2),         /* 8 */
+        JX(BPF_JGT, BPF_REG_1, BPF_REG_9, 43),        /* 9  -> 53 */
+        BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_0, 0),  /* 10 R1 = old checksum */
+        BPF_MOV64_REG(BPF_REG_3, BPF_REG_6),          /* 11 */
+        BPF_ALU64_IMM(BPF_AND, BPF_REG_3, 0x20),      /* 12 R3 = MARK_MANGLED_0 */
+        J(BPF_JEQ, BPF_REG_3, 0, 1),                  /* 13 -> 15 */
+        J(BPF_JEQ, BPF_REG_1, 0, 36),                 /* 14 -> 51: no checksum, unchanged */
+        BPF_ALU64_IMM(BPF_XOR, BPF_REG_1, 0xFFFF),    /* 15 ~old */
+        BPF_MOV64_REG(BPF_REG_4, BPF_REG_6),          /* 16 */
+        BPF_ALU64_IMM(BPF_AND, BPF_REG_4, 0xF),       /* 17 size */
+        J(BPF_JEQ, BPF_REG_4, 0, 7),                  /* 18 -> 26: R4 is a difference */
+        J(BPF_JEQ, BPF_REG_4, 2, 12),                 /* 19 -> 32 */
+        ((struct bpf_insn){.code=BPF_ALU|BPF_XOR|BPF_K, .dst_reg=BPF_REG_7, .imm=-1}), /* 20 size 4: + ~from */
+        BPF_MOV64_REG(BPF_REG_4, BPF_REG_7),          /* 21 */
+        BPF_ALU64_IMM(BPF_RSH, BPF_REG_4, 16),        /* 22 */
+        BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_4), /* 23 */
+        BPF_ALU64_IMM(BPF_AND, BPF_REG_7, 0xFFFF),    /* 24 */
+        BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_7), /* 25 */
+        BPF_MOV64_REG(BPF_REG_4, BPF_REG_8),          /* 26 + to (32 bits) */
+        BPF_ALU64_IMM(BPF_RSH, BPF_REG_4, 16),        /* 27 */
+        BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_4), /* 28 */
+        BPF_ALU64_IMM(BPF_AND, BPF_REG_8, 0xFFFF),    /* 29 */
+        BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_8), /* 30 */
+        J(BPF_JA, 0, 0, 5),                           /* 31 -> 37 */
+        BPF_ALU64_IMM(BPF_XOR, BPF_REG_7, 0xFFFF),    /* 32 size 2: + ~from */
+        BPF_ALU64_IMM(BPF_AND, BPF_REG_7, 0xFFFF),    /* 33 */
+        BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_7), /* 34 */
+        BPF_ALU64_IMM(BPF_AND, BPF_REG_8, 0xFFFF),    /* 35 + to */
+        BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_8), /* 36 */
+        BPF_MOV64_REG(BPF_REG_4, BPF_REG_1),          /* 37 fold (sum < 2^19: twice) */
+        BPF_ALU64_IMM(BPF_RSH, BPF_REG_4, 16),        /* 38 */
+        BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0xFFFF),    /* 39 */
+        BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_4), /* 40 */
+        BPF_MOV64_REG(BPF_REG_4, BPF_REG_1),          /* 41 */
+        BPF_ALU64_IMM(BPF_RSH, BPF_REG_4, 16),        /* 42 */
+        BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0xFFFF),    /* 43 */
+        BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_4), /* 44 */
+        BPF_ALU64_IMM(BPF_XOR, BPF_REG_1, 0xFFFF),    /* 45 new = ~sum */
+        BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0xFFFF),    /* 46 */
+        J(BPF_JNE, BPF_REG_1, 0, 2),                  /* 47 -> 50 */
+        J(BPF_JEQ, BPF_REG_3, 0, 1),                  /* 48 -> 50 */
+        BPF_MOV64_IMM(BPF_REG_1, 0xFFFF),             /* 49 UDP: 0 is sent as 0xffff */
+        BPF_STX_MEM(BPF_H, BPF_REG_0, BPF_REG_1, 0),  /* 50 */
+        BPF_MOV64_IMM(BPF_REG_0, 0),                  /* 51 */
+        BPF_EXIT_INSN(),                              /* 52 */
+        BPF_MOV64_IMM(BPF_REG_0, -14),                /* 53 -EFAULT */
+        BPF_EXIT_INSN(),                              /* 54 */
+    };
+#undef J
+#undef JX
+#undef MOV32
+    int start = prog_idx;
+    for (size_t i = 0; i < sizeof(sub) / sizeof(sub[0]); i++) emit(sub[i]);
+    for (int i = 0; i < num_xdp_csum_calls; i++)
+        prog[xdp_csum_calls[i]].imm = start - xdp_csum_calls[i] - 1;
 }
 
 /*
@@ -321,7 +521,7 @@ int load_bpf_prog_mem() {
      * a log to show why (full trace with -v, errors only otherwise).
      */
     union bpf_attr attr = {
-        .prog_type = BPF_PROG_TYPE_SCHED_CLS,
+        .prog_type = is_xdp ? BPF_PROG_TYPE_XDP : BPF_PROG_TYPE_SCHED_CLS,
         .insns     = (unsigned long)prog,
         .insn_cnt  = prog_idx,
         .license   = (unsigned long)"GPL",
@@ -833,27 +1033,40 @@ void parse_port_range(char *v, uint16_t *min_p, uint16_t *max_p) {
 
 /* --- Terminal Actions --- */
 void compile_drop_packet(void) { 
-    emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_SHOT));
+    emit(BPF_MOV64_IMM(BPF_REG_0, is_xdp ? XDP_ACT_DROP : TC_ACT_SHOT));
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
     //resolve_local_block();
 }
 	
 void compile_continue_packet(void) { 
-    emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_PIPE));
+    /* XDP has one program per interface: continuing means passing it on */
+    emit(BPF_MOV64_IMM(BPF_REG_0, is_xdp ? XDP_ACT_PASS : TC_ACT_PIPE));
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
     //resolve_local_block();
 }
 
 void compile_accept_packet(void) {
-    emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_OK));
+    emit(BPF_MOV64_IMM(BPF_REG_0, is_xdp ? XDP_ACT_PASS : TC_ACT_OK));
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
     //resolve_local_block();
 }
 	
+/* tx: send the packet back out of the interface it arrived on (XDP_TX). */
+void compile_xdp_tx(void) {
+    if (!is_xdp) {
+        fprintf(stderr, "Error: tx is only available in XDP programs (-d xdp)\n");
+        exit(1);
+    }
+    emit(BPF_MOV64_IMM(BPF_REG_0, XDP_ACT_TX));
+    emit(BPF_EXIT_INSN());
+    last_cmd_terminal = 1;
+}
+
 void compile_reclassify(void) { 
+    if (is_xdp) xdp_unsupported("there is no classifier to restart");
     emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_RECLASSIFY));
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
@@ -911,6 +1124,9 @@ void compile_redirect_neigh(const char *iface_arg) {
 
 void compile_redirect(const char *iface_arg, const char *d) {
     int f = 0;
+    /* XDP: out of the interface (flags must be 0; the result is XDP_REDIRECT) */
+    if (is_xdp && !strcmp(d, "ingress"))
+        xdp_unsupported("XDP can only redirect out of an interface (egress)");
     if(strcmp(d, "ingress")==0)
         f = BPF_F_INGRESS;
     else if(strcmp(d, "egress")==0)
@@ -1295,14 +1511,14 @@ void compile_fib_lookup(int flags, const char *dst_ip_arg, const char *src_ip_ar
         }
     } else {
 	// Load skb->ingress_ifindex into R1
-        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, ingress_ifindex)));
+        emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, ingress_ifindex));
         
         // If R1 > 0, jump over the fallback
         int j_valid_idx = prog_idx;
         emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_1, .imm=0}));
         
         // Fallback: Load skb->ifindex (which is guaranteed to be valid) into R1
-        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, ifindex)));
+        emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, ifindex));
         
         // Write the valid R1 interface index into the lookup struct
         prog[j_valid_idx].off = prog_idx - j_valid_idx - 1;
@@ -1437,7 +1653,7 @@ void compile_fib_lookup6(int flags, const char *dst_ip_arg, const char *src_ip_a
         }
     } else {
         // Default: Read native ingress_ifindex from packet context
-        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, ingress_ifindex)));
+        emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, ingress_ifindex));
         emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, base + 56));
     }
 
@@ -1950,10 +2166,15 @@ static void match_l3_proto(uint16_t ethertype, const char *what) {
  */
 void compile_match_outer_tag(uint32_t tpid) {
     /* the caller opened the block */
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_present)));
+    if (is_xdp) {
+        /* XDP sees the tag in the packet (no offload) */
+        compile_match_core(12, 2, tpid, 0xFFFFFFFF, NULL);
+        return;
+    }
+    emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_present));
     int j_payload = prog_idx;
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=0}));
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto)));
+    emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto));
     add_block_jump();
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=tpid}));
     int j_ok = prog_idx;
@@ -2045,7 +2266,7 @@ void compile_match_vlan_range(uint16_t min_vid, uint16_t max_vid) {
 
 
     // 1. Load VLAN EtherType into R1
-    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto)));
+    emit_ctx_ld(BPF_H, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto));
 
     // Jump 2: Verify it is 0x8100 (802.1Q) or 0x88A8 (QinQ).
     // If it is neither, jump to the epilogue (this packet has no VLAN tags!)
@@ -2061,7 +2282,7 @@ void compile_match_vlan_range(uint16_t min_vid, uint16_t max_vid) {
     prog[j_is_8100].off = prog_idx - j_is_8100 - 1;
 
     // 3. Load the 2-byte TCI from stack into R1
-    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_tci)));
+    emit_ctx_ld(BPF_H, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_tci));
 
     // 5. Convert R1 from Network Byte Order to Host Byte Order (16-bit)
     //emit(((struct bpf_insn){.code=BPF_ALU|BPF_END|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=16}));
@@ -2737,6 +2958,7 @@ void compile_set_l4_port(int is_udp, int is_dst, uint16_t p, const char *var) {
 }
 
 void compile_set_queue(uint32_t q_id, const char *var) {
+    tc_only_ctx_store("XDP cannot set the transmit queue");
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     if (var) {
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, get_var_offset(var)));
@@ -2747,6 +2969,7 @@ void compile_set_queue(uint32_t q_id, const char *var) {
 }
 
 void compile_set_mark(uint32_t fwmark, const char *var) {
+    tc_only_ctx_store("XDP has no skb mark");
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     if (var) {
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, get_var_offset(var)));
@@ -2757,6 +2980,7 @@ void compile_set_mark(uint32_t fwmark, const char *var) {
 }
 
 void compile_set_hash(uint32_t _hash, const char *var) {
+    tc_only_ctx_store("XDP has no skb hash");
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     if (var) {
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, get_var_offset(var)));
@@ -2767,6 +2991,7 @@ void compile_set_hash(uint32_t _hash, const char *var) {
 }
 
 void compile_set_cb(uint8_t i, uint32_t val, const char *var) {
+    tc_only_ctx_store("XDP has no skb control block");
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
     if (var) {
         emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, get_var_offset(var)));
@@ -3066,7 +3291,7 @@ void compile_push_vlan(const char *vid_arg, const char *pcp_arg) {
  * Stack scratch: -8 TPID, -16 new TCI.
  */
 void compile_set_vlan_id(const char *vid_arg) {
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto)));
+    emit_ctx_ld(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto));
     int j_have = prog_idx;
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_2, .imm=0}));
     emit(BPF_MOV32_IMM(BPF_REG_2, htons(ETH_P_8021Q)));
@@ -3083,7 +3308,7 @@ void compile_set_vlan_id(const char *vid_arg) {
         emit(BPF_MOV64_IMM(BPF_REG_3, (int)(strtoul(vid_arg, NULL, 0) & 0x0FFF)));
     }
     emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_3, 0x0FFF));
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_tci)));
+    emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_tci));
     emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0xF000));             /* priority + DEI */
     emit(BPF_ALU64_REG(BPF_OR, BPF_REG_3, BPF_REG_1));
     emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_3, -16));
@@ -3121,7 +3346,7 @@ void compile_push_bytes_net(uint32_t len) {
     /*// 1. PRE-EXPAND THE TAIL: Prevent clipping bugs by allocating physical room first.
     // Read current packet length (skb->len) into R8
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len)));
+    emit_ctx_ld(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len));
     // R2 = new length (skb->len + requested expansion length)
     emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_8));
     emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, len));
@@ -3251,11 +3476,12 @@ void compile_add_head_bytes(const char *len_arg) {
  */
 void emit_drop_if_r0_error(void) {
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_0, .imm=0, .off=2}));
-    emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_SHOT));
+    emit(BPF_MOV64_IMM(BPF_REG_0, is_xdp ? XDP_ACT_DROP : TC_ACT_SHOT));
     emit(BPF_EXIT_INSN());
 }
 
 void compile_set_length(const char *len_arg) {
+    tc_only_ctx_store("it resizes the packet (skb helpers)");
     if (len_arg[0] == '%') {
         int v_off = get_var_offset(len_arg);
         int v_sz = get_var_size(len_arg);
@@ -3298,7 +3524,7 @@ void compile_delete_bytes(int offset, int dlen) {
 
     int ctx_spill = next_var_offset - 8;
     emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_6, ctx_spill));
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_6, BPF_REG_6, offsetof(struct __sk_buff, len)));
+    emit_ctx_ld(BPF_W, BPF_REG_6, BPF_REG_6, offsetof(struct __sk_buff, len));
 
     add_safety_jump();
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_K, .dst_reg=BPF_REG_6, .imm=9000}));
@@ -3644,7 +3870,7 @@ void compile_encap_gre(uint32_t src, uint32_t dst, uint32_t key) {
     add_safety_jump();
     emit(((struct bpf_insn){.code=BPF_JMP|BPF_JSLT|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
 
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct __sk_buff, len)));
+    emit_ctx_ld(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct __sk_buff, len));
     emit(BPF_ALU64_IMM(BPF_SUB, BPF_REG_2, 14));
     uint32_t sm = 0x4500 + 0x4000 + 0x402F + (ntohl(src)>>16) + (ntohl(src)&0xFFFF) + (ntohl(dst)>>16) + (ntohl(dst)&0xFFFF);
     emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_2));
@@ -3749,7 +3975,7 @@ void compile_decap_gre(void) {
 void compile_get_skb_field(size_t field_offset, uint32_t shift, uint32_t mask, const char *var_name) {
     int v_off = allocate_var(var_name, 4); // Context fields are 32-bit (BPF_W)
     // Load skb->field into R1
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, field_offset));
+    emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, field_offset);
     // Store R1 into the variable stack slot
     if (shift > 0) emit(((struct bpf_insn){.code=BPF_ALU64|BPF_RSH|BPF_K, .dst_reg=BPF_REG_1, .imm=shift}));
     if (mask > 0)  emit(((struct bpf_insn){.code=BPF_ALU64|BPF_AND|BPF_K, .dst_reg=BPF_REG_1, .imm=mask}));
@@ -3761,6 +3987,7 @@ void compile_get_skb_field(size_t field_offset, uint32_t shift, uint32_t mask, c
  * Bypasses the verifier's restriction against direct BPF_ST_MEM context writes.
  */
 void compile_set_skb_field(size_t field_offset, const char *val_str) {
+    tc_only_ctx_store("XDP has no skb fields to set");
     if (val_str[0] == '%') {
         int v_off = get_var_offset(val_str);
         // 1. Load the variable from the stack into R1
@@ -3817,7 +4044,7 @@ void compile_set_skb_proto(const char *val_str) {
  * (get protocol stores it swapped); the raw value used to be compared. */
 void compile_match_skb_proto_var(const char *var) {
     start_match_block();
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, protocol)));
+    emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, protocol));
     emit(((struct bpf_insn){.code = BPF_END | BPF_ALU | BPF_TO_BE, .dst_reg = BPF_REG_1, .imm = 16}));
     int v_off = get_var_offset(var), v_sz = get_var_size(var);
     emit(BPF_LDX_MEM(v_sz == 1 ? BPF_B : v_sz == 2 ? BPF_H : BPF_W, BPF_REG_2, BPF_REG_10, v_off));
@@ -3831,7 +4058,7 @@ void compile_match_skb_field(size_t field_offset, uint32_t expected, uint32_t ma
     start_match_block();
 
     // 1. Load the 32-bit context field from R6 (skb) into R1
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, field_offset));
+    emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, field_offset);
 
     // 2. If the field is uninitialized (e.g., hash is 0), handle optionally
     // (Note: Unlike loading raw packet bytes, context reads cannot physically fail, 
@@ -4386,8 +4613,15 @@ void compile_save_packet(int map_fd, const char *key, const char *len_arg, const
     add_safety_jump();
     emit(((struct bpf_insn){.code = BPF_JMP|BPF_JEQ|BPF_K, .dst_reg = BPF_REG_0, .imm = 0}));
 
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len)));
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    if (is_xdp) {
+        /* the length is a helper call there: keep the map value pointer */
+        int spill = stack_scratch(8, "save-packet");
+        emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, spill));
+        emit_ctx_ld(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len));
+        emit(BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_10, spill));
+    } else
+        emit_ctx_ld(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len));
 
     // 4. Resolve SRC offset (from packet) into R2
     if (src_off_arg && src_off_arg[0] == '%') {
@@ -5252,10 +5486,11 @@ void compile_set_raw_bytes_var(const char *offvar, int size, const char *val_str
  * packet until then under the fq qdisc (earliest departure time pacing). */
 void compile_get_tstamp(const char *var) {
     int v_off = allocate_var(var, 8);
-    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, tstamp)));
+    emit_ctx_ld(BPF_DW, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, tstamp));
     emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, v_off));
 }
 void compile_set_tstamp(const char *val) {
+    tc_only_ctx_store("XDP has no skb timestamp");
     emit_load_operand(BPF_REG_1, val);
     emit(BPF_STX_MEM(BPF_DW, BPF_REG_6, BPF_REG_1, offsetof(struct __sk_buff, tstamp)));
 }
@@ -5485,11 +5720,11 @@ void compile_strip_l2(int len, uint16_t ethertype) {
     int saved = -24;                   /* saved offloaded tag: [-24] proto, [-20] tci, [-16] present */
 
     /* remember and clear an offloaded tag */
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_present)));
+    emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_present));
     emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, saved + 8));
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto)));
+    emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_proto));
     emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, saved));
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_tci)));
+    emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_tci));
     emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, saved + 4));
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, saved + 8));
     int no_tag = prog_idx;
@@ -6208,6 +6443,50 @@ int detach_bpf_prio(const char *iface, const char *dir, int pri) {
     return 0;
 }
 
+/*
+ * XDP (-d xdp): one program per interface, in generic (skb) mode for now,
+ * which works on every device. A program already attached in generic mode is
+ * replaced atomically (no XDP_FLAGS_UPDATE_IF_NOEXIST); the kernel refuses
+ * while a native-mode program is attached.
+ */
+static uint32_t xdp_attach_flags = XDP_FLAGS_SKB_MODE;
+
+static int xdp_setlink(int idx, int fd) {
+    int s = nl_open();
+    if (s < 0) { perror("netlink socket"); return -1; }
+    char b[512] = {0};
+    struct nlmsghdr *n = (struct nlmsghdr *)b;
+    n->nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+    n->nlmsg_flags = NLM_F_REQUEST;
+    n->nlmsg_type = RTM_SETLINK;
+    struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(n);
+    ifi->ifi_family = AF_UNSPEC;
+    ifi->ifi_index = idx;
+    struct rtattr *x = nl_nest_start(n, IFLA_XDP);
+    nl_addattr(n, IFLA_XDP_FD, &fd, 4);
+    nl_addattr(n, IFLA_XDP_FLAGS, &xdp_attach_flags, 4);
+    nl_nest_end(n, x);
+    int err = nl_transact(s, n);
+    close(s);
+    return err;
+}
+
+int attach_bpf_xdp(int fd, const char *iface) {
+    int idx = get_ifindex(iface);
+    if (!idx) return -1;
+    int err = xdp_setlink(idx, fd);
+    if (err) { nl_report("attaching XDP program", err); return -1; }
+    return 0;
+}
+
+int detach_bpf_xdp(const char *iface) {
+    int idx = get_ifindex(iface);
+    if (!idx) return -1;
+    int err = xdp_setlink(idx, -1);
+    if (err) { nl_report("removing XDP program", err); return -1; }
+    return 0;
+}
+
 int detach_bpf_tc(const char *iface) {
     int idx = get_ifindex(iface);
     if (!idx) return -1;
@@ -6354,9 +6633,9 @@ char* read_instructions_from_file(const char *filename) {
 void help(const char *arg0) {
     char *opts[] = {
         "-i <interface>"	,"attach program to specific interface",
-        "-d ingress|egress"	,"direction to attach, default ingress",
-        "-c"			,"clear all attached program on interface",
-        "-D"			,"delete only the program at -p <priority> on -d <direction>",
+        "-d ingress|egress|xdp"	,"direction to attach, default ingress; xdp: the interface's XDP program (generic mode, no -p)",
+        "-c"			,"clear all attached program on interface (TC; with -d xdp the XDP program)",
+        "-D"			,"delete only the program at -p <priority> on -d <direction> (-d xdp: the XDP program)",
         "-p <priority>"		,"attachment priority, lower first; an existing program at this priority is replaced atomically",
         "-n <name>"		,"name the program (kernel name: last 15 chars of [A-Za-z0-9_.]) and TC filter (full name)",
         "-I"			,"print a BPFC_INFO line with the program id and tag after attaching",
@@ -6458,6 +6737,8 @@ void help(const char *arg0) {
 	"  reclassify"				,"restart packet processing from top chain - terminal command",
 	"  redirect <iface> [ingress|egress]"	,"send packet to specified interface, optionally specifying ingress or egress - terminal command",
 	"  redirect-neigh <iface>"		,"send packet to specified interface and apply next-hop layer-2 fields - terminal command",
+	"  tx"					,"XDP only: send the packet back out of the interface it arrived on - terminal command",
+	"XDP (-d xdp)"				,"accept and continue pass the packet on; commands that need an skb (resizing, VLAN offload, marks, clone) are refused; $XDP is 1",
 
     };
     char *l2_fields[] = {
@@ -6522,7 +6803,7 @@ void help(const char *arg0) {
     printf("Usage: %s [OPTION...] 'COMMAND;COMMAND;...'\n\n", arg0);
     int opt_num = sizeof(opts) / sizeof(opts[0]);
     for (int i=0; i < opt_num; i+=2) {
-	printf("   %-20s %s\n",opts[i], opts[i+1]);
+	printf("   %-22s %s\n",opts[i], opts[i+1]);
     }
 
     printf("\nCOMMANDS:\n");
@@ -6713,7 +6994,16 @@ static int check_field_value(const char *op, const char *f, const char *val) {
     return 0;
 }
 
+static int cmd_depth = 0; /* > 1 while a command compiles the commands it expands into */
+static int process_cmd_1(char *cmd, const char *dir);
 int process_cmd(char *cmd, const char *dir) {
+    cmd_depth++;
+    int rc = process_cmd_1(cmd, dir);
+    if (--cmd_depth == 0) cur_op = "";
+    return rc;
+}
+
+static int process_cmd_1(char *cmd, const char *dir) {
 
 	char *save_w ;
 
@@ -6765,6 +7055,14 @@ int process_cmd(char *cmd, const char *dir) {
 		return 1;
         
         char *op = tok[0]; 
+	/* "set skb-mark", "drop", ...: what an error message names */
+	/* commands that expand into others (ip-defrag, ...) are named by the outer one */
+	static char cur_op_buf[96];
+	if (cmd_depth == 1) {
+		int field = t > 1 && (!strcmp(op, "get") || !strcmp(op, "set") || !strcmp(op, "match") || !strcmp(op, "if"));
+		snprintf(cur_op_buf, sizeof(cur_op_buf), "%s%s%s", op, field ? " " : "", field ? tok[1] : "");
+		cur_op = cur_op_buf;
+	}
 	char *a1 = t>1 ? tok[1] : NULL; 
 	char *a2 = t>2 ? tok[2] : NULL; 
 	char *a3 = t>3 ? tok[3] : NULL; 
@@ -6814,7 +7112,7 @@ int process_cmd(char *cmd, const char *dir) {
 		}
 	}
 
-	if (last_cmd_terminal && (!strcmp(op, "drop") || !strcmp(op, "continue") || !strcmp(op, "accept") ||
+	if (last_cmd_terminal && (!strcmp(op, "drop") || !strcmp(op, "continue") || !strcmp(op, "accept") || !strcmp(op, "tx") ||
 	                          !strcmp(op, "reclassify") || !strcmp(op, "redirect") || !strcmp(op, "redirect-neigh"))) {
 		printf("error with cmd '%s', last command was terminal, must have end-if, end-match or else\n", op);
 		return 1;
@@ -6823,6 +7121,7 @@ int process_cmd(char *cmd, const char *dir) {
 	if (strcmp(op, "drop")==0){ compile_drop_packet(); return 0; }
         else if (strcmp(op, "continue")==0){ compile_continue_packet(); return 0; }
         else if (strcmp(op, "accept")==0){ compile_accept_packet(); return 0; }
+        else if (strcmp(op, "tx")==0){ compile_xdp_tx(); return 0; }
         else if (strcmp(op, "reclassify")==0){ compile_reclassify(); return 0; }
         else if (strcmp(op, "redirect")==0){ compile_redirect(a1, a2?a2:dir); return 0; }
         else if (strcmp(op, "redirect-neigh")==0){ compile_redirect_neigh(a1); return 0; }
@@ -6917,6 +7216,7 @@ int process_cmd(char *cmd, const char *dir) {
             else if (strcmp(f,"src-mac")==0) compile_get_field(6,6,var);
             else if (strcmp(f,"mpls-label")==0) compile_get_bitfield(14,4,12,0xFFFFF,var);
             else if (strcmp(f,"mpls-bos")==0) compile_get_bitfield(14,4,8,1,var);
+            else if (strcmp(f,"vlan-id")==0 && is_xdp) compile_get_bitfield(14, 2, 0, 0x0FFF, var); /* tag in the packet */
             else if (strcmp(f,"vlan-id")==0) compile_get_skb_field(offsetof(struct __sk_buff, vlan_tci), 0, 0x0FFF, var);
             else if (strcmp(f,"arp-htype")==0) compile_get_field(14, 2, var);
             else if (strcmp(f,"arp-ptype")==0) compile_get_field(16, 2, var);
@@ -7460,7 +7760,7 @@ static const char *pp_reserved[] = {
     "free", "get", "goto", "if", "insert-l2", "ip-defrag", "ip-frag", "label", "load-packet",
     "load-packet-keyed", "loop", "loop-reg", "match", "pop-eth", "pop-mac-bytes", "pop-net-bytes",
     "pop-vlan", "push-eth", "push-mac-bytes", "push-net-bytes", "push-qinq", "push-vlan",
-    "recalc-tcp-csum", "recalc-udp-csum", "reclassify", "redirect", "remove-l2",
+    "recalc-tcp-csum", "recalc-udp-csum", "reclassify", "redirect", "remove-l2", "tx",
     "redirect-neigh", "save-packet", "save-packet-keyed", "set", "set-reg-loop",
     "shared-buffer-map", "start-loop", "strip-l2", "tcp-option", "xor-packet", "xor-packet-keyed",
     "zero-buffer", "zero-buffer-keyed",
@@ -8366,8 +8666,13 @@ int main(int argc, char **argv) {
         dump_map_contents(read_map, bpf_map_dir);
         return 0;
     }
-    if(strcmp(dir, "ingress") && strcmp(dir, "egress")) {
-        fprintf(stderr, "Error: direction must be 'ingress' or 'egress', not '%s'\n", dir);
+    if(strcmp(dir, "ingress") && strcmp(dir, "egress") && strcmp(dir, "xdp")) {
+        fprintf(stderr, "Error: direction must be 'ingress', 'egress' or 'xdp', not '%s'\n", dir);
+        return 1;
+    }
+    is_xdp = !strcmp(dir, "xdp");
+    if (is_xdp && pri) {
+        fprintf(stderr, "Error: XDP has one program per interface: -p does not apply to -d xdp\n");
         return 1;
     }
     if (pri < 0 || pri > 65535) {
@@ -8378,18 +8683,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: -c and -D require -i <interface>\n");
         return 1;
     }
+    if (clean && is_xdp) return detach_bpf_xdp(iface) < 0 ? 1 : 0;
     if (clean) return detach_bpf_tc(iface) < 0 ? 1 : 0;
-    if (delete_prio) {
+    if (delete_prio && !is_xdp) {
         if (pri <= 0) {
             fprintf(stderr, "Error: -D requires -p <priority> (1-65535)\n");
             return 1;
         }
         return detach_bpf_prio(iface, dir, pri) < 0 ? 1 : 0;
     }
+    if (delete_prio && is_xdp) return detach_bpf_xdp(iface) < 0 ? 1 : 0;
     if (filename) {
         instr = read_instructions_from_file(filename);
     }
-    if (!instr) { printf("Usage: %s -i <iface> [-d ingress|egress] \"<cmds>\"\n", argv[0]); return 1; }
+    if (!instr) { printf("Usage: %s -i <iface> [-d ingress|egress|xdp] \"<cmds>\"\n", argv[0]); return 1; }
 
     /* $IFNAME, $IFINDEX, $IFTYPE and $IFKIND for the -i interface (bpfcd
      * compiles a %all% or %<kind>% template once per interface). -s wins. */
@@ -8422,6 +8729,11 @@ int main(int argc, char **argv) {
         }
         l3off = atoi(l3);
     }
+
+    /* $XDP (1 in an XDP program) and $HOOK (ingress, egress or xdp), so one
+     * file can serve several hooks. */
+    pp_set_const("XDP", is_xdp ? "1" : "0", 0, NULL);
+    pp_set_const("HOOK", dir, 0, NULL);
 
     instr = pp_run(instr, filename);
     if (!instr) return 1;
@@ -8485,9 +8797,10 @@ int main(int argc, char **argv) {
             printf("[%d] Default continue\n",prog_idx);
         }
         //emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_OK));
-        emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_PIPE));
+        emit(BPF_MOV64_IMM(BPF_REG_0, is_xdp ? XDP_ACT_PASS : TC_ACT_PIPE));
         emit(BPF_EXIT_INSN());
     }
+    xdp_finish();
 
     if (iface) {
         //union bpf_attr a = {.prog_type=BPF_PROG_TYPE_SCHED_CLS, .insns=(unsigned long)prog, .insn_cnt=prog_idx, .license=(unsigned long)"GPL"};
@@ -8497,7 +8810,12 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Error: kernel rejected program: %s\n", strerror(errno));
             return 1;
         }
-        if (attach_bpf_tc(fd, iface, dir, pri) < 0) {
+        if (is_xdp) {
+            if (attach_bpf_xdp(fd, iface) < 0) {
+                fprintf(stderr, "Error: failed to attach XDP program to %s\n", iface);
+                return 1;
+            }
+        } else if (attach_bpf_tc(fd, iface, dir, pri) < 0) {
             fprintf(stderr, "Error: failed to attach program to %s %s priority %d\n", iface, dir, pri);
             return 1;
         }
