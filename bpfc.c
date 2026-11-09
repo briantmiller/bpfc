@@ -1615,9 +1615,14 @@ void compile_vlan_offset() {
  *             (net.ipv4.fib_multipath_hash_policy=1) and ip rules on ports,
  *             protocol or TOS apply.
  *   fib_tbid: the table for BPF_FIB_LOOKUP_TBID, or -1.
+ *   fib_ports: a variable whose low 16 bits become the source port and next 16
+ *             the destination port of the lookup, with protocol UDP: a chosen
+ *             input for the multipath hash instead of the packet's own, so a
+ *             program can find which values select which next hop of a route.
  */
 static int fib_flow = 0;
 static long fib_tbid = -1;
+static const char *fib_ports = NULL;
 
 /* Fills the flow fields of the IPv4 lookup at base from the packet, using 20
  * bytes of scratch at tmp. A packet too short for an IP header leaves them 0. */
@@ -1839,6 +1844,14 @@ void compile_fib_lookup(int flags, const char *dst_ip_arg, const char *src_ip_ar
     }
 
     if (fib_flow) fib_fill_flow(base, scratch);
+    if (fib_ports) {                                  /* after flow: replaces its ports and protocol */
+        int v_off = get_var_offset(fib_ports);
+        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+        emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, base + offsetof(struct bpf_fib_lookup, sport)));
+        emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 16));
+        emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, base + offsetof(struct bpf_fib_lookup, dport)));
+        emit(BPF_ST_MEM(BPF_B, BPF_REG_10, base + offsetof(struct bpf_fib_lookup, l4_protocol), IPPROTO_UDP));
+    }
     fib_set_tbid(base);
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
     emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10)); 
@@ -7205,6 +7218,7 @@ void help(const char *arg0) {
 	"  tbid <table>"			,"look up in this routing table (directly: ip rules do not apply)",
 	"  skip-neigh"				,"do not require a resolved neighbour (FIB_DMAC is then not set)",
 	"  flow"				,"IPv4: also use the packet's protocol, ports and TOS, for per-flow multipath (fib_multipath_hash_policy 1) and ip rules on them",
+	"  ports %VAR"				,"IPv4: use VAR (low 16 bits source port, next 16 destination port) and protocol UDP as the multipath hash input",
 	"clone <iface> [ingress|egress]"	,"clone and send packet to specified interface, optionally specifying ingress or egress",
 	"buffer-map <MAP> [size]"		,"declare a per-CPU buffer map with values of size bytes (default 18000); lengths are capped at size/2",
 	"shared-buffer-map <MAP> [n [size]]"	,"declare a shared buffer map of n entries (default 10000) of size bytes",
@@ -8061,6 +8075,7 @@ static int process_cmd_1(char *cmd, const char *dir) {
              * one off: output set DIRECT, tbid OUTPUT, src TBID, mark SRC). */
             fib_flow = 0;
             fib_tbid = -1;
+            fib_ports = NULL;
             for (int k = 1; k < t; k++) {
                 struct in_addr a4;
                 struct in6_addr a6;
@@ -8098,6 +8113,17 @@ static int process_cmd_1(char *cmd, const char *dir) {
                     }
                     fib_flow = 1;
                 }
+                else if (strcmp(tok[k], "ports") == 0) {
+                    if (is_ipv6) {
+                        fprintf(stderr, "Error: fib-lookup6 ports is not supported yet\n");
+                        exit(1);
+                    }
+                    if (k + 1 >= t || tok[k + 1][0] != '%') {
+                        fprintf(stderr, "Error: fib-lookup ports needs a %%VAR\n");
+                        exit(1);
+                    }
+                    fib_ports = tok[++k];
+                }
 		else if (strcmp(tok[k], "iface") == 0 && (k + 1) < t) 
                     custom_iface = tok[++k];
                 else
@@ -8108,6 +8134,7 @@ static int process_cmd_1(char *cmd, const char *dir) {
             else         compile_fib_lookup(flags, custom_dst_ip, custom_src_ip, custom_iface);
             fib_flow = 0;
             fib_tbid = -1;
+            fib_ports = NULL;
         }
         else if (strcmp(op, "start-loop") == 0) compile_start_loop();
         else if (strcmp(op, "loop") == 0 && t > 1) compile_loop(a1);
