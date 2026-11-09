@@ -25,7 +25,7 @@ if ! make -s install DESTDIR="$R" > "$T/install.log" 2>&1; then
 	test_fail "make install"; sed 's/^/    /' "$T/install.log"; tests_exit
 fi
 
-for f in bpfc bpfcd bpfcctl bpfcd-entrypoint bpfc-dataplane-gen bpfc-dataplane-status; do
+for f in bpfc bpfcd bpfcctl bpfcd-entrypoint bpfc-dataplane-gen bpfc-dataplane-status bpfc-ecmp-gen bpfc-ecmp-status; do
 	check "installed /usr/sbin/$f, executable" test -x "$R/usr/sbin/$f"
 done
 missing=

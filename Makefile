@@ -36,13 +36,13 @@ DAEMON_CFLAGS = $(WARN) -Wno-format-truncation -DBPFC_VERSION='"$(VERSION)"'
 
 # Everything that goes into the source tarball used by `make rpm`.
 DIST_FILES = Makefile LICENSE README.md bpfc.8 bpfc.c test.sh tests \
-             bpfcd/*.c bpfcd/*.h dist dataplane
+             bpfcd/*.c bpfcd/*.h dist dataplane ecmp
 
 RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
 TARBALL    = bpfc-$(VERSION).tar.gz
 
-.PHONY: check-compile check-dataplane check-all all clean install install-scripts dist rpm srpm check
+.PHONY: check-compile check-dataplane check-ecmp check-all all clean install install-scripts dist rpm srpm check
 
 all: $(TARGET) $(DAEMON) $(CTL)
 
@@ -98,6 +98,14 @@ install-scripts:
 	install -d -m 0755 $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/examples/interfaces.d/eth0/egress
 	install -m 0644 dataplane/examples/interfaces.d/eth0/ingress/*.bpfc $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/examples/interfaces.d/eth0/ingress/
 	install -m 0644 dataplane/examples/interfaces.d/eth0/egress/*.bpfc $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/examples/interfaces.d/eth0/egress/
+	sed 's,/usr/share/bpfc/ecmp/profiles,$(DATADIR)/bpfc/ecmp/profiles,' \
+	    ecmp/bpfc-ecmp-gen > $(DESTDIR)$(SBINDIR)/bpfc-ecmp-gen
+	chmod 0755 $(DESTDIR)$(SBINDIR)/bpfc-ecmp-gen
+	install -D -m 0755 ecmp/bpfc-ecmp-status $(DESTDIR)$(SBINDIR)/bpfc-ecmp-status
+	install -d -m 0755 $(DESTDIR)$(DATADIR)/bpfc/ecmp/profiles
+	install -m 0644 ecmp/profiles/*.profile $(DESTDIR)$(DATADIR)/bpfc/ecmp/profiles/
+	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/ecmp/profiles.d
+	install -D -m 0644 ecmp/DESIGN.md $(DESTDIR)$(SCRIPTS_DOCDIR)/ecmp/DESIGN.md
 
 dist: $(TARBALL)
 
@@ -128,12 +136,15 @@ srpm: $(TARBALL)
 TESTFLAGS ?=
 
 check: all
-	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd xdp xdp-examples tc-examples container install
+	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd xdp xdp-examples tc-examples ecmp container install
 
 # Compile-only checks of every field and command and of the error messages;
 # needs no root (the few commands that create maps are skipped without it).
 check-compile: $(TARGET)
 	bash tests/run-tests.sh $(TESTFLAGS) compile
+
+check-ecmp: $(TARGET)
+	bash tests/run-tests.sh $(TESTFLAGS) ecmp
 
 check-dataplane: $(TARGET)
 	bash tests/run-tests.sh $(TESTFLAGS) verifier-budget dataplane dataplane-udp

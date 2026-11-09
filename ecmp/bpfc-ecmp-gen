@@ -1,0 +1,1164 @@
+#!/bin/bash
+# bpfc-ecmp-gen - generate a bandwidth-aware, policy-based ECMP layer as bpfc
+# programs for /etc/bpfc/interfaces.d.
+#
+# The routing table stays the only authority on which next hops are valid.
+# The programs choose among the members of a multipath route, per flow, using
+# the measured load of each interface, and re-check the route on every packet.
+# Packets change only as in any router (TTL, IP checksum, MACs), and nothing
+# is needed from the neighbours.
+#
+# See DESIGN.md for how the pieces fit together.
+
+set -e
+VERSION=1
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+PROFILE_DIRS=(/etc/bpfc/ecmp/profiles.d /usr/share/bpfc/ecmp/profiles "$SELF_DIR/profiles")
+SAVE_DIR=/etc/bpfc/ecmp/profiles.d
+MAX_MEMBERS=8
+MAX_POLICIES=31
+
+die()  { echo "Error: $*" >&2; exit 1; }
+warn() { echo "Warning: $*" >&2; }
+
+# ---------------------------------------------------------------- settings
+# key | kind | class | default | help
+#   kind:  dur (ms unless a unit is given), pct, rate, int:<min>:<max>, enum:<a>,<b>
+#   class: structural (needs regenerating), runtime (also changeable with
+#          "bpfc-ecmp-status set"; the cfg index is in CFGIDX)
+SETTINGS='mode|enum:l3,l3+tos,l3+proto,l4,l4+tos,l3-sym,l3+tos-sym,l3+proto-sym,l4-sym,l4+tos-sym|structural|l4|what identifies a flow: addresses (l3), plus DSCP (+tos), plus protocol (+proto), plus protocol and ports (l4); -sym: both directions of a flow get the same key
+flows|int:256:4194304|structural|65536|flows tracked (rounded up to a power of two)
+sweep|int:0:64|structural|0|multipath hash values tried when choosing a next hop (0: 16, or 8 per member if more)
+rate-interval|dur|structural|100ms|how often each interface measures its rate
+flow-interval|dur|structural|200ms|how often each flow measures its rate
+place|enum:hash,balanced|runtime|hash|new flows: hash (the route hash while the interface is below shed) or balanced (always pick the less loaded of two valid interfaces)
+shed|pct|runtime|70|utilisation at which an interface stops taking new flows
+move|pct|runtime|90|utilisation at which existing flows start moving away
+clear|pct|runtime|80|flows stop moving once utilisation is below this; also the most a move may fill the target
+force|pct|runtime|95|utilisation at which a flow may move without waiting for a gap
+elephant|rate|runtime|1m|only flows at least this fast are moved
+dwell|dur|runtime|5s|least time between two moves of one flow
+gap|dur|runtime|50ms|a flow normally moves only after a pause this long, so it cannot be reordered
+move-interval|dur|runtime|500ms|how often the amount of traffic to move is worked out
+idle|dur|runtime|30s|a flow unseen this long may be replaced
+moves|enum:on,off|runtime|on|allow moving existing flows (route changes always move them)'
+declare -A CFGIDX=([shed]=0 [move]=1 [clear]=2 [force]=3 [elephant]=4 [dwell]=5 [gap]=6 [idle]=7 [place]=8 [moves]=9 [move-interval]=10)
+
+declare -A KIND CLASS DEF HELP VAL SRC
+KEYS=()
+while IFS='|' read -r k kind class def help; do
+    KEYS+=("$k"); KIND[$k]=$kind; CLASS[$k]=$class; DEF[$k]=$def; HELP[$k]=$help
+done <<< "$SETTINGS"
+is_key() { [ -n "${KIND[$1]+x}" ]; }
+
+usage() {
+cat <<EOF
+Usage: $(basename "$0") --member IF=RATE [--member IF=RATE ...] --ingress IF[,IF...]
+           [--policy "MATCH prefer IF[,IF...] [strict] [no-move]"]... [settings...]
+       $(basename "$0") --list-profiles | --show-profile NAME
+       $(basename "$0") --save-profile NAME [--description TEXT] [settings...]
+
+Writes <outdir>/<interface>/{ingress,egress}/<priority>.bpfc.
+
+  -M, --member IF=RATE     an egress interface and its bandwidth (k/m/g bit/s)
+                           Ethernet or tunnel. Repeat, or separate with commas.
+  -I, --ingress IF[,IF..]  Ethernet interfaces whose traffic is balanced
+      --no-move IF[,IF..]  never move flows off these (a different NAT or
+                           public address per interface, for example)
+      --policy SPEC        match -> interface preference, first match wins:
+                             src PREFIX | dst PREFIX | dscp N[-M] | proto N
+                             sport N[-M] | dport N[-M] | iif IF
+                             prefer IF[,IF...] [strict] [no-move]
+                           strict: only the listed interfaces, else the packet
+                           is dropped. Otherwise any valid member is the
+                           fallback.
+  -o, --outdir DIR         default /etc/bpfc/interfaces.d (- for stdout)
+  -P, --prefix NAME        map name prefix (1-10 of A-Za-z0-9_.), default em
+  -b, --priority N         TC priority of every program, default 400
+  -p, --profile NAME       start from a profile (see --list-profiles)
+      --profile-dir DIR    also look for profiles in DIR (searched first)
+      --list-profiles      list the available profiles
+      --show-profile NAME  print every effective setting and where it comes from
+      --save-profile NAME  save --profile and the settings given as a new profile
+      --description TEXT   description for --save-profile
+      --setup-hints        print the sysctls this needs
+      --remove-maps        delete the pinned maps (remove the programs first)
+  -m, --map-dir DIR        pinned maps, for --remove-maps (default /sys/fs/bpf)
+
+Settings (--name value or --name=value; the same names in profiles):
+EOF
+    local k
+    for k in "${KEYS[@]}"; do
+        printf "  --%-16s %s [%s]\n" "$k" "${HELP[$k]}" "${DEF[$k]}"
+    done
+cat <<EOF
+Durations take us, ms, s or m (a bare number is ms); rates take k, m or g.
+
+Needs net.ipv4.fib_multipath_hash_policy=1 and net.ipv4.ip_forward=1.
+IPv4 only: other packets are left to the kernel.
+EOF
+}
+
+# ---------------------------------------------------------------- units
+parse_rate() {
+    local v=${1,,}
+    v=${v%/s}; v=${v%bps}; v=${v%bit}; v=${v%b}
+    [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)([kmgt]?)$ ]] || return 1
+    awk -v n="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[3]}" \
+        'BEGIN{m=(u=="k")?1e3:(u=="m")?1e6:(u=="g")?1e9:(u=="t")?1e12:1; printf "%.0f\n", n*m}'
+}
+# duration -> ns
+parse_dur_ns() {
+    local v=${1,,}
+    [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)(us|ms|s|m)?$ ]] || return 1
+    awk -v n="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[3]:-ms}" \
+        'BEGIN{m=(u=="us")?1e3:(u=="ms")?1e6:(u=="s")?1e9:6e10; printf "%.0f\n", n*m}'
+}
+valid_ifname() { [[ ${#1} -ge 1 && ${#1} -le 15 && "$1" != *[/:%[:space:]]* ]]; }
+
+check_value() {   # key value: dies if the value does not fit the key
+    local k=$1 v=$2 kind=${KIND[$1]} list min max
+    case $kind in
+    dur)  parse_dur_ns "$v" >/dev/null || die "--$k: not a duration: $v" ;;
+    rate) parse_rate "$v" >/dev/null || die "--$k: not a rate: $v" ;;
+    pct)  [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 100 ] || die "--$k: 1-100, not $v" ;;
+    int:*) IFS=: read -r _ min max <<< "$kind"
+          [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge "$min" ] && [ "$v" -le "$max" ] || die "--$k: $min-$max, not $v" ;;
+    enum:*) list=,${kind#enum:},; [[ "$list" == *,"$v",* ]] || die "--$k: one of ${kind#enum:}, not $v" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- arguments
+MEMBERS_RAW=(); INGRESS_RAW=(); NOMOVE_RAW=(); POLICY_RAW=()
+OUTDIR=/etc/bpfc/interfaces.d; PREFIX=em; PRIO=400; MAP_DIR=/sys/fs/bpf
+PROFILE=; DESC=; ACTION=generate; ACTION_ARG=
+declare -A CLI
+
+add_member()  { MEMBERS_RAW+=("$1"); }
+
+# profile <name> [depth]: applies its keys (lowest priority first: inherit)
+find_profile() {
+    local d
+    for d in "${PROFILE_DIRS[@]}"; do [ -f "$d/$1.profile" ] && { echo "$d/$1.profile"; return 0; }; done
+    return 1
+}
+load_profile() {
+    local name=$1 depth=${2:-0} f k v line
+    [ "$depth" -le 8 ] || die "profile $name: inherit is nested too deep (or a loop)"
+    f=$(find_profile "$name") || die "no profile named $name"
+    local parent; parent=$(awk -F= '/^[ \t]*inherit[ \t]*=/{gsub(/[ \t]/,"",$2); print $2; exit}' "$f")
+    [ -z "$parent" ] || load_profile "$parent" $((depth + 1))
+    while IFS= read -r line; do
+        line=${line%%#*}
+        [[ "$line" == *=* ]] || continue
+        k=${line%%=*}; v=${line#*=}
+        k=${k//[[:space:]]/}; v=$(sed 's/^[ \t]*//; s/[ \t]*$//' <<< "$v")
+        case $k in
+        inherit|description) ;;
+        member)  add_member "$v" ;;
+        ingress) INGRESS_RAW+=("$v") ;;
+        no-move) NOMOVE_RAW+=("$v") ;;
+        policy)  POLICY_RAW+=("$v") ;;
+        *) is_key "$k" || die "profile $name: unknown setting $k"
+           check_value "$k" "$v"; VAL[$k]=$v; SRC[$k]="profile $name" ;;
+        esac
+    done < "$f"
+}
+
+ARGS=("$@")
+# the profile comes first, wherever it is on the command line
+for ((i = 0; i < ${#ARGS[@]}; i++)); do
+    case ${ARGS[i]} in
+    --profile-dir) PROFILE_DIRS=("${ARGS[i+1]}" "${PROFILE_DIRS[@]}") ;;
+    --profile-dir=*) PROFILE_DIRS=("${ARGS[i]#*=}" "${PROFILE_DIRS[@]}") ;;
+    -p|--profile) PROFILE=${ARGS[i+1]} ;;
+    --profile=*) PROFILE=${ARGS[i]#*=} ;;
+    esac
+done
+
+for k in "${KEYS[@]}"; do VAL[$k]=${DEF[$k]}; SRC[$k]=default; done
+
+CLI_MEMBERS=(); CLI_INGRESS=(); CLI_NOMOVE=(); CLI_POLICY=()
+while [ $# -gt 0 ]; do
+    a=$1; v=
+    case $a in
+    --*=*) v=${a#*=}; a=${a%%=*}; set -- "$a" "$v" "${@:2}" ;;
+    esac
+    case $a in
+    -h|--help) usage; exit 0 ;;
+    -M|--member)  [ $# -ge 2 ] || die "$a needs a value"; CLI_MEMBERS+=("$2"); shift 2 ;;
+    -I|--ingress) [ $# -ge 2 ] || die "$a needs a value"; CLI_INGRESS+=("$2"); shift 2 ;;
+    --no-move)    [ $# -ge 2 ] || die "$a needs a value"; CLI_NOMOVE+=("$2"); shift 2 ;;
+    --policy)     [ $# -ge 2 ] || die "$a needs a value"; CLI_POLICY+=("$2"); shift 2 ;;
+    -o|--outdir)  OUTDIR=$2; shift 2 ;;
+    -P|--prefix)  PREFIX=$2; shift 2 ;;
+    -b|--priority) PRIO=$2; shift 2 ;;
+    -m|--map-dir) MAP_DIR=$2; shift 2 ;;
+    -p|--profile|--profile-dir) shift 2 ;;
+    --list-profiles) ACTION=list; shift ;;
+    --show-profile) ACTION=show; ACTION_ARG=$2; shift 2 ;;
+    --save-profile) ACTION=save; ACTION_ARG=$2; shift 2 ;;
+    --description) DESC=$2; shift 2 ;;
+    --setup-hints) ACTION=hints; shift ;;
+    --remove-maps) ACTION=remove; shift ;;
+    --*) k=${a#--}; is_key "$k" || die "unknown option $a (see --help)"
+         [ $# -ge 2 ] || die "$a needs a value"
+         check_value "$k" "$2"; CLI[$k]=$2; shift 2 ;;
+    *) die "unexpected argument: $a (see --help)" ;;
+    esac
+done
+
+[[ "$PREFIX" =~ ^[A-Za-z0-9_.]{1,10}$ ]] || die "--prefix: 1-10 of A-Za-z0-9_.: $PREFIX"
+[[ "$PRIO" =~ ^[0-9]+$ ]] && [ "$PRIO" -ge 1 ] && [ "$PRIO" -le 65535 ] || die "--priority: 1-65535: $PRIO"
+
+MAP_NAMES=(ft m if cfg ctr ev sc)
+
+case $ACTION in
+hints)
+cat <<EOF
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv4.fib_multipath_hash_policy=1
+# On a routing daemon's ECMP routes, drop a next hop as soon as its link goes:
+sysctl -w net.ipv4.conf.all.ignore_routes_with_linkdown=1
+EOF
+    exit 0 ;;
+list)
+    seen=" "
+    for d in "${PROFILE_DIRS[@]}"; do
+        for f in "$d"/*.profile; do
+            [ -f "$f" ] || continue
+            n=$(basename "$f" .profile)
+            [[ "$seen" == *" $n "* ]] && continue
+            seen+="$n "
+            printf "%-16s %s\n" "$n" "$(awk -F= '/^[ \t]*description[ \t]*=/{sub(/^[ \t]*/,"",$2); print $2; exit}' "$f")"
+        done
+    done
+    exit 0 ;;
+remove)
+    for m in "${MAP_NAMES[@]}"; do rm -f "$MAP_DIR/${PREFIX}_$m"; done
+    exit 0 ;;
+esac
+
+if [ "$ACTION" = show ]; then PROFILE=$ACTION_ARG; fi
+[ -z "$PROFILE" ] || load_profile "$PROFILE"
+for k in "${!CLI[@]}"; do VAL[$k]=${CLI[$k]}; SRC[$k]="command line"; done
+# The command line replaces a profile's interfaces and policies.
+[ ${#CLI_MEMBERS[@]} -eq 0 ] || MEMBERS_RAW=("${CLI_MEMBERS[@]}")
+[ ${#CLI_INGRESS[@]} -eq 0 ] || INGRESS_RAW=("${CLI_INGRESS[@]}")
+[ ${#CLI_NOMOVE[@]} -eq 0 ] || NOMOVE_RAW=("${CLI_NOMOVE[@]}")
+[ ${#CLI_POLICY[@]} -eq 0 ] || POLICY_RAW=("${CLI_POLICY[@]}")
+
+if [ "$ACTION" = show ]; then
+    for k in "${KEYS[@]}"; do printf "%-16s %-10s (%s)\n" "$k" "${VAL[$k]}" "${SRC[$k]}"; done
+    for m in "${MEMBERS_RAW[@]}"; do echo "member           $m"; done
+    for m in "${INGRESS_RAW[@]}"; do echo "ingress          $m"; done
+    for m in "${NOMOVE_RAW[@]}"; do echo "no-move          $m"; done
+    for m in "${POLICY_RAW[@]}"; do echo "policy           $m"; done
+    exit 0
+fi
+if [ "$ACTION" = save ]; then
+    [[ "$ACTION_ARG" =~ ^[A-Za-z0-9_.-]+$ ]] || die "bad profile name: $ACTION_ARG"
+    d=${PROFILE_DIRS[0]}
+    mkdir -p "$d"; f=$d/$ACTION_ARG.profile
+    {
+        [ -z "$DESC" ] || echo "description = $DESC"
+        [ -z "$PROFILE" ] || echo "inherit = $PROFILE"
+        for k in "${KEYS[@]}"; do [ -z "${CLI[$k]+x}" ] || echo "$k = ${CLI[$k]}"; done
+        for m in "${CLI_MEMBERS[@]}"; do echo "member = $m"; done
+        for m in "${CLI_INGRESS[@]}"; do echo "ingress = $m"; done
+        for m in "${CLI_NOMOVE[@]}"; do echo "no-move = $m"; done
+        for m in "${CLI_POLICY[@]}"; do echo "policy = $m"; done
+    } > "$f"
+    echo "$f"
+    exit 0
+fi
+
+# ---------------------------------------------------------------- interfaces
+declare -A SLOT CAP
+MEMBER=()
+for spec in "${MEMBERS_RAW[@]}"; do
+    IFS=, read -ra parts <<< "$spec"
+    for p in "${parts[@]}"; do
+        [[ "$p" == *=* ]] || die "--member needs IF=RATE: $p"
+        n=${p%%=*}; r=${p#*=}
+        valid_ifname "$n" || die "--member: bad interface name: $n"
+        [ -z "${SLOT[$n]+x}" ] || die "--member: $n given twice"
+        b=$(parse_rate "$r") || die "--member $n: not a rate: $r"
+        [ "$b" -gt 0 ] || die "--member $n: rate must be above 0"
+        SLOT[$n]=${#MEMBER[@]}; CAP[$n]=$b; MEMBER+=("$n")
+    done
+done
+[ ${#MEMBER[@]} -ge 2 ] || die "at least two --member interfaces are needed"
+[ ${#MEMBER[@]} -le $MAX_MEMBERS ] || die "at most $MAX_MEMBERS members"
+INGRESS=()
+for s in "${INGRESS_RAW[@]}"; do
+    IFS=, read -ra parts <<< "$s"
+    for n in "${parts[@]}"; do
+        valid_ifname "$n" || die "--ingress: bad interface name: $n"
+        for x in "${INGRESS[@]}"; do [ "$x" != "$n" ] || die "--ingress: $n given twice"; done
+        INGRESS+=("$n")
+        t=/sys/class/net/$n/type
+        if [ -r "$t" ] && [ "$(cat "$t")" != 1 ]; then
+            die "--ingress $n: only Ethernet interfaces can steer traffic (device type $(cat "$t")): fib-lookup needs an Ethernet header. Traffic arriving on it is still counted at the members, and routed by the kernel"
+        fi
+    done
+done
+[ ${#INGRESS[@]} -ge 1 ] || die "at least one --ingress interface is needed"
+NOMOVE_MASK=0
+for s in "${NOMOVE_RAW[@]}"; do
+    IFS=, read -ra parts <<< "$s"
+    for n in "${parts[@]}"; do
+        [ -n "${SLOT[$n]+x}" ] || die "--no-move: $n is not a member"
+        NOMOVE_MASK=$((NOMOVE_MASK | (1 << SLOT[$n])))
+    done
+done
+
+v() { echo "${VAL[$1]}"; }
+ns() { parse_dur_ns "${VAL[$1]}"; }
+SHED=$(( $(v shed) * 10 )); MOVE=$(( $(v move) * 10 )); CLEAR=$(( $(v clear) * 10 )); FORCE=$(( $(v force) * 10 ))
+[ "$CLEAR" -lt "$MOVE" ] || die "--clear ($(v clear)) must be below --move ($(v move))"
+[ "$MOVE" -le "$FORCE" ] || die "--force ($(v force)) must not be below --move ($(v move))"
+[ "$SHED" -le "$MOVE" ] || die "--shed ($(v shed)) must not be above --move ($(v move))"
+MODE=$(v mode)
+SYM=0; [[ "$MODE" == *-sym ]] && SYM=1
+M=${MODE%-sym}
+KEY_TOS=0; [[ "$M" == *+tos ]] && KEY_TOS=1
+KEY_PROTO=0; [[ "$M" == l3+proto ]] && KEY_PROTO=1
+KEY_PORTS=0; [[ "$M" == l4* ]] && { KEY_PORTS=1; KEY_PROTO=1; }
+FLOWS=$(v flows); N=256; while [ "$N" -lt "$FLOWS" ]; do N=$((N * 2)); done
+SWEEP=$(v sweep)
+if [ "$SWEEP" = 0 ]; then
+    SWEEP=$(( ${#MEMBER[@]} * 8 )); [ "$SWEEP" -ge 16 ] || SWEEP=16; [ "$SWEEP" -le 64 ] || SWEEP=64
+fi
+
+# ---------------------------------------------------------------- policies
+POL_MATCH=""; POL_RANK=""; POL_STRICT=0; POL_NOMOVE=0; POL_HDR=""; WANT_PORTS=$KEY_PORTS
+# port_cond VAR N[-M]: the two-sided comparison as bpfc "if" lines
+port_cond() {
+    local var=$1 r=$2 lo hi
+    [[ "$r" =~ ^([0-9]+)(-([0-9]+))?$ ]] || die "--policy: not a number or range: $r"
+    lo=${BASH_REMATCH[1]}; hi=${BASH_REMATCH[3]:-$lo}
+    [ "$lo" -le "$hi" ] || die "--policy: empty range: $r"
+    echo "if val %$var ge $lo; if val %$var le $hi;"
+}
+PNUM=0
+for spec in "${POLICY_RAW[@]}"; do
+    PNUM=$((PNUM + 1))
+    [ $PNUM -le $MAX_POLICIES ] || die "at most $MAX_POLICIES policies"
+    read -ra w <<< "$spec"
+    open=""; close=""; prefer=""; strict=0; nomove=0; i=0
+    while [ $i -lt ${#w[@]} ]; do
+        kw=${w[i]}; arg=${w[i+1]:-}
+        case $kw in
+        strict) strict=1; i=$((i + 1)); continue ;;
+        no-move) nomove=1; i=$((i + 1)); continue ;;
+        esac
+        [ -n "$arg" ] || die "--policy: $kw needs a value: $spec"
+        case $kw in
+        src) open+="match ip-src $arg; "; close="end-match; $close" ;;
+        dst) open+="match ip-dst $arg; "; close="end-match; $close" ;;
+        dscp) c=$(port_cond DSCP "$arg"); open+="$c "; close="end-if; end-if; $close"
+              [ "$KEY_TOS" = 1 ] || WARN_TOS=1 ;;
+        proto) [[ "$arg" =~ ^[0-9]+$ ]] && [ "$arg" -le 255 ] || die "--policy: proto is a number: $arg"
+              open+="if val %PR eq $arg; "; close="end-if; $close" ;;
+        sport|dport) [ "$KEY_PORTS" = 1 ] || die "--policy: $kw needs a mode that includes ports (l4, l4+tos), not $MODE"
+              v2=SP; [ "$kw" = dport ] && v2=DP
+              c=$(port_cond $v2 "$arg"); open+="$c "; close="end-if; end-if; $close" ;;
+        iif)  open+="when \$IFNAME == $arg; "; close="end-when; $close" ;;
+        prefer) prefer=$arg ;;
+        *) die "--policy: unknown keyword $kw: $spec" ;;
+        esac
+        i=$((i + 2))
+    done
+    [ -n "$prefer" ] || die "--policy: no prefer list: $spec"
+    POL_MATCH+="  ${open}set val POL $PNUM; goto pol_done; ${close}"$'\n'
+    POL_RANK+="        if val %POL eq $PNUM;"
+    IFS=, read -ra pf <<< "$prefer"; rank=0
+    for n in "${pf[@]}"; do
+        [ -n "${SLOT[$n]+x}" ] || die "--policy: $n is not a member: $spec"
+        rank=$((rank + 1))
+        POL_RANK+=" if val %SL eq ${SLOT[$n]}; set val RK $rank; end-if;"
+    done
+    POL_RANK+=" end-if;"$'\n'
+    [ "$strict" = 0 ] || POL_STRICT=$((POL_STRICT | (1 << (PNUM - 1))))
+    [ "$nomove" = 0 ] || POL_NOMOVE=$((POL_NOMOVE | (1 << (PNUM - 1))))
+    POL_HDR+="# bpfc-ecmp policy=$PNUM $spec"$'\n'
+done
+# Roughly what the verifier will take (kernel 6.18), against its limit of 1M.
+COST=$(( 60000 + 65000 * ${#MEMBER[@]} + 20000 * ${#MEMBER[@]} * PNUM ))
+[ "$COST" -lt 900000 ] || warn "${#MEMBER[@]} members and $PNUM policies may exceed the verifier limit when loaded; if so, fewer of either"
+[ -z "${WARN_TOS:-}" ] || warn "a policy matches DSCP but mode $MODE does not: a flow takes the policy of its first packet's DSCP"
+
+# ---------------------------------------------------------------- program text
+FW=12        # words per flow
+MF=24        # words per member
+C1=0x9E3779B97F4A7C15; C2=0xC2B2AE3D27D4EB4F
+
+common_consts() {
+cat <<EOF
+const FT ${PREFIX}_ft; const MT ${PREFIX}_m; const IFM ${PREFIX}_if;
+const CFG ${PREFIX}_cfg; const CTR ${PREFIX}_ctr; const EV ${PREFIX}_ev; const SC ${PREFIX}_sc; const MAXCPU 256;
+const N $N; const FW $FW; const MF $MF; const MAXM $MAX_MEMBERS;
+const EVN 256; const EVW 5;
+array-map \$FT \$(N * FW);
+array-map \$MT \$(MAXM * MF);
+array-map \$CFG 32;
+array-map \$CTR 16;
+array-map \$EV \$(EVN * EVW);
+array-map \$SC \$(MAXCPU * MAXM);
+# flow words
+const F_TAG 0; const F_ADDR 1; const F_META 2; const F_ASSIGN 3; const F_BYTES 4;
+const F_WIN 5; const F_WBYTES 6; const F_BPS 7; const F_SEEN 8; const F_STATE 9;
+const F_MOVED 10; const F_FIRST 11;
+# member words
+const M_CAP_SET 0; const M_CAP 1; const M_TXB 2; const M_PREVB 3; const M_WIN 4;
+const M_TS 5; const M_RATE 6; const M_UTIL 7; const M_RSV 8; const M_BUDGET 9;
+const M_MOVING 10; const M_BTS 11; const M_TXP 12; const M_IFINDEX 13;
+const M_RXB 15; const M_RXPREV 16; const M_RXRATE 17; const M_RXWIN 18; const M_RXTS 19; const M_RXP 20;
+# counters
+const C_NEW 0; const C_SHED 1; const C_MOVED 2; const C_ROUTE 3; const C_POLICY 4;
+const C_COLLIDE 5; const C_NOMEMBER 6; const C_UNMANAGED 7; const C_NONEIGH 8;
+const C_STRICT 9; const C_EVHEAD 10; const C_SWEEP 11; const C_PREFERRED 12; const C_KEPT 13;
+# reasons
+const R_HASH 1; const R_SHED 2; const R_POLICY 3; const R_BALANCED 4; const R_MOVED 5;
+const R_ROUTE 6; const R_PREFERRED 7;
+# settings: stored + 1 at run time, 0 = the value generated here
+const D_SHED $SHED; const D_MOVE $MOVE; const D_CLEAR $CLEAR; const D_FORCE $FORCE;
+const D_ELEPHANT $(parse_rate "$(v elephant)"); const D_DWELL $(ns dwell); const D_GAP $(ns gap);
+const D_IDLE $(ns idle); const D_PLACE $([ "$(v place)" = balanced ] && echo 1 || echo 0);
+const D_MOVES $([ "$(v moves)" = on ] && echo 1 || echo 0); const D_MOVEINT $(ns move-interval);
+const RW_NS $(ns rate-interval); const FW_NS $(ns flow-interval);
+define cfg VAR IDX DEF;
+  decl \$VAR 8; decl CFGT 8; get map \$CFG \$IDX \$VAR;
+  set val CFGT %\$VAR; calc sub \$VAR 1; calc sub CFGT 1; calc rsh CFGT 63;
+  calc mul CFGT \$(DEF + 1); calc add \$VAR %CFGT; free CFGT;
+end-define;
+EOF
+}
+
+# rx-count SLOT: counts what a member receives (shown, never acted on)
+rx_block() {
+cat <<'EOF'
+decl RXL 8; get len RXL;
+decl RXN 8; get time RXN;
+calc-map add $MT $(MSLOT * MF + M_RXB) %RXL;
+calc-map add $MT $(MSLOT * MF + M_RXP) 1;
+decl RXW 8; set val RXW %RXN; calc div RXW $RW_NS;
+decl RXO 8; calc-map xchg $MT $(MSLOT * MF + M_RXWIN) %RXW RXO;
+if val %RXO ne %RXW;
+  decl RXB 8; get map $MT $(MSLOT * MF + M_RXB) RXB;
+  decl RXP 8; calc-map xchg $MT $(MSLOT * MF + M_RXPREV) %RXB RXP;
+  decl RXT 8; calc-map xchg $MT $(MSLOT * MF + M_RXTS) %RXN RXT;
+  if val %RXT ne 0;
+    decl RXD 8; set val RXD %RXN; calc sub RXD %RXT; calc div RXD 1000;
+    calc sub RXB %RXP; calc mul RXB 8000000; calc div RXB %RXD;
+    decl RXR 8; get map $MT $(MSLOT * MF + M_RXRATE) RXR;
+    if val %RXD gt $(RW_NS * 4 / 1000); set val RXR %RXB;
+    else; calc mul RXR 3; calc add RXR %RXB; calc div RXR 4; end-if;
+    set map $MT $(MSLOT * MF + M_RXRATE) %RXR;
+    free RXR; free RXD;
+  end-if;
+  free RXT; free RXP; free RXB;
+end-if;
+free RXO; free RXW; free RXN; free RXL;
+EOF
+}
+
+gen_member_egress() {   # member
+    local n=$1
+cat <<EOF
+# bpfc-ecmp prefix=$PREFIX version=$VERSION role=member slot=${SLOT[$n]} if=$n cap=${CAP[$n]}
+# Counts what leaves $n and works out its rate, utilisation and how much
+# traffic should move. Generated by bpfc-ecmp-gen; do not edit.
+EOF
+    common_consts
+cat <<EOF
+const MSLOT ${SLOT[$n]}; const CAP_DEF ${CAP[$n]};
+EOF
+cat <<'EOF'
+decl LEN 8; get len LEN;
+calc-map add $MT $(MSLOT * MF + M_TXB) %LEN;
+calc-map add $MT $(MSLOT * MF + M_TXP) 1;
+decl NOW 8; get time NOW;
+decl W 8; set val W %NOW; calc div W $RW_NS;
+decl OLDW 8; calc-map xchg $MT $(MSLOT * MF + M_WIN) %W OLDW;
+if val %OLDW ne %W;                        # first packet of this window, on any CPU
+  decl BY 8; get map $MT $(MSLOT * MF + M_TXB) BY;
+  decl PB 8; calc-map xchg $MT $(MSLOT * MF + M_PREVB) %BY PB;
+  decl TS 8; calc-map xchg $MT $(MSLOT * MF + M_TS) %NOW TS;
+  decl C 8; get map $MT $(MSLOT * MF + M_CAP_SET) C;
+  if val %C eq 0; set val C $CAP_DEF; end-if;
+  set map $MT $(MSLOT * MF + M_CAP) %C;
+  when $L3OFF == 0;
+    const IFVAL $((MSLOT + 1) | 256);
+  otherwise;
+    const IFVAL $(MSLOT + 1);
+  end-when;
+  decl IFI 8; get skb-ifindex IFI;
+  set map $IFM %IFI $IFVAL;
+  set map $MT $(MSLOT * MF + M_IFINDEX) %IFI;
+  if val %TS ne 0;
+    decl DT 8; set val DT %NOW; calc sub DT %TS; calc div DT 1000;
+    calc sub BY %PB; calc mul BY 8000000; calc div BY %DT;       # bit/s this window
+    decl R 8; get map $MT $(MSLOT * MF + M_RATE) R;
+    if val %DT gt $(RW_NS * 4 / 1000); set val R %BY;            # idle for a while
+    else; calc mul R 3; calc add R %BY; calc div R 4; end-if;
+    set map $MT $(MSLOT * MF + M_RATE) %R;
+    decl U 8; set val U %R; calc mul U 1000; calc div U %C;
+    set map $MT $(MSLOT * MF + M_UTIL) %U;
+    decl Z 8; set val Z 0; calc-map xchg $MT $(MSLOT * MF + M_RSV) %Z Z;   # what was promised is now measured
+    # Move hysteresis, and how much traffic should leave.
+    decl MV 8; get map $MT $(MSLOT * MF + M_MOVING) MV;
+    cfg TH 1 $D_MOVE;
+    if val %U ge %TH; set val MV 1; end-if;
+    cfg CL 2 $D_CLEAR;
+    if val %U lt %CL; set val MV 0; end-if;
+    set map $MT $(MSLOT * MF + M_MOVING) %MV;
+    decl BT 8; get map $MT $(MSLOT * MF + M_BTS) BT;
+    decl EL 8; set val EL %NOW; calc sub EL %BT;
+    cfg MI 10 $D_MOVEINT;
+    if val %EL ge %MI;
+      set map $MT $(MSLOT * MF + M_BTS) %NOW;
+      decl BG 8; set val BG 0;
+      if val %MV ne 0;
+        decl TG 8; set val TG %C; calc mul TG %CL; calc div TG 1000;
+        if val %R gt %TG; set val BG %R; calc sub BG %TG; end-if;
+      end-if;
+      set map $MT $(MSLOT * MF + M_BUDGET) %BG;
+    end-if;
+  end-if;
+end-if;
+EOF
+}
+
+gen_member_ingress() {  # member that does not also steer
+    local n=$1
+cat <<EOF
+# bpfc-ecmp prefix=$PREFIX version=$VERSION role=rx slot=${SLOT[$n]} if=$n
+# Counts what arrives on $n. Generated by bpfc-ecmp-gen; do not edit.
+EOF
+    common_consts
+    echo "const MSLOT ${SLOT[$n]};"
+    rx_block
+}
+
+key_block() {
+    # K: the flow key. PR, DSCP, SP, DP hold the fields for policies and display.
+cat <<EOF
+decl S 4; decl D 4; get ip-src S; get ip-dst D;
+decl B1 1; decl PR 8; decl DSCP 8;
+get ip-proto B1; set val PR %B1;
+get ip-tos B1; set val DSCP %B1; calc rsh DSCP 2; free B1;
+decl SP 8; decl DP 8; set val SP 0; set val DP 0;
+EOF
+    if [ "$WANT_PORTS" = 1 ]; then
+cat <<'EOF'
+decl FR 2; get bytes 20 2 FR; calc and FR 0x3fff;
+if val %FR eq 0;
+  decl PX 8; set val PX 0;
+  if val %PR eq 6; set val PX 1; end-if;
+  if val %PR eq 17; set val PX 1; end-if;
+  if val %PR eq 132; set val PX 1; end-if;
+  if val %PX eq 1;
+    decl OF 8; get l4-off OF; get bytes %OF 2 SP; calc add OF 2; get bytes %OF 2 DP; free OF;
+  end-if;
+  free PX;
+end-if;
+free FR;
+EOF
+    fi
+    echo 'decl X 8; decl Y 8; set val X %S; set val Y %D;'
+    echo 'decl EP1 8; decl EP2 8; set val EP1 %SP; set val EP2 %DP;'
+    if [ "$SYM" = 1 ]; then
+cat <<'EOF'
+decl SWP 8; set val SWP 0;
+if val %X gt %Y; set val SWP 1; end-if;
+if val %X eq %Y; if val %EP1 gt %EP2; set val SWP 1; end-if; end-if;
+if val %SWP eq 1;
+  decl TMP 8;
+  set val TMP %X; set val X %Y; set val Y %TMP;
+  set val TMP %EP1; set val EP1 %EP2; set val EP2 %TMP;
+  free TMP;
+end-if;
+free SWP;
+EOF
+    fi
+    echo 'decl K 8; set val K %X; calc lsh K 32; calc or K %Y;'
+    echo 'decl E 8; set val E 0;'
+    [ "$KEY_PROTO" = 0 ] || echo 'set val X %PR; calc lsh X 40; calc or E %X;'
+    [ "$KEY_TOS" = 0 ] || echo 'set val X %DSCP; calc lsh X 32; calc or E %X;'
+    [ "$KEY_PORTS" = 0 ] || echo 'set val X %EP1; calc lsh X 16; calc or X %EP2; calc or E %X;'
+cat <<EOF
+calc mul K $C1; set val Y %K; calc rsh Y 32; calc xor K %Y;
+calc mul E $C2; calc xor K %E; calc mul K $C1;
+set val Y %K; calc rsh Y 29; calc xor K %Y;
+calc or K 1;                                # never 0 (0 marks an empty place)
+free E; free EP2; free EP1;
+EOF
+}
+
+gen_selector() {  # ingress interface
+    local n=$1
+cat <<EOF
+# bpfc-ecmp prefix=$PREFIX version=$VERSION role=selector if=$n mode=$MODE members=${#MEMBER[@]} flows=$N
+$POL_HDR# Chooses the member each flow leaves by. Generated by bpfc-ecmp-gen; do not edit.
+EOF
+    common_consts
+    cat <<EOF
+const SWEEP $SWEEP; const MEMBERS ${#MEMBER[@]};
+const NOMOVE_MEMBERS $NOMOVE_MASK; const NOMOVE_POLICIES $POL_NOMOVE; const STRICT_POLICIES $POL_STRICT;
+const NO_SLOT 255; const STALE \$(RW_NS * 8);
+EOF
+cat <<'EOF'
+define ftget BASE FIELD VAR;
+  set val Q %$BASE; calc add Q $FIELD; get map $FT %Q $VAR;
+end-define;
+define ftset BASE FIELD VAL;
+  set val Q %$BASE; calc add Q $FIELD; set map $FT %Q %$VAL;
+end-define;
+define mget SLOT FIELD VAR;
+  set val Q %$SLOT; calc mul Q $MF; calc add Q $FIELD; get map $MT %Q $VAR;
+end-define;
+match ip;
+decl TTLV 1; get bytes 22 1 TTLV;
+if val %TTLV le 1; continue; end-if;
+free TTLV;
+decl Q 8;
+EOF
+    if [ -n "${SLOT[$n]+x}" ]; then
+        echo "const MSLOT ${SLOT[$n]};"
+        rx_block
+    fi
+    key_block
+cat <<'EOF'
+decl NOW 8; get time NOW;
+free S;
+
+# ------- find the flow (two places it can be)
+decl B 8; decl H 8; decl TAG 8;
+set val H 0;
+set val B %K; calc and B $(N - 1); calc mul B $FW;
+get map $FT %B TAG;
+if val %TAG eq %K;
+  set val H 1;
+else;
+  decl B2 8; set val B2 %K; calc and B2 $(N - 1); calc xor B2 1; calc mul B2 $FW;
+  get map $FT %B2 TAG;
+  if val %TAG eq %K; set val B %B2; set val H 1; end-if;
+  free B2;
+end-if;
+free TAG;
+
+decl SALT 8; decl IFI 8; decl CUR 8; decl ST 8; decl NEED 8; decl RSN 8; decl POL 8; decl FB 8;
+set val NEED 0; set val RSN 0; set val POL 0; set val IFI 0; set val ST 0; set val FB 0;
+set val CUR $NO_SLOT;
+if val %H eq 1;
+  ftget B $F_ASSIGN X;
+  set val SALT %X; calc rsh SALT 32;
+  set val IFI %X; calc and IFI 0xffffffff;
+  ftget B $F_STATE ST;
+  set val CUR %ST; calc and CUR 0xff;
+  set val POL %ST; calc rsh POL 8; calc and POL 0xff;
+else;
+  set val SALT %K; calc rsh SALT 16; calc and SALT 0xffffffff;
+end-if;
+
+# ------- the route decides: every packet, the flow's own hash value
+fib-lookup flow ports %SALT %D;
+decl OK 8; set val OK 0;
+if val %FIB_RESULT eq 0; set val OK 1; end-if;
+if val %FIB_RESULT eq 7;
+  get map $IFM %FIB_IFINDEX X; calc rsh X 8;
+  if val %X ne 0; set val OK 1; end-if;                   # a tunnel has no neighbour entry
+end-if;
+
+if val %H eq 1;
+  if val %OK eq 1; if val %FIB_IFINDEX eq %IFI;
+    set val NEED 100;                                     # still a member: stay
+  end-if; end-if;
+  if val %NEED ne 100;
+    if val %FIB_RESULT eq 7; if val %FIB_IFINDEX eq %IFI;
+      calc-map add $CTR $C_NONEIGH 1;                     # right interface, ARP pending
+      continue;
+    end-if; end-if;
+    set val X 0;
+    if val %FIB_RESULT eq 0; set val X 1; end-if;
+    if val %OK eq 1; set val X 1; end-if;
+    if val %FIB_RESULT eq 7; set val X 1; end-if;
+    if val %X eq 0; continue; end-if;                     # no route, local, needs fragmenting: the kernel's
+    set val NEED 1; set val RSN $R_ROUTE;                 # the route changed
+  else;
+    set val NEED 0;
+    # accounting for the flow
+    decl LEN 8; get len LEN;
+    decl PREV 8; ftget B $F_SEEN PREV;
+    ftset B $F_SEEN NOW;
+    set val Q %B; calc add Q $F_BYTES; calc-map add $FT %Q %LEN;
+    free LEN;
+    ftget B $F_BPS FB;
+    decl CL 8; set val CL 0;
+    ftget B $F_WIN X;
+    set val Y %NOW; calc sub Y %X;
+    decl TF 8; set val TF %Y; calc sub TF $FW_NS; calc rsh TF 63;
+    if val %TF eq 0;
+      set val CL 1;
+      decl FBY 8; ftget B $F_BYTES FBY;
+      ftget B $F_WBYTES X; ftset B $F_WBYTES FBY;
+      calc sub FBY %X; calc mul FBY 8000000;
+      calc div Y 1000; calc div FBY %Y;
+      if val %FB eq 0; set val FB %FBY;
+      else; if val %Y gt $(FW_NS * 4 / 1000); set val FB %FBY;
+      else; calc mul FB 3; calc add FB %FBY; calc div FB 4; end-if; end-if;
+      ftset B $F_BPS FB;
+      ftset B $F_WIN NOW;
+      free FBY;
+    end-if;
+    free TF;
+
+    # A flow away from its preferred interface goes back when it can.
+    if val %CL eq 1; if val %POL ne 0;
+      set val X %ST; calc rsh X 16; calc and X 0xff;
+      if val %X ne 1;
+        ftget B $F_MOVED X;
+        set val Y %NOW; calc sub Y %X;
+        cfg V3 5 $D_DWELL;
+        if val %Y ge %V3;                                 # try at most once per dwell
+          free V3;
+          set val Y %NOW; calc sub Y %PREV;
+          cfg V3 6 $D_GAP;
+          if val %Y ge %V3; set val NEED 3; ftset B $F_MOVED NOW; end-if;
+        end-if;
+        free V3;
+      end-if;
+    end-if; end-if;
+    free CL;
+
+    # Congestion: move this flow if it is big enough and the time is right.
+    decl MV 8; mget CUR $M_MOVING MV;
+    if val %MV ne 0; if val %NEED eq 0;
+      cfg V1 9 $D_MOVES;
+      if val %V1 ne 0;
+        set val X $NOMOVE_MEMBERS; calc rsh X %CUR; calc and X 1;
+        set val Y 0;
+        if val %POL ne 0;
+          set val Y %POL; calc sub Y 1; set val V1 $NOMOVE_POLICIES; calc rsh V1 %Y; calc and V1 1; set val Y %V1;
+        end-if;
+        if val %X eq 0; if val %Y eq 0;
+          cfg V2 4 $D_ELEPHANT;
+          if val %FB ge %V2;
+            ftget B $F_MOVED X;
+            set val Y %NOW; calc sub Y %X;
+            cfg V3 5 $D_DWELL;
+            if val %Y ge %V3;
+              set val Y %NOW; calc sub Y %PREV;
+              cfg V4 6 $D_GAP;
+              decl GO 8; set val GO 0;
+              if val %Y ge %V4; set val GO 1; end-if;
+              mget CUR $M_UTIL X;
+              cfg V5 3 $D_FORCE;
+              if val %X ge %V5; set val GO 1; end-if;
+              if val %GO eq 1;
+                mget CUR $M_BUDGET X;
+                set val Y %X; calc rsh Y 62;
+                if val %Y eq 0;                           # not overdrawn
+                  calc mul X 2;                           # a flow up to twice what is left may still go
+                  if val %X ge %FB; set val NEED 2; set val RSN $R_MOVED; end-if;
+                end-if;
+              end-if;
+              free GO; free V5; free V4;
+            end-if;
+            free V3;
+          end-if;
+          free V2;
+        end-if; end-if;
+      end-if;
+      free V1;
+    end-if; end-if;
+    free MV; free PREV;
+  end-if;
+else;
+  # ------- a new flow
+  if val %OK eq 0; continue; end-if;                      # not forwardable here: the kernel's
+  get map $IFM %FIB_IFINDEX X;
+  if val %X eq 0;
+    calc-map add $CTR $C_UNMANAGED 1;                     # not a member (or not yet seen sending)
+    continue;
+  end-if;
+  calc and X 0xff; calc sub X 1;
+  decl NS 8; set val NS %X;                               # the member the hash picked
+EOF
+    if [ -n "$POL_MATCH" ]; then
+        printf '%s' "$POL_MATCH"
+        echo 'label pol_done;'
+    fi
+cat <<'EOF'
+  if val %POL ne 0;
+    set val NEED 1; set val RSN $R_POLICY;
+  else;
+    cfg V1 8 $D_PLACE;
+    if val %V1 eq 1;
+      set val NEED 1; set val RSN $R_BALANCED;
+    else;
+      mget NS $M_UTIL X;
+      mget NS $M_TS Y;
+      decl T2 8; set val T2 %NOW; calc sub T2 %Y; calc sub T2 $STALE; calc rsh T2 63;
+      calc mul X %T2;                                     # not measured lately: idle
+      mget NS $M_RSV Y;
+      calc add X %Y;
+      set val T2 %X; calc rsh T2 63; calc xor T2 1; calc mul X %T2;    # a negative promise counts as 0
+      free T2;
+      cfg V2 0 $D_SHED;
+      if val %X ge %V2;
+        set val NEED 1; set val RSN $R_SHED;
+      else;
+        set val CUR %NS; set val RSN $R_HASH;
+      end-if;
+      free V2;
+    end-if;
+    free V1;
+  end-if;
+  free NS;
+end-if;
+free OK;
+free DP; free SP; free DSCP; free PR;
+
+# ------- choose a member: try hash values and see what the route offers
+free IFI;
+decl CH 8; set val CH $NO_SLOT;
+# Everything above is only constants to the verifier on some paths; a word
+# that is always 0 makes them all look alike, so the paths merge here and the
+# cost stays linear in the sweep.
+get map $CTR 14 X;
+calc or NEED %X; calc or RSN %X; calc or POL %X; calc or CUR %X; calc or H %X; calc or FB %X; calc or ST %X; calc or CH %X;
+if val %NEED ne 0;
+  calc-map add $CTR $C_SWEEP 1;
+  decl SEEN 8; get map $CTR 14 SEEN;
+  decl N0 8; get map $CTR 14 N0;
+  decl TT 8; set val TT %K; calc and TT 0xffffffff;
+  decl SL 8; decl V 8;
+  # What this sweep is for, as data, so the loop body does not branch on it:
+  # PM = want-room | best-rank << 8 | excluded slot << 16 | slot to keep << 24.
+  decl LIMIT 8; decl PM 8;
+  if val %NEED ge 2;
+    cfg H1 2 $D_CLEAR; set val LIMIT %H1; free H1;
+    set val PM %CUR; calc lsh PM 16; calc or PM 1;
+    set val X $NO_SLOT; calc lsh X 24; calc or PM %X;
+    set val X 255;
+    if val %NEED eq 3; set val X %ST; calc rsh X 16; calc and X 0xff; end-if;
+    calc lsh X 8; calc or PM %X;
+  else;
+    cfg H1 0 $D_SHED; set val LIMIT %H1; free H1;
+    set val FB 0;
+    set val PM %CUR; calc lsh PM 24;
+    set val X $NO_SLOT; calc lsh X 16; calc or PM %X;
+    set val X 255; calc lsh X 8; calc or PM %X;
+  end-if;
+  get map $CTR 14 X; calc or LIMIT %X; calc or PM %X; calc or FB %X;
+  # Which members does this route offer? Hash values are tried; each member
+  # found is noted with the value that selects it (per-CPU scratch map).
+  decl SCB 8; get cpu SCB; calc mod SCB $MAXCPU; calc mul SCB $MAXM;
+  repeat $SWEEP as I;
+    calc add TT 0x9E3779B1; calc and TT 0xffffffff;
+    fib-lookup flow ports %TT %D;
+    if val %FIB_RESULT gt 7; next-repeat; end-if;
+    get map $IFM %FIB_IFINDEX V;
+    if val %V eq 0; next-repeat; end-if;
+    if val %FIB_RESULT ne 0;
+      if val %FIB_RESULT ne 7; next-repeat; end-if;
+      set val X %V; calc rsh X 8;
+      if val %X eq 0; next-repeat; end-if;
+    end-if;
+    set val SL %V; calc and SL 0xff; calc sub SL 1;
+    set val X %SCB; calc add X %SL; set map $SC %X %TT;
+    set val X 1; calc lsh X %SL; calc or SEEN %X;
+    if val %SEEN eq $(((1 << MEMBERS) - 1)); break-repeat; end-if;
+  end-repeat;
+
+  # Still a member after the route changed: stay on it.
+  set val X %PM; calc rsh X 24; calc and X 0xff;
+  if val %X ne $NO_SLOT;
+    set val Y %SEEN; calc rsh Y %X; calc and Y 1;
+    if val %Y ne 0;
+      set val CH %X; calc add X %SCB; get map $SC %X SALT;
+      set val SEEN 0;
+      calc-map add $CTR $C_KEPT 1;
+    end-if;
+  end-if;
+
+  # Judge the members found.
+  decl AS 8; decl AF 8; decl BS 8; decl BF 8;              # slot << 32 | hash value, free capacity
+  get map $CTR 14 AF; get map $CTR 14 BF; get map $CTR 14 AS; get map $CTR 14 BS;
+  decl CS 8; decl CSC 8;
+  set val CS $NO_SLOT; calc lsh CS 32; set val CSC 0xffffffffffffff;
+  get map $CTR 14 X; calc or CS %X; calc or CSC %X;
+  decl RK 8; decl U 8;
+  repeat $MEMBERS as I;
+    set val X %SEEN; calc rsh X $I; calc and X 1;
+    if val %X eq 0; next-repeat; end-if;
+    set val SL $I;
+    set val Y %SCB; calc add Y $I; get map $SC %Y TT;
+    set val X %PM; calc rsh X 16; calc and X 0xff;
+    if val %X eq $I; next-repeat; end-if;
+    set val RK 1;
+EOF
+    if [ -n "$POL_MATCH" ]; then
+cat <<EOF
+    if val %POL ne 0;
+      set val RK 0;
+$POL_RANK      if val %RK eq 0;
+        set val Y %POL; calc sub Y 1; set val X \$STRICT_POLICIES; calc rsh X %Y; calc and X 1;
+        if val %X eq 1; next-repeat; end-if;
+        set val RK 200;
+      end-if;
+    end-if;
+EOF
+    fi
+cat <<'EOF'
+    mget SL $M_UTIL U;
+    mget SL $M_TS V;
+    set val Y %NOW; calc sub Y %V; calc sub Y $STALE; calc rsh Y 63;   # 1: measured recently, else it is idle
+    calc mul U %Y;
+    mget SL $M_RSV V;
+    calc add U %V;
+    set val Y %U; calc rsh Y 63; calc xor Y 1; calc mul U %Y;           # a negative promise counts as 0
+    mget SL $M_CAP V;                                     # V = capacity
+    set val Y %FB; calc mul Y 1000; calc div Y %V;        # this flow's share of it (0 for a new flow)
+    calc add Y %U; calc sub Y %LIMIT; calc rsh Y 63; calc xor Y 1;      # Y = tier: 0 has room
+    set val X %PM; calc and X 1; calc and X %Y;
+    if val %X ne 0; next-repeat; end-if;                  # a move needs room on the target
+    set val X %PM; calc rsh X 8; calc and X 0xff;
+    if val %RK ge %X; if val %X ne 255; next-repeat; end-if; end-if;
+    set val X %POL; if val %X eq 0; if val %Y eq 0;
+      # room, no preference: remember two at random (power of two choices)
+      calc add N0 1;
+      set val X %N0; calc sub X 1;
+      if val %N0 gt 2; get random X; calc mod X %N0; end-if;
+      set val Y 0; if val %U lt 1000; set val Y 1000; calc sub Y %U; calc mul Y %V; calc div Y 1000; end-if;
+      if val %X eq 0; set val AS %SL; calc lsh AS 32; calc or AS %TT; set val AF %Y; end-if;
+      if val %X eq 1; set val BS %SL; calc lsh BS 32; calc or BS %TT; set val BF %Y; end-if;
+      next-repeat;
+    end-if; end-if;
+    calc lsh Y 40; set val X %RK; calc lsh X 32; calc or Y %X; calc or Y %U;
+    if val %Y lt %CSC; set val CSC %Y; set val CS %SL; calc lsh CS 32; calc or CS %TT; end-if;
+  end-repeat;
+  free SCB; free PM; free LIMIT; free V; free U; free RK; free SL;
+
+  if val %N0 gt 0;
+    if val %N0 ge 2;
+      get random X; calc and X 1;                         # equal free capacity: either one
+      if val %BF eq %AF; if val %X eq 1; set val AS %BS; end-if; end-if;
+      if val %BF gt %AF; set val AS %BS; end-if;
+    end-if;
+    set val CS %AS;
+  end-if;
+  set val X %CS; calc rsh X 32;
+  if val %X ne $NO_SLOT;
+    set val CH %X;
+    set val SALT %CS; calc and SALT 0xffffffff;
+  end-if;
+
+  if val %CH eq $NO_SLOT;
+    if val %NEED eq 1;
+      if val %POL gt 0;
+        set val Y %POL; calc sub Y 1; set val X $STRICT_POLICIES; calc rsh X %Y; calc and X 1;
+        if val %X eq 1; calc-map add $CTR $C_STRICT 1; drop; end-if;
+      end-if;
+      calc-map add $CTR $C_NOMEMBER 1;
+      continue;
+    end-if;
+    set val NEED 0;                                       # nowhere better: stay
+  end-if;
+  free TT; free CSC; free CS; free BF; free BS; free AF; free AS; free N0; free SEEN;
+  fib-lookup flow ports %SALT %D;                         # the sweep overwrote the results
+else;
+  if val %H eq 0; set val CH %CUR; end-if;                # a new flow on its hash
+end-if;
+
+# ------- forward on the chosen hash value
+decl FWD 8; set val FWD 0;
+if val %FIB_RESULT eq 0; set val FWD 1; end-if;
+if val %FIB_RESULT eq 7;
+  get map $IFM %FIB_IFINDEX X;
+  set val Y %X; calc rsh Y 8;
+  if val %Y ne 0; set val FWD 2; end-if;                  # tunnel: the kernel removes the Ethernet header
+end-if;
+if val %FWD eq 0;
+  if val %FIB_RESULT eq 7; calc-map add $CTR $C_NONEIGH 1; end-if;
+  continue;
+end-if;
+
+# ------- record what was decided
+if val %CH ne $NO_SLOT;
+@METABLOCK@
+  if val %H eq 0;
+    # a place for the new flow: free or idle, in either of its two positions
+    calc-map add $CTR $C_NEW 1;
+    cfg V8 7 $D_IDLE;
+    decl B2 8; set val B2 %K; calc and B2 $(N - 1); calc xor B2 1; calc mul B2 $FW;
+    set val H 2;
+    get map $FT %B X;
+    if val %X eq 0; set val H 1; end-if;
+    if val %H eq 2;
+      ftget B $F_SEEN X; set val Y %NOW; calc sub Y %X;
+      if val %Y ge %V8; set val H 1; end-if;
+    end-if;
+    if val %H eq 2;
+      set val B %B2;
+      get map $FT %B X;
+      if val %X eq 0; set val H 1; end-if;
+      if val %H eq 2;
+        ftget B $F_SEEN X; set val Y %NOW; calc sub Y %X;
+        if val %Y ge %V8; set val H 1; end-if;
+      end-if;
+    end-if;
+    free B2; free V8;
+    if val %H eq 1;
+      set val X 0; ftset B $F_TAG X;
+      ftset B $F_ADDR ADDR; ftset B $F_META META;
+      set val X 0; ftset B $F_BYTES X; ftset B $F_WBYTES X; ftset B $F_BPS X; ftset B $F_MOVED X;
+      ftset B $F_WIN NOW; ftset B $F_SEEN NOW; ftset B $F_FIRST NOW;
+      decl LEN 8; get len LEN; set val Q %B; calc add Q $F_BYTES; calc-map add $FT %Q %LEN; free LEN;
+      set val ST 0;
+    else;
+      calc-map add $CTR $C_COLLIDE 1;                     # table full here: it keeps its hash, unrecorded
+    end-if;
+  end-if;
+  if val %H eq 1;
+    if val %NEED ge 2;
+      # Pay for the move, and promise the load to the target.
+      mget CUR $M_CAP X;
+      set val Y %FB; calc mul Y 1000; calc div Y %X;
+      calc not Y; calc add Y 1;
+      set val Q %CUR; calc mul Q $MF; calc add Q $M_RSV; calc-map add $MT %Q %Y;
+      mget CH $M_CAP X;
+      set val Y %FB; calc mul Y 1000; calc div Y %X;
+      set val Q %CH; calc mul Q $MF; calc add Q $M_RSV; calc-map add $MT %Q %Y;
+      if val %NEED eq 2;
+        set val Y %FB; calc not Y; calc add Y 1;
+        set val Q %CUR; calc mul Q $MF; calc add Q $M_BUDGET; calc-map add $MT %Q %Y;
+        calc-map add $CTR $C_MOVED 1;
+      else;
+        set val RSN $R_PREFERRED; calc-map add $CTR $C_PREFERRED 1;
+      end-if;
+      ftset B $F_MOVED NOW;
+    end-if;
+    if val %RSN eq $R_ROUTE;
+      if val %CH eq %CUR;
+        set val RSN %ST; calc rsh RSN 24; calc and RSN 0xff;  # kept: not a decision
+      else;
+        calc-map add $CTR $C_ROUTE 1; ftset B $F_MOVED NOW;
+      end-if;
+    end-if;
+    if val %RSN eq $R_SHED; calc-map add $CTR $C_SHED 1; end-if;
+    if val %RSN eq $R_POLICY; calc-map add $CTR $C_POLICY 1; end-if;
+    # state: slot, policy, rank, reason, moves
+    decl OM 8; set val OM %ST; calc rsh OM 32; calc and OM 0xffff;
+    if val %NEED ge 1; if val %CUR ne $NO_SLOT; if val %CH ne %CUR; calc add OM 1; end-if; end-if; end-if;
+    decl NST 8; set val NST %OM; calc lsh NST 8; calc or NST %RSN; calc lsh NST 8;
+    set val RK2 0;
+EOF
+    # placeholder replaced below: rank of the chosen member
+    cat <<'EOF'
+@RANKCH@
+    calc or NST %RK2; calc lsh NST 8; calc or NST %POL; calc lsh NST 8; calc or NST %CH;
+    ftset B $F_STATE NST;
+    set val X %SALT; calc lsh X 32; set val Y %FIB_IFINDEX; calc or X %Y;
+    ftset B $F_ASSIGN X;
+    ftset B $F_TAG K;
+    # the event log
+    # (a new flow placed by hash, policy or balance would flood it)
+    set val X 0;
+    if val %RSN eq $R_SHED; set val X 1; end-if;
+    if val %RSN eq $R_MOVED; set val X 1; end-if;
+    if val %RSN eq $R_ROUTE; set val X 1; end-if;
+    if val %RSN eq $R_PREFERRED; set val X 1; end-if;
+    if val %X eq 1;
+      decl EVI 8; calc-map add $CTR $C_EVHEAD 1 EVI;
+      calc mod EVI $EVN; calc mul EVI $EVW;
+      set map $EV %EVI %NOW;
+      calc add EVI 1; set map $EV %EVI %ADDR;
+      calc add EVI 1; set map $EV %EVI %META;
+      calc add EVI 1; set val X %CUR; calc lsh X 8; calc or X %CH; calc lsh X 8; calc or X %RSN; calc lsh X 8; calc or X %POL;
+      set map $EV %EVI %X;
+      calc add EVI 1; set map $EV %EVI %FB;
+      free EVI;
+    end-if;
+    free NST; free OM;
+  end-if;
+  free META; free ADDR;
+end-if;
+
+# ------- the same changes any router makes
+decl TV 1; decl CK 4; decl CY 4;
+get bytes 22 1 TV; calc sub TV 1; set bytes 22 1 %TV;
+get bytes 24 2 CK; calc add CK 0x100;
+set val CY %CK; calc rsh CY 16;
+calc and CK 0xffff; calc add CK %CY;
+calc hton CK 16; set bytes 24 2 %CK;
+if val %FWD eq 1;
+  set dst-mac %FIB_DMAC; set src-mac %FIB_SMAC;
+end-if;
+redirect %FIB_IFINDEX egress;
+end-match;
+EOF
+}
+
+# ---------------------------------------------------------------- output
+emit() {  # interface direction text
+    local d
+    if [ "$OUTDIR" = - ]; then
+        echo "=== $1/$2/$PRIO.bpfc"
+        cat
+        return
+    fi
+    d=$OUTDIR/$1/$2
+    mkdir -p "$d"
+    cat > "$d/$PRIO.bpfc"
+}
+
+# the rank of member CH under policy POL, for the state word and "status flows"
+RANKCH=""
+if [ -n "$POL_RANK" ]; then
+    RANKCH="    if val %POL ne 0; set val RK2 200; decl SL2 8; set val SL2 %CH;"$'\n'
+    RANKCH+=$(sed 's/%SL /%SL2 /g; s/set val RK /set val RK2 /g' <<< "$POL_RANK")$'\n'
+    RANKCH+="    free SL2; end-if;"
+fi
+
+meta_block() {
+    echo '  decl ADDR 8; decl META 8; decl W4 4; decl W1 1; decl W2 2;'
+    echo '  get ip-src W4; set val ADDR %W4; calc lsh ADDR 32; get ip-dst W4; set val Y %W4; calc or ADDR %Y;'
+    echo '  get ip-proto W1; set val META %W1; calc lsh META 8; get ip-tos W1; set val Y %W1; calc rsh Y 2; calc or META %Y; calc lsh META 32;'
+    if [ "$WANT_PORTS" = 1 ]; then
+cat <<'XEOF'
+  get bytes 20 2 W2; set val X %W2; calc and X 0x3fff;
+  if val %X eq 0;
+    get ip-proto W1; set val Y %W1; set val X 0;
+    if val %Y eq 6; set val X 1; end-if; if val %Y eq 17; set val X 1; end-if; if val %Y eq 132; set val X 1; end-if;
+    if val %X eq 1;
+      get l4-off X; set val Y 0; get bytes %X 2 Y; calc lsh Y 16; calc or META %Y;
+      calc add X 2; set val Y 0; get bytes %X 2 Y; calc or META %Y;
+    end-if;
+  end-if;
+XEOF
+    fi
+    echo '  free W2; free W1; free W4;'
+}
+selector_text() {
+    local t mb; t=$(gen_selector "$1"); mb=$(meta_block)
+    t=${t//@METABLOCK@/$mb}
+    t=${t//@RANKCH@/$RANKCH}
+    # RK2 is declared where it is first used
+    t=${t/"    set val RK2 0;"/"    decl RK2 8; set val RK2 0;"}
+    printf '%s\n' "$t"
+}
+
+for n in "${INGRESS[@]}"; do selector_text "$n" | emit "$n" ingress; done
+for n in "${MEMBER[@]}"; do
+    gen_member_egress "$n" | emit "$n" egress
+    in_ingress=0
+    for x in "${INGRESS[@]}"; do [ "$x" = "$n" ] && in_ingress=1; done
+    [ "$in_ingress" = 1 ] || gen_member_ingress "$n" | emit "$n" ingress
+done
+if [ "$OUTDIR" != - ]; then
+    echo "Wrote programs for ${#INGRESS[@]} ingress and ${#MEMBER[@]} member interface(s) under $OUTDIR (priority $PRIO)"
+fi
