@@ -7,6 +7,7 @@ each frame and redirects it to the sniffer, which compares the bytes.
   xdp-resize.py send <iface> <case>           send the case's frame
   xdp-resize.py check <case> <out>            exit 0 if the frame is what the case expects
 """
+import os
 import sys
 import time
 
@@ -16,6 +17,8 @@ from scapy.contrib.mpls import MPLS  # noqa: E402
 conf.verb = 0
 SRC, DST = "02:00:00:00:00:01", "02:00:00:00:00:02"
 NS, ND = "02:00:00:00:00:aa", "02:00:00:00:00:bb"   # MACs the programs write
+# pw-encap: the MACs fib-lookup finds on the DUT (test-xdp.sh passes them)
+FS, FD = os.environ.get("FIB_SMAC", NS), os.environ.get("FIB_DMAC", ND)
 PAY = bytes(range(64)) * 3                          # 192 recognisable bytes
 
 
@@ -38,9 +41,9 @@ CASES = {
     "decap-mpls-cw": (Ether(src=SRC, dst=DST, type=0x8847) / MPLS(label=16, s=1, ttl=9) / Raw(b"\0\0\0\0") / ip(),
                       bytes(inner())),
     # README / test-mpls.sh pseudowire: next-hop label 20, PW label 16, whole Ethernet frame inside
-    "pw-encap": (inner(), bytes(Ether(src=NS, dst=ND, type=0x8847)) + mpls_word(20, 0, 225) + mpls_word(16, 1, 225)
+    "pw-encap": (inner(), bytes(Ether(src=FS, dst=FD, type=0x8847)) + mpls_word(20, 0, 225) + mpls_word(16, 1, 225)
                  + bytes(inner())),
-    "pw-encap-cw": (inner(), bytes(Ether(src=NS, dst=ND, type=0x8847)) + mpls_word(20, 0, 225) + mpls_word(16, 1, 225)
+    "pw-encap-cw": (inner(), bytes(Ether(src=FS, dst=FD, type=0x8847)) + mpls_word(20, 0, 225) + mpls_word(16, 1, 225)
                     + b"\0\0\0\0" + bytes(inner())),
     "pw-decap": (Ether(src=NS, dst=ND, type=0x8847) / MPLS(label=16, s=1, ttl=225) / inner(), bytes(inner())),
     "pw-decap-cw": (Ether(src=NS, dst=ND, type=0x8847) / MPLS(label=16, s=1, ttl=225) / Raw(b"\0\0\0\0") / inner(),
@@ -76,6 +79,9 @@ CASES.update({
     "match-vlan-id-range": (tagged(15), bytes(tagged(300))),
     "match-vlan-id-untagged": (inner(), bytes(inner())),
 })
+
+# pw-encap with a next hop fib-lookup cannot resolve: the frame is not encapsulated
+CASES["pw-encap-miss"] = (inner(), bytes(inner()))
 
 # del-l2-bytes: 4 bytes after the Ethernet header go, the EtherType stays what it was
 _del = Ether(src=SRC, dst=DST, type=0x0800) / Raw(b"\xee" * 4) / ip()

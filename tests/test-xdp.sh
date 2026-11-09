@@ -183,14 +183,17 @@ $A "$BPFC" -i va -d xdp -D; umount "$T/m"
 echo "resizing (bpf_xdp_adjust_head / adjust_tail), frames checked byte for byte"
 RZ="python3 $TOP/tests/xdp-resize.py"
 rz() { # rz <case> <program>: the program changes XB's frame and redirects it to XC
+	# (a program with its own redirect is used as it is)
 	local c=$1; shift
-	if ! load "$* ; redirect vc"; then test_fail "XDP-resize-$c (load)"; return; fi
+	local p="$*"
+	[[ "$p" == *redirect* ]] || p="$p ; redirect vc"
+	if ! load "$p"; then test_fail "XDP-resize-$c (load)"; return; fi
 	rm -f "$T/rz.out" "$T/rz.ready"
 	$C $RZ sniff vd "$T/rz.out" "$T/rz.ready" & local s=$!
 	for _ in $(seq 80); do [ -e "$T/rz.ready" ] && break; sleep 0.1; done
 	$B $RZ send vb "$c"
 	wait $s
-	check "XDP-resize-$c" $RZ check "$c" "$T/rz.out"
+	check "XDP-resize-$c" env FIB_SMAC="$VC_MAC" FIB_DMAC="$VD_MAC" $RZ check "$c" "$T/rz.out"
 }
 mpls_words() { # the README / test-mpls.sh label arithmetic: next-hop label 20, PW label 16, TTL 225
 	echo "decl MPLS1 4; decl MPLS2 4;
@@ -201,8 +204,20 @@ NS_MAC=02:00:00:00:00:aa; ND_MAC=02:00:00:00:00:bb
 rz encap-mpls     "match ip; encap-mpls label 16 bos 1"
 rz decap-mpls     "match mpls; decap-mpls"
 rz decap-mpls-cw  "match mpls; decap-mpls"
-rz pw-encap       "$(mpls_words) add-head-bytes 22; set bytes 14 4 %MPLS1; set bytes 18 4 %MPLS2; set eth-proto 0x8847; set dst-mac $ND_MAC; set src-mac $NS_MAC"
-rz pw-encap-cw    "$(mpls_words) add-head-bytes 26; set bytes 14 4 %MPLS1; set bytes 18 4 %MPLS2; set eth-proto 0x8847; set dst-mac $ND_MAC; set src-mac $NS_MAC"
+# pw-encap as in test-mpls.sh's mpls_out_nh: fib-lookup (a bpf helper call from the XDP
+# path) gives the next hop's MACs and interface, toward XC through vc. The kernel's FIB
+# helper needs forwarding on and the neighbour resolved.
+$A sysctl -qw net.ipv4.conf.all.forwarding=1 net.ipv4.conf.va.forwarding=1
+ip -n xdpXA neigh replace 10.8.0.2 lladdr "$VD_MAC" dev vc
+pw_encap() { # pw_encap <next hop> <header bytes>
+	echo "decl FIB_DMAC 8; $(mpls_words) fib-lookup $1; match val %FIB_RESULT eq 0; add-head-bytes $2;
+	set bytes 14 4 %MPLS1; set bytes 18 4 %MPLS2; set eth-proto 0x8847; set dst-mac %FIB_DMAC; set src-mac %FIB_SMAC;
+	redirect %FIB_IFINDEX egress" | tr -d '\n\t'
+}
+rz pw-encap       "$(pw_encap 10.8.0.2 22)"
+rz pw-encap-cw    "$(pw_encap 10.8.0.2 26)"
+rz pw-encap-miss  "$(pw_encap 10.7.7.7 22); end-match; redirect vc"
+$A sysctl -qw net.ipv4.conf.all.forwarding=0 net.ipv4.conf.va.forwarding=0
 rz pw-decap       "match mpls; match mpls-label 16; del-bytes 0 18"
 rz pw-decap-cw    "match mpls; match mpls-label 16; del-bytes 0 22"
 rz add-l2-bytes   "add-l2-bytes 20"
