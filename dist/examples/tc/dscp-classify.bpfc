@@ -1,0 +1,14 @@
+# dscp-classify.bpfc: mark traffic for QoS by application (TC egress, on the
+# WAN interface or on a host). The DSCP goes in the IP header (the checksum
+# is updated), so routers along the path and the local qdisc can queue by it.
+const EF 0xb8;           # DSCP 46: voice
+const AF41 0x88;         # DSCP 34: interactive video
+const CS1 0x20;          # DSCP 8: bulk, below best effort
+define class PROTO PORTS TOS;
+  match $PROTO; match $PROTO-dst $PORTS; set ip-tos $TOS; continue; end-match; end-match;
+end-define;
+class udp 5060 $EF;
+class udp 10000-20000 $EF;
+class udp 3478-3497 $AF41;     # STUN/TURN media (conferencing)
+class tcp 873 $CS1;            # rsync
+class tcp 20-21 $CS1;          # ftp

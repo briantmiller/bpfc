@@ -297,6 +297,13 @@ timeout 4 ip netns exec TX ping -c2 -i 0.1 -W 2 -Q 192 10.0.0.2 &>/dev/null && t
 #ip netns exec TX ./bpfc $COPTS -m /var/run/bpf/RX -r OFF14
 #kill -9 $P1
 
+# calc with constants that do not fit a 32-bit immediate (they used to be truncated or sign-extended)
+ip netns exec TX ./bpfc $COPTS -i tx0 -d egress -p 93 -m /var/run/bpf/TX 'decl X 8; set val X 24000000000; calc div X 8000000000; set map C64 0 %X; decl Y 8; set val Y 0x123456789; calc and Y 0xffffffff; set map C64 1 %Y; decl Z 8; set val Z 5; calc add Z 0x100000000; set map C64 2 %Z' >/dev/null || test_fail Calc-64-install
+ip netns exec TX ping -c1 -W1 2.2.2.2 &>/dev/null
+c64() { ip netns exec TX ./bpfc -m /var/run/bpf/TX -r C64 | awk -v k=$(printf "0x%016x" $1) '$3 == k {print $6}'; }
+[ "$(c64 0)" = 0x0000000000000003 ] && [ "$(c64 1)" = 0x0000000023456789 ] && [ "$(c64 2)" = 0x0000000100000005 ] && test_pass Calc-64-bit-constants || test_fail Calc-64-bit-constants
+ip netns exec TX ./bpfc -i tx0 -d egress -p 93 -D
+
 kill -9 $TCP_PID &>/dev/null 
 wait &>/dev/null
 for C in TX RX RX2 HOST1

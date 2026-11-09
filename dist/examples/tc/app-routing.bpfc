@@ -1,0 +1,12 @@
+# app-routing.bpfc: send some applications out of a second uplink (TC ingress,
+# on the LAN interface, before the routing decision). The program only marks
+# the packets; ip rule picks the routing table for the mark:
+#   ip rule add fwmark 2 table 200
+#   ip route add default via <second uplink's gateway> table 200
+const MARK 2;
+define app PROTO PORTS;
+  match $PROTO; match $PROTO-dst $PORTS; set skb-mark $MARK; end-match; end-match;
+end-define;
+app udp 5060;            # SIP
+app udp 10000-20000;     # RTP
+app tcp 3389;            # remote desktop

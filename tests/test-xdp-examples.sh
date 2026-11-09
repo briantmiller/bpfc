@@ -116,8 +116,9 @@ spread() { # spread <cmd...>: packets arriving at N1 and N2 while cmd runs -> "n
 	local a1 a2; a1=$(rxp xeN1 n1); a2=$(rxp xeN2 n2); "$@"; sleep 0.5
 	echo "$(( $(rxp xeN1 n1) - a1 )) $(( $(rxp xeN2 n2) - a2 ))"
 }
-both() { set -- $1; [ "$1" -gt 0 ] && [ "$2" -gt 0 ]; }
-one()  { set -- $1; [ "$1" -eq 0 ] || [ "$2" -eq 0 ]; }
+# rx_packets also counts the odd ARP/ND probe, so a path needs more than 3 packets to count
+both() { set -- $1; [ "$1" -gt 3 ] && [ "$2" -gt 3 ]; }
+one()  { set -- $1; [ "$1" -le 3 ] || [ "$2" -le 3 ]; }
 many_sources() { for a in $(seq 10 41); do udp_flows 1 5000 10.1.0.$a; done; }
 $R sysctl -qw net.ipv4.fib_multipath_hash_policy=0
 f0=$(fwd); s=$(spread many_sources)
