@@ -131,6 +131,27 @@ bpfc-dataplane-gen -i eth0 --profile leo --carrier udp --peer learn --protect 10
 
 See [dataplane/DESIGN.md](dataplane/DESIGN.md) for the wire format, the algorithms and the limits; `make check-dataplane` (root) runs its end-to-end tests (`dataplane`, `dataplane-udp`, `verifier-budget`).
 
+### Bandwidth-aware ECMP (`bpfc-ecmp-gen`)
+
+A routing layer on a single router: it balances flows over the next hops of the kernel's multipath routes by measured load, with interface preferences per traffic class. It needs nothing from its neighbours and is independent of the FEC dataplane. Packets change only as in any router (TTL, IP checksum, MACs). IPv4.
+
+```bash
+sysctl -w net.ipv4.ip_forward=1 net.ipv4.fib_multipath_hash_policy=1
+
+bpfc-ecmp-gen --member eth1=1g --member eth2=1g --member wg0=100m --ingress eth0 \
+              --mode l4 --shed 70 --move 90 --clear 80 \
+              --policy "src 10.1.0.0/16 dscp 46 prefer wg0,eth1"
+systemctl reload bpfcd
+
+bpfc-ecmp-status                       # load per interface
+bpfc-ecmp-status flows -n 20           # bit/s, path and last decision per flow
+bpfc-ecmp-status events                # recent decisions
+bpfc-ecmp-status bw wg0 80m            # new bandwidth, at once (an outside estimator can do this)
+bpfc-ecmp-status set shed 60           # thresholds and timers at run time
+```
+
+Every packet re-checks that its flow's interface is still a member of the route, so a withdrawn next hop is noticed on the next packet. See [ecmp/DESIGN.md](ecmp/DESIGN.md); `make check-ecmp` (root) runs the end-to-end tests.
+
 ---
 
 ## Language Syntax
@@ -220,6 +241,7 @@ Allows persistent data storage across packets and network interfaces.
   * `iface <iface | %VAR>` - the incoming interface (default: the packet's).
   * `output` - look up as for a locally generated packet; `direct` - the main table, skipping ip rules; `tbid <table>` - that table (direct); `skip-neigh` - do not require a resolved neighbour.
   * `flow` - IPv4: also give the packet's protocol, TCP/UDP/SCTP ports (not for fragments) and TOS, so a multipath route is chosen per flow (`fib_multipath_hash_policy=1`) the same way the kernel chooses it, and ip rules on ports, protocol or TOS apply.
+  * `ports %VAR` - IPv4: use `VAR` (low 16 bits the source port, next 16 the destination port) and protocol UDP as the multipath hash input, in place of the packet's. With `fib_multipath_hash_policy=1` a different value can select a different next hop of the route, so a program can find which next hops a route has, and keep a flow on one of them: the result can only be that next hop while it is still in the route. After `flow` it replaces the ports and protocol and keeps the TOS. `ip rule` matches on ports or protocol see these values.
   * `%FIB_RESULT`: 0 success, 1 blackhole, 2 unreachable, 3 prohibit, 4 not forwarded (e.g. a local address), 5 forwarding disabled on the interface, 7 no neighbour entry (`%FIB_IFINDEX` is still set), 8 fragmentation needed.
   * The option bits used to be one off (`output` was a direct lookup, `tbid` an output one, `src <address>` was ignored); they are the kernel's now.
 * `redirect <ifname | %VAR> [egress|ingress]`, `redirect-neigh` - Terminal forwarding actions. If direction is not specified, will use same direction as attached mode.

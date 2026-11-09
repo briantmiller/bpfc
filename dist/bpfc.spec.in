@@ -49,7 +49,7 @@ pinned maps and execs bpfcd in the foreground. Includes an example
 Containerfile and run instructions.
 
 %package scripts
-Summary:        Program generators for bpfc: the FEC/ARQ dataplane, with profiles and examples
+Summary:        Program generators for bpfc: the FEC/ARQ dataplane and bandwidth-aware ECMP
 BuildArch:      noarch
 Requires:       %{name} = %{version}-%{release}
 Requires:       bash
@@ -62,7 +62,10 @@ correction, retransmission, loss and capacity measurement) for a link as
 bpfc programs that bpfcd installs, over Layer 2 or UDP, from built-in or
 local profiles. bpfc-dataplane-status shows its state and changes its
 runtime settings. Includes the built-in profiles, the design notes and
-example programs.
+example programs. bpfc-ecmp-gen generates a bandwidth-aware, policy-based
+ECMP layer over the kernel's multipath routes, and bpfc-ecmp-status shows
+per-interface load, per-flow bandwidth and decisions and sets each
+interface's bandwidth.
 
 %prep
 %autosetup
@@ -111,6 +114,10 @@ example programs.
 %files scripts
 %{_sbindir}/bpfc-dataplane-gen
 %{_sbindir}/bpfc-dataplane-status
+%{_sbindir}/bpfc-ecmp-gen
+%{_sbindir}/bpfc-ecmp-status
+%dir %{_sysconfdir}/bpfc/ecmp
+%dir %{_sysconfdir}/bpfc/ecmp/profiles.d
 %dir %{_sysconfdir}/bpfc/dataplane
 %dir %{_sysconfdir}/bpfc/dataplane/profiles.d
 %{_datadir}/bpfc/

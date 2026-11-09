@@ -1,0 +1,377 @@
+#!/bin/bash
+# bpfc-ecmp-status - what the bandwidth-aware ECMP layer is doing: load per
+# interface, bandwidth per flow, the decisions it took, and the settings that
+# can change at run time. Reads the pinned maps with "bpfc -r".
+#
+# Must run as root (reads pinned eBPF maps).
+
+BPFC=${BPFC:-bpfc}
+CONF=/etc/bpfc/bpfc.conf
+CONFIG_DIR=""; MAP_DIR=""; PREFIX=em; JSON=0; TOP=30; FILTER_IF=""; ALL=0; SORT=bps
+
+usage() {
+cat <<EOF
+Usage: $(basename "$0") [options] [command]
+
+Commands:
+  status                 load and state of every member (the default)
+  flows                  bandwidth, path and last decision per flow
+  events                 recent decisions, newest first
+  counters               decision counters
+  bw                     the bandwidth in use per interface
+  bw IF                  ... for one interface
+  bw IF RATE             change it now (k/m/g bit/s); survives reloads
+  bw IF default          return to the generated value
+  set SETTING VALUE      change a setting at run time
+  unset SETTING          return it to the generated value
+  settings               the settings in force
+  sync                   tell the programs about the members now, instead of
+                         waiting for each one's next packet
+
+Options:
+  -P NAME   map prefix (default em)
+  -m DIR    pinned map directory (default: map_dir in $CONF, else /sys/fs/bpf)
+  -c DIR    program directory (default: config_dir in $CONF, else /etc/bpfc/interfaces.d)
+  -j        JSON (status, flows, events, counters, bw, settings)
+  -n N      flows: how many (default 30, 0 = all)
+  -i IF     flows: only those on this interface
+  -a        flows: also idle ones (default: seen in the last 10 s)
+  -s KEY    flows: sort by bps (default), bytes or age
+  -h        help
+
+Settings: shed, move, clear, force (percent); elephant (rate); dwell, gap,
+idle, move-interval (durations); place hash|balanced; moves on|off.
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+conf_value() { [ -r "$CONF" ] && sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" | tail -1; }
+
+# Options may come before or after the command.
+CMD=; ARGS=()
+while [ $# -gt 0 ]; do
+    OPTIND=1
+    while getopts "P:m:c:jn:i:as:h" o; do
+        case $o in
+        P) PREFIX=$OPTARG ;;
+        m) MAP_DIR=$OPTARG ;;
+        c) CONFIG_DIR=$OPTARG ;;
+        j) JSON=1 ;;
+        n) TOP=$OPTARG ;;
+        i) FILTER_IF=$OPTARG ;;
+        a) ALL=1 ;;
+        s) SORT=$OPTARG ;;
+        h) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    [ $# -gt 0 ] || break
+    if [ -z "$CMD" ]; then CMD=$1; else ARGS+=("$1"); fi
+    shift
+done
+CMD=${CMD:-status}
+set -- "${ARGS[@]}"
+
+[ -n "$MAP_DIR" ] || MAP_DIR=$(conf_value map_dir)
+[ -n "$MAP_DIR" ] || MAP_DIR=/sys/fs/bpf
+[ -n "$CONFIG_DIR" ] || CONFIG_DIR=$(conf_value config_dir)
+[ -n "$CONFIG_DIR" ] || CONFIG_DIR=/etc/bpfc/interfaces.d
+[ -e "$MAP_DIR/${PREFIX}_m" ] || die "no ECMP maps with prefix $PREFIX in $MAP_DIR (are the programs loaded?)"
+
+MF=24; FW=12
+M_CAP_SET=0; M_CAP=1; M_TXB=2; M_TS=5; M_RATE=6; M_UTIL=7; M_RSV=8; M_BUDGET=9; M_MOVING=10; M_IFINDEX=13
+declare -A CFGIDX=([shed]=0 [move]=1 [clear]=2 [force]=3 [elephant]=4 [dwell]=5 [gap]=6 [idle]=7 [place]=8 [moves]=9 [move-interval]=10)
+SETTING_ORDER=(shed move clear force elephant dwell gap move-interval idle place moves)
+
+MEMBERS=()      # name per slot
+declare -A SLOT_OF DEFCAP
+load_members() {
+    local f line s n c
+    for f in "$CONFIG_DIR"/*/egress/*.bpfc; do
+        [ -r "$f" ] || continue
+        line=$(sed -n '1p' "$f")
+        [[ "$line" == "# bpfc-ecmp prefix=$PREFIX "*"role=member "* ]] || continue
+        s=${line##*slot=}; s=${s%% *}
+        n=${line##*if=}; n=${n%% *}
+        c=${line##*cap=}; c=${c%% *}
+        MEMBERS[$s]=$n; SLOT_OF[$n]=$s; DEFCAP[$n]=$c
+    done
+    [ ${#MEMBERS[@]} -gt 0 ] || die "no programs with prefix $PREFIX under $CONFIG_DIR"
+}
+# dump MAP: "index value" decimal lines, with non-zero values only
+dump() {
+    "$BPFC" -m "$MAP_DIR" -r "$1" 2>/dev/null | awk '/Key:/ {
+        k = strtonum($3); v = $NF
+        if (v != "0x0000000000000000") print k, v }'
+}
+NOW_NS=$(awk '{printf "%.0f", $1 * 1e9}' /proc/uptime)
+fmt_rate() {
+    awk -v b="$1" 'BEGIN{ if (b>=1e9) printf "%.2fG", b/1e9; else if (b>=1e6) printf "%.1fM", b/1e6;
+                          else if (b>=1e3) printf "%.0fk", b/1e3; else printf "%d", b }'
+}
+parse_rate() {
+    local v=${1,,}
+    v=${v%/s}; v=${v%bps}; v=${v%bit}; v=${v%b}
+    [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)([kmgt]?)$ ]] || return 1
+    awk -v n="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[3]}" \
+        'BEGIN{m=(u=="k")?1e3:(u=="m")?1e6:(u=="g")?1e9:(u=="t")?1e12:1; printf "%.0f\n", n*m}'
+}
+parse_dur_ns() {
+    local v=${1,,}
+    [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)(us|ms|s|m)?$ ]] || return 1
+    awk -v n="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[3]:-ms}" \
+        'BEGIN{m=(u=="us")?1e3:(u=="ms")?1e6:(u=="s")?1e9:6e10; printf "%.0f\n", n*m}'
+}
+wr() { "$BPFC" -m "$MAP_DIR" -w "$1" "$2" "$3" >/dev/null || die "cannot write $1[$2]"; }
+
+# the flows, as tab-separated fields, on stdin of the awk programs below
+REASONS='split("hash shed policy balanced moved route-change preferred", RN, " ")'
+
+cmd_status() {
+    load_members
+    local names; names=$(IFS=,; echo "${MEMBERS[*]}")
+    { dump "${PREFIX}_m" | sed 's/^/m /'; dump "${PREFIX}_ft" | sed 's/^/f /'; dump "${PREFIX}_cfg" | sed 's/^/c /'; } |
+    awk -v names="$names" -v MF=$MF -v FW=$FW -v now="$NOW_NS" -v json=$JSON '
+    function v(a) { return strtonum(a) }
+    $1=="m" { i=$2; s=int(i/MF); m[s, i-s*MF]=v($3) }
+    $1=="f" { i=$2; e=int(i/FW); f[e, i-e*FW]=v($3); e_seen[e]=1 }
+    $1=="c" { c[$2]=v($3) }
+    END {
+      n=split(names, N, ",")
+      for (e in e_seen) if (f[e,0]) { s=and(f[e,9],255); if (now-f[e,8] < 10e9) fl[s]++ }
+      shed = (c[0] ? c[0]-1 : -1)
+      if (!json) printf "%-16s %4s %10s %10s %6s %10s %6s %s\n", "Interface","Slot","Bandwidth","Tx","Util","Rx","Flows","State"
+      for (s=0; s<n; s++) {
+        cap=m[s,1]; if (m[s,0]) cap=m[s,0]
+        age=now-m[s,5]; tx=m[s,6]; u=m[s,7]
+        if (m[s,5]==0 || age>2e9) { tx=0; u=0 }
+        rx=m[s,17]; if (m[s,19]==0 || now-m[s,19]>2e9) rx=0
+        st = m[s,13] ? (m[s,10] ? "moving" : "ok") : "not seen yet"
+        if (json) {
+          printf "%s{\"interface\":\"%s\",\"slot\":%d,\"bandwidth\":%d,\"tx_bps\":%d,\"utilisation_pct\":%.1f,\"rx_bps\":%d,\"flows\":%d,\"state\":\"%s\"}", (s?",":"["), N[s+1], s, cap, tx, u/10, rx, fl[s]+0, st
+        } else {
+          printf "%-16s %4d %10s %10s %5.1f%% %10s %6d %s\n", N[s+1], s, rate(cap), rate(tx), u/10, rate(rx), fl[s]+0, st
+        }
+      }
+      if (json) print "]"
+    }
+    function rate(b) { if (b>=1e9) return sprintf("%.2fG",b/1e9); if (b>=1e6) return sprintf("%.1fM",b/1e6); if (b>=1e3) return sprintf("%.0fk",b/1e3); return sprintf("%d",b) }'
+}
+
+cmd_flows() {
+    load_members
+    local names; names=$(IFS=,; echo "${MEMBERS[*]}")
+    dump "${PREFIX}_ft" | awk -v names="$names" -v FW=$FW -v now="$NOW_NS" -v json=$JSON -v top="$TOP" \
+        -v only="$FILTER_IF" -v all=$ALL -v sortk="$SORT" '
+    function v(a) { return strtonum(a) }
+    function ip(x) { return sprintf("%d.%d.%d.%d", and(rshift(x,24),255), and(rshift(x,16),255), and(rshift(x,8),255), and(x,255)) }
+    function rate(b) { if (b>=1e9) return sprintf("%.2fG",b/1e9); if (b>=1e6) return sprintf("%.1fM",b/1e6); if (b>=1e3) return sprintf("%.0fk",b/1e3); return sprintf("%d",b) }
+    function bytes(b) { if (b>=1e9) return sprintf("%.1fG",b/1e9); if (b>=1e6) return sprintf("%.1fM",b/1e6); if (b>=1e3) return sprintf("%.0fk",b/1e3); return sprintf("%d",b) }
+    BEGIN { n=split(names,N,","); split("hash shed policy balanced moved route-change preferred",RN," ") }
+    { i=$1; e=int(i/FW); f[e,i-e*FW]=$2; seen[e]=1 }
+    END {
+      c=0
+      for (e in seen) {
+        if (f[e,0]=="") continue
+        last=v(f[e,8]); idle=(now-last)/1e9; if (idle<0) idle=0
+        if (!all && idle>10) continue
+        stw=v(f[e,9]); s=and(stw,255); pol=and(rshift(stw,8),255); rk=and(rshift(stw,16),255); rs=and(rshift(stw,24),255); mv=and(rshift(stw,32),65535)
+        ifn=N[s+1]; if (only!="" && ifn!=only) continue
+        a=f[e,1]; src=strtonum("0x" substr(a,3,8)); dst=strtonum("0x" substr(a,11,8))
+        m=v(f[e,2]); pr=and(rshift(m,40),255); ds=and(rshift(m,32),255); sp=and(rshift(m,16),65535); dp=and(m,65535)
+        bps=v(f[e,7]); if (idle>2) bps=0
+        by=v(f[e,4]); age=(now-v(f[e,11]))/1e9
+        sub2 = (sortk=="bytes") ? by : (sortk=="age") ? age : bps
+        c++; row[c]=e; key[c]=sub2; Fsrc[c]=ip(src); Fdst[c]=ip(dst); Pr[c]=pr; Ds[c]=ds; Sp[c]=sp; Dp[c]=dp
+        If[c]=ifn; Bp[c]=bps; By[c]=by; Ag[c]=age; Id[c]=idle; Rs[c]=RN[rs]; Mv[c]=mv; Pl[c]=pol
+      }
+      asorti_by(c)
+      lim=(top>0 && top<c)?top:c
+      if (json) { printf "[" }
+      else printf "%-22s %-22s %5s %4s %-10s %9s %9s %7s %6s %-13s %5s %4s\n","Source","Destination","Proto","DSCP","Interface","bit/s","Bytes","Age(s)","Idle","Decision","Moves","Pol"
+      for (i=1;i<=lim;i++) { j=ord[i]
+        sa=Fsrc[j]; da=Fdst[j]; if (Sp[j]||Dp[j]) { sa=sa ":" Sp[j]; da=da ":" Dp[j] }
+        if (json) printf "%s{\"src\":\"%s\",\"dst\":\"%s\",\"proto\":%d,\"dscp\":%d,\"interface\":\"%s\",\"bps\":%d,\"bytes\":%d,\"age\":%.1f,\"idle\":%.1f,\"decision\":\"%s\",\"moves\":%d,\"policy\":%d}",(i>1?",":""),sa,da,Pr[j],Ds[j],If[j],Bp[j],By[j],Ag[j],Id[j],Rs[j],Mv[j],Pl[j]
+        else printf "%-22s %-22s %5d %4d %-10s %9s %9s %7.1f %6.1f %-13s %5d %4s\n",sa,da,Pr[j],Ds[j],If[j],rate(Bp[j]),bytes(By[j]),Ag[j],Id[j],Rs[j],Mv[j],(Pl[j]?Pl[j]:"-")
+      }
+      if (json) print "]"
+      else printf "%d flow(s)%s\n", c, (lim<c)?sprintf(", showing %d (-n 0 for all)",lim):""
+    }
+    function asorti_by(n,    i,j,t) {
+      for (i=1;i<=n;i++) ord[i]=i
+      # heap-free insertion is fine for display sizes; large tables use a merge via sort
+      if (n>2000) { cmd="sort -k2,2gr"; for (i=1;i<=n;i++) print i, key[i] |& cmd; close(cmd,"to"); i=0; while ((cmd |& getline l)>0) { split(l,p," "); ord[++i]=p[1] } close(cmd); return }
+      for (i=2;i<=n;i++) { t=ord[i]; j=i-1; while (j>=1 && key[ord[j]]<key[t]) { ord[j+1]=ord[j]; j-- } ord[j+1]=t }
+    }'
+}
+
+cmd_events() {
+    load_members
+    local names; names=$(IFS=,; echo "${MEMBERS[*]}")
+    dump "${PREFIX}_ev" | awk -v names="$names" -v now="$NOW_NS" -v json=$JSON '
+    function v(a) { return strtonum(a) }
+    function ip(x) { return sprintf("%d.%d.%d.%d", and(rshift(x,24),255), and(rshift(x,16),255), and(rshift(x,8),255), and(x,255)) }
+    function rate(b) { if (b>=1e9) return sprintf("%.2fG",b/1e9); if (b>=1e6) return sprintf("%.1fM",b/1e6); if (b>=1e3) return sprintf("%.0fk",b/1e3); return sprintf("%d",b) }
+    BEGIN { n=split(names,N,","); split("hash shed policy balanced moved route-change preferred",RN," ") }
+    { i=$1; e=int(i/5); f[e,i-e*5]=v($2); if (i%5==1) raw[e]=$2; seen[e]=1 }
+    END {
+      c=0; for (e in seen) if (f[e,0]) { c++; o[c]=e }
+      for (i=2;i<=c;i++) { t=o[i]; j=i-1; while (j>=1 && f[o[j],0]<f[t,0]) { o[j+1]=o[j]; j-- } o[j+1]=t }
+      if (json) printf "["; else printf "%9s %-22s %-22s %-10s %-10s %-13s %9s\n","Ago(s)","Source","Destination","From","To","Decision","bit/s"
+      for (i=1;i<=c;i++) { e=o[i]
+        a=raw[e]; m=f[e,2]; d=f[e,3]
+        pr=and(rshift(m,40),255); sp=and(rshift(m,16),65535); dp=and(m,65535)
+        sa=ip(strtonum("0x" substr(a,3,8))); da=ip(strtonum("0x" substr(a,11,8))); if (sp||dp) { sa=sa ":" sp; da=da ":" dp }
+        fr=and(rshift(d,24),255); to=and(rshift(d,16),255); rs=and(rshift(d,8),255); fn=(fr==255)?"-":N[fr+1]; tn=(to==255)?"-":N[to+1]
+        ago=(now-f[e,0])/1e9; if (ago<0) ago=0
+        if (json) printf "%s{\"ago\":%.1f,\"src\":\"%s\",\"dst\":\"%s\",\"from\":\"%s\",\"to\":\"%s\",\"decision\":\"%s\",\"bps\":%d}",(i>1?",":""),ago,sa,da,fn,tn,RN[rs],f[e,4]
+        else printf "%9.1f %-22s %-22s %-10s %-10s %-13s %9s\n",ago,sa,da,fn,tn,RN[rs],rate(f[e,4])
+      }
+      if (json) print "]"
+    }'
+}
+
+cmd_counters() {
+    "$BPFC" -m "$MAP_DIR" -r "${PREFIX}_ctr" 2>/dev/null | awk -v json=$JSON '
+    BEGIN { split("new_flows shed_to_other moved route_changes policy_placed table_full no_valid_member unmanaged neighbour_pending strict_dropped events sweeps back_to_preferred kept_after_route_change", K, " ") }
+    /Key:/ { k=strtonum($3); if (k<14) v[k]=strtonum($NF) }
+    END { if (json) printf "{"; for (i=0;i<14;i++) { if (json) printf "%s\"%s\":%d",(i?",":""),K[i+1],v[i]; else printf "%-26s %d\n",K[i+1],v[i] } if (json) print "}" }'
+}
+
+cmd_bw() {
+    load_members
+    local n=$1 r=$2 s b
+    if [ -z "$n" ]; then
+        local first=1 cap src
+        [ "$JSON" = 1 ] && printf "[" || printf "%-16s %12s %s\n" Interface "bit/s" Source
+        for n in "${MEMBERS[@]}"; do
+            s=${SLOT_OF[$n]}
+            cap=$(dump "${PREFIX}_m" | awk -v k=$((s * MF + M_CAP_SET)) '$1==k{print strtonum($2)}')
+            if [ -n "$cap" ]; then src=map; else cap=${DEFCAP[$n]}; src=generated; fi
+            if [ "$JSON" = 1 ]; then
+                [ "$first" = 1 ] || printf ","
+                printf '{"interface":"%s","bandwidth":%s,"source":"%s"}' "$n" "$cap" "$src"; first=0
+            else
+                printf "%-16s %12s %s\n" "$n" "$cap" "$src"
+            fi
+        done
+        [ "$JSON" = 1 ] && echo "]"
+        return
+    fi
+    [ -n "${SLOT_OF[$n]+x}" ] || die "$n is not a member"
+    s=${SLOT_OF[$n]}
+    if [ -z "$r" ]; then
+        b=$(dump "${PREFIX}_m" | awk -v k=$((s * MF + M_CAP_SET)) '$1==k{print strtonum($2)}')
+        echo "${b:-${DEFCAP[$n]}}"
+        return
+    fi
+    if [ "$r" = default ]; then
+        wr "${PREFIX}_m" $((s * MF + M_CAP_SET)) 0
+        wr "${PREFIX}_m" $((s * MF + M_CAP)) "${DEFCAP[$n]}"
+    else
+        b=$(parse_rate "$r") || die "not a rate: $r"
+        [ "$b" -gt 0 ] || die "the bandwidth must be above 0"
+        wr "${PREFIX}_m" $((s * MF + M_CAP_SET)) "$b"
+        wr "${PREFIX}_m" $((s * MF + M_CAP)) "$b"
+    fi
+}
+
+setting_value() {   # setting value -> number stored
+    local k=$1 x=$2
+    case $k in
+    shed|move|clear|force) [[ "$x" =~ ^[0-9]+$ ]] && [ "$x" -ge 1 ] && [ "$x" -le 100 ] || die "$k: 1-100"; echo $((x * 10)) ;;
+    elephant) parse_rate "$x" || die "$k: not a rate: $x" ;;
+    dwell|gap|idle|move-interval) parse_dur_ns "$x" || die "$k: not a duration: $x" ;;
+    place) case $x in hash) echo 0 ;; balanced) echo 1 ;; *) die "place: hash or balanced" ;; esac ;;
+    moves) case $x in on) echo 1 ;; off) echo 0 ;; *) die "moves: on or off" ;; esac ;;
+    *) die "unknown setting $k" ;;
+    esac
+}
+cmd_set() {
+    local k=$1 x=$2
+    [ -n "${CFGIDX[$k]+x}" ] || die "unknown setting $k"
+    [ -n "$x" ] || die "set $k needs a value"
+    local n; n=$(setting_value "$k" "$x") || exit 1
+    wr "${PREFIX}_cfg" "${CFGIDX[$k]}" $((n + 1))
+}
+cmd_unset() {
+    local k=$1
+    [ -n "${CFGIDX[$k]+x}" ] || die "unknown setting $k"
+    wr "${PREFIX}_cfg" "${CFGIDX[$k]}" 0
+}
+# the value generated into the member programs
+gen_const() {
+    local f
+    for f in "$CONFIG_DIR"/*/egress/*.bpfc; do
+        grep -q "^# bpfc-ecmp prefix=$PREFIX " "$f" 2>/dev/null || continue
+        sed -n "s/.*const $1 \\([0-9]*\\).*/\\1/p" "$f" | head -1
+        return
+    done
+}
+cmd_settings() {
+    local k i x
+    local cfg; cfg=$(dump "${PREFIX}_cfg")
+    [ "$JSON" = 1 ] && printf "{"
+    local first=1
+    for k in "${SETTING_ORDER[@]}"; do
+        i=${CFGIDX[$k]}
+        x=$(awk -v i="$i" '$1==i{print strtonum($2)}' <<< "$cfg")
+        local src=generated show
+        if [ -n "$x" ]; then
+            src=set; x=$((x - 1))
+            case $k in
+            shed|move|clear|force) show=$((x / 10))% ;;
+            elephant) show=$(fmt_rate "$x") ;;
+            dwell|gap|idle|move-interval) show=$((x / 1000000))ms ;;
+            place) [ "$x" = 1 ] && show=balanced || show=hash ;;
+            moves) [ "$x" = 1 ] && show=on || show=off ;;
+            esac
+        else
+            case $k in
+            shed|move|clear|force) show=$(( $(gen_const "D_${k^^}") / 10 ))% ;;
+            elephant) show=$(fmt_rate "$(gen_const D_ELEPHANT)") ;;
+            dwell|gap) show=$(( $(gen_const "D_${k^^}") / 1000000 ))ms ;;
+            idle) show=$(( $(gen_const D_IDLE) / 1000000 ))ms ;;
+            move-interval) show=$(( $(gen_const D_MOVEINT) / 1000000 ))ms ;;
+            place) [ "$(gen_const D_PLACE)" = 1 ] && show=balanced || show=hash ;;
+            moves) [ "$(gen_const D_MOVES)" = 1 ] && show=on || show=off ;;
+            esac
+        fi
+        if [ "$JSON" = 1 ]; then
+            [ "$first" = 1 ] || printf ","
+            printf '"%s":{"value":"%s","source":"%s"}' "$k" "$show" "$src"; first=0
+        else
+            printf "%-14s %s\n" "$k" "$show"
+        fi
+    done
+    [ "$JSON" = 1 ] && echo "}"
+}
+cmd_sync() {
+    load_members
+    local n s idx t l3 val cap
+    for n in "${MEMBERS[@]}"; do
+        [ -r "/sys/class/net/$n/ifindex" ] || continue
+        s=${SLOT_OF[$n]}
+        idx=$(cat "/sys/class/net/$n/ifindex"); t=$(cat "/sys/class/net/$n/type")
+        l3=256; [ "$t" = 1 ] && l3=0
+        val=$(( (s + 1) | l3 ))
+        wr "${PREFIX}_if" "$idx" "$val"
+        wr "${PREFIX}_m" $((s * MF + M_IFINDEX)) "$idx"
+        cap=$(dump "${PREFIX}_m" | awk -v k=$((s * MF + M_CAP_SET)) '$1==k{print strtonum($2)}')
+        wr "${PREFIX}_m" $((s * MF + M_CAP)) "${cap:-${DEFCAP[$n]}}"
+    done
+}
+
+case $CMD in
+status)   cmd_status ;;
+flows)    cmd_flows ;;
+events)   cmd_events ;;
+counters) cmd_counters ;;
+bw)       cmd_bw "$@" ;;
+set)      cmd_set "$@" ;;
+unset)    cmd_unset "$@" ;;
+settings) cmd_settings ;;
+sync)     cmd_sync ;;
+*)        usage >&2; exit 2 ;;
+esac
