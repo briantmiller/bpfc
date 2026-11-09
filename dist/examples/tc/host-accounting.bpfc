@@ -1,0 +1,15 @@
+# host-accounting.bpfc: bytes per inside host, in both directions, on the
+# WAN interface: attach the same file to ingress and egress. $HOOK tells the
+# two apart: going out, the inside host is the source; coming in, the
+# destination. Maps BYTES_egress and BYTES_ingress, key = the IPv4 address.
+#   bpfc -m /sys/fs/bpf -r BYTES_egress
+match ip;
+  decl HOST 4; decl LEN 8;
+  when $HOOK == egress;
+    get ip-src HOST;
+  otherwise;
+    get ip-dst HOST;
+  end-when;
+  get len LEN;
+  calc-map add BYTES_$HOOK %HOST %LEN;
+end-match;

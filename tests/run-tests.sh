@@ -6,7 +6,7 @@
 #
 #   suite   compile, preprocessor, stack, bpfc, util, loops, nat, mpls, mpls-xdp, frag,
 #           mpls-frag, throttle, cve-2026-98432, bpfcd, container, install,
-#           verifier-budget, xdp, xdp-examples, dataplane, dataplane-udp or pytest
+#           verifier-budget, xdp, xdp-examples, tc-examples, dataplane, dataplane-udp or pytest
 #           (default: all of them, in that order)
 #   -f      print failures only (plus the summary)
 #   -v      print each suite's full output, not just its results
@@ -22,7 +22,7 @@
 
 cd "$(dirname "$0")/.." || exit 1
 
-ALL="compile preprocessor stack bpfc util loops nat mpls mpls-xdp frag mpls-frag throttle cve-2026-98432 bpfcd container install verifier-budget xdp xdp-examples dataplane dataplane-udp pytest"
+ALL="compile preprocessor stack bpfc util loops nat mpls mpls-xdp frag mpls-frag throttle cve-2026-98432 bpfcd container install verifier-budget xdp xdp-examples tc-examples dataplane dataplane-udp pytest"
 FAILURES_ONLY=0
 VERBOSE=0
 LOGDIR=

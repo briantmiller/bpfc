@@ -1500,7 +1500,17 @@ void compile_math(int op, const char *d_var, const char *s_val) {
         else emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, s_off));
         emit(((struct bpf_insn){.code=BPF_ALU64|op|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2}));
     } else {
-        emit(((struct bpf_insn){.code=BPF_ALU64|op|BPF_K, .dst_reg=BPF_REG_1, .imm=strtoul(s_val,NULL,0)}));
+        /* An immediate is a signed 32-bit field: a constant above 0x7fffffff
+         * (8000000000, 0xffffffff, ...) used to be truncated or sign-extended.
+         * Those go through a register (ld_imm64); small ones are unchanged. */
+        unsigned long long v = strtoull(s_val, NULL, 0);
+        if (v <= 0x7fffffffULL || v >= 0xffffffff80000000ULL) {   /* sign-extends to itself */
+            emit(((struct bpf_insn){.code=BPF_ALU64|op|BPF_K, .dst_reg=BPF_REG_1, .imm=(int32_t)v}));
+        } else {
+            emit(((struct bpf_insn){.code=BPF_LD|BPF_DW|BPF_IMM, .dst_reg=BPF_REG_2, .imm=(int32_t)(uint32_t)v}));
+            emit(((struct bpf_insn){.code=0, .imm=(int32_t)(uint32_t)(v >> 32)}));
+            emit(((struct bpf_insn){.code=BPF_ALU64|op|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2}));
+        }
     }
 
     if (d_sz==1) emit(BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_1, d_off));

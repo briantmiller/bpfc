@@ -1,0 +1,21 @@
+# policer.bpfc: a token-bucket policer: traffic from $NET gets $RATE bit/s
+# with bursts of $BURST bytes, and the excess is dropped (TC ingress or
+# egress). The bucket holds wire time in ns, so there is no division per
+# packet: it fills with the time that passes and each packet costs its
+# length times $NS_PER_BYTE. Map POLICE: 0 = time of the last packet,
+# 1 = credit in ns. It is shared by all CPUs without locking (approximate).
+# TCP backs off on the drops; to delay instead of drop, see edt-pacing.bpfc.
+const NET 10.1.0.0/24;
+const RATE 8000000;                          # bit/s (up to 8 Gbit/s: whole ns per byte)
+const BURST 30000;                           # bytes
+const NS_PER_BYTE $(8000000000 / RATE);
+match ip; match ip-src $NET;
+  decl NOW 8; decl LAST 8; decl CREDIT 8; decl COST 8;
+  get time NOW; get map POLICE 0 LAST; get map POLICE 1 CREDIT;
+  calc add CREDIT %NOW; calc sub CREDIT %LAST;                   # + the time since the last packet
+  if CREDIT gt $(BURST * NS_PER_BYTE); set val CREDIT $(BURST * NS_PER_BYTE); end-if;
+  set map POLICE 0 %NOW;
+  get len COST; calc mul COST $NS_PER_BYTE;
+  if CREDIT lt %COST; set map POLICE 1 %CREDIT; drop; end-if;
+  calc sub CREDIT %COST; set map POLICE 1 %CREDIT;
+end-match; end-match;

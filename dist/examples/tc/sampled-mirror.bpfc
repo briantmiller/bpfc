@@ -1,0 +1,8 @@
+# sampled-mirror.bpfc: copy one packet in $RATE to a monitoring interface (an
+# IDS, a capture host) without slowing the traffic itself (TC ingress or
+# egress; clone exists only in TC). Restrict it with a match to sample a
+# subnet or a service.
+const RATE 100;
+const MIRROR mon0;
+decl R 4; get random R; calc mod R $RATE;
+if R eq 0; clone $MIRROR egress; end-if;

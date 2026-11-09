@@ -1,0 +1,18 @@
+# edt-pacing.bpfc: pace traffic to $NET at $RATE bit/s by giving each packet
+# an earliest departure time (TC egress, with the fq qdisc on the interface:
+# tc qdisc replace dev eth0 root fq). Packets are delayed, not dropped, so TCP
+# sees a clean bottleneck. Map PACE key 0 is the next free departure time;
+# packets more than $HORIZON ns ahead are dropped.
+const NET 10.9.9.0/24;
+const RATE 16000000;
+const HORIZON 200000000;           # 200 ms of queue
+match ip; match ip-dst $NET;
+  decl NOW 8; decl NEXT 8; decl LEN 8; decl AHEAD 8;
+  get time NOW; get map PACE 0 NEXT;
+  if NEXT lt %NOW; set val NEXT %NOW; end-if;
+  set val AHEAD %NEXT; calc sub AHEAD %NOW;
+  if AHEAD gt $HORIZON; drop; end-if;
+  set tstamp %NEXT;
+  get len LEN; calc mul LEN $(8000000000 / RATE);              # ns this packet takes on the wire
+  calc add NEXT %LEN; set map PACE 0 %NEXT;
+end-match; end-match;

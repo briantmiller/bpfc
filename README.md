@@ -481,7 +481,7 @@ Note: The `ip-frag <size> <max>` and `ip-defrag` commands will automatically ins
 
 When performing an `ip-defrag` the maximum reassembled size is limited by the interface MTU. When forwarding, it is recommended to attach the `ip-frag` to ingress and `ip-defrag` to egress.  When operating as the end host, do the opposite with `ip-frag` on the egress and `ip-defrag` on the ingress.   
 
-The examples below are XDP programs that use the preprocessor (`const`, `define`, `include`, `repeat`, `when`, `$IFNAME`/`$IFINDEX`/`$IFMAC`) for common network problems. They are installed in `/usr/share/doc/bpfc/examples/xdp/` (`dist/examples/xdp/` in the source), and `tests/test-xdp-examples.sh` runs each of them as it is. Attach one with `bpfc -i <iface> -d xdp -f <file>`, or let bpfcd do it: copy it to `/etc/bpfc/interfaces.d/<iface>/xdp.bpfc` (or `%all%/`, `%nic%/`, ... for every interface; `$IFNAME`, `$IFINDEX` and `$IFMAC` are then each interface's own). Constants can be changed without editing the file: `-s MSS=1400`.
+The examples below use the preprocessor (`const`, `define`, `include`, `repeat`, `when`, `$IFNAME`/`$IFINDEX`/`$IFMAC`/`$HOOK`) for common network problems: 6–12 are XDP programs (the earliest hook, for forwarding and filtering at line rate), 13–18 TC programs (both directions, and the kernel's skb metadata: marks for policy routing, departure times for pacing, clones for mirroring). They are installed in `/usr/share/doc/bpfc/examples/{xdp,tc}/` (`dist/examples/` in the source), and `tests/test-xdp-examples.sh` and `tests/test-tc-examples.sh` run each of them as it is. Attach one with `bpfc -i <iface> -d xdp -f <file>` (or `-d ingress|egress -p <prio>`), or let bpfcd do it: copy it to `/etc/bpfc/interfaces.d/<iface>/xdp.bpfc` or `.../<iface>/{ingress,egress}/<prio>.bpfc` (or `%all%/`, `%nic%/`, ... for every interface; `$IFNAME`, `$IFINDEX` and `$IFMAC` are then each interface's own). Constants can be changed without editing the file: `-s MSS=1400`.
 
 ### 6. Fast-path IPv4 routing in XDP
 
@@ -713,3 +713,171 @@ bpfc -i eth0 -d xdp -s LIMIT=50 -f syn-guard.bpfc
 ```
 
 Legitimate clients behind one NAT share a source address, so set the limit for the busiest of them; SYN cookies (`net.ipv4.tcp_syncookies`) remain the kernel's defence against a flood from many sources.
+
+### 13. Application-based policy routing (two uplinks)
+
+Send some applications out of a second uplink (a cheaper link, a low-latency one, a VPN) while everything else keeps the default route, as an SD-WAN edge does. The TC ingress program on the LAN interface runs before the routing decision and only marks the packets; `ip rule` picks the table for the mark. Each `app` line is one use of a `define`:
+
+```
+# app-routing.bpfc: send some applications out of a second uplink (TC ingress,
+# on the LAN interface, before the routing decision). The program only marks
+# the packets; ip rule picks the routing table for the mark:
+#   ip rule add fwmark 2 table 200
+#   ip route add default via <second uplink's gateway> table 200
+const MARK 2;
+define app PROTO PORTS;
+  match $PROTO; match $PROTO-dst $PORTS; set skb-mark $MARK; end-match; end-match;
+end-define;
+app udp 5060;            # SIP
+app udp 10000-20000;     # RTP
+app tcp 3389;            # remote desktop
+```
+
+```bash
+ip rule add fwmark 2 table 200
+ip route add default via 192.0.2.1 dev wan2 table 200
+bpfc -i lan0 -d ingress -p 10 -f app-routing.bpfc
+```
+
+The kernel still forwards, so netfilter, NAT and conntrack apply as usual (with conntrack, `CONNMARK` can keep the mark for the replies). It steers forwarded traffic: the router's own packets are routed before TC egress sees them, so a mark set there comes too late; mark those with the socket (`SO_MARK`) or netfilter's `OUTPUT` chain instead.
+
+### 14. DSCP classification for QoS
+
+Mark traffic by application so that the queues along the path (the local qdisc, the WAN routers) can prioritise it: voice as EF, conferencing media as AF41, bulk transfers as CS1, below best effort. The IP checksum is updated with the DSCP. The first matching `class` wins (`continue` ends the program):
+
+```
+# dscp-classify.bpfc: mark traffic for QoS by application (TC egress, on the
+# WAN interface or on a host). The DSCP goes in the IP header (the checksum
+# is updated), so routers along the path and the local qdisc can queue by it.
+const EF 0xb8;           # DSCP 46: voice
+const AF41 0x88;         # DSCP 34: interactive video
+const CS1 0x20;          # DSCP 8: bulk, below best effort
+define class PROTO PORTS TOS;
+  match $PROTO; match $PROTO-dst $PORTS; set ip-tos $TOS; continue; end-match; end-match;
+end-define;
+class udp 5060 $EF;
+class udp 10000-20000 $EF;
+class udp 3478-3497 $AF41;     # STUN/TURN media (conferencing)
+class tcp 873 $CS1;            # rsync
+class tcp 20-21 $CS1;          # ftp
+```
+
+```bash
+bpfc -i wan0 -d egress -p 10 -f dscp-classify.bpfc
+```
+
+On egress it also marks what the host itself sends; on a router, attach it to the LAN interface's ingress to mark before forwarding. A qdisc that queues by DSCP (`cake diffserv4`, or `prio`/`htb` with `tc filter` on the TOS) then does the scheduling.
+
+### 15. Sampled port mirroring
+
+Send a copy of one packet in `$RATE` to an IDS or a capture host, without slowing the traffic itself. `clone` exists only in TC (XDP cannot copy a packet):
+
+```
+# sampled-mirror.bpfc: copy one packet in $RATE to a monitoring interface (an
+# IDS, a capture host) without slowing the traffic itself (TC ingress or
+# egress; clone exists only in TC). Restrict it with a match to sample a
+# subnet or a service.
+const RATE 100;
+const MIRROR mon0;
+decl R 4; get random R; calc mod R $RATE;
+if R eq 0; clone $MIRROR egress; end-if;
+```
+
+```bash
+bpfc -i eth0 -d ingress -p 5 -s RATE=1000 -s MIRROR=mon0 -f sampled-mirror.bpfc
+```
+
+Put a `match` around it to sample one subnet or service, and attach it to both directions to see both halves of the flows.
+
+### 16. Token-bucket policer
+
+Limit traffic from a subnet (a guest network, a customer) to a rate, with a burst allowance, and drop the excess. The bucket holds wire time in nanoseconds rather than bytes, so each packet costs a multiplication and there is no rounding: at high packet rates a bucket in bytes, earning `elapsed * rate` per packet, would round every packet's share down to nothing.
+
+```
+# policer.bpfc: a token-bucket policer: traffic from $NET gets $RATE bit/s
+# with bursts of $BURST bytes, and the excess is dropped (TC ingress or
+# egress). The bucket holds wire time in ns, so there is no division per
+# packet: it fills with the time that passes and each packet costs its
+# length times $NS_PER_BYTE. Map POLICE: 0 = time of the last packet,
+# 1 = credit in ns. It is shared by all CPUs without locking (approximate).
+# TCP backs off on the drops; to delay instead of drop, see edt-pacing.bpfc.
+const NET 10.1.0.0/24;
+const RATE 8000000;                          # bit/s (up to 8 Gbit/s: whole ns per byte)
+const BURST 30000;                           # bytes
+const NS_PER_BYTE $(8000000000 / RATE);
+match ip; match ip-src $NET;
+  decl NOW 8; decl LAST 8; decl CREDIT 8; decl COST 8;
+  get time NOW; get map POLICE 0 LAST; get map POLICE 1 CREDIT;
+  calc add CREDIT %NOW; calc sub CREDIT %LAST;                   # + the time since the last packet
+  if CREDIT gt $(BURST * NS_PER_BYTE); set val CREDIT $(BURST * NS_PER_BYTE); end-if;
+  set map POLICE 0 %NOW;
+  get len COST; calc mul COST $NS_PER_BYTE;
+  if CREDIT lt %COST; set map POLICE 1 %CREDIT; drop; end-if;
+  calc sub CREDIT %COST; set map POLICE 1 %CREDIT;
+end-match; end-match;
+```
+
+```bash
+bpfc -i lan0 -d ingress -p 10 -m /sys/fs/bpf -s NET=192.168.50.0/24 -s RATE=20000000 -f policer.bpfc
+```
+
+A policer drops, and TCP reacts to drops by backing off hard; for traffic the host sends, pacing (18) delays instead.
+
+### 17. Per-host traffic accounting, both directions
+
+Bytes per inside host, in each direction, on the WAN interface: one file attached to both hooks, telling them apart with `$HOOK` (when going out, the inside host is the source; coming in, the destination). The maps are `BYTES_egress` and `BYTES_ingress`, keyed by the IPv4 address in host order:
+
+```
+# host-accounting.bpfc: bytes per inside host, in both directions, on the
+# WAN interface: attach the same file to ingress and egress. $HOOK tells the
+# two apart: going out, the inside host is the source; coming in, the
+# destination. Maps BYTES_egress and BYTES_ingress, key = the IPv4 address.
+#   bpfc -m /sys/fs/bpf -r BYTES_egress
+match ip;
+  decl HOST 4; decl LEN 8;
+  when $HOOK == egress;
+    get ip-src HOST;
+  otherwise;
+    get ip-dst HOST;
+  end-when;
+  get len LEN;
+  calc-map add BYTES_$HOOK %HOST %LEN;
+end-match;
+```
+
+```bash
+for h in ingress egress; do bpfc -i wan0 -d $h -p 20 -m /sys/fs/bpf -f host-accounting.bpfc; done
+bpfc -m /sys/fs/bpf -r BYTES_egress           # key 0x...c0a83202 = 192.168.50.2
+```
+
+### 18. Rate limiting without drops: EDT pacing
+
+Pace traffic to a destination (a backup target, a remote site with a small link) by giving each packet an earliest departure time. The `fq` qdisc holds each packet until then, so the traffic leaves at `$RATE` without drops, and TCP sees a clean bottleneck instead of losses. Packets that would wait more than `$HORIZON` are dropped, to bound the queue:
+
+```
+# edt-pacing.bpfc: pace traffic to $NET at $RATE bit/s by giving each packet
+# an earliest departure time (TC egress, with the fq qdisc on the interface:
+# tc qdisc replace dev eth0 root fq). Packets are delayed, not dropped, so TCP
+# sees a clean bottleneck. Map PACE key 0 is the next free departure time;
+# packets more than $HORIZON ns ahead are dropped.
+const NET 10.9.9.0/24;
+const RATE 16000000;
+const HORIZON 200000000;           # 200 ms of queue
+match ip; match ip-dst $NET;
+  decl NOW 8; decl NEXT 8; decl LEN 8; decl AHEAD 8;
+  get time NOW; get map PACE 0 NEXT;
+  if NEXT lt %NOW; set val NEXT %NOW; end-if;
+  set val AHEAD %NEXT; calc sub AHEAD %NOW;
+  if AHEAD gt $HORIZON; drop; end-if;
+  set tstamp %NEXT;
+  get len LEN; calc mul LEN $(8000000000 / RATE);              # ns this packet takes on the wire
+  calc add NEXT %LEN; set map PACE 0 %NEXT;
+end-match; end-match;
+```
+
+```bash
+tc qdisc replace dev wan0 root fq
+bpfc -i wan0 -d egress -p 10 -m /sys/fs/bpf -s NET=198.51.100.0/24 -s RATE=50000000 -f edt-pacing.bpfc
+```
+
+The departure times are CLOCK_MONOTONIC, as `get time` gives them. The next-departure time in map `PACE` is shared by all CPUs without locking, so the rate is approximate under heavy parallel load; one key per destination (a map keyed by `ip-dst`) paces each destination separately.
