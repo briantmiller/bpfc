@@ -217,6 +217,10 @@ pw_encap() { # pw_encap <next hop> <header bytes>
 rz pw-encap       "$(pw_encap 10.8.0.2 22)"
 rz pw-encap-cw    "$(pw_encap 10.8.0.2 26)"
 rz pw-encap-miss  "$(pw_encap 10.7.7.7 22); end-match; redirect vc"
+# fib-lookup %VAR with the packet's own destination (host order, as get ip-dst gives it;
+# 10.8.0.2 differs from its byte swap), and FIB_IP_DST coming back in the same order
+rz fib-var        "decl D 4; get ip-dst D; fib-lookup %D; match val %FIB_RESULT eq 0; set dst-mac %FIB_DMAC; set src-mac %FIB_SMAC; redirect %FIB_IFINDEX; end-match; drop"
+rz fib-ip-dst     "decl D 4; get ip-dst D; fib-lookup %D; match val %FIB_RESULT eq 0; match val %FIB_IP_DST eq %D; set dst-mac %FIB_DMAC; set src-mac %FIB_SMAC; redirect %FIB_IFINDEX; end-match; end-match; drop"
 $A sysctl -qw net.ipv4.conf.all.forwarding=0 net.ipv4.conf.va.forwarding=0
 rz pw-decap       "match mpls; match mpls-label 16; del-bytes 0 18"
 rz pw-decap-cw    "match mpls; match mpls-label 16; del-bytes 0 22"
