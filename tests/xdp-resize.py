@@ -80,6 +80,10 @@ CASES.update({
     "match-vlan-id-untagged": (inner(), bytes(inner())),
 })
 
+# routed by fib-lookup %VAR (get ip-dst): only the MACs change, to the next hop's
+CASES["fib-var"] = (inner(), bytes(Ether(src=FS, dst=FD) / ip()))
+CASES["fib-ip-dst"] = (inner(), bytes(Ether(src=FS, dst=FD) / ip()))
+
 # pw-encap with a next hop fib-lookup cannot resolve: the frame is not encapsulated
 CASES["pw-encap-miss"] = (inner(), bytes(inner()))
 
