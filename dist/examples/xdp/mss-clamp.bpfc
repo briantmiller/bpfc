@@ -1,0 +1,24 @@
+# mss-clamp.bpfc: lower the MSS of TCP SYNs to $MSS (-s MSS=...), for links
+# with a smaller MTU (tunnels, PPPoE, IPsec). Walks the TCP options, at most
+# 10, so it finds the MSS wherever it is; recomputes the TCP checksum once.
+const MSS 1360;
+match tcp; match tcp-flags SYN;
+  decl VI 1; get bytes 14 1 VI;
+  match val %VI eq 0x45;                                        # IPv4 without IP options
+  decl O 2; decl E 2; decl K 1; decl L 1; decl M 2; decl CH 1;
+  set val O 54;                                                 # first option (14 + 20 + 20)
+  get bytes 46 1 E; calc rsh E 4; calc mul E 4; calc add E 34;  # end of the TCP header
+  repeat 10;
+    if O ge %E; break-repeat; end-if;
+    get bytes %O 1 K;
+    if K eq 0; break-repeat; end-if;                            # end of options
+    if K eq 1; calc add O 1; next-repeat; end-if;               # NOP
+    if K eq 2;                                                  # MSS: kind 2, length 4
+      calc add O 2; get bytes %O 2 M;
+      if M gt $MSS; set val M $MSS; calc hton M 16; set bytes %O 2 %M; set val CH 1; end-if;
+      break-repeat;
+    end-if;
+    calc add O 1; get bytes %O 1 L; calc add O %L; calc sub O 1;   # other option: skip its length
+  end-repeat;
+  if CH eq 1; recalc-tcp-csum; end-if;
+end-match; end-match; end-match;

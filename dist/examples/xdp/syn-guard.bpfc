@@ -1,0 +1,11 @@
+# syn-guard.bpfc: at most $LIMIT TCP SYNs per source address per window of
+# 2^30 ns (about a second); the rest are dropped. Counters live in an LRU hash
+# keyed by window and source, so old windows age out by themselves.
+const LIMIT 100;
+match tcp; match tcp-flags SYN;
+  decl K 8; decl S 4; decl OLD 8;
+  get time K; calc rsh K 30; calc lsh K 32;        # window number in the high half
+  get ip-src S; calc or K %S;
+  calc-map add SYNS %K 1 OLD;
+  if OLD ge $LIMIT; drop; end-if;
+end-match; end-match;

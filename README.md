@@ -185,6 +185,8 @@ Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val |
 * `tstamp` - `skb->tstamp`, 64-bit ns. On egress, a time in the future (CLOCK_MONOTONIC, as `get time`) holds the packet until then under the fq qdisc (earliest-departure-time pacing).
 * `skb-cb <0-4>` - 20-byte control buffer array (5x `u32` slots) for passing state across tail-calls and to the next TC priority.
 * `cpu` - (`get` only) number of the CPU running the program.
+* `time` - (`get` only) CLOCK_MONOTONIC in ns (`bpf_ktime_get_ns`), into an 8-byte variable.
+* `random` - (`get` only) a pseudo-random 32-bit number (`bpf_get_prandom_u32`).
 * `queue` - Hardware TX queue mapping.
 
 ### ALU Math Engine (`calc`)
@@ -213,7 +215,13 @@ Allows persistent data storage across packets and network interfaces.
 * `zero-buffer <MAP_NAME> <len> [dst]` / `zero-buffer-keyed <MAP_NAME> <key> <len> [dst]` - Zero part of a buffer.
 
 ### Routing & Forwarding
-* `fib-lookup [direct|output] [tbid] [skip-neigh] [src] [mark]` - Queries kernel routing tables. Populates `%FIB_RESULT`, `%FIB_SMAC`, `%FIB_DMAC`, `%FIB_IP_DST`, `%FIB_IP6_DST`, `%FIB_IFINDEX`. The address can be a 4-byte variable in host order, as `get ip-dst` gives it (`get ip-dst D; fib-lookup %D`); `%FIB_IP_DST` comes back in the same order.
+* `fib-lookup [options] [<address> | %VAR]` / `fib-lookup6 ...` - Queries the kernel's routing tables (`bpf_fib_lookup`), for the packet's destination unless an address is given. Populates `%FIB_RESULT`, `%FIB_SMAC`, `%FIB_DMAC`, `%FIB_IP_DST`, `%FIB_IP6_DST`, `%FIB_IFINDEX`. The address can be a 4-byte variable in host order, as `get ip-dst` gives it (`get ip-dst D; fib-lookup %D`); `%FIB_IP_DST` comes back in the same order. Options:
+  * `src <address | %VAR>` - the source to look up from (default: the packet's), so `ip rule from ...` applies; a bare `src` sets `BPF_FIB_LOOKUP_SRC`.
+  * `iface <iface | %VAR>` - the incoming interface (default: the packet's).
+  * `output` - look up as for a locally generated packet; `direct` - the main table, skipping ip rules; `tbid <table>` - that table (direct); `skip-neigh` - do not require a resolved neighbour.
+  * `flow` - IPv4: also give the packet's protocol, TCP/UDP/SCTP ports (not for fragments) and TOS, so a multipath route is chosen per flow (`fib_multipath_hash_policy=1`) the same way the kernel chooses it, and ip rules on ports, protocol or TOS apply.
+  * `%FIB_RESULT`: 0 success, 1 blackhole, 2 unreachable, 3 prohibit, 4 not forwarded (e.g. a local address), 5 forwarding disabled on the interface, 7 no neighbour entry (`%FIB_IFINDEX` is still set), 8 fragmentation needed.
+  * The option bits used to be one off (`output` was a direct lookup, `tbid` an output one, `src <address>` was ignored); they are the kernel's now.
 * `redirect <ifname | %VAR> [egress|ingress]`, `redirect-neigh` - Terminal forwarding actions. If direction is not specified, will use same direction as attached mode.
 * `clone <ifname | %VAR> [egress|ingress]` - Clone packet to specified interface. If direction is not specified, will use the same direction as attached mode.
 * `encap-gre ip-src <ip> ip-dst <ip> key <val>` / `decap-gre`
@@ -245,7 +253,7 @@ A preprocessing step runs before compilation; `bpfc -E` prints its output (plain
 * `repeat %VAR max <count> [as I]` ... `end-repeat` - The same, but stops once `%VAR <= $I`, so it runs `%VAR` times, at most `count`. `%VAR` is checked before each copy.
 * `break-repeat` / `next-repeat` - Leave the innermost repeat / skip to its next copy (a forward jump).
 * `when <expr>` ... [`otherwise` ...] `end-when` - Keep one branch, decided at compile time. `defined(NAME)` tests for a const; `when <word> == <word>` (or `!=`) compares text when a side is not a number, e.g. `when $IFKIND == gre`.
-* `$IFNAME`, `$IFINDEX`, `$IFTYPE`, `$IFKIND` - The `-i` interface's name, index, device type (ARPHRD) and kind (as for `dev-kind`), so one file can serve many interfaces (bpfcd's `%all%`): `set map CNT_$IFNAME 1 1`. `-s` overrides them.
+* `$IFNAME`, `$IFINDEX`, `$IFTYPE`, `$IFKIND`, `$IFMAC` - The `-i` interface's name, index, device type (ARPHRD), kind (as for `dev-kind`) and MAC address, so one file can serve many interfaces (bpfcd's `%all%`): `set map CNT_$IFNAME 1 1`. `-s` overrides them.
 * `$L3OFF` - Where the IP header starts: 14 behind an Ethernet header, 0 on devices whose packets start with it (device types none, GRE, IP6GRE, IPIP, IPv6 tunnel, SIT, raw IP, PPP: tun, wireguard, gre, ipip, sit, ...). bpfc reads every IP and L4 field from there by itself; `match ip`/`ip6`/`tcp`/... check the IP version instead of the EtherType; Ethernet fields and commands (MACs, `eth-proto`, VLAN, ARP, MPLS, push/pop-eth, encap/decap, strip/insert-l2, fib-lookup, ip-frag) are an error. Raw offsets (`get bytes`, `add-bytes`, `xor-packet`, ...) are frame offsets, so write them as `$(L3OFF + 9)` in a program for both kinds of device. Set by `-i`, or `-s L3OFF=0`.
 * `$NAME`, `$(expr)`, `$$` - Substitution anywhere in a command, constant arithmetic (C operators and precedence on 64-bit integers; `>>` is logical), and a literal `$`. Names inside `$( )` need no `$`. A name runs until the first character that is not a letter, digit or `_`: write `$(I)_x`, not `$I_x`.
 
@@ -472,3 +480,236 @@ bpfc -i eth0 -d egress -p 100 "ip-defrag"
 Note: The `ip-frag <size> <max>` and `ip-defrag` commands will automatically install matching criteria for IPv4 packets, but will ignore the DF bit by design. If it is desired to not fragment packets with the DF-bit set, use `match ip-ndf` before `ip-frag` to only match packets without the DF-bit set.
 
 When performing an `ip-defrag` the maximum reassembled size is limited by the interface MTU. When forwarding, it is recommended to attach the `ip-frag` to ingress and `ip-defrag` to egress.  When operating as the end host, do the opposite with `ip-frag` on the egress and `ip-defrag` on the ingress.   
+
+The examples below are XDP programs that use the preprocessor (`const`, `define`, `include`, `repeat`, `when`, `$IFNAME`/`$IFINDEX`/`$IFMAC`) for common network problems. They are installed in `/usr/share/doc/bpfc/examples/xdp/` (`dist/examples/xdp/` in the source), and `tests/test-xdp-examples.sh` runs each of them as it is. Attach one with `bpfc -i <iface> -d xdp -f <file>`, or let bpfcd do it: copy it to `/etc/bpfc/interfaces.d/<iface>/xdp.bpfc` (or `%all%/`, `%nic%/`, ... for every interface; `$IFNAME`, `$IFINDEX` and `$IFMAC` are then each interface's own). Constants can be changed without editing the file: `-s MSS=1400`.
+
+### 6. Fast-path IPv4 routing in XDP
+
+The kernel stays the control plane (routes, neighbours, `ip rule`, FRR, ...), and XDP does the forwarding: the destination is looked up in the kernel's FIB, TTL is decremented with an incremental checksum update, and the packet is redirected to the next hop's MAC and interface, before an skb is allocated, before GRO, netfilter and the stack. Whatever the program does not forward continues to the kernel, which handles it as before: a TTL about to expire (ICMP time exceeded), no route, a neighbour that is not resolved yet (the kernel resolves it; the next packets take the fast path), local destinations, ARP, IPv6, and IPv4 with a FIB result other than success.
+
+`ip-lib.bpfc`, a small macro library:
+```
+# ip-lib.bpfc: macros shared by the XDP examples (include ip-lib.bpfc;).
+
+# dec-ttl: IPv4 TTL - 1, with the header checksum updated incrementally
+# (RFC 1141: the checksum goes up by 0x0100, with the end-around carry).
+# get bytes gives host order; set bytes %VAR writes the variable as it is,
+# so the checksum is turned back to network order first.
+define dec-ttl;
+  decl TTL_$UNIQUE 1; decl CK_$UNIQUE 4; decl CY_$UNIQUE 4;
+  get bytes 22 1 TTL_$UNIQUE; calc sub TTL_$UNIQUE 1; set bytes 22 1 %TTL_$UNIQUE;
+  get bytes 24 2 CK_$UNIQUE; calc add CK_$UNIQUE 0x100;
+  set val CY_$UNIQUE %CK_$UNIQUE; calc rsh CY_$UNIQUE 16;
+  calc and CK_$UNIQUE 0xffff; calc add CK_$UNIQUE %CY_$UNIQUE;
+  calc hton CK_$UNIQUE 16; set bytes 24 2 %CK_$UNIQUE;
+end-define;
+```
+
+`router.bpfc`:
+```
+# router.bpfc: IPv4 forwarding in XDP. The kernel's routing table decides
+# (fib-lookup); the program forwards what it can and passes everything else
+# (TTL about to expire, no route, unresolved neighbour, local traffic, ARP,
+# IPv6, ...) to the kernel, which handles it as usual.
+#   bpfc -i eth0 -d xdp -f router.bpfc            (one per interface, or bpfcd %nic%/xdp.bpfc)
+#   -s FLOW=1: hash multipath routes per flow (protocol and ports), for
+#              net.ipv4.fib_multipath_hash_policy=1
+include ip-lib.bpfc;
+const FLOW 0;
+match ip;
+  decl TTL 1; get bytes 22 1 TTL;
+  match val %TTL gt 1;
+    decl DST 4; get ip-dst DST;
+    when FLOW;
+      fib-lookup flow %DST;
+    otherwise;
+      fib-lookup %DST;
+    end-when;
+    match val %FIB_RESULT eq 0;
+      dec-ttl;
+      set dst-mac %FIB_DMAC; set src-mac %FIB_SMAC;
+      redirect %FIB_IFINDEX;
+    end-match;
+  end-match;
+end-match;
+```
+
+```bash
+sysctl -w net.ipv4.ip_forward=1          # the FIB helper needs forwarding on
+for i in eth0 eth1 eth2; do bpfc -i $i -d xdp -f router.bpfc; done
+```
+
+Attach it to every interface a routed packet can arrive on. Netfilter does not see the fast-path packets: put filtering in front of it (see 8 and 12) or keep `match` blocks that `continue` the traffic the kernel must see. In generic mode XDP runs on any device; the native mode, when it comes, will skip the skb allocation altogether.
+
+#### Multipath (ECMP) routes
+
+With several next hops for a subnet the kernel's own selection applies, so nothing changes in the program:
+
+```bash
+ip route add 10.9.9.0/24 nexthop via 10.2.0.2 dev eth1 nexthop via 10.3.0.2 dev eth2
+# or nexthop objects: weights, and resilient groups (a removed next hop moves only its own flows)
+ip nexthop add id 1 via 10.2.0.2 dev eth1
+ip nexthop add id 2 via 10.3.0.2 dev eth2
+ip nexthop add id 10 group 1/2,3                                   # 1:3
+ip nexthop add id 11 group 1/2 type resilient buckets 64
+ip route add 10.9.9.0/24 nhid 11
+```
+
+`bpf_fib_lookup` hashes the fields the program gives it. With the default `net.ipv4.fib_multipath_hash_policy=0` that is the source and destination addresses, which `fib-lookup` always fills in: flows spread per host pair. With policy 1 (5-tuple) the protocol and ports are needed too, or every flow between two hosts takes the same path: compile with `-s FLOW=1` (`fib-lookup flow %DST`). Then the program picks the same next hop as the kernel would for the same flow, so a flow does not change path when some of its packets go through the kernel (a neighbour miss, say). Fragments are hashed without ports, so all fragments of a datagram take the same path. A next hop whose link goes down is dropped from the selection as for the kernel (`net.ipv4.conf.*.ignore_routes_with_linkdown=1` to drop it on carrier loss).
+
+To spread by something the kernel does not hash on (a weight per tenant, a map of pinned flows), choose the next hop in the program and look it up instead of the destination: `fib-lookup 10.2.0.2` gives that next hop's MAC and interface, as in the pseudowire example (3).
+
+### 7. TCP MSS clamping
+
+Tunnels, PPPoE and IPsec lower the path MTU; when ICMP "fragmentation needed" is filtered somewhere, TCP connections hang once they send full-size segments. Clamping the MSS in the SYNs makes both ends send segments that fit. The program walks the TCP options with an unrolled `repeat` (`break-repeat`, `next-repeat`), so it finds the MSS wherever it is, lowers it only when it is larger, and recomputes the checksum once.
+
+```
+# mss-clamp.bpfc: lower the MSS of TCP SYNs to $MSS (-s MSS=...), for links
+# with a smaller MTU (tunnels, PPPoE, IPsec). Walks the TCP options, at most
+# 10, so it finds the MSS wherever it is; recomputes the TCP checksum once.
+const MSS 1360;
+match tcp; match tcp-flags SYN;
+  decl VI 1; get bytes 14 1 VI;
+  match val %VI eq 0x45;                                        # IPv4 without IP options
+  decl O 2; decl E 2; decl K 1; decl L 1; decl M 2; decl CH 1;
+  set val O 54;                                                 # first option (14 + 20 + 20)
+  get bytes 46 1 E; calc rsh E 4; calc mul E 4; calc add E 34;  # end of the TCP header
+  repeat 10;
+    if O ge %E; break-repeat; end-if;
+    get bytes %O 1 K;
+    if K eq 0; break-repeat; end-if;                            # end of options
+    if K eq 1; calc add O 1; next-repeat; end-if;               # NOP
+    if K eq 2;                                                  # MSS: kind 2, length 4
+      calc add O 2; get bytes %O 2 M;
+      if M gt $MSS; set val M $MSS; calc hton M 16; set bytes %O 2 %M; set val CH 1; end-if;
+      break-repeat;
+    end-if;
+    calc add O 1; get bytes %O 1 L; calc add O %L; calc sub O 1;   # other option: skip its length
+  end-repeat;
+  if CH eq 1; recalc-tcp-csum; end-if;
+end-match; end-match; end-match;
+```
+
+```bash
+bpfc -i ppp0 -d xdp -s MSS=1452 -f mss-clamp.bpfc        # 1492 - 40
+```
+
+Attach it to the interface the SYNs arrive on, in both directions' ingress (the SYN and the SYN-ACK). Packets with IP options are left alone (the first byte of the IP header must be 0x45). (TC egress works too: `-d egress`, for traffic the host itself sends.)
+
+### 8. Source address validation (uRPF, BCP 38)
+
+Drop packets whose source the network would not route back to: spoofed sources, bogons, our own addresses arriving from outside. Strict mode also requires the route back to use the interface the packet came in on; loose mode (`-s LOOSE=1`) only requires that a route exists, for asymmetric routing. One file covers every interface through `$IFINDEX`:
+
+```
+# urpf.bpfc: source address validation (BCP 38, RFC 3704) on every interface
+# (bpfcd: interfaces.d/%all%/xdp.bpfc). Drops a packet when the routing table
+# has no way back to its source; strict mode also drops it when the way back
+# is not the interface it came in on (asymmetric routing: use -s LOOSE=1).
+# The kernel's FIB helper needs forwarding enabled on the interface.
+const LOOSE 0;
+match ip;
+  decl SRC 4; get ip-src SRC;
+  if SRC ne 0;                                       # 0.0.0.0 (DHCP) is not checked
+    fib-lookup %SRC;
+    if FIB_RESULT ge 1; if FIB_RESULT le 4; drop; end-if; end-if;   # blackhole, unreachable, prohibit, our own address
+    when !LOOSE;
+      if FIB_RESULT eq 0; if FIB_IFINDEX ne $IFINDEX; drop; end-if; end-if;
+      if FIB_RESULT eq 7; if FIB_IFINDEX ne $IFINDEX; drop; end-if; end-if;   # route found, neighbour not resolved yet
+    end-when;
+  end-if;
+end-match;
+```
+
+```bash
+cp urpf.bpfc /etc/bpfc/interfaces.d/%nic%/xdp.bpfc && systemctl reload bpfcd
+```
+
+XDP has one program per interface, so to combine this with the router (6), put both in one file: `include` this one before the router's commands. (A `drop` ends the program; what passes goes on to the routing part.)
+
+### 9. Direct-server-return load balancer
+
+A layer-4 load balancer for a TCP service on a virtual IP, as Katran or Maglev do it: each flow (source address and port) is sent to one backend by rewriting only the destination MAC, so there is no checksum work and no connection state, and the backends answer the client directly. The backends are on the same layer-2 segment and have the VIP on their loopback (`ip addr add 10.9.0.100/32 dev lo`, with `arp_ignore=1`, `arp_announce=2`). `$IFMAC` is the load balancer's own MAC, and each `backend` line is a `define` used once per server:
+
+```
+# dsr-lb.bpfc: direct-server-return load balancer for a TCP service on a VIP.
+# Each flow (source address and port) goes to one backend; only the
+# destination MAC changes, so no checksum work. The backends have the VIP on
+# their loopback and answer the client directly. Add a backend line per server.
+const VIP 10.9.0.100;
+const PORT 80;
+const BACKENDS 3;
+define backend N MAC;
+  if B eq $N; set dst-mac $MAC; set src-mac $IFMAC; tx; end-if;
+end-define;
+match tcp; match ip-dst $VIP; match tcp-dst $PORT;
+  decl B 4; decl P 4;
+  get ip-src B; get tcp-src P; calc xor B %P; calc mod B $BACKENDS;
+  backend 0 02:00:00:00:00:a0;
+  backend 1 02:00:00:00:00:a1;
+  backend 2 02:00:00:00:00:a2;
+end-match; end-match; end-match;
+```
+
+Changing the number of backends moves most flows; for long-lived connections, use a consistent hash (a Maglev-style table in a map, indexed by the flow hash) instead of the modulo.
+
+### 10. VLAN translation on a trunk
+
+Map customer VLANs onto provider VLANs (or back) where two networks meet. The `repeat` unrolls into one `match vlan-id` per VLAN, so the mapping is a few constants; `set vlan-id` keeps each tag's priority:
+
+```
+# vlan-translate.bpfc: map customer VLANs $FROM..$FROM+$COUNT-1 to provider
+# VLANs from $TO on a trunk. The repeat unrolls into one match per VLAN; the
+# tag's priority bits stay.
+const FROM 100;
+const TO 2000;
+const COUNT 10;
+repeat $COUNT as I;
+  match vlan-id $(FROM + I); set vlan-id $(TO + I); break-repeat; end-match;
+end-repeat;
+```
+
+```bash
+bpfc -i eth1 -d xdp -s FROM=100 -s TO=2000 -s COUNT=50 -f vlan-translate.bpfc
+```
+
+### 11. Packet-size histograms on every interface
+
+Cheap traffic profiling: count packets per size bucket on every interface, with a map named after it. In bpfcd's `%all%/xdp.bpfc`, each interface gets its own `SIZES_<name>` map:
+
+```
+# size-histogram.bpfc: packet sizes per interface (bpfcd %all%), in buckets
+# up to 64, 128, ..., 8192 bytes: map SIZES_<interface>, key = bucket.
+#   bpfc -m <dir> -r SIZES_eth0
+decl LEN 4; get len LEN;
+repeat 8 as I;
+  if LEN le $(64 << I); calc-map add SIZES_$IFNAME $I 1; break-repeat; end-if;
+end-repeat;
+```
+
+```bash
+bpfc -m /sys/fs/bpf -r SIZES_eth0          # key = bucket: 0 for <= 64 bytes, 1 for <= 128, ...
+```
+
+### 12. SYN-flood guard
+
+Limit each source to `$LIMIT` TCP SYNs per window of about a second, and drop the rest before they reach the TCP stack. The counters are in an LRU hash keyed by window number and source, so old windows age out without cleanup:
+
+```
+# syn-guard.bpfc: at most $LIMIT TCP SYNs per source address per window of
+# 2^30 ns (about a second); the rest are dropped. Counters live in an LRU hash
+# keyed by window and source, so old windows age out by themselves.
+const LIMIT 100;
+match tcp; match tcp-flags SYN;
+  decl K 8; decl S 4; decl OLD 8;
+  get time K; calc rsh K 30; calc lsh K 32;        # window number in the high half
+  get ip-src S; calc or K %S;
+  calc-map add SYNS %K 1 OLD;
+  if OLD ge $LIMIT; drop; end-if;
+end-match; end-match;
+```
+
+```bash
+bpfc -i eth0 -d xdp -s LIMIT=50 -f syn-guard.bpfc
+```
+
+Legitimate clients behind one NAT share a source address, so set the limit for the busiest of them; SYN cookies (`net.ipv4.tcp_syncookies`) remain the kernel's defence against a flood from many sources.

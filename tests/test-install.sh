@@ -34,6 +34,8 @@ for p in dataplane/profiles/*.profile; do
 done
 check "every built-in profile installed in /usr/share/bpfc/dataplane/profiles${missing:+ (missing:$missing)}" [ -z "$missing" ]
 check "local profile directory /etc/bpfc/dataplane/profiles.d" test -d "$R/etc/bpfc/dataplane/profiles.d"
+check "XDP examples in the bpfc docs" eval \
+	'test -f "$R/usr/share/doc/bpfc/examples/xdp/router.bpfc" && test -f "$R/usr/share/doc/bpfc/examples/xdp/ip-lib.bpfc"'
 check "dataplane DESIGN.md and examples in the bpfc-scripts docs" eval \
 	'test -f "$R/usr/share/doc/bpfc-scripts/dataplane/DESIGN.md" && ls "$R"/usr/share/doc/bpfc-scripts/dataplane/examples/interfaces.d/eth0/ingress/*.bpfc >/dev/null'
 check "installed generator is the source one (default DATADIR)" cmp -s dataplane/bpfc-dataplane-gen "$R/usr/sbin/bpfc-dataplane-gen"
