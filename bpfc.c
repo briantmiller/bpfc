@@ -1674,6 +1674,12 @@ void compile_fib_lookup(int flags, const char *dst_ip_arg, const char *src_ip_ar
                 fprintf(stderr, "Error: fib-lookup requires a 4-byte IPv4 variable.\n"); exit(1);
             }
             emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+            /* variables hold IPv4 addresses in host order (get/set/match ip-dst);
+             * the lookup takes network order. (The value used to be copied
+             * as it was, so 10.2.0.2 was looked up as 2.0.2.10.) */
+#if defined(HOST_LITTLE_ENDIAN)
+            emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=32}));
+#endif
             emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, base + bpf_fib_dst_off)); // offset 16 is ipv4_dst
             custom_dst = 1;
         } else {
@@ -1704,6 +1710,10 @@ void compile_fib_lookup(int flags, const char *dst_ip_arg, const char *src_ip_ar
                 fprintf(stderr, "Error: fib-lookup requires a 4-byte IPv4 variable.\n"); exit(1);
             }
             emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
+            /* host to network order, as for the destination */
+#if defined(HOST_LITTLE_ENDIAN)
+            emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=32}));
+#endif
             emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, base + bpf_fib_src_off));
             custom_src = 1;
         } else {
@@ -1768,8 +1778,11 @@ void compile_fib_lookup(int flags, const char *dst_ip_arg, const char *src_ip_ar
 	emit(BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, dmac_off+i));
     }
 
-    //Populate FIB_IP_DST
+    //Populate FIB_IP_DST, in host order like the other IPv4 variables
     emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, base + bpf_fib_dst_off));
+#if defined(HOST_LITTLE_ENDIAN)
+    emit(((struct bpf_insn){.code=BPF_END|BPF_ALU|BPF_TO_BE, .dst_reg=BPF_REG_1, .imm=32}));
+#endif
     emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, dst_off));
 
     //Populate FIB_IFINDEX
@@ -7123,7 +7136,7 @@ void help(const char *arg0) {
 	"remove-l2 <len> [ethertype]"		,"remove len bytes after the Ethernet header (IPv4/IPv6 packets; skb->protocol unchanged)",
 	"strip-l2 <len> <ethertype>"		,"remove len bytes (multiple of 4) after the Ethernet header and set the EtherType, any protocol",
 	"get cpu <VAR>"				,"number of the CPU running the program",
-	"calc hton|ntoh <VAR> [bits]"		,"convert VAR between host and network byte order (before set bytes / after get bytes)",
+	"calc hton|ntoh <VAR> [bits]"		,"convert VAR between host and network byte order (hton before set bytes %VAR; get bytes already gives host order)",
 	"Preprocessor"				,"expanded before compiling; bpfc -E prints the result",
 	"  const <NAME> <value>"		,"define $NAME (a number, expression or text); -s NAME=VALUE overrides it",
 	"  define <NAME> [P ...] ... end-define","macro used as 'NAME arg ...'; $P in the body, $UNIQUE differs per use",
