@@ -1,0 +1,14 @@
+# ip-lib.bpfc: macros shared by the XDP examples (include ip-lib.bpfc;).
+
+# dec-ttl: IPv4 TTL - 1, with the header checksum updated incrementally
+# (RFC 1141: the checksum goes up by 0x0100, with the end-around carry).
+# get bytes gives host order; set bytes %VAR writes the variable as it is,
+# so the checksum is turned back to network order first.
+define dec-ttl;
+  decl TTL_$UNIQUE 1; decl CK_$UNIQUE 4; decl CY_$UNIQUE 4;
+  get bytes 22 1 TTL_$UNIQUE; calc sub TTL_$UNIQUE 1; set bytes 22 1 %TTL_$UNIQUE;
+  get bytes 24 2 CK_$UNIQUE; calc add CK_$UNIQUE 0x100;
+  set val CY_$UNIQUE %CK_$UNIQUE; calc rsh CY_$UNIQUE 16;
+  calc and CK_$UNIQUE 0xffff; calc add CK_$UNIQUE %CY_$UNIQUE;
+  calc hton CK_$UNIQUE 16; set bytes 24 2 %CK_$UNIQUE;
+end-define;

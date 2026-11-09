@@ -1,0 +1,9 @@
+# vlan-translate.bpfc: map customer VLANs $FROM..$FROM+$COUNT-1 to provider
+# VLANs from $TO on a trunk. The repeat unrolls into one match per VLAN; the
+# tag's priority bits stay.
+const FROM 100;
+const TO 2000;
+const COUNT 10;
+repeat $COUNT as I;
+  match vlan-id $(FROM + I); set vlan-id $(TO + I); break-repeat; end-match;
+end-repeat;

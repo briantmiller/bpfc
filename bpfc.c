@@ -12,6 +12,8 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <net/if.h>
+#include <net/if_arp.h>
+#include <sys/ioctl.h>
 #include <arpa/inet.h>
 #include <linux/bpf.h>
 #include <linux/rtnetlink.h>
@@ -1596,6 +1598,68 @@ void compile_vlan_offset() {
  * Emits bytecode to perform an IPv4 FIB lookup.
  * Syntax: fib-lookup [flags] [dst_ip_addr | %VAR]
  */
+/*
+ * fib-lookup options set by the parser for the next lookup:
+ *   fib_flow: fill the packet's protocol, ports (TCP/UDP/SCTP, not for
+ *             fragments) and TOS, so a multipath route hashes per flow
+ *             (net.ipv4.fib_multipath_hash_policy=1) and ip rules on ports,
+ *             protocol or TOS apply.
+ *   fib_tbid: the table for BPF_FIB_LOOKUP_TBID, or -1.
+ */
+static int fib_flow = 0;
+static long fib_tbid = -1;
+
+/* Fills the flow fields of the IPv4 lookup at base from the packet, using 20
+ * bytes of scratch at tmp. A packet too short for an IP header leaves them 0. */
+static void fib_fill_flow(int base, int tmp) {
+    int proto_off = offsetof(struct bpf_fib_lookup, l4_protocol);
+    int sport_off = offsetof(struct bpf_fib_lookup, sport);
+    int tos_off = offsetof(struct bpf_fib_lookup, tos);
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_IMM(BPF_REG_2, 14));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, tmp));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 20));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));
+    int j_short = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_0, .imm=0}));
+    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, tmp + 1));          /* TOS */
+    emit(BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_1, base + tos_off));
+    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, tmp + 9));          /* protocol */
+    emit(BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_1, base + proto_off));
+    /* ports only for TCP, UDP and SCTP, and not in fragments (MF or an offset) */
+    int j_tcp = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=6}));
+    int j_udp = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=17}));
+    int j_noports = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=132}));
+    prog[j_tcp].off = prog_idx - j_tcp - 1;
+    prog[j_udp].off = prog_idx - j_udp - 1;
+    emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, tmp + 6));          /* flags + fragment offset */
+    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, htons(0x3FFF)));
+    int j_frag = prog_idx;
+    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=0}));
+    emit(BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_10, tmp));              /* 14 + IHL * 4 */
+    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_2, 0x0F));
+    emit(BPF_ALU64_IMM(BPF_LSH, BPF_REG_2, 2));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, 14));
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, base + sport_off));         /* sport, dport: adjacent */
+    emit(BPF_MOV64_IMM(BPF_REG_4, 4));
+    emit(BPF_CALL_FUNC(BPF_FUNC_skb_load_bytes));                      /* failure zeroes them */
+    prog[j_short].off = prog_idx - j_short - 1;
+    prog[j_noports].off = prog_idx - j_noports - 1;
+    prog[j_frag].off = prog_idx - j_frag - 1;
+}
+
+/* the table for BPF_FIB_LOOKUP_TBID */
+static void fib_set_tbid(int base) {
+    if (fib_tbid >= 0)
+        emit(BPF_ST_MEM(BPF_W, BPF_REG_10, base + offsetof(struct bpf_fib_lookup, tbid), (int)fib_tbid));
+}
+
 void compile_fib_lookup(int flags, const char *dst_ip_arg, const char *src_ip_arg, const char *iface_arg) {
     /*
     next_var_offset &= ~7;
@@ -1615,7 +1679,9 @@ void compile_fib_lookup(int flags, const char *dst_ip_arg, const char *src_ip_ar
      * scratch below the variables. (It used to get one 8-byte variable slot,
      * so it overlapped the seven slots above: the FIB_* results and the two
      * variables declared just before fib-lookup, which it overwrote.) */
-    int base = stack_scratch(sizeof(struct bpf_fib_lookup) + 8, "fib-lookup") + 8;
+    int extra = fib_flow ? 24 : 0;     /* flow: the IP header, below the struct */
+    int scratch = stack_scratch(sizeof(struct bpf_fib_lookup) + 8 + extra, "fib-lookup");
+    int base = scratch + 8 + extra;
     next_var_offset = base - 8;
 
     int bpf_fib_dst_off = offsetof(struct bpf_fib_lookup, ipv4_dst); //16?
@@ -1762,6 +1828,8 @@ void compile_fib_lookup(int flags, const char *dst_ip_arg, const char *src_ip_ar
         emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, base + bpf_fib_idx_off));
     }
 
+    if (fib_flow) fib_fill_flow(base, scratch);
+    fib_set_tbid(base);
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); 
     emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10)); 
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_2, .imm=base}));
@@ -1905,6 +1973,7 @@ void compile_fib_lookup6(int flags, const char *dst_ip_arg, const char *src_ip_a
     //emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, ingress_ifindex)));
     //emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, base + 56));
 
+    fib_set_tbid(base);
     emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6)); emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10)); 
     emit(((struct bpf_insn){.code=BPF_ALU64|BPF_ADD|BPF_K, .dst_reg=BPF_REG_2, .imm=base}));
     emit(BPF_MOV64_IMM(BPF_REG_3, sizeof(struct bpf_fib_lookup)));
@@ -7118,10 +7187,14 @@ void help(const char *arg0) {
 	"load-packet <len> <src> <dst>"		,"load data of length from per-CPU map into packet, optionally specify src and/or dst offset variables supported",
 	"save-packet-keyed <len> <key> ..."	,"save packet data of length into a shared map at key, optionally specify src and/or dst offset variables supported",
 	"load-packet-keyed <len> <key> ..."	,"load data of length from shared map at key into packet, optionally specify src and/or dst offset variables supported",
-	"fib-lookup [OPTS] <ip-address>"	,"perform FIB lookup on IP address, populate FIB_SMAC, FIB_DMAC, FIB_IFINDEX and FIB_IP_DST variables",
-	"  src <ip-address>"			,"set source IP address for FIB lookup - if source based routing is needed",
+	"fib-lookup [OPTS] [<ip-address>|%VAR]"	,"perform FIB lookup on IP address (default: the packet's destination), populate FIB_RESULT, FIB_SMAC, FIB_DMAC, FIB_IFINDEX and FIB_IP_DST variables",
+	"  src <ip-address>|%VAR"		,"set source IP address for FIB lookup (default: the packet's) - if source based routing is needed",
 	"  iface <iface>"			,"set source IP interface for FIB lookup - if source based routing is needed",
 	"  output"				,"perform FIB lookup as an output route (sourced locally)",
+	"  direct"				,"look up the main table directly, skipping ip rules",
+	"  tbid <table>"			,"look up in this routing table (directly: ip rules do not apply)",
+	"  skip-neigh"				,"do not require a resolved neighbour (FIB_DMAC is then not set)",
+	"  flow"				,"IPv4: also use the packet's protocol, ports and TOS, for per-flow multipath (fib_multipath_hash_policy 1) and ip rules on them",
 	"clone <iface> [ingress|egress]"	,"clone and send packet to specified interface, optionally specifying ingress or egress",
 	"buffer-map <MAP> [size]"		,"declare a per-CPU buffer map with values of size bytes (default 18000); lengths are capped at size/2",
 	"shared-buffer-map <MAP> [n [size]]"	,"declare a shared buffer map of n entries (default 10000) of size bytes",
@@ -7974,29 +8047,57 @@ static int process_cmd_1(char *cmd, const char *dir) {
 	    char *custom_dst_ip = NULL;
             char *custom_iface = NULL;
 
+            /* The flag bits are the kernel's BPF_FIB_LOOKUP_* (they used to be
+             * one off: output set DIRECT, tbid OUTPUT, src TBID, mark SRC). */
+            fib_flow = 0;
+            fib_tbid = -1;
             for (int k = 1; k < t; k++) {
+                struct in_addr a4;
+                struct in6_addr a6;
                 if (strcmp(tok[k], "direct") == 0)
-                    flags |= (0 << 0);
-	        else if (strcmp(tok[k], "output") == 0)
-                    flags |= (1 << 0);
-                else if (strcmp(tok[k], "tbid") == 0)
-                    flags |= (1 << 1);
+                    flags |= 1 << 0;                      /* BPF_FIB_LOOKUP_DIRECT */
+                else if (strcmp(tok[k], "output") == 0)
+                    flags |= 1 << 1;                      /* BPF_FIB_LOOKUP_OUTPUT */
                 else if (strcmp(tok[k], "skip-neigh") == 0)
-                    flags |= (1 << 2);
+                    flags |= 1 << 2;                      /* BPF_FIB_LOOKUP_SKIP_NEIGH */
+                else if (strcmp(tok[k], "tbid") == 0) {
+                    char *end = NULL;
+                    if (k + 1 < t) fib_tbid = strtol(tok[k + 1], &end, 0);
+                    if (k + 1 >= t || !end || *end || fib_tbid < 0) {
+                        fprintf(stderr, "Error: fib-lookup tbid needs a table number\n");
+                        exit(1);
+                    }
+                    k++;
+                    /* BPF_FIB_LOOKUP_TBID; the kernel reads the table only with DIRECT */
+                    flags |= (1 << 3) | (1 << 0);
+                }
+                else if (strcmp(tok[k], "src") == 0 && k + 1 < t &&
+                         (tok[k + 1][0] == '%' || inet_pton(AF_INET, tok[k + 1], &a4) == 1 ||
+                          inet_pton(AF_INET6, tok[k + 1], &a6) == 1))
+                    custom_src_ip = tok[++k];             /* src <address|%VAR>: the source to look up from */
                 else if (strcmp(tok[k], "src") == 0)
-                    flags |= (1 << 3);
-                else if (strcmp(tok[k], "mark") == 0)
-                    flags |= (1 << 4);
+                    flags |= 1 << 4;                      /* BPF_FIB_LOOKUP_SRC */
+                else if (strcmp(tok[k], "mark") == 0) {
+                    fprintf(stderr, "Error: fib-lookup mark is not supported yet\n");
+                    exit(1);
+                }
+                else if (strcmp(tok[k], "flow") == 0) {
+                    if (is_ipv6) {
+                        fprintf(stderr, "Error: fib-lookup6 flow is not supported yet\n");
+                        exit(1);
+                    }
+                    fib_flow = 1;
+                }
 		else if (strcmp(tok[k], "iface") == 0 && (k + 1) < t) 
                     custom_iface = tok[++k];
-		else if (strcmp(tok[k], "src") == 0 && (k + 1) < t)
-                    custom_src_ip = tok[++k];
                 else
                     custom_dst_ip = tok[k];
             }
 
             if (is_ipv6) compile_fib_lookup6(flags, custom_dst_ip, custom_src_ip, custom_iface);
             else         compile_fib_lookup(flags, custom_dst_ip, custom_src_ip, custom_iface);
+            fib_flow = 0;
+            fib_tbid = -1;
         }
         else if (strcmp(op, "start-loop") == 0) compile_start_loop();
         else if (strcmp(op, "loop") == 0 && t > 1) compile_loop(a1);
@@ -9132,6 +9233,19 @@ int main(int argc, char **argv) {
             pp_set_const("IFTYPE", num, 0, NULL);
             pp_set_const("IFKIND", kind, 0, NULL);
         }
+        /* $IFMAC: its MAC address, for devices that have one (6 bytes) */
+        int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", iface);
+        if (fd >= 0 && ioctl(fd, SIOCGIFHWADDR, &ifr) == 0 &&
+            (ifr.ifr_hwaddr.sa_family == ARPHRD_ETHER || ifr.ifr_hwaddr.sa_family == ARPHRD_LOOPBACK)) {
+            unsigned char *m = (unsigned char *)ifr.ifr_hwaddr.sa_data;
+            char mac[18];
+            snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+            pp_set_const("IFMAC", mac, 0, NULL);
+        }
+        if (fd >= 0) close(fd);
     }
     /* $L3OFF: where the IP header starts. 0 on device types whose packets
      * start with it (TC sees no link-layer header): none (tun, wireguard),

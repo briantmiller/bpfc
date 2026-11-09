@@ -1,0 +1,25 @@
+# router.bpfc: IPv4 forwarding in XDP. The kernel's routing table decides
+# (fib-lookup); the program forwards what it can and passes everything else
+# (TTL about to expire, no route, unresolved neighbour, local traffic, ARP,
+# IPv6, ...) to the kernel, which handles it as usual.
+#   bpfc -i eth0 -d xdp -f router.bpfc            (one per interface, or bpfcd %nic%/xdp.bpfc)
+#   -s FLOW=1: hash multipath routes per flow (protocol and ports), for
+#              net.ipv4.fib_multipath_hash_policy=1
+include ip-lib.bpfc;
+const FLOW 0;
+match ip;
+  decl TTL 1; get bytes 22 1 TTL;
+  match val %TTL gt 1;
+    decl DST 4; get ip-dst DST;
+    when FLOW;
+      fib-lookup flow %DST;
+    otherwise;
+      fib-lookup %DST;
+    end-when;
+    match val %FIB_RESULT eq 0;
+      dec-ttl;
+      set dst-mac %FIB_DMAC; set src-mac %FIB_SMAC;
+      redirect %FIB_IFINDEX;
+    end-match;
+  end-match;
+end-match;

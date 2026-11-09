@@ -72,6 +72,8 @@ install: all install-scripts
 	install -m 0644 dist/examples/interfaces.d/eth0/ingress/*.bpfc $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/ingress/
 	install -m 0644 dist/examples/interfaces.d/eth0/egress/*.bpfc $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/egress/
 	install -m 0644 dist/examples/cve-2026-98432.bpfc $(DESTDIR)$(DOCDIR)/examples/
+	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/xdp
+	install -m 0644 dist/examples/xdp/*.bpfc $(DESTDIR)$(DOCDIR)/examples/xdp/
 	install -m 0644 README.md $(DESTDIR)$(DOCDIR)/README.md
 	install -D -m 0755 dist/container/bpfcd-entrypoint $(DESTDIR)$(SBINDIR)/bpfcd-entrypoint
 	install -D -m 0644 dist/container/README.md $(DESTDIR)$(CONTAINER_DOCDIR)/README.md
@@ -124,7 +126,7 @@ srpm: $(TARBALL)
 TESTFLAGS ?=
 
 check: all
-	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd xdp container install
+	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd xdp xdp-examples container install
 
 # Compile-only checks of every field and command and of the error messages;
 # needs no root (the few commands that create maps are skipped without it).

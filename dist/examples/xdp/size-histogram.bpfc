@@ -1,0 +1,7 @@
+# size-histogram.bpfc: packet sizes per interface (bpfcd %all%), in buckets
+# up to 64, 128, ..., 8192 bytes: map SIZES_<interface>, key = bucket.
+#   bpfc -m <dir> -r SIZES_eth0
+decl LEN 4; get len LEN;
+repeat 8 as I;
+  if LEN le $(64 << I); calc-map add SIZES_$IFNAME $I 1; break-repeat; end-if;
+end-repeat;

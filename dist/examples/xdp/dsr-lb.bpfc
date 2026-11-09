@@ -1,0 +1,17 @@
+# dsr-lb.bpfc: direct-server-return load balancer for a TCP service on a VIP.
+# Each flow (source address and port) goes to one backend; only the
+# destination MAC changes, so no checksum work. The backends have the VIP on
+# their loopback and answer the client directly. Add a backend line per server.
+const VIP 10.9.0.100;
+const PORT 80;
+const BACKENDS 3;
+define backend N MAC;
+  if B eq $N; set dst-mac $MAC; set src-mac $IFMAC; tx; end-if;
+end-define;
+match tcp; match ip-dst $VIP; match tcp-dst $PORT;
+  decl B 4; decl P 4;
+  get ip-src B; get tcp-src P; calc xor B %P; calc mod B $BACKENDS;
+  backend 0 02:00:00:00:00:a0;
+  backend 1 02:00:00:00:00:a1;
+  backend 2 02:00:00:00:00:a2;
+end-match; end-match; end-match;

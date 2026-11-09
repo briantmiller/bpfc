@@ -1,0 +1,17 @@
+# urpf.bpfc: source address validation (BCP 38, RFC 3704) on every interface
+# (bpfcd: interfaces.d/%all%/xdp.bpfc). Drops a packet when the routing table
+# has no way back to its source; strict mode also drops it when the way back
+# is not the interface it came in on (asymmetric routing: use -s LOOSE=1).
+# The kernel's FIB helper needs forwarding enabled on the interface.
+const LOOSE 0;
+match ip;
+  decl SRC 4; get ip-src SRC;
+  if SRC ne 0;                                       # 0.0.0.0 (DHCP) is not checked
+    fib-lookup %SRC;
+    if FIB_RESULT ge 1; if FIB_RESULT le 4; drop; end-if; end-if;   # blackhole, unreachable, prohibit, our own address
+    when !LOOSE;
+      if FIB_RESULT eq 0; if FIB_IFINDEX ne $IFINDEX; drop; end-if; end-if;
+      if FIB_RESULT eq 7; if FIB_IFINDEX ne $IFINDEX; drop; end-if; end-if;   # route found, neighbour not resolved yet
+    end-when;
+  end-if;
+end-match;
