@@ -114,11 +114,27 @@ tunnel works once it sends. `bpfc-ecmp-status sync` does the same at once.
 
 ## Verifier
 
-The selector costs about 60k + 65k per member + 20k per member and policy
-verified instructions (kernel 6.18): 3 members 190k, 6 members and 3 policies
-930k. The generator warns near the limit. The design keeps it linear: the sweep
-only records (no judging), members are then judged once each, and the loop bodies
-branch on data rather than on what the sweep is for.
+Instruction count is not the limit: 3 members is about 8,000 instructions. The
+limit is the 1,000,000 the verifier may process. Verified (kernel 6.18):
+
+| Members / policies | Verified |
+|---|---|
+| 3 / 0 | 58k |
+| 3 / 3 | 93k |
+| 8 / 8 | 230k |
+| 16 / 0 | 134k |
+| 16 / 16 | 541k |
+
+Most of it is finding the members (the sweep, about 157 instructions per try),
+recording the decision, and judging the members. The per-packet path is under
+2%. The generator warns near the limit.
+
+The design keeps the cost linear: the sweep only records (no judging), members
+are then judged once each, and the loop bodies branch on data rather than on
+what the sweep is for. Before the sweep, an always-zero map word is added to the
+variables that hold constants on some paths, so those paths merge. It has to be
+an addition: an OR keeps the known bits, which left the paths split and cost
+about 4 times as much.
 
 ## Limits
 
@@ -126,7 +142,10 @@ branch on data rather than on what the sweep is for.
 - Ingress interfaces must be Ethernet.
 - Accounting is per interface, as configured. Tunnels sharing an underlay are
   separate members; their shared bottleneck is not seen.
-- Up to 8 members, fewer with many policies.
+- Up to 16 members, and 31 policies (fewer with many members: see the warning).
+- `sweep` is capped at 64 tries. With 16 members, about 2% of searches miss a
+  given member; the flow goes to another valid one. Flows placed by hash do not
+  search.
 - The flow table is not locked: two CPUs creating different flows in the same
   position at once can lose one (it continues on its hash). Likewise the first
   packets of one flow arriving on two CPUs can each create it, which only
