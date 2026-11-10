@@ -37,7 +37,8 @@ gen_err "shed not above move" "must not be above" "${BASE[@]}" --shed 95 --move 
 gen_err "policy interface must be a member" "not a member" "${BASE[@]}" --policy "src 10.0.0.0/8 prefer z"
 gen_err "ports need an l4 mode" "needs a mode" "${BASE[@]}" --mode l3 --policy "dport 80 prefer a"
 gen_err "policy needs prefer" "no prefer" "${BASE[@]}" --policy "src 10.0.0.0/8"
-gen_err "too many members" "at most" -M a=1g -M b=1g -M c1=1g -M d=1g -M e=1g -M f=1g -M g=1g -M h=1g -M i=1g -I c
+m=(); for i in $(seq 1 17); do m+=(-M y$i=1g); done
+gen_err "too many members" "at most 16" "${m[@]}" -I c
 o=$("$GEN" -o "$T/g0" -M a=1g -M b=2g -I c,a --mode l3 2>&1) && [ -f "$T/g0/c/ingress/400.bpfc" ] && [ -f "$T/g0/a/ingress/400.bpfc" ] \
 	&& [ -f "$T/g0/a/egress/400.bpfc" ] && [ -f "$T/g0/b/ingress/400.bpfc" ] && [ ! -f "$T/g0/c/egress/400.bpfc" ]
 check "generator: writes each program where it belongs" test $? -eq 0
@@ -127,11 +128,11 @@ gen_load "${MEMBERS[@]}"; check "programs load (l4, 3 members)" test $? -eq 0
 for mode in l3 l3+tos l3+proto l4+tos l3-sym l4-sym; do
 	gen_load "${MEMBERS[@]}" --mode $mode; check "programs load (mode $mode)" test $? -eq 0
 done
-M8=(); for i in 1 2 3 4 5 6; do M8+=(-M x$i=1g); done
-"$GEN" -o "$T/g8" -P e8 "${M8[@]}" -I eth0 --policy "src 10.0.0.0/8 prefer x1,x2" --policy "dscp 46 prefer x3,x4 strict" --policy "dport 443 prefer x5" >/dev/null 2>&1
+M8=(); P8=(); for i in $(seq 1 16); do M8+=(-M x$i=1g); P8+=(--policy "src 10.$i.0.0/16 dscp 46 prefer x$i,x1,x2"); done
+"$GEN" -o "$T/g8" -P e8 "${M8[@]}" -I eth0 "${P8[@]}" >/dev/null 2>&1
 o=$($R "$BPFC" -m "$T/m" -s IFNAME=eth0 -i eth0 -p 300 -I -f "$T/g8/eth0/ingress/400.bpfc" 2>&1); rc=$?
 v=$(sed -n 's/.*verified=\([0-9]*\).*/\1/p' <<< "$o")
-if [ $rc -eq 0 ]; then test_pass "programs load (6 members, 3 policies, $v verified)"; else test_fail "programs load (6 members, 3 policies): $(tail -2 <<< "$o")"; fi
+if [ $rc -eq 0 ]; then test_pass "programs load (16 members, 16 policies, $v verified)"; else test_fail "programs load (16 members, 16 policies): $(tail -2 <<< "$o")"; fi
 $R "$BPFC" -i eth0 -p 300 -D >/dev/null 2>&1
 rm -f "$T"/m/e8_*
 
@@ -436,6 +437,38 @@ else
 	test_skip "tunnel members (no tun device)"
 fi
 gen_err "tunnel ingress refused" "only Ethernet" -M a=1g -M b=1g -I lo
+
+# ---------------------------------------------------------------- the most members
+for i in $(seq 4 16); do
+	ip link add p$i netns ecH type veth peer name eth$i netns ecR
+	ip -n ecR addr add 10.$i.0.1/24 dev eth$i; ip -n ecR link set eth$i up
+	ip -n ecH link set p$i up
+	$R sysctl -qw net.ipv4.conf.eth$i.rp_filter=0
+	$R tc qdisc add dev eth$i clsact 2>/dev/null
+	ip -n ecR neigh replace 10.$i.0.2 lladdr "$($H cat /sys/class/net/p$i/address)" dev eth$i nud permanent
+done
+M16=(); for i in $(seq 1 16); do M16+=(-M eth$i=1g); done
+set_ecmp $(seq 1 16)
+gen_load "${M16[@]}" -I eth0 --policy "src 192.168.1.2/32 dport 6100 prefer eth16,eth1"
+check "16 members load" test $? -eq 0
+sum16() { local i t=0; for i in $(seq 1 16); do t=$((t + $(rx $i))); done; echo $t; }
+a=(); for i in $(seq 1 16); do a[$i]=$(rx $i); done; t0=$(sum16)
+$H $SEND flows 1600 --count 1 --sport 10000; sleep 0.5
+used=0; for i in $(seq 1 16); do [ $(( $(rx $i) - a[i] )) -gt 0 ] && used=$((used + 1)); done
+check "16 members: flows reach every one ($used)" test "$used" -eq 16
+d=$(( $(sum16) - t0 )); check "16 members: every packet forwarded ($d of 1600)" test "$d" -eq 1600
+a16=$(rx 16); t0=$(sum16)
+$H $SEND flows 60 --count 2 --dport 6100 --sport 12000; sleep 0.3
+d16=$(( $(rx 16) - a16 )); d=$(( $(sum16) - t0 ))
+check "16 members: a policy reaches the last one ($d16 of 120)" test "$d16" -ge 96 -a "$d" -eq 120
+set_ecmp $(seq 1 15)
+a16=$(rx 16); t0=$(sum16)
+$H $SEND flows 1600 --count 1 --sport 10000; sleep 0.5
+d16=$(( $(rx 16) - a16 )); d=$(( $(sum16) - t0 ))
+check "16 members: withdrawn, the last one gets nothing ($d16)" test "$d16" -eq 0
+check "16 members: its flows moved on ($d of 1600)" test "$d" -eq 1600
+for i in $(seq 4 16); do ip -n ecR link del eth$i; done
+set_ecmp 1 2
 
 # ---------------------------------------------------------------- under bpfcd
 if [ -x "$PWD/bpfcd/bpfcd" ]; then

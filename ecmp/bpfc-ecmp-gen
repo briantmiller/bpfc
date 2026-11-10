@@ -15,7 +15,7 @@ VERSION=1
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 PROFILE_DIRS=(/etc/bpfc/ecmp/profiles.d /usr/share/bpfc/ecmp/profiles "$SELF_DIR/profiles")
 SAVE_DIR=/etc/bpfc/ecmp/profiles.d
-MAX_MEMBERS=8
+MAX_MEMBERS=16
 MAX_POLICIES=31
 
 die()  { echo "Error: $*" >&2; exit 1; }
@@ -385,7 +385,7 @@ for spec in "${POLICY_RAW[@]}"; do
     POL_HDR+="# bpfc-ecmp policy=$PNUM $spec"$'\n'
 done
 # Roughly what the verifier will take (kernel 6.18), against its limit of 1M.
-COST=$(( 60000 + 65000 * ${#MEMBER[@]} + 20000 * ${#MEMBER[@]} * PNUM ))
+n=${#MEMBER[@]}; COST=$(( 30000 + 11000 * (n < 8 ? n : 8) + 2000 * (n > 8 ? n - 8 : 0) + PNUM * (8000 + 1200 * n) ))
 [ "$COST" -lt 900000 ] || warn "${#MEMBER[@]} members and $PNUM policies may exceed the verifier limit when loaded; if so, fewer of either"
 [ -z "${WARN_TOS:-}" ] || warn "a policy matches DSCP but mode $MODE does not: a flow takes the policy of its first packet's DSCP"
 
@@ -827,9 +827,10 @@ free IFI;
 decl CH 8; set val CH $NO_SLOT;
 # Everything above is only constants to the verifier on some paths; a word
 # that is always 0 makes them all look alike, so the paths merge here and the
-# cost stays linear in the sweep.
+# cost stays linear in the sweep. It must be "add": "or" keeps the known bits,
+# so the verifier can still tell the constants apart and the paths stay split.
 get map $CTR 14 X;
-calc or NEED %X; calc or RSN %X; calc or POL %X; calc or CUR %X; calc or H %X; calc or FB %X; calc or ST %X; calc or CH %X;
+calc add NEED %X; calc add RSN %X; calc add POL %X; calc add CUR %X; calc add H %X; calc add FB %X; calc add ST %X; calc add CH %X;
 if val %NEED ne 0;
   calc-map add $CTR $C_SWEEP 1;
   decl SEEN 8; get map $CTR 14 SEEN;
@@ -853,7 +854,7 @@ if val %NEED ne 0;
     set val X $NO_SLOT; calc lsh X 16; calc or PM %X;
     set val X 255; calc lsh X 8; calc or PM %X;
   end-if;
-  get map $CTR 14 X; calc or LIMIT %X; calc or PM %X; calc or FB %X;
+  get map $CTR 14 X; calc add LIMIT %X; calc add PM %X; calc add FB %X;
   # Which members does this route offer? Hash values are tried; each member
   # found is noted with the value that selects it (per-CPU scratch map).
   decl SCB 8; get cpu SCB; calc mod SCB $MAXCPU; calc mul SCB $MAXM;
@@ -890,7 +891,7 @@ if val %NEED ne 0;
   get map $CTR 14 AF; get map $CTR 14 BF; get map $CTR 14 AS; get map $CTR 14 BS;
   decl CS 8; decl CSC 8;
   set val CS $NO_SLOT; calc lsh CS 32; set val CSC 0xffffffffffffff;
-  get map $CTR 14 X; calc or CS %X; calc or CSC %X;
+  get map $CTR 14 X; calc add CS %X; calc add CSC %X;
   decl RK 8; decl U 8;
   repeat $MEMBERS as I;
     set val X %SEEN; calc rsh X $I; calc and X 1;
