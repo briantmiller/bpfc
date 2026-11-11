@@ -116,6 +116,7 @@ interface's bandwidth.
 %{_sbindir}/bpfc-dataplane-status
 %{_sbindir}/bpfc-ecmp-gen
 %{_sbindir}/bpfc-ecmp-status
+%{_sbindir}/bpfc-flows
 %dir %{_sysconfdir}/bpfc/ecmp
 %dir %{_sysconfdir}/bpfc/ecmp/profiles.d
 %dir %{_sysconfdir}/bpfc/dataplane
