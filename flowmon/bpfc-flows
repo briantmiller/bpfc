@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# bpfc-flows - display BPFC flow-monitor maps.  Requires bash and Python 3
+# standard library only.  Run as root or an account permitted to read bpffs.
+set -euo pipefail
+
+BPFC_BIN=${BPFC_BIN:-bpfc}
+STATE_FILE=${STATE_FILE:-/run/bpfc/bpfc-flows.prev.json}
+WATCH=0; FORMAT=table; SORT=bps-total; REVERSE=0; LIMIT=0; ACTIVE=60; SHOW_L2=0
+FILTERS=()
+usage() { cat <<'USAGE'
+Usage: bpfc-flows [options]
+  -w, --watch SEC         refresh every SEC seconds (default active window: 60 sec)
+  --active SEC            show flows seen during the last SEC seconds (0 disables age filtering)
+  --sort FIELD            bps-in|bps-out|bps-total|bytes-in|bytes-out|bytes-total|
+                          packets-in|packets-out|last-seen|src|dst|proto|sport|dport|vlan|dscp|ingress|egress
+  --reverse               reverse the selected sort
+  --limit N               display at most N flows after filtering/sorting
+  --filter FIELD=VALUE    repeatable. Fields: src,dst,proto,dscp,sport,dport,icmp,vlan,
+                          ingress,egress,mac,ethertype,min-bps-in,min-bps-out,min-bps-total
+  -l2, --l2                include ingress/egress MAC and EtherType columns in table output
+  --json | --csv          emit machine-readable output (default: table; L2 fields always included)
+  --bpfc PATH             path to bpfc binary (default: BPFC_BIN or bpfc)
+  --state PATH            prior-snapshot state path (default: /run/bpfc/bpfc-flows.prev.json)
+  -h, --help              show this help
+
+Notes: source/destination metadata is fixed by the first observed packet for a
+flow. In/out mean TC ingress/egress observations on this host, not necessarily
+wire-unique packets on stacked bridge/bond devices.
+USAGE
+}
+while (($#)); do
+  case "$1" in
+    -w|--watch) WATCH=${2:?missing seconds}; shift 2;;
+    --active) ACTIVE=${2:?missing seconds}; shift 2;;
+    --sort) SORT=${2:?missing field}; shift 2;;
+    --reverse) REVERSE=1; shift;;
+    --limit) LIMIT=${2:?missing limit}; shift 2;;
+    --filter) FILTERS+=("${2:?missing filter}"); shift 2;;
+    -l2|--l2) SHOW_L2=1; shift;;
+    --json) FORMAT=json; shift;;
+    --csv) FORMAT=csv; shift;;
+    --bpfc) BPFC_BIN=${2:?missing path}; shift 2;;
+    --state) STATE_FILE=${2:?missing path}; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "bpfc-flows: unknown option: $1" >&2; usage >&2; exit 2;;
+  esac
+done
+[[ $WATCH =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo 'watch interval must be numeric' >&2; exit 2; }
+[[ $ACTIVE =~ ^[0-9]+$ ]] || { echo 'active window must be an integer' >&2; exit 2; }
+
+MAPS=(FM_FIRST FM_LAST FM_SRCIP FM_DSTIP FM_META
+      FM_I_BYTES FM_I_LAST FM_I_LOC FM_I_SMAC FM_I_DMAC FM_I_L2
+      FM_E_BYTES FM_E_LAST FM_E_LOC FM_E_SMAC FM_E_DMAC FM_E_L2)
+
+dump_once() {
+  local work; work=$(mktemp -d)
+  trap 'rm -rf "$work"' RETURN
+  local m
+  for m in "${MAPS[@]}"; do
+    "$BPFC_BIN" -r "$m" 2>/dev/null >"$work/$m" || :
+  done
+  BPFC_FLOWS_WORK="$work" BPFC_FLOWS_STATE="$STATE_FILE" BPFC_FLOWS_FORMAT="$FORMAT" \
+  BPFC_FLOWS_SORT="$SORT" BPFC_FLOWS_REVERSE="$REVERSE" BPFC_FLOWS_LIMIT="$LIMIT" \
+  BPFC_FLOWS_ACTIVE="$ACTIVE" BPFC_FLOWS_SHOW_L2="$SHOW_L2" BPFC_FLOWS_FILTERS="$(printf '%s\n' "${FILTERS[@]-}")" \
+  python3 - <<'PY'
+import csv, ipaddress, json, os, re, sys, time
+from pathlib import Path
+work=Path(os.environ['BPFC_FLOWS_WORK']); state_path=Path(os.environ['BPFC_FLOWS_STATE'])
+fmt=os.environ['BPFC_FLOWS_FORMAT']; sort=os.environ['BPFC_FLOWS_SORT']; reverse=os.environ['BPFC_FLOWS_REVERSE']=='1'
+limit=int(os.environ['BPFC_FLOWS_LIMIT']); active=int(os.environ['BPFC_FLOWS_ACTIVE'])
+show_l2=os.environ.get('BPFC_FLOWS_SHOW_L2','0')=='1'
+filters=[x for x in os.environ.get('BPFC_FLOWS_FILTERS','').splitlines() if x]
+pat=re.compile(r'Key:\s+0x([0-9a-fA-F]{16})\s+->\s+Value:\s+0x([0-9a-fA-F]{16})')
+def dump(n):
+ d={}
+ p=work/n
+ if p.exists():
+  for line in p.read_text(errors='replace').splitlines():
+   m=pat.search(line)
+   if m: d[int(m.group(1),16)]=int(m.group(2),16)
+ return d
+maps={p.name:dump(p.name) for p in work.iterdir()}
+def get(n,k): return maps.get(n,{}).get(k,0)
+def ipv4(v):
+ try: return str(ipaddress.IPv4Address(v & 0xffffffff))
+ except: return '0.0.0.0'
+def mac(v):
+ return '—' if not v else ':'.join(f'{(v>>s)&255:02x}' for s in range(0,48,8))
+def iface(v):
+ if not v: return '—'
+ try:
+  return Path('/sys/class/net').joinpath(next(p.name for p in Path('/sys/class/net').iterdir() if p.is_dir() and int((p/'ifindex').read_text())==v)).name
+ except Exception: return f'if{v}'
+def proto(v): return {1:'ICMP',6:'TCP',17:'UDP'}.get(v,str(v))
+def dscp_name(v):
+ names={0:'0',1:'LE',8:'CS1',10:'AF11',12:'AF12',14:'AF13',16:'CS2',18:'AF21',20:'AF22',22:'AF23',24:'CS3',26:'AF31',28:'AF32',30:'AF33',32:'CS4',34:'AF41',36:'AF42',38:'AF43',40:'CS5',46:'EF',48:'CS6',56:'CS7'}
+ return names.get(v,str(v))
+def vlan_display(r):
+ iv=str(r['ingress_vlan']) if r['ingress_ethertype'] else '—'
+ ev=str(r['egress_vlan']) if r['egress_ethertype'] else '—'
+ return iv if iv==ev else f'{iv}/{ev}'
+try: old=json.loads(state_path.read_text())
+except Exception: old={}
+now=time.monotonic_ns(); wall=time.time(); rows=[]
+keys=set().union(*[set(v) for v in maps.values()]) if maps else set()
+for k in keys:
+ last=get('FM_LAST',k)
+ if not last: continue
+ age=max(0,(now-last)/1e9)
+ if active and age>active: continue
+ ib,ob=get('FM_I_BYTES',k),get('FM_E_BYTES',k)
+ meta=get('FM_META',k); iloc=get('FM_I_LOC',k); eloc=get('FM_E_LOC',k); il2=get('FM_I_L2',k); el2=get('FM_E_L2',k)
+ prev=old.get(str(k),{}); elapsed=max((now-prev.get('t',now))/1e9,1e-9)
+ bi=max(0,(ib-prev.get('ib',ib))*8/elapsed); bo=max(0,(ob-prev.get('ob',ob))*8/elapsed)
+ pnum=meta & 0xff; tos=(meta>>8)&0xff; ict=(meta>>16)&0xff; sport=(meta>>24)&0xffff; dport=(meta>>40)&0xffff
+ iif=(iloc>>32)&0xffffffff; iin=iloc&0xffffffff; eif=(eloc>>32)&0xffffffff; ein=eloc&0xffffffff
+ r={'flow_key':f'0x{k:016x}','src':ipv4(get('FM_SRCIP',k)),'dst':ipv4(get('FM_DSTIP',k)),
+    'protocol':proto(pnum),'protocol_number':pnum,'tos':tos,'dscp':tos>>2,'dscp_name':dscp_name(tos>>2),
+    'sport':sport,'dport':dport,'icmp_type':ict,
+    'first_seen_ns':get('FM_FIRST',k),'last_seen_ns':last,'age_seconds':round(age,3),
+    'bytes_in':ib,'bytes_out':ob,'bytes_total':ib+ob,
+    'bps_in':bi,'bps_out':bo,'bps_total':bi+bo,
+    'ingress_interface':iface(iif),'ingress_ifindex':iif,'ingress_skb_ingress':iface(iin),
+    'egress_interface':iface(eif),'egress_ifindex':eif,'egress_skb_ingress':iface(ein),
+    'ingress_src_mac':mac(get('FM_I_SMAC',k)),'ingress_dst_mac':mac(get('FM_I_DMAC',k)),
+    'ingress_ethertype':(il2>>32)&0xffff,'ingress_vlan':il2&0xfff,
+    'egress_src_mac':mac(get('FM_E_SMAC',k)),'egress_dst_mac':mac(get('FM_E_DMAC',k)),
+    'egress_ethertype':(el2>>32)&0xffff,'egress_vlan':el2&0xfff}
+ rows.append(r)
+def match(r,f):
+ if '=' not in f: raise SystemExit(f'Invalid filter (use FIELD=VALUE): {f}')
+ a,b=f.split('=',1); a=a.lower(); b=b.lower()
+ if a in ('src','dst'):
+  value=r[a]
+  if '/' in b:
+   try: return ipaddress.ip_address(value) in ipaddress.ip_network(b, strict=False)
+   except ValueError: raise SystemExit(f'Invalid IPv4 CIDR filter: {f}')
+  return b in value.lower()
+ if a in ('proto','ingress','egress','mac'):
+  vals={'proto':r['protocol'],'ingress':r['ingress_interface'],'egress':r['egress_interface'],
+        'mac':r['ingress_src_mac']+' '+r['ingress_dst_mac']+' '+r['egress_src_mac']+' '+r['egress_dst_mac']}[a]
+  return b in vals.lower()
+ nums={'dscp':r['dscp'],'sport':r['sport'],'dport':r['dport'],'icmp':r['icmp_type'],'vlan':r['ingress_vlan'] or r['egress_vlan'],
+       'ethertype':r['ingress_ethertype'] or r['egress_ethertype'],'min-bps-in':r['bps_in'],'min-bps-out':r['bps_out'],'min-bps-total':r['bps_total']}
+ if a in nums:
+  try: return nums[a] >= float(b) if a.startswith('min-') else nums[a] == int(b,0)
+  except ValueError: raise SystemExit(f'Invalid numeric filter value: {f}')
+ raise SystemExit(f'Unknown filter field: {a}')
+for f in filters: rows=[r for r in rows if match(r,f)]
+keysort={'bps-in':'bps_in','bps-out':'bps_out','bps-total':'bps_total','bytes-in':'bytes_in','bytes-out':'bytes_out','bytes-total':'bytes_total','last-seen':'last_seen_ns','src':'src','dst':'dst','proto':'protocol','sport':'sport','dport':'dport','vlan':'ingress_vlan','dscp':'dscp','ingress':'ingress_interface','egress':'egress_interface'}.get(sort)
+if not keysort: raise SystemExit(f'Unknown sort field: {sort}')
+rows.sort(key=lambda r:r[keysort],reverse=not reverse)
+if limit: rows=rows[:limit]
+new={str(int(r['flow_key'],16)):{'t':now,'ib':r['bytes_in'],'ob':r['bytes_out']} for r in rows}
+state_path.parent.mkdir(parents=True,exist_ok=True); state_path.write_text(json.dumps(new))
+def rate(n):
+ for u,x in [('Gb/s',1e9),('Mb/s',1e6),('Kb/s',1e3)]:
+  if n>=x:return f'{n/x:.2f}{u}'
+ return f'{n:.0f}b/s'
+if fmt=='json': print(json.dumps(rows,indent=2)); sys.exit()
+if fmt=='csv':
+ if rows:
+  w=csv.DictWriter(sys.stdout,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+ sys.exit()
+headers=['SRC','DST','P','SPORT','DPORT/TYPE','DSCP','VLAN','INGRESS','EGRESS','AGE']
+if show_l2: headers += ['IN-L2','OUT-L2']
+headers += ['IN-BPS','OUT-BPS']
+body=[]
+for r in rows:
+ port=str(r['icmp_type']) if r['protocol']=='ICMP' else str(r['dport']) if r['protocol'] in ('TCP','UDP') else '—'
+ il2=f"{r['ingress_src_mac']}→{r['ingress_dst_mac']} 0x{r['ingress_ethertype']:04x} v{r['ingress_vlan']}" if r['ingress_ethertype'] else '—'
+ ol2=f"{r['egress_src_mac']}→{r['egress_dst_mac']} 0x{r['egress_ethertype']:04x} v{r['egress_vlan']}" if r['egress_ethertype'] else '—'
+ row=[r['src'],r['dst'],r['protocol'],str(r['sport']) if r['protocol'] in ('TCP','UDP') else '—',port,r['dscp_name'],vlan_display(r),r['ingress_interface'],r['egress_interface'],f"{r['age_seconds']:.1f}s"]
+ if show_l2: row += [il2,ol2]
+ row += [rate(r['bps_in']),rate(r['bps_out'])]
+ body.append(row)
+width=[len(h) for h in headers]
+for row in body:
+ for i,x in enumerate(row): width[i]=min(max(width[i],len(x)),44)
+def fmtrow(row): return '  '.join((x[:width[i]-1]+'…' if len(x)>width[i] else x).ljust(width[i]) for i,x in enumerate(row))
+print(fmtrow(headers)); print(fmtrow(['-'*w for w in width]))
+for row in body: print(fmtrow(row))
+print(f'Flows: {len(rows)}  active-window: {active}s  rate-sample: current snapshot')
+PY
+}
+if (( WATCH )); then
+  while :; do clear; dump_once; sleep "$WATCH"; done
+else
+  dump_once
+fi
+

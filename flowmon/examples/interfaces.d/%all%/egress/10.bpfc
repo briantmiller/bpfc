@@ -1,0 +1,55 @@
+# BPFC IPv4 flow monitor - TC egress.
+# Uses 15 scalar maps, below BPFC's per-program 16-map compiler limit.
+match ip;
+  decl KEY 8; get flow-key KEY symmetric;
+  decl TOS 1; get ip-tos TOS;
+  decl MIX 8; calc or MIX %TOS; calc lsh MIX 48; calc xor KEY %MIX;
+
+  decl ICTYPE 1;
+  match icmp;
+    decl L4OFF 2; get l4-off L4OFF; get bytes %L4OFF 1 ICTYPE;
+    decl IMIX 8; calc or IMIX %ICTYPE; calc lsh IMIX 40; calc xor KEY %IMIX;
+  end-match;
+
+  decl NOW 8; get time NOW;
+  decl LEN 4; get len LEN;
+  decl IFIDX 4; get skb-ifindex IFIDX;
+  decl INIDX 4; get skb-ingress INIDX;
+
+  decl OLD 8; get map FM_FIRST %KEY OLD;
+  if OLD eq 0;
+    set map FM_FIRST %KEY %NOW;
+    decl SIP 4; get ip-src SIP; set map FM_SRCIP %KEY %SIP;
+    decl DIP 4; get ip-dst DIP; set map FM_DSTIP %KEY %DIP;
+
+    decl META 8; decl TMP 8;
+    decl PROTO 1; get ip-proto PROTO; calc or META %PROTO;
+    calc or TMP %TOS; calc lsh TMP 8; calc or META %TMP;
+    calc xor TMP %TMP; calc or TMP %ICTYPE; calc lsh TMP 16; calc or META %TMP;
+    match tcp;
+      decl SPORT 2; get tcp-src SPORT; calc xor TMP %TMP; calc or TMP %SPORT; calc lsh TMP 24; calc or META %TMP;
+      decl DPORT 2; get tcp-dst DPORT; calc xor TMP %TMP; calc or TMP %DPORT; calc lsh TMP 40; calc or META %TMP;
+    end-match;
+    match udp;
+      decl USPORT 2; get udp-src USPORT; calc xor TMP %TMP; calc or TMP %USPORT; calc lsh TMP 24; calc or META %TMP;
+      decl UDPORT 2; get udp-dst UDPORT; calc xor TMP %TMP; calc or TMP %UDPORT; calc lsh TMP 40; calc or META %TMP;
+    end-match;
+    set map FM_META %KEY %META;
+  end-if;
+
+  calc-map add FM_E_BYTES %KEY %LEN;
+  set map FM_LAST %KEY %NOW;
+
+  decl LOC 8; calc or LOC %IFIDX; calc lsh LOC 32; calc or LOC %INIDX; set map FM_E_LOC %KEY %LOC;
+
+  when $L3OFF == 14;
+    decl SMAC 8; get src-mac SMAC; set map FM_E_SMAC %KEY %SMAC;
+    decl DMAC 8; get dst-mac DMAC; set map FM_E_DMAC %KEY %DMAC;
+    decl ETYPE 2; get eth-proto ETYPE;
+    decl VLAN 4; get vlan-id VLAN;
+    decl L2 8; calc or L2 %ETYPE; calc lsh L2 32; calc or L2 %VLAN; set map FM_E_L2 %KEY %L2;
+  otherwise;
+    set map FM_E_SMAC %KEY 0; set map FM_E_DMAC %KEY 0; set map FM_E_L2 %KEY 0;
+  end-when;
+end-match;
+

@@ -36,7 +36,7 @@ DAEMON_CFLAGS = $(WARN) -Wno-format-truncation -DBPFC_VERSION='"$(VERSION)"'
 
 # Everything that goes into the source tarball used by `make rpm`.
 DIST_FILES = Makefile LICENSE README.md bpfc.8 bpfc.c test.sh tests \
-             bpfcd/*.c bpfcd/*.h dist dataplane ecmp
+             bpfcd/*.c bpfcd/*.h dist dataplane ecmp flowmon
 
 RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
@@ -106,6 +106,11 @@ install-scripts:
 	install -m 0644 ecmp/profiles/*.profile $(DESTDIR)$(DATADIR)/bpfc/ecmp/profiles/
 	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/ecmp/profiles.d
 	install -D -m 0644 ecmp/DESIGN.md $(DESTDIR)$(SCRIPTS_DOCDIR)/ecmp/DESIGN.md
+	install -D -m 0755 flowmon/bpfc-flows $(DESTDIR)$(SBINDIR)/bpfc-flows
+	install -d -m 0755 $(DESTDIR)$(SCRIPTS_DOCDIR)/flowmon/examples/interfaces.d/\%all\%/ingress
+	install -d -m 0755 $(DESTDIR)$(SCRIPTS_DOCDIR)/flowmon/examples/interfaces.d/\%all\%/egress
+	install -m 0644 flowmon/examples/interfaces.d/\%all\%/ingress/*.bpfc $(DESTDIR)$(SCRIPTS_DOCDIR)/flowmon/examples/interfaces.d/\%all\%/ingress/
+	install -m 0644 flowmon/examples/interfaces.d/\%all\%/egress/*.bpfc $(DESTDIR)$(SCRIPTS_DOCDIR)/flowmon/examples/interfaces.d/\%all\%/egress/
 
 dist: $(TARBALL)
 
