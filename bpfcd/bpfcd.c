@@ -16,12 +16,16 @@
  *   interfaces so that removed/replaced programs are reinstalled or logged
  *   (on_external_change in bpfc.conf).
  * - The current view is written to <state_dir>/state for bpfcctl.
+ * - With -n <name>, all of this happens inside network namespace <name>,
+ *   configured from /etc/bpfc/netns/<name>/; see netns.c for how the
+ *   namespace is found and the NETNS section below for following it.
  *
  * Copyright (C) 2026
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #define _GNU_SOURCE
 #include "common.h"
+#include "netns.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -29,6 +33,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,15 +50,26 @@
 #include <linux/rtnetlink.h>
 
 #define VERIFY_DELAY_MS 200            /* debounce for TC change bursts */
+#define NETNS_CHECK_MS  1000           /* how often the namespace (and its symlinks) is re-checked */
 
 static struct config cfg;
-static char conf_path[PATH_MAX] = DEFAULT_CONF_PATH;
+static char conf_path[PATH_MAX + 16] = DEFAULT_CONF_PATH;   /* the file read, for messages */
+static const char *conf_override;                           /* -c */
+static const char *netns_arg;                               /* -n */
 static struct daemon_info dinfo;
 static struct slot *slots;
 static int nslots, cap_slots;
 static int state_dirty;
 static int sigfd = -1, nlfd = -1, tfd = -1, pidfd = -1;
 static int verify_pending;
+
+/* -n: the namespace bpfcd started in, and the one it manages (cur.fd < 0 while waiting). */
+static int host_nsfd = -1, host_rtnl = -1, nstfd = -1;
+static struct netns_loc cur = {.fd = -1};
+static char ns_wait_reason[512];
+
+/* Programs may only be touched while inside the managed namespace. */
+static int ns_active(void) { return !cfg.netns[0] || cur.fd >= 0; }
 
 /* ======================= sd_notify (no libsystemd needed) ======================= */
 
@@ -128,6 +144,13 @@ static void write_state(void) {
     dinfo.on_external_change = cfg.on_external_change;
     snprintf(dinfo.config_dir, sizeof(dinfo.config_dir), "%s", cfg.config_dir);
     snprintf(dinfo.bpfc_path, sizeof(dinfo.bpfc_path), "%s", cfg.bpfc_path);
+    snprintf(dinfo.netns, sizeof(dinfo.netns), "%s", cfg.netns);
+    if (cfg.netns[0]) {
+        snprintf(dinfo.netns_status, sizeof(dinfo.netns_status), "%s", cur.fd >= 0 ? "active" : "waiting");
+        snprintf(dinfo.netns_target, sizeof(dinfo.netns_target), "%s", cur.fd >= 0 ? cur.desc : ns_wait_reason);
+        dinfo.netns_dev = cur.dev;
+        dinfo.netns_ino = cur.ino;
+    }
     int rc = state_write(path, &dinfo, slots, nslots);
     if (rc < 0) logmsg(LOG_LVL_ERR, "cannot write %s: %s", path, strerror(-rc));
     state_dirty = 0;
@@ -265,9 +288,10 @@ static void warn_if_foreign(const struct slot *s, int ifindex) {
 }
 
 static void install_slot(struct slot *s, const char *why) {
-    int ifindex = (int)if_nametoindex(s->iface);
+    /* Waiting for the namespace: the current one is the host's, never touch it. */
+    int ifindex = ns_active() ? (int)if_nametoindex(s->iface) : 0;
     if (!ifindex) {
-        if (s->status != ST_PENDING)
+        if (s->status != ST_PENDING && ns_active())
             logmsg(LOG_LVL_INFO, "%s %s prio %d: interface not present, waiting for it",
                    s->iface, dir_name(s->dir), s->prio);
         s->ifindex = 0;
@@ -342,7 +366,7 @@ static int xdp_still_ours(const struct slot *s) {
 
 static void uninstall_slot(struct slot *s, const char *why) {
     /* Only our own program is removed; a filter someone else put in its place is left alone. */
-    if (s->ifindex && if_nametoindex(s->iface) == (unsigned)s->ifindex && s->status == ST_INSTALLED &&
+    if (ns_active() && s->ifindex && if_nametoindex(s->iface) == (unsigned)s->ifindex && s->status == ST_INSTALLED &&
         (s->dir != DIR_XDP || xdp_still_ours(s))) {
         if (bpfc_delete(s) == 0)
             logmsg(LOG_LVL_INFO, "%s %s prio %d: removed (%s)", s->iface, dir_name(s->dir), s->prio, why);
@@ -585,6 +609,12 @@ static void scan_dir(void) {
 
 /* Re-reads the interface list (start-up, and after the monitor lost events). */
 static void load_links(void) {
+    if (!ns_active()) {   /* no namespace: no interfaces, so templates expand to nothing */
+        free(links);
+        links = NULL;
+        nlinks = 0;
+        return;
+    }
     struct link_info *l = NULL;
     int n = link_dump(&l);
     if (n < 0) { logmsg(LOG_LVL_ERR, "cannot list interfaces: %s", strerror(-n)); return; }
@@ -594,6 +624,9 @@ static void load_links(void) {
 }
 
 /* ======================= reconcile / verify ======================= */
+
+/* What a retry of a non-installed slot is logged as. */
+static const char *retry_reason = "reload retry";
 
 /* Makes the kernel match the slot table. A reload also retries slots in any non-installed state. */
 static void apply(int is_reload) {
@@ -636,7 +669,7 @@ static void apply(int is_reload) {
             install_slot(s, was_new ? "new file" : "file changed");
         } else if (s->status == ST_EXCLUDED || (is_reload && s->status != ST_INSTALLED)) {
             s->reinstall_count = 0;
-            install_slot(s, "reload retry");
+            install_slot(s, retry_reason);
         }
     }
 }
@@ -709,6 +742,7 @@ static void verify_iface_dir(int ifindex, int dir) {
 }
 
 static void verify_all(void) {
+    if (!ns_active()) return;
     /* Each (ifindex, dir) pair is dumped once. */
     for (int i = 0; i < nslots; i++) {
         struct slot *s = &slots[i];
@@ -745,6 +779,12 @@ static void adopt_previous_state(void) {
     struct slot *old = NULL;
     int n = state_read(path, &old_di, &old);
     if (n <= 0) { free(old); return; }
+    /* Programs recorded for another namespace are not ours to adopt or remove here. */
+    if (cfg.netns[0] && (old_di.netns_ino != cur.ino || old_di.netns_dev != cur.dev)) {
+        logmsg(LOG_LVL_INFO, "previous state is for a different namespace; installing afresh");
+        free(old);
+        return;
+    }
     int adopted = 0;
     for (int i = 0; i < n; i++) {
         struct slot *o = &old[i];
@@ -943,6 +983,131 @@ static void handle_netlink(void) {
     }
 }
 
+/* ======================= NETNS: entering and following a namespace ======================= */
+
+/*
+ * With -n, bpfcd lives inside its namespace while it exists: setns() makes
+ * if_nametoindex(), the TC netlink requests and every bpfc it runs act there.
+ * Sockets stay with the namespace they were created in, so the event monitor
+ * is reopened on every switch, and host_rtnl (created before the first
+ * setns) keeps looking at the host side of a netns_veth.
+ *
+ * Every NETNS_CHECK_MS the namespace is checked again (netns_changed):
+ *   - it disappeared (path gone, veth deleted, or nothing but bpfcd left in
+ *     it): log, keep the programs as they are, and drop bpfcd's own
+ *     reference so the namespace can be freed; wait for it to come back.
+ *   - the path or veth now leads to a different namespace: remove bpfcd's
+ *     programs from the old one, then install everything in the new one.
+ */
+static void ns_set_waiting(const char *why) {
+    if (strcmp(ns_wait_reason, why)) {
+        logmsg(LOG_LVL_INFO, "netns %s: waiting: %s", cfg.netns, why);
+        snprintf(ns_wait_reason, sizeof(ns_wait_reason), "%s", why);
+        state_dirty = 1;
+    }
+}
+
+static void ns_forget_programs(int remove) {
+    for (int i = 0; i < nslots; i++) {
+        struct slot *s = &slots[i];
+        if (remove) uninstall_slot(s, "namespace changed");
+        if (s->status == ST_INSTALLED || s->status == ST_REMOVED_EXT || s->status == ST_REPLACED_EXT ||
+            s->status == ST_DISABLED || s->status == ST_FAILED) {
+            s->ifindex = 0;
+            s->prog_id = 0;
+            s->tag[0] = '\0';
+            s->insns = 0;
+            set_status(s, ST_PENDING, NULL);
+        }
+    }
+}
+
+/* Leaves the managed namespace: back to the host one, holding no reference to it. */
+static void ns_leave(int remove_programs, const char *why) {
+    if (cur.fd < 0) return;
+    ns_forget_programs(remove_programs);
+    if (nlfd >= 0) { close(nlfd); nlfd = -1; }
+    if (setns(host_nsfd, CLONE_NEWNET) < 0)
+        logmsg(LOG_LVL_ERR, "cannot return to the host namespace: %s", strerror(errno));
+    netns_loc_close(&cur);
+    ns_wait_reason[0] = '\0';
+    ns_set_waiting(why);
+    load_links();
+    scan_dir();          /* template slots for the namespace's interfaces go away */
+    apply(0);
+    state_dirty = 1;
+}
+
+/* Enters a located namespace and installs everything there. */
+static int ns_enter(struct netns_loc *loc, int at_start) {
+    if (setns(loc->fd, CLONE_NEWNET) < 0) {
+        int e = errno;
+        char why[600];
+        snprintf(why, sizeof(why), "%s: cannot enter: %s", loc->desc, strerror(e));
+        netns_loc_close(loc);
+        ns_set_waiting(why);
+        return -e;
+    }
+    cur = *loc;
+    loc->fd = -1;
+    ns_wait_reason[0] = '\0';
+    logmsg(LOG_LVL_INFO, "netns %s: managing %s", cfg.netns, cur.desc);
+    if (nlfd >= 0) close(nlfd);
+    nlfd = open_monitor();
+    if (nlfd < 0) logmsg(LOG_LVL_ERR, "netns %s: event monitor: %s", cfg.netns, strerror(-nlfd));
+    load_links();
+    scan_dir();
+    if (at_start) adopt_previous_state();
+    retry_reason = "namespace found";
+    apply(1);           /* every slot not adopted is pending: install them all */
+    retry_reason = "reload retry";
+    verify_all();
+    state_dirty = 1;
+    return 0;
+}
+
+static void ns_check(int at_start) {
+    if (cur.fd >= 0 && !netns_changed(&cfg, host_rtnl, &cur)) return;
+    struct netns_loc loc;
+    int rc = netns_locate(&cfg, host_rtnl, &loc);
+    if (cur.fd >= 0) {
+        if (rc == 0 && loc.dev == cur.dev && loc.ino == cur.ino) {
+            /* same namespace, found through another witness */
+            snprintf(cur.witness, sizeof(cur.witness), "%s", loc.witness);
+            snprintf(cur.desc, sizeof(cur.desc), "%s", loc.desc);
+            cur.veth_ifindex = loc.veth_ifindex;
+            cur.veth_nsid = loc.veth_nsid;
+            netns_loc_close(&loc);
+            state_dirty = 1;
+            return;
+        }
+        if (rc == 0) {
+            logmsg(LOG_LVL_WARN, "netns %s: now %s, a different namespace; moving the programs there",
+                   cfg.netns, loc.desc);
+            ns_leave(1, "switching namespace");
+        } else {
+            logmsg(LOG_LVL_WARN, "netns %s: the namespace is gone (%s); its programs are left as they "
+                   "are, bpfcd waits for it to return", cfg.netns, loc.desc);
+            ns_leave(0, loc.desc);
+            return;
+        }
+    }
+    if (rc < 0) {
+        if (rc != -ENOENT && strcmp(ns_wait_reason, loc.desc))
+            logmsg(LOG_LVL_ERR, "netns %s: %s", cfg.netns, loc.desc);
+        ns_set_waiting(loc.desc);
+        return;
+    }
+    ns_enter(&loc, at_start);
+}
+
+static void ns_start_timer(void) {
+    struct itimerspec its = {
+        .it_interval = {.tv_sec = NETNS_CHECK_MS / 1000, .tv_nsec = (NETNS_CHECK_MS % 1000) * 1000000L},
+        .it_value = {.tv_sec = NETNS_CHECK_MS / 1000, .tv_nsec = (NETNS_CHECK_MS % 1000) * 1000000L}};
+    timerfd_settime(nstfd, 0, &its, NULL);
+}
+
 /* ======================= lifecycle ======================= */
 
 static int acquire_pidfile(void) {
@@ -1009,21 +1174,28 @@ static void notify_status(const char *prefix) {
 
 static int reload_config_file(void) {
     struct config nc;
-    config_defaults(&nc);
     char err[512] = "";
-    if (config_load(conf_path, &nc, err, sizeof(err)) < 0 ||
-        config_apply_env(&nc, err, sizeof(err)) < 0) {
+    if (config_resolve(netns_arg, conf_override, &nc, conf_path, sizeof(conf_path), err, sizeof(err)) < 0) {
         logmsg(LOG_LVL_ERR, "%s; keeping the previous settings", err);
         return -1;
     }
+    int ns_moved = strcmp(nc.netns_path, cfg.netns_path) || strcmp(nc.netns_veth, cfg.netns_veth);
     if (strcmp(nc.state_dir, cfg.state_dir)) {
         logmsg(LOG_LVL_WARN, "state_dir changes take effect after a restart");
         snprintf(nc.state_dir, sizeof(nc.state_dir), "%s", cfg.state_dir);
     }
     if (strcmp(nc.map_dir, cfg.map_dir))
         logmsg(LOG_LVL_INFO, "map_dir changed; it applies to programs installed from now on");
+    if (cfg.netns[0] && strcmp(nc.map_dir, cfg.map_dir)) {
+        int rc = mkdir_p(nc.map_dir, 0700);
+        if (rc < 0) logmsg(LOG_LVL_WARN, "cannot create map directory %s: %s", nc.map_dir, strerror(-rc));
+    }
     cfg = nc;
     log_set_level(cfg.log_level);
+    if (ns_moved && cfg.netns[0]) {
+        logmsg(LOG_LVL_INFO, "netns %s: netns_path/netns_veth changed; looking for the namespace again", cfg.netns);
+        ns_check(0);
+    }
     return 0;
 }
 
@@ -1033,6 +1205,19 @@ static int check_only(void) {
     scan_dir();
     qsort(slots, nslots, sizeof(*slots), slot_cmp);
     printf("config:   %s\nprograms: %s\n", conf_path, cfg.config_dir);
+    if (cfg.netns[0]) {
+        printf("netns:    %s\nstate:    %s\nmaps:     %s\n", cfg.netns, cfg.state_dir, cfg.map_dir);
+        struct netns_loc loc;
+        int rc = netns_locate(&cfg, host_rtnl, &loc);
+        printf("found:    %s%s\n", rc == 0 ? "" : "no: ", loc.desc);
+        if (rc == 0) {
+            if (setns(loc.fd, CLONE_NEWNET) < 0)
+                printf("          (cannot enter it to check interfaces: %s)\n", strerror(errno));
+            netns_loc_close(&loc);
+        } else {
+            printf("          (interfaces below are checked in the current namespace)\n");
+        }
+    }
     for (int i = 0; i < nslots; i++) {
         struct slot *s = &slots[i];
         if (!s->seen) continue;
@@ -1046,6 +1231,8 @@ static int check_only(void) {
 
 static void usage(const char *argv0) {
     printf("Usage: %s [options]\n"
+           "  -n, --netns <name>   manage network namespace <name>, configured from\n"
+           "                       %s/netns/<name>/ (see bpfcd(8), NETWORK NAMESPACES)\n"
            "  -c, --config <file>  configuration file (default %s)\n"
            "  -b, --background     daemonize and log to syslog (non-systemd systems)\n"
            "  -D, --debug          log debug messages\n"
@@ -1053,13 +1240,14 @@ static void usage(const char *argv0) {
            "  -V, --version        print version\n"
            "  -h, --help           this help\n"
            "Signals: SIGHUP rescans %s and bpfc.conf; SIGTERM/SIGINT stop.\n",
-           argv0, DEFAULT_CONF_PATH, DEFAULT_CONFIG_DIR);
+           argv0, DEFAULT_CONF_ROOT, DEFAULT_CONF_PATH, DEFAULT_CONFIG_DIR);
 }
 
 int main(int argc, char **argv) {
     int background = 0, debug = 0, test = 0;
     static const struct option longopts[] = {
         {"config", required_argument, 0, 'c'}, {"background", no_argument, 0, 'b'},
+        {"netns", required_argument, 0, 'n'},
         {"debug", no_argument, 0, 'D'}, {"test", no_argument, 0, 't'},
         {"version", no_argument, 0, 'V'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
     /*
@@ -1078,9 +1266,10 @@ int main(int argc, char **argv) {
     sigprocmask(SIG_BLOCK, &mask, NULL);
 
     int o;
-    while ((o = getopt_long(argc, argv, "c:bDtVh", longopts, NULL)) != -1) {
+    while ((o = getopt_long(argc, argv, "c:n:bDtVh", longopts, NULL)) != -1) {
         switch (o) {
-        case 'c': snprintf(conf_path, sizeof(conf_path), "%s", optarg); break;
+        case 'c': conf_override = optarg; break;
+        case 'n': netns_arg = optarg; break;
         case 'b': background = 1; break;
         case 'D': debug = 1; break;
         case 't': test = 1; break;
@@ -1091,15 +1280,23 @@ int main(int argc, char **argv) {
     }
 
     log_init("bpfcd", LOG_TO_STDERR, LOG_LVL_INFO);
-    config_defaults(&cfg);
     char err[512] = "";
-    if (config_load(conf_path, &cfg, err, sizeof(err)) < 0 ||
-        config_apply_env(&cfg, err, sizeof(err)) < 0) {
+    if (config_resolve(netns_arg, conf_override, &cfg, conf_path, sizeof(conf_path), err, sizeof(err)) < 0) {
         logmsg(LOG_LVL_ERR, "%s", err);
         return 1;
     }
     if (debug) cfg.log_level = LOG_LVL_DEBUG;
     log_set_level(cfg.log_level);
+    if (cfg.netns[0]) {
+        /* Taken before entering any namespace: the way back, and the host side of netns_veth. */
+        host_nsfd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+        host_rtnl = netns_host_socket();
+        if (host_nsfd < 0 || host_rtnl < 0) {
+            logmsg(LOG_LVL_ERR, "cannot open the current network namespace: %s",
+                   strerror(host_nsfd < 0 ? errno : -host_rtnl));
+            return 1;
+        }
+    }
     if (test) return check_only();
 
     if (geteuid() != 0) logmsg(LOG_LVL_WARN, "not running as root; attaching programs will likely fail");
@@ -1112,6 +1309,10 @@ int main(int argc, char **argv) {
     snprintf(errdir, sizeof(errdir), "%s/%s", cfg.state_dir, ERROR_DIR_NAME);
     int rc = mkdir_p(errdir, 0755);
     if (rc < 0) { logmsg(LOG_LVL_ERR, "cannot create %s: %s", errdir, strerror(-rc)); return 1; }
+    /* bpfc does not create its map directory; a namespace's default one is new. */
+    if (cfg.netns[0] && cfg.map_dir[0] && (rc = mkdir_p(cfg.map_dir, 0700)) < 0)
+        logmsg(LOG_LVL_WARN, "cannot create map directory %s: %s (programs using maps will fail)",
+               cfg.map_dir, strerror(-rc));
     /* Locked before daemonizing so a duplicate start fails on the terminal, not just in syslog. */
     if (acquire_pidfile() < 0) return 1;
     if (background) {
@@ -1123,9 +1324,11 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     sigfd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
     tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-    /* The monitor is opened before the first scan so no interface event is missed. */
-    nlfd = open_monitor();
-    if (sigfd < 0 || tfd < 0 || nlfd < 0) {
+    /* The monitor is opened before the first scan so no interface event is missed.
+     * In a namespace it is opened on entering it (ns_enter). */
+    if (!cfg.netns[0]) nlfd = open_monitor();
+    else nstfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    if (sigfd < 0 || tfd < 0 || (cfg.netns[0] ? nstfd < 0 : nlfd < 0)) {
         logmsg(LOG_LVL_ERR, "setup failed: %s", strerror(nlfd < 0 ? -nlfd : errno));
         release_pidfile();
         return 1;
@@ -1136,23 +1339,32 @@ int main(int argc, char **argv) {
     dinfo.started = time(NULL);
     snprintf(dinfo.version, sizeof(dinfo.version), "%s", BPFC_VERSION);
 
-    logmsg(LOG_LVL_INFO, "bpfcd %s starting%s; programs from %s, external changes: %s",
-           BPFC_VERSION, is_init ? " as PID 1" : "", cfg.config_dir,
-           cfg.on_external_change == EXT_LOG ? "log" : "reinstall");
-    load_links();
-    scan_dir();
-    adopt_previous_state();
-    apply(0);
-    verify_all();
+    logmsg(LOG_LVL_INFO, "bpfcd %s starting%s%s%s; programs from %s, external changes: %s",
+           BPFC_VERSION, is_init ? " as PID 1" : "", cfg.netns[0] ? " for network namespace " : "",
+           cfg.netns, cfg.config_dir, cfg.on_external_change == EXT_LOG ? "log" : "reinstall");
+    if (cfg.netns[0]) {
+        ns_set_waiting("not looked for yet");
+        scan_dir();          /* the programs show as pending until the namespace is found */
+        apply(0);
+        ns_check(1);
+        ns_start_timer();
+    } else {
+        load_links();
+        scan_dir();
+        adopt_previous_state();
+        apply(0);
+        verify_all();
+    }
     dinfo.last_reload = time(NULL);
     write_state();
     notify_status("READY=1\n");
 
     int running = 1;
     while (running) {
-        struct pollfd pfd[3] = {
-            {.fd = sigfd, .events = POLLIN}, {.fd = nlfd, .events = POLLIN}, {.fd = tfd, .events = POLLIN}};
-        if (poll(pfd, 3, -1) < 0) {
+        struct pollfd pfd[4] = {
+            {.fd = sigfd, .events = POLLIN}, {.fd = nlfd, .events = POLLIN}, {.fd = tfd, .events = POLLIN},
+            {.fd = nstfd, .events = POLLIN}};   /* negative fds (no monitor, no namespace) are skipped */
+        if (poll(pfd, 4, -1) < 0) {
             if (errno == EINTR) continue;
             logmsg(LOG_LVL_ERR, "poll: %s", strerror(errno));
             break;
@@ -1163,6 +1375,11 @@ int main(int argc, char **argv) {
             if (read(tfd, &exp, sizeof(exp)) < 0) { /* spurious */ }
             verify_pending = 0;
             verify_all();
+        }
+        if (pfd[3].revents & POLLIN) {
+            uint64_t exp;
+            if (read(nstfd, &exp, sizeof(exp)) < 0) { /* spurious */ }
+            ns_check(0);
         }
         if (pfd[0].revents & POLLIN) {
             struct signalfd_siginfo si;
@@ -1176,6 +1393,7 @@ int main(int argc, char **argv) {
                     logmsg(LOG_LVL_INFO, "SIGHUP: reloading %s and %s", conf_path, cfg.config_dir);
                     sd_notify_msg("STATUS=reloading");
                     reload_config_file();
+                    if (cfg.netns[0]) ns_check(0);   /* a reload also looks for a missing namespace */
                     full_reload();
                     write_state();
                     notify_status("");

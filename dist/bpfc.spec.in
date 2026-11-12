@@ -86,10 +86,18 @@ interface's bandwidth.
 
 %preun
 %{?systemd_preun:%systemd_preun bpfcd.service}
+# Per-namespace instances (bpfcd-netns@<name>): the systemd macros take unit
+# names, not patterns, so stop them by pattern on removal.
+if [ $1 -eq 0 ] && [ -d /run/systemd/system ]; then
+    systemctl --no-reload stop 'bpfcd-netns@*.service' >/dev/null 2>&1 || :
+fi
 
 %postun
 # Restart on upgrade: running programs are adopted, not reinstalled.
 %{?systemd_postun_with_restart:%systemd_postun_with_restart bpfcd.service}
+if [ $1 -ge 1 ] && [ -d /run/systemd/system ]; then
+    systemctl try-restart 'bpfcd-netns@*.service' >/dev/null 2>&1 || :
+fi
 
 %files
 %license LICENSE
@@ -102,9 +110,11 @@ interface's bandwidth.
 %{_mandir}/man8/bpfcctl.8*
 %{_mandir}/man5/bpfc.conf.5*
 %{_unitdir}/bpfcd.service
+%{_unitdir}/bpfcd-netns@.service
 %dir %{_sysconfdir}/bpfc
 %config(noreplace) %{_sysconfdir}/bpfc/bpfc.conf
 %dir %{_sysconfdir}/bpfc/interfaces.d
+%dir %{_sysconfdir}/bpfc/netns
 %dir %{_sysconfdir}/bpfc/include
 
 %files container
@@ -125,6 +135,26 @@ interface's bandwidth.
 %{_docdir}/%{name}-scripts/
 
 %changelog
+* Wed Nov 11 2026 bpfc maintainers <brun064@gmail.com> - @VERSION@-@RELEASE@
+- Network namespaces: bpfcd -n <name> manages a namespace configured from
+  /etc/bpfc/netns/<name>/ (bpfc.conf, interfaces.d); without its own
+  bpfc.conf it takes the global file's behavior settings, never its paths.
+  Default paths per namespace: state /run/bpfc/netns/<name>, pinned maps
+  /sys/fs/bpf/netns/<name>
+- The namespace is /run/netns/<name>, or netns_path (symlinks followed and
+  re-checked every second), or the namespace of netns_veth's peer (host-side
+  veth name: for pods and containers). bpfcd waits for a missing namespace,
+  moves its programs when the path or veth comes to point at another one,
+  and lets go of a deleted one so it can be freed
+- bpfcd-netns@.service instances (systemctl enable --now bpfcd-netns@<name>)
+- bpfcctl -n <name>; status --all-netns; env and exec commands for scripts.
+  reload's short -n (no wait) is now --no-wait only
+- bpfc-ecmp-gen, bpfc-ecmp-status, bpfc-dataplane-gen,
+  bpfc-dataplane-status, bpfc-flows: -n <name> (bpfc-ecmp-status: -n with
+  a number is still the flow count; --netns for an all-digit name).
+  bpfc-flows now reads maps from map_dir
+- bpfcd-entrypoint: BPFCD_NETNS
+
 * Wed Nov 04 2026 bpfc maintainers <brun064@gmail.com> - 0.1.1-4
 - New bpfc-scripts subpackage (noarch, optional): the FEC/ARQ dataplane
   generator and status tool (bpfc-dataplane-gen, bpfc-dataplane-status) in

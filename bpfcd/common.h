@@ -17,10 +17,14 @@
 #define BPFC_VERSION "0.0.0"
 #endif
 
-#define DEFAULT_CONF_PATH   "/etc/bpfc/bpfc.conf"
-#define DEFAULT_CONFIG_DIR  "/etc/bpfc/interfaces.d"
+#define DEFAULT_CONF_ROOT   "/etc/bpfc"
+#define DEFAULT_CONF_PATH   DEFAULT_CONF_ROOT "/bpfc.conf"
+#define DEFAULT_CONFIG_DIR  DEFAULT_CONF_ROOT "/interfaces.d"
 #define DEFAULT_STATE_DIR   "/run/bpfc"
 #define DEFAULT_BPFC_PATH   "/usr/sbin/bpfc"
+#define DEFAULT_MAP_ROOT    "/sys/fs/bpf"
+#define NETNS_RUN_DIR       "/run/netns"        /* where `ip netns add` names namespaces */
+#define NETNS_NAME_MAX      64
 #define STATE_FILE_NAME     "state"
 #define PID_FILE_NAME       "bpfcd.pid"
 #define ERROR_DIR_NAME      "errors"
@@ -64,6 +68,19 @@ struct config {
     int reinstall_limit;         /* max automatic reinstalls per slot per minute */
     int compile_timeout;         /* seconds before a bpfc run is killed */
     int log_level;               /* enum log_level */
+    /* Network namespace (bpfcd/bpfcctl -n NAME); empty for the namespace bpfcd starts in. */
+    char netns[NETNS_NAME_MAX + 1];
+    char netns_path[PATH_MAX];   /* netns_path: a namespace file, symlinks followed on every check */
+    char netns_veth[IFNAMSIZ];   /* netns_veth: the namespace holding this host veth's peer */
+    unsigned set;                /* CFG_SET_* bits: settings given explicitly (file or environment) */
+};
+
+enum {
+    CFG_SET_CONFIG_DIR = 1u << 0,
+    CFG_SET_STATE_DIR  = 1u << 1,
+    CFG_SET_MAP_DIR    = 1u << 2,
+    CFG_SET_NETNS_PATH = 1u << 3,
+    CFG_SET_NETNS_VETH = 1u << 4,
 };
 
 void config_defaults(struct config *c);
@@ -78,6 +95,32 @@ int config_load(const char *path, struct config *c, char *err, size_t errlen);
  * config file. Applied after config_load(). Returns 0, or -1 with a message.
  */
 int config_apply_env(struct config *c, char *err, size_t errlen);
+
+/*
+ * Root of the configuration tree (/etc/bpfc) and of per-namespace state
+ * (/run/bpfc). BPFC_CONF_ROOT and BPFC_RUN_ROOT override them, for tests.
+ */
+const char *conf_root(void);
+const char *run_root(void);
+
+/* Namespace names: 1-64 characters of [A-Za-z0-9_.-], not starting with '.' or '-'. */
+int netns_name_valid(const char *name);
+
+/*
+ * The complete configuration for the default namespace (netns NULL or "") or
+ * for network namespace netns:
+ *   - <root>/netns/<netns>/bpfc.conf if it exists, otherwise only the behavior
+ *     settings of <root>/bpfc.conf (never its paths, which belong to the
+ *     default namespace's bpfcd);
+ *   - BPFCD_* environment overrides;
+ *   - path defaults: config_dir <root>/netns/<netns>/interfaces.d, state_dir
+ *     <run>/netns/<netns>, map_dir /sys/fs/bpf/netns/<netns>.
+ * conf_override (-c) replaces the file lookup. conf_used receives the file
+ * that was (or would have been) read, with " (fallback)" when the global file
+ * stood in. Returns 0, or -1 with a message in err.
+ */
+int config_resolve(const char *netns, const char *conf_override, struct config *c,
+                   char *conf_used, size_t conf_used_len, char *err, size_t errlen);
 
 /* ---------------- hashing ---------------- */
 
@@ -158,6 +201,10 @@ struct daemon_info {
     char config_dir[PATH_MAX];
     int on_external_change;
     char bpfc_path[PATH_MAX];   /* the daemon's bpfc, for hashing programs with includes */
+    char netns[NETNS_NAME_MAX + 1];  /* empty: the namespace bpfcd started in */
+    char netns_status[16];      /* "active" or "waiting" (netns only) */
+    char netns_target[512];     /* what the namespace was found through, or why it was not */
+    uint64_t netns_dev, netns_ino;   /* identity of the namespace being managed (0: none) */
 };
 
 /* Atomically writes the state file (temp file + rename). Returns 0 or -errno. */

@@ -11,12 +11,16 @@
  */
 #define _GNU_SOURCE
 #include "common.h"
+#include "netns.h"
 
 #include <ctype.h>
 
 #include <errno.h>
 #include <getopt.h>
 #include <signal.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,9 +29,21 @@
 #include <linux/bpf.h>
 
 static struct config cfg;
-static char conf_path[PATH_MAX] = DEFAULT_CONF_PATH;
+static char conf_path[PATH_MAX + 16] = DEFAULT_CONF_PATH;
+static const char *conf_override;     /* -c */
+static const char *netns_arg;         /* -n */
 static char state_dir_override[PATH_MAX];
 static int use_color;
+
+/*
+ * Kernel cross-checks run in the namespace being looked at. kernel_ok is 0
+ * when bpfcctl could not get there (not root, or the namespace is missing);
+ * kernel_note says why.
+ */
+static int kernel_ok = 1;
+static char kernel_note[600];
+static int host_nsfd = -1, host_rtnl = -1;
+static int left_host;   /* bpfcctl has entered another namespace */
 
 #define C_RED    (use_color ? "\033[31m" : "")
 #define C_GREEN  (use_color ? "\033[32m" : "")
@@ -38,6 +54,21 @@ static int use_color;
 
 static const char *state_dir(void) {
     return state_dir_override[0] ? state_dir_override : cfg.state_dir;
+}
+
+/* The systemd unit and the reload command for the namespace being looked at. */
+static const char *unit_name(void) {
+    static char u[NETNS_NAME_MAX + 32];
+    if (cfg.netns[0]) snprintf(u, sizeof(u), "bpfcd-netns@%s", cfg.netns);
+    else snprintf(u, sizeof(u), "bpfcd");
+    return u;
+}
+
+static const char *reload_cmd(void) {
+    static char r[NETNS_NAME_MAX + 64];
+    if (cfg.netns[0]) snprintf(r, sizeof(r), "bpfcctl -n %s reload", cfg.netns);
+    else snprintf(r, sizeof(r), "systemctl reload bpfcd");
+    return r;
 }
 
 static void fmt_time(time_t t, char *out, size_t len) {
@@ -105,7 +136,8 @@ static int file_is_empty(const char *path) {
 
 static int file_state(const struct slot *s) {
     struct stat st;
-    if (stat(s->path, &st) < 0) return -1; /* deleted */
+    if (stat(s->path, &st) < 0) return errno == ENOENT || errno == ENOTDIR ? -1 : 0; /* deleted; unreadable: unknown */
+    if (access(s->path, R_OK) < 0) return 0;   /* cannot hash it: say nothing rather than "modified" */
     /* bpfcd records an empty (opt-out) file as "empty", not as its hash */
     if (!strcmp(s->sha256, "empty")) return file_is_empty(s->path) ? 0 : 1;
     char hex[65];
@@ -136,6 +168,7 @@ static const struct kview *kernel_view(int ifindex, int dir) {
 }
 
 static const struct tc_filter *kernel_at(const char *iface, int dir, int prio) {
+    if (!kernel_ok) return NULL;
     int idx = (int)if_nametoindex(iface);
     if (!idx) return NULL;
     const struct kview *v = kernel_view(idx, dir);
@@ -149,6 +182,7 @@ static const struct tc_filter *kernel_at(const char *iface, int dir, int prio) {
 static const char *kernel_check(const struct slot *s, const char **color) {
     const struct tc_filter *k = kernel_at(s->iface, s->dir, s->prio);
     *color = C_DIM;
+    if (!kernel_ok) return "?";
     if (s->status == ST_INSTALLED) {
         if (!if_nametoindex(s->iface)) { *color = C_RED; return "no-iface"; }
         if (!k) { *color = C_RED; return "MISSING"; }
@@ -186,14 +220,21 @@ static int cmd_status(int show_all, int long_fmt) {
                C_GREEN, C_OFF, di.pid, di.version, started, reloaded);
     else
         printf("bpfcd: %snot running%s -- information below is from its last run\n", C_RED, C_OFF);
-    printf("programs: %s    external changes: %s\n\n", di.config_dir,
+    if (cfg.netns[0]) {
+        int waiting = alive && !strcmp(di.netns_status, "waiting");
+        printf("netns: %s%s%s%s  %s\n", cfg.netns, waiting ? " (" : "", waiting ? "waiting" : "",
+               waiting ? ")" : "", di.netns_target[0] ? di.netns_target : "");
+    }
+    printf("programs: %s    external changes: %s\n", di.config_dir,
            di.on_external_change == EXT_LOG ? "log" : "reinstall");
+    if (!kernel_ok) printf("%skernel not checked: %s%s\n", C_DIM, kernel_note, C_OFF);
+    printf("\n");
 
     int problems = 0, pending_reload = 0;
     if (n == 0) {
         const char *cd = di.config_dir[0] ? di.config_dir : DEFAULT_CONFIG_DIR;
         printf("No programs configured. Add files as %s/<interface|%%all%%|%%<kind>%%>/<ingress|egress>/<priority>.bpfc\n"
-               "or %s/<interface|%%all%%|%%<kind>%%>/xdp.bpfc and run: systemctl reload bpfcd\n", cd, cd);
+               "or %s/<interface|%%all%%|%%<kind>%%>/xdp.bpfc and run: %s\n", cd, cd, reload_cmd());
     } else {
         int wif = 5;
         for (int i = 0; i < n; i++) if ((int)strlen(slots[i].iface) > wif) wif = (int)strlen(slots[i].iface);
@@ -223,12 +264,14 @@ static int cmd_status(int show_all, int long_fmt) {
                        t, s->insns, s->sha256, s->ifindex, C_OFF);
             }
             if (s->status == ST_FAILED || s->status == ST_DISABLED || s->status == ST_REMOVED_EXT ||
-                s->status == ST_REPLACED_EXT || (s->status == ST_INSTALLED && strcmp(kw, "ok")))
+                s->status == ST_REPLACED_EXT || (s->status == ST_INSTALLED && kernel_ok && strcmp(kw, "ok")))
                 problems++;
         }
     }
 
-    if (show_all) {
+    if (show_all && !kernel_ok) {
+        printf("\n%sFilters not managed by bpfcd: not available (%s)%s\n", C_DIM, kernel_note, C_OFF);
+    } else if (show_all) {
         /* Every TC filter on every interface that bpfcd is not responsible for. */
         printf("\n%sFilters not managed by bpfcd%s\n", C_BOLD, C_OFF);
         struct if_nameindex *ifs = if_nameindex();
@@ -266,7 +309,7 @@ static int cmd_status(int show_all, int long_fmt) {
     }
 
     if (pending_reload)
-        printf("\nFiles changed on disk since the last reload. Apply with: systemctl reload bpfcd\n");
+        printf("\nFiles changed on disk since the last reload. Apply with: %s\n", reload_cmd());
     free(slots);
     /* Exit status lets scripts and monitoring use `bpfcctl status -q`-style checks. */
     return !alive ? 3 : problems ? 2 : 0;
@@ -527,7 +570,8 @@ static int cmd_reload(int wait) {
     slots = NULL;
     if (kill(pid, SIGHUP) < 0) {
         if (errno == EPERM)
-            fprintf(stderr, "Reloading bpfcd requires root: run 'sudo bpfcctl reload' or 'sudo systemctl reload bpfcd'\n");
+            fprintf(stderr, "Reloading bpfcd requires root: run 'sudo %s' or 'sudo systemctl reload %s'\n",
+                    cfg.netns[0] ? reload_cmd() : "bpfcctl reload", unit_name());
         else
             fprintf(stderr, "Cannot signal bpfcd (pid %d): %s\n", pid, strerror(errno));
         return 1;
@@ -544,7 +588,7 @@ static int cmd_reload(int wait) {
         n = -1;
     }
     if (n < 0) {
-        fprintf(stderr, "bpfcd did not finish reloading within 120s; check: journalctl -u bpfcd\n");
+        fprintf(stderr, "bpfcd did not finish reloading within 120s; check: journalctl -u %s\n", unit_name());
         return 1;
     }
     int counts[ST__COUNT] = {0};
@@ -562,6 +606,159 @@ static int cmd_reload(int wait) {
     return failed ? 2 : 0;
 }
 
+/* ======================= namespaces ======================= */
+
+/*
+ * Moves bpfcctl into the namespace cfg describes, for the kernel checks.
+ * Only the network namespace changes: files are read as before.
+ */
+static void enter_cfg_netns(void) {
+    kernel_ok = 1;
+    kernel_note[0] = '\0';
+    for (int i = 0; i < nkviews; i++) free(kviews[i].f);
+    nkviews = 0;
+    if (left_host) {
+        if (setns(host_nsfd, CLONE_NEWNET) < 0) {
+            kernel_ok = 0;
+            snprintf(kernel_note, sizeof(kernel_note), "cannot return to the host namespace: %s", strerror(errno));
+            return;
+        }
+        left_host = 0;
+    }
+    if (!cfg.netns[0]) return;
+    struct netns_loc loc;
+    if (netns_locate(&cfg, host_rtnl, &loc) < 0) {
+        kernel_ok = 0;
+        snprintf(kernel_note, sizeof(kernel_note), "namespace not found: %s", loc.desc);
+        return;
+    }
+    if (setns(loc.fd, CLONE_NEWNET) < 0) {
+        kernel_ok = 0;
+        snprintf(kernel_note, sizeof(kernel_note), "cannot enter the namespace: %s%s", strerror(errno),
+                 errno == EPERM ? " (needs root)" : "");
+    } else {
+        left_host = 1;
+    }
+    netns_loc_close(&loc);
+}
+
+/* Loads cfg for netns (NULL: default). Returns 0, or -1 after printing why. */
+static int load_cfg(const char *netns) {
+    char err[512] = "";
+    if (config_resolve(netns, conf_override, &cfg, conf_path, sizeof(conf_path), err, sizeof(err)) < 0) {
+        fprintf(stderr, "bpfcctl: %s\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static int cmd_status(int show_all, int long_fmt);
+
+/* status for the default namespace and every namespace with bpfcd state under the run root. */
+static int cmd_status_all(int show_all, int long_fmt) {
+    int worst = 0, sections = 0;
+    char nsdir[PATH_MAX];
+    snprintf(nsdir, sizeof(nsdir), "%s/netns", run_root());
+    char names[256][NETNS_NAME_MAX + 1];
+    int nnames = 0;
+    DIR *d = opendir(nsdir);
+    struct dirent *de;
+    while (d && (de = readdir(d)) && nnames < 256) {
+        if (!netns_name_valid(de->d_name)) continue;
+        char st[PATH_MAX + NETNS_NAME_MAX + 32];
+        snprintf(st, sizeof(st), "%s/%s/%s", nsdir, de->d_name, STATE_FILE_NAME);
+        if (access(st, F_OK) == 0) snprintf(names[nnames++], sizeof(names[0]), "%s", de->d_name);
+    }
+    if (d) closedir(d);
+    qsort(names, nnames, sizeof(names[0]), (int (*)(const void *, const void *))strcmp);
+
+    for (int i = -1; i < nnames; i++) {
+        if (load_cfg(i < 0 ? NULL : names[i]) < 0) { worst = worst > 1 ? worst : 1; continue; }
+        char st[PATH_MAX + 32];
+        snprintf(st, sizeof(st), "%s/%s", cfg.state_dir, STATE_FILE_NAME);
+        if (i < 0 && access(st, F_OK) < 0) continue;     /* no bpfcd in the default namespace */
+        if (sections++) printf("\n");
+        printf("%s==== %s ====%s\n", C_BOLD, i < 0 ? "default namespace" : names[i], C_OFF);
+        enter_cfg_netns();
+        int rc = cmd_status(show_all, long_fmt);
+        if (rc > worst) worst = rc;
+    }
+    if (!sections) printf("No bpfcd state found (default namespace or %s/*).\n", nsdir);
+    return worst;
+}
+
+/* Shell assignments for scripts: eval "$(bpfcctl -n NAME env)". */
+static void shell_quote(const char *k, const char *v) {
+    printf("%s='", k);
+    for (; *v; v++) {
+        if (*v == '\'') fputs("'\\''", stdout);
+        else putchar(*v);
+    }
+    printf("'\n");
+}
+
+static void print_env(int with_file) {
+    shell_quote("BPFC_NETNS", cfg.netns);
+    char conf[PATH_MAX + 16];
+    snprintf(conf, sizeof(conf), "%s", conf_path);
+    char *fb = strstr(conf, " (fallback)");
+    if (fb) *fb = '\0';
+    shell_quote("BPFC_CONF", conf);
+    shell_quote("BPFC_CONF_FALLBACK", fb ? "1" : "");
+    shell_quote("BPFC_CONFIG_DIR", cfg.config_dir);
+    shell_quote("BPFC_STATE_DIR", state_dir());
+    shell_quote("BPFC_MAP_DIR", cfg.map_dir[0] ? cfg.map_dir : DEFAULT_MAP_ROOT);
+    shell_quote("BPFC_BPFC", cfg.bpfc_path);
+    if (with_file && cfg.netns[0]) {
+        struct netns_loc loc;
+        int rc = netns_locate(&cfg, host_rtnl, &loc);
+        shell_quote("BPFC_NETNS_FILE", rc == 0 ? loc.witness : "");
+        if (rc == 0) netns_loc_close(&loc);
+    }
+}
+
+static int cmd_env(void) {
+    print_env(1);
+    return 0;
+}
+
+/* Runs a command inside the namespace, with /sys remounted there and BPFC_* set. */
+static int cmd_exec(int argc, char **argv) {
+    if (!cfg.netns[0]) {
+        fprintf(stderr, "bpfcctl: exec needs -n <namespace>\n");
+        return 2;
+    }
+    if (argc < 1) {
+        fprintf(stderr, "Usage: bpfcctl -n <namespace> exec [--] <command> [args...]\n");
+        return 2;
+    }
+    struct netns_loc loc;
+    if (netns_locate(&cfg, host_rtnl, &loc) < 0) {
+        fprintf(stderr, "bpfcctl: network namespace %s not found: %s\n", cfg.netns, loc.desc);
+        return 1;
+    }
+    char conf[PATH_MAX + 16];
+    snprintf(conf, sizeof(conf), "%s", conf_path);
+    char *fb = strstr(conf, " (fallback)");
+    if (fb) *fb = '\0';
+    setenv("BPFC_NETNS", cfg.netns, 1);
+    setenv("BPFC_IN_NETNS", cfg.netns, 1);   /* scripts: already inside, do not re-enter */
+    setenv("BPFC_CONF", conf, 1);
+    setenv("BPFC_CONF_FALLBACK", fb ? "1" : "", 1);
+    setenv("BPFC_CONFIG_DIR", cfg.config_dir, 1);
+    setenv("BPFC_STATE_DIR", state_dir(), 1);
+    setenv("BPFC_MAP_DIR", cfg.map_dir[0] ? cfg.map_dir : DEFAULT_MAP_ROOT, 1);
+    setenv("BPFC_BPFC", cfg.bpfc_path, 1);
+    setenv("BPFC_NETNS_FILE", loc.witness, 1);
+    if (netns_enter_for_exec(loc.fd) < 0) return 1;
+    netns_loc_close(&loc);
+    if (host_nsfd >= 0) close(host_nsfd);
+    if (host_rtnl >= 0) close(host_rtnl);
+    execvp(argv[0], argv);
+    fprintf(stderr, "bpfcctl: %s: %s\n", argv[0], strerror(errno));
+    return 127;
+}
+
 /* ======================= main ======================= */
 
 static void usage(void) {
@@ -573,8 +770,12 @@ static void usage(void) {
            "  show <iface> <dir> <prio>      details, source and failure output for one program\n"
            "  show <iface> xdp               the same for the interface's XDP program\n"
            "      -b, --bytecode             also print the kernel's translated bytecode\n"
-           "  reload [--no-wait]             make bpfcd rescan and report the result\n\n"
+           "  reload [--no-wait]             make bpfcd rescan and report the result\n"
+           "  env                            the paths in use, as shell assignments (for scripts)\n"
+           "  exec [--] <command> [args]     run a command inside the -n namespace\n\n"
            "Options:\n"
+           "  -n, --netns <name>             the bpfcd instance for network namespace <name>\n"
+           "      --all-netns                status: every instance (default namespace and all -n ones)\n"
            "  -c, --config <file>            bpfc.conf to read state_dir from (default %s)\n"
            "  -s, --state-dir <dir>          bpfcd state directory (default from bpfc.conf)\n"
            "      --color=auto|always|never  colorize output (default auto)\n"
@@ -584,23 +785,45 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
-    int show_all = 0, long_fmt = 0, bytecode = 0, nowait = 0;
+    int show_all = 0, long_fmt = 0, bytecode = 0, nowait = 0, all_netns = 0;
     const char *color = "auto";
+    enum { OPT_NOWAIT = 256, OPT_ALL_NETNS };
     static const struct option longopts[] = {
         {"config", required_argument, 0, 'c'}, {"state-dir", required_argument, 0, 's'},
+        {"netns", required_argument, 0, 'n'}, {"all-netns", no_argument, 0, OPT_ALL_NETNS},
         {"all", no_argument, 0, 'a'}, {"long", no_argument, 0, 'l'}, {"bytecode", no_argument, 0, 'b'},
-        {"no-wait", no_argument, 0, 'n'}, {"color", required_argument, 0, 'C'},
+        {"no-wait", no_argument, 0, OPT_NOWAIT}, {"color", required_argument, 0, 'C'},
         {"version", no_argument, 0, 'V'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
+
+    /*
+     * Options may follow the command ("status -a"), except after "exec":
+     * everything from there on belongs to the command being run.
+     */
+    int opt_argc = argc;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--")) break;
+        if (a[0] == '-' && a[1]) {
+            if ((!strcmp(a, "-c") || !strcmp(a, "-s") || !strcmp(a, "-n") || !strcmp(a, "--config") ||
+                 !strcmp(a, "--state-dir") || !strcmp(a, "--netns") || !strcmp(a, "--color")) && i + 1 < argc)
+                i++;
+            continue;
+        }
+        if (!strcmp(a, "exec")) opt_argc = i + 1;
+        break;
+    }
     int o;
     /* "+" would stop at the command; we want options anywhere, so permute (GNU default). */
-    while ((o = getopt_long(argc, argv, "c:s:albnVh", longopts, NULL)) != -1) {
+    while ((o = getopt_long(opt_argc, argv, "c:s:n:albVh", longopts, NULL)) != -1) {
         switch (o) {
-        case 'c': snprintf(conf_path, sizeof(conf_path), "%s", optarg); break;
+        case 'c': conf_override = optarg; break;
+        case 'n': netns_arg = optarg; break;
+        case OPT_ALL_NETNS: all_netns = 1; break;
         case 's': snprintf(state_dir_override, sizeof(state_dir_override), "%s", optarg); break;
         case 'a': show_all = 1; break;
         case 'l': long_fmt = 1; break;
         case 'b': bytecode = 1; break;
-        case 'n': nowait = 1; break;
+        case OPT_NOWAIT: nowait = 1; break;
         case 'C': color = optarg; break;
         case 'V': printf("bpfcctl %s\n", BPFC_VERSION); return 0;
         case 'h': usage(); return 0;
@@ -609,17 +832,27 @@ int main(int argc, char **argv) {
     }
     use_color = !strcmp(color, "always") || (!strcmp(color, "auto") && isatty(1) && !getenv("NO_COLOR"));
 
-    config_defaults(&cfg);
+    /* Same resolution and BPFCD_* overrides as bpfcd, so `podman exec` finds a relocated state_dir. */
     char err[512] = "";
-    if (config_load(conf_path, &cfg, err, sizeof(err)) < 0)
+    if (config_resolve(netns_arg, conf_override, &cfg, conf_path, sizeof(conf_path), err, sizeof(err)) < 0) {
+        if (netns_arg) { fprintf(stderr, "bpfcctl: %s\n", err); return 2; }
         fprintf(stderr, "warning: %s (using defaults)\n", err);
-    /* Same BPFCD_* overrides as bpfcd, so `podman exec` finds a relocated state_dir. */
-    if (config_apply_env(&cfg, err, sizeof(err)) < 0)
-        fprintf(stderr, "warning: %s\n", err);
+    }
+    /* Kept from the start: the way back for --all-netns, and the host side of netns_veth. */
+    host_nsfd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+    host_rtnl = netns_host_socket();
 
     const char *cmd = optind < argc ? argv[optind++] : "status";
+    if (!strcmp(cmd, "exec") && optind < argc && !strcmp(argv[optind], "--")) optind++;
     int rest = argc - optind;
     char **args = argv + optind;
+    if (all_netns) {
+        if (strcmp(cmd, "status")) { fprintf(stderr, "bpfcctl: --all-netns applies to status\n"); return 2; }
+        return cmd_status_all(show_all, long_fmt);
+    }
+    if (!strcmp(cmd, "env")) return cmd_env();
+    if (!strcmp(cmd, "exec")) return cmd_exec(rest, args);
+    if (!strcmp(cmd, "status") || !strcmp(cmd, "show")) enter_cfg_netns();
     if (!strcmp(cmd, "status")) return cmd_status(show_all, long_fmt);
     if (!strcmp(cmd, "show")) return cmd_show(rest, args, bytecode);
     if (!strcmp(cmd, "reload")) return cmd_reload(!nowait);

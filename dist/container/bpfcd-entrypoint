@@ -13,6 +13,10 @@
 # variables, e.g. -e BPFCD_ON_EXTERNAL_CHANGE=log. See bpfcd(8), section
 # CONTAINERS. Set BPFCD_SKIP_CHECKS=1 to skip the privilege checks.
 #
+# BPFCD_NETNS=<name> (or -n <name>) manages network namespace <name> instead
+# of the container's own, configured from /etc/bpfc/netns/<name>/ as on a host
+# (netns_path / netns_veth there, or BPFCD_NETNS_PATH / BPFCD_NETNS_VETH).
+#
 # POSIX sh only: runs under bash, dash or busybox ash. Uses /proc, sed, tr and
 # tail (coreutils or busybox); `mount` only if bpffs has to be mounted.
 #
@@ -21,7 +25,9 @@
 set -eu
 
 BPFCD=${BPFCD_BIN:-/usr/sbin/bpfcd}
+BPFCCTL=${BPFCCTL_BIN:-/usr/sbin/bpfcctl}
 CONF=/etc/bpfc/bpfc.conf
+NETNS=${BPFCD_NETNS:-}
 
 log() { printf 'bpfcd-entrypoint: %s\n' "$*" >&2; }
 die() { log "error: $*"; exit 1; }
@@ -33,13 +39,18 @@ case "${1:-}" in
 	*) exec "$@" ;;
 esac
 
+CONF_GIVEN=0
 for a in "$@"; do
+	if [ "${CONF_NEXT:-0}" = 1 ]; then CONF=$a; CONF_GIVEN=1; CONF_NEXT=0; continue; fi
+	if [ "${NETNS_NEXT:-0}" = 1 ]; then NETNS=$a; NETNS_ARG=1; NETNS_NEXT=0; continue; fi
 	case "$a" in
 	-b | --background) die "do not pass $a: in a container bpfcd must stay in the foreground" ;;
-	-c | --config) CONF_NEXT=1; continue ;;
+	-c | --config) CONF_NEXT=1 ;;
+	-n | --netns) NETNS_NEXT=1 ;;
 	esac
-	if [ "${CONF_NEXT:-0}" = 1 ]; then CONF=$a; CONF_NEXT=0; fi
 done
+# BPFCD_NETNS becomes -n, unless -n was given.
+if [ -n "$NETNS" ] && [ "${NETNS_ARG:-0}" != 1 ]; then set -- -n "$NETNS" "$@"; fi
 
 # Value of a bpfc.conf setting: environment first, then the file, then $2.
 setting() {
@@ -96,7 +107,17 @@ bpffs_for() {
 	[ -n "$_best" ] && printf '%s\n' "$_best"
 }
 
-map_dir=$(setting map_dir /sys/fs/bpf)
+if [ -n "$NETNS" ]; then
+	# A namespace's paths and defaults come from bpfcctl, exactly as bpfcd resolves them.
+	if [ "$CONF_GIVEN" = 1 ]; then _env=$("$BPFCCTL" -n "$NETNS" -c "$CONF" env) || die "network namespace $NETNS: bad configuration"
+	else _env=$("$BPFCCTL" -n "$NETNS" env) || die "network namespace $NETNS: bad configuration"; fi
+	eval "$_env"
+	map_dir=$BPFC_MAP_DIR
+	if [ -n "${BPFC_NETNS_FILE:-}" ]; then log "network namespace $NETNS: $BPFC_NETNS_FILE"
+	else log "network namespace $NETNS: not there yet; bpfcd waits for it"; fi
+else
+	map_dir=$(setting map_dir /sys/fs/bpf)
+fi
 if mp=$(bpffs_for "$map_dir"); then
 	[ -d "$map_dir" ] || mkdir -p "$map_dir" || die "cannot create map directory $map_dir"
 	log "pinned maps go to $map_dir (bpffs at $mp)"
@@ -126,7 +147,7 @@ if cur=$(ulimit -l 2>/dev/null) && [ "$cur" != unlimited ]; then
 fi
 
 # ---- start -----------------------------------------------------------------
-config_dir=$(setting config_dir /etc/bpfc/interfaces.d)
+if [ -n "$NETNS" ]; then config_dir=$BPFC_CONFIG_DIR; else config_dir=$(setting config_dir /etc/bpfc/interfaces.d); fi
 if [ ! -d "$config_dir" ]; then
 	log "warning: $config_dir does not exist; mount your programs there (-v ./interfaces.d:$config_dir:ro)"
 fi

@@ -1,0 +1,37 @@
+[Unit]
+Description=bpfc eBPF program manager for network namespace %i
+Documentation=man:bpfcd(8) man:bpfcctl(8) man:bpfc.conf(5) man:bpfc(8)
+After=local-fs.target
+# No dependency on whatever creates the namespace: bpfcd waits for it to
+# appear, follows it if netns_path or netns_veth comes to point elsewhere,
+# and lets go of it when it is deleted. To tie this instance to a unit that
+# creates the namespace, add BindsTo= and After= with `systemctl edit`.
+
+[Service]
+Type=notify
+# Configuration: /etc/bpfc/netns/%i/bpfc.conf (falling back to the behavior
+# settings of /etc/bpfc/bpfc.conf) and /etc/bpfc/netns/%i/interfaces.d/.
+ExecStart=/usr/sbin/bpfcd -n %i
+# `bpfcctl -n %i reload` does the same but waits and reports failures.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+# /run/bpfc/netns/%i holds this instance's state for bpfcctl -n %i, kept
+# across restarts so running programs are adopted, not reinstalled.
+RuntimeDirectory=bpfc/netns/%i
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+LimitMEMLOCK=infinity
+
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+# netns_path and its symlinks must not live in /tmp: this service has its own.
+PrivateTmp=yes
+# CAP_SYS_ADMIN also covers setns() into the namespace.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
+
+[Install]
+WantedBy=multi-user.target

@@ -1,4 +1,4 @@
-.TH BPFCCTL 8 "October 2026" "bpfc" "System Administration"
+.TH BPFCCTL 8 "November 2026" "bpfc" "System Administration"
 .SH NAME
 bpfcctl \- show and inspect programs managed by bpfcd
 .SH SYNOPSIS
@@ -25,13 +25,33 @@ bpfcctl \- show and inspect programs managed by bpfcd
 .RI [ options ]
 .B reload
 .RB [ \-\-no\-wait ]
+.br
+.B bpfcctl
+.B \-\-all\-netns
+.RB [ status ]
+.br
+.B bpfcctl
+.BI \-n " netns"
+.B env
+.br
+.B bpfcctl
+.BI \-n " netns"
+.B exec
+.RB [ \-\- ]
+.I command
+.RI [ args ]
 .SH DESCRIPTION
 .B bpfcctl
 reads the state
 .BR bpfcd (8)
 keeps in
 .I /run/bpfc
-and checks it against the kernel.
+and checks it against the kernel. With
+.BI \-n " netns"
+it looks at the bpfcd instance for that network namespace instead, and checks
+the kernel inside that namespace (which needs root; otherwise the KERNEL
+column shows
+.BR ? ).
 .SH COMMANDS
 .TP
 .B status
@@ -126,10 +146,64 @@ Send SIGHUP to bpfcd, wait for the rescan to finish and summarize the
 result, listing failed programs.
 .RS
 .TP
-.BR \-n ", " \-\-no\-wait
-Only send the signal.
+.B \-\-no\-wait
+Only send the signal. (Before namespace support this was also
+.BR \-n ,
+which now selects the namespace.)
 .RE
+.TP
+.B env
+Print the paths the instance uses as shell assignments, for scripts:
+.BR BPFC_NETNS ,
+.B BPFC_CONF
+(and
+.B BPFC_CONF_FALLBACK=1
+when the global file stands in),
+.BR BPFC_CONFIG_DIR ,
+.BR BPFC_STATE_DIR ,
+.BR BPFC_MAP_DIR ,
+.BR BPFC_BPFC ,
+and with
+.B \-n
+.B BPFC_NETNS_FILE
+(the namespace file found now, empty if none).
+.EX
+eval "$(bpfcctl \-n web env)"
+.EE
+.TP
+.BI exec " command"
+Run a command inside the
+.B \-n
+namespace, like
+.BR "ip netns exec" ,
+for namespaces found by any of bpfcd's means (name, netns_path, netns_veth).
+.I /sys
+is remounted for the namespace, so
+.I /sys/class/net
+lists its interfaces, while bpffs and the other mounts below
+.I /sys
+stay reachable. The
+.B env
+variables are set, plus
+.BR BPFC_IN_NETNS .
+Everything after
+.B exec
+belongs to the command. Needs root.
 .SH OPTIONS
+.TP
+.BI \-n ", " \-\-netns " name"
+The bpfcd instance for network namespace
+.I name
+(see
+.BR bpfcd (8),
+.BR "Network namespaces" ).
+.TP
+.B \-\-all\-netns
+.BR status :
+one section for the default namespace's bpfcd and one for each namespace that
+has bpfcd state in
+.IR /run/bpfc/netns .
+The exit status is the worst of them.
 .TP
 .BI \-c ", " \-\-config " file"
 .I bpfc.conf
@@ -159,6 +233,9 @@ Other errors exit 1.
 # bpfcctl status \-a
 # bpfcctl show eth0 ingress 100 \-\-bytecode
 # bpfcctl reload
+# bpfcctl \-n web
+# bpfcctl \-\-all\-netns
+# bpfcctl \-n web exec \-\- ip route
 .EE
 .SH SEE ALSO
 .BR bpfcd (8),

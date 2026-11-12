@@ -72,7 +72,7 @@ Writes <outdir>/<interface>/{ingress,egress}/<priority>.bpfc.
                            strict: only the listed interfaces, else the packet
                            is dropped. Otherwise any valid member is the
                            fallback.
-  -o, --outdir DIR         default /etc/bpfc/interfaces.d (- for stdout)
+  -o, --outdir DIR         default /etc/bpfc/interfaces.d, or the -n namespace's (- for stdout)
   -P, --prefix NAME        map name prefix (1-10 of A-Za-z0-9_.), default em
   -b, --priority N         TC priority of every program, default 400
   -p, --profile NAME       start from a profile (see --list-profiles)
@@ -84,6 +84,8 @@ Writes <outdir>/<interface>/{ingress,egress}/<priority>.bpfc.
       --setup-hints        print the sysctls this needs
       --remove-maps        delete the pinned maps (remove the programs first)
   -m, --map-dir DIR        pinned maps, for --remove-maps (default /sys/fs/bpf)
+  -n, --netns NAME         for network namespace NAME: run inside it, with its
+                           program and map directories as defaults
 
 Settings (--name value or --name=value; the same names in profiles):
 EOF
@@ -130,7 +132,7 @@ check_value() {   # key value: dies if the value does not fit the key
 
 # ---------------------------------------------------------------- arguments
 MEMBERS_RAW=(); INGRESS_RAW=(); NOMOVE_RAW=(); POLICY_RAW=()
-OUTDIR=/etc/bpfc/interfaces.d; PREFIX=em; PRIO=400; MAP_DIR=/sys/fs/bpf
+OUTDIR=${BPFC_CONFIG_DIR:-/etc/bpfc/interfaces.d}; PREFIX=em; PRIO=400; MAP_DIR=${BPFC_MAP_DIR:-/sys/fs/bpf}
 PROFILE=; DESC=; ACTION=generate; ACTION_ARG=
 declare -A CLI
 
@@ -165,7 +167,31 @@ load_profile() {
     done < "$f"
 }
 
+
+# -n NETNS: run again inside network namespace NETNS through "bpfcctl exec",
+# which also sets BPFC_CONFIG_DIR, BPFC_MAP_DIR, BPFC_STATE_DIR and BPFC_CONF
+# to that namespace's paths (see bpfcd(8), NETWORK NAMESPACES).
+netns_reexec() {
+    local ns=$1; shift
+    [ -n "$ns" ] || return 0
+    [ "${BPFC_IN_NETNS:-}" = "$ns" ] && return 0
+    local ctl=${BPFCCTL:-}
+    if [ -z "$ctl" ]; then
+        ctl=$(command -v bpfcctl 2>/dev/null) || ctl=$(cd "$(dirname "$0")" && pwd)/../bpfcd/bpfcctl
+    fi
+    [ -x "$ctl" ] || { echo "Error: -n needs bpfcctl (not found; set BPFCCTL=)" >&2; exit 1; }
+    exec "$ctl" -n "$ns" exec -- "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$@"
+}
+
 ARGS=("$@")
+NETNS=
+for ((i = 0; i < ${#ARGS[@]}; i++)); do
+    case ${ARGS[i]} in
+    -n|--netns) NETNS=${ARGS[i+1]:-} ;;
+    --netns=*) NETNS=${ARGS[i]#*=} ;;
+    esac
+done
+netns_reexec "$NETNS" "${ARGS[@]}"
 # the profile comes first, wherever it is on the command line
 for ((i = 0; i < ${#ARGS[@]}; i++)); do
     case ${ARGS[i]} in
@@ -194,6 +220,7 @@ while [ $# -gt 0 ]; do
     -P|--prefix)  PREFIX=$2; shift 2 ;;
     -b|--priority) PRIO=$2; shift 2 ;;
     -m|--map-dir) MAP_DIR=$2; shift 2 ;;
+    -n|--netns)   shift 2 ;;   # handled above
     -p|--profile|--profile-dir) shift 2 ;;
     --list-profiles) ACTION=list; shift ;;
     --show-profile) ACTION=show; ACTION_ARG=$2; shift 2 ;;

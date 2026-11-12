@@ -6,8 +6,19 @@
 # Must run as root (reads pinned eBPF maps).
 
 BPFC=${BPFC:-bpfc}
-CONF=/etc/bpfc/bpfc.conf
-CONFIG_DIR=""; MAP_DIR=""; PREFIX=em; JSON=0; TOP=30; FILTER_IF=""; ALL=0; SORT=bps
+CONF=${BPFC_CONF:-/etc/bpfc/bpfc.conf}
+CONFIG_DIR=""; MAP_DIR=""; PREFIX=em; JSON=0; TOP=30; FILTER_IF=""; ALL=0; SORT=bps; NETNS=
+ORIG_ARGS=("$@")
+# --netns NAME / --netns=NAME: always a namespace (getopts has no long options).
+_args=()
+while [ $# -gt 0 ]; do
+    case $1 in
+    --netns) NETNS=${2:-}; shift 2 || shift ;;
+    --netns=*) NETNS=${1#*=}; shift ;;
+    *) _args+=("$1"); shift ;;
+    esac
+done
+set -- ${_args[@]+"${_args[@]}"}
 
 usage() {
 cat <<EOF
@@ -32,8 +43,10 @@ Options:
   -P NAME   map prefix (default em)
   -m DIR    pinned map directory (default: map_dir in $CONF, else /sys/fs/bpf)
   -c DIR    program directory (default: config_dir in $CONF, else /etc/bpfc/interfaces.d)
+  -n NAME   network namespace NAME: run inside it, with its directories as defaults
+            (also --netns NAME; needed for a name made only of digits)
   -j        JSON (status, flows, events, counters, bw, settings)
-  -n N      flows: how many (default 30, 0 = all)
+  -n N, -N N  flows: how many (default 30, 0 = all); -n with a number is the count
   -i IF     flows: only those on this interface
   -a        flows: also idle ones (default: seen in the last 10 s)
   -s KEY    flows: sort by bps (default), bytes or age
@@ -51,13 +64,14 @@ conf_value() { [ -r "$CONF" ] && sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:
 CMD=; ARGS=()
 while [ $# -gt 0 ]; do
     OPTIND=1
-    while getopts "P:m:c:jn:i:as:h" o; do
+    while getopts "P:m:c:jn:N:i:as:h" o; do
         case $o in
         P) PREFIX=$OPTARG ;;
         m) MAP_DIR=$OPTARG ;;
         c) CONFIG_DIR=$OPTARG ;;
         j) JSON=1 ;;
-        n) TOP=$OPTARG ;;
+        n) if [[ $OPTARG =~ ^[0-9]+$ ]]; then TOP=$OPTARG; else NETNS=$OPTARG; fi ;;
+        N) TOP=$OPTARG ;;
         i) FILTER_IF=$OPTARG ;;
         a) ALL=1 ;;
         s) SORT=$OPTARG ;;
@@ -73,6 +87,24 @@ done
 CMD=${CMD:-status}
 set -- "${ARGS[@]}"
 
+# -n NETNS: run again inside network namespace NETNS through "bpfcctl exec",
+# which also sets BPFC_CONFIG_DIR, BPFC_MAP_DIR, BPFC_STATE_DIR and BPFC_CONF
+# to that namespace's paths (see bpfcd(8), NETWORK NAMESPACES).
+netns_reexec() {
+    local ns=$1; shift
+    [ -n "$ns" ] || return 0
+    [ "${BPFC_IN_NETNS:-}" = "$ns" ] && return 0
+    local ctl=${BPFCCTL:-}
+    if [ -z "$ctl" ]; then
+        ctl=$(command -v bpfcctl 2>/dev/null) || ctl=$(cd "$(dirname "$0")" && pwd)/../bpfcd/bpfcctl
+    fi
+    [ -x "$ctl" ] || { echo "Error: -n needs bpfcctl (not found; set BPFCCTL=)" >&2; exit 1; }
+    exec "$ctl" -n "$ns" exec -- "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$@"
+}
+netns_reexec "$NETNS" "${ORIG_ARGS[@]}"
+# Inside a namespace (or with BPFC_* set) those paths come first.
+[ -n "$MAP_DIR" ] || MAP_DIR=${BPFC_MAP_DIR:-}
+[ -n "$CONFIG_DIR" ] || CONFIG_DIR=${BPFC_CONFIG_DIR:-}
 [ -n "$MAP_DIR" ] || MAP_DIR=$(conf_value map_dir)
 [ -n "$MAP_DIR" ] || MAP_DIR=/sys/fs/bpf
 [ -n "$CONFIG_DIR" ] || CONFIG_DIR=$(conf_value config_dir)

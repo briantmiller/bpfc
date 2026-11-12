@@ -76,6 +76,15 @@ bpfcctl show eth0 ingress 100 --bytecode
 * **XDP**: `xdp.bpfc` in an interface's (or template's) directory is its XDP program, attached in generic mode, one per interface (no priority; `bpfcctl show eth0 xdp`). Templates, empty files, reloads, failures, adoption and external changes work as for TC. It runs before TC ingress.
 * **External changes**: if something else removes or replaces a managed program, bpfcd reinstalls it or only logs it, per `on_external_change` in `/etc/bpfc/bpfc.conf`.
 * **Tracking**: each program's id and tag are recorded with its file path and hash in `/run/bpfc/state`; filters are named `bpfcd:<iface>/<dir>/<prio>`.
+* **Network namespaces**: `bpfcd -n <name>` (usually `systemctl enable --now bpfcd-netns@<name>`) manages namespace `<name>` from `/etc/bpfc/netns/<name>/` (`bpfc.conf`, `interfaces.d/`), with its own state (`/run/bpfc/netns/<name>`) and pinned maps (`/sys/fs/bpf/netns/<name>`). The namespace is `/run/netns/<name>`, or `netns_path` (a namespace file or a symlink to one, re-followed every second), or `netns_veth` (the namespace holding the peer of a host-side veth: a pod or container). bpfcd waits for a namespace that is not there yet, moves its programs when the path or veth comes to point at another namespace, and lets a deleted one be freed. `bpfcctl -n <name>`, `bpfcctl --all-netns` and the `-n` option of the bpfc-scripts tools work on it; `bpfcctl -n <name> exec <command>` runs a command inside it.
+
+```bash
+mkdir -p /etc/bpfc/netns/pod1/interfaces.d/eth0/ingress
+echo 'netns_veth = veth3f2a1c' > /etc/bpfc/netns/pod1/bpfc.conf   # the pod's host-side veth
+cp drop-telnet.bpfc /etc/bpfc/netns/pod1/interfaces.d/eth0/ingress/100.bpfc
+systemctl enable --now bpfcd-netns@pod1
+bpfcctl -n pod1
+```
 
 See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)`. Build an RPM (RHEL 9/10) with `make rpm`; run the daemon's integration and container tests with `make check` (root).
 

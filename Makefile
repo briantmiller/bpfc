@@ -1,5 +1,5 @@
 VERSION   ?= 0.1.1
-RELEASE   ?= 4
+RELEASE   ?= 5
 
 CC        ?= gcc
 CFLAGS    ?= -O2 -g
@@ -30,8 +30,8 @@ DESTDIR   ?=
 TARGET     = bpfc
 DAEMON     = bpfcd/bpfcd
 CTL        = bpfcd/bpfcctl
-COMMON_SRC = bpfcd/common.c
-COMMON_HDR = bpfcd/common.h
+COMMON_SRC = bpfcd/common.c bpfcd/netns.c
+COMMON_HDR = bpfcd/common.h bpfcd/netns.h
 DAEMON_CFLAGS = $(WARN) -Wno-format-truncation -DBPFC_VERSION='"$(VERSION)"'
 
 # Everything that goes into the source tarball used by `make rpm`.
@@ -64,8 +64,10 @@ install: all install-scripts
 	install -D -m 0644 dist/bpfcctl.8 $(DESTDIR)$(MANDIR)/man8/bpfcctl.8
 	install -D -m 0644 dist/bpfc.conf.5 $(DESTDIR)$(MANDIR)/man5/bpfc.conf.5
 	install -D -m 0644 dist/bpfcd.service $(DESTDIR)$(UNITDIR)/bpfcd.service
+	install -D -m 0644 dist/bpfcd-netns@.service $(DESTDIR)$(UNITDIR)/bpfcd-netns@.service
 	install -D -m 0644 dist/bpfc.conf $(DESTDIR)$(SYSCONFDIR)/bpfc/bpfc.conf
 	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/interfaces.d
+	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/netns
 	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/include
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/ingress
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/egress
@@ -141,7 +143,7 @@ srpm: $(TARBALL)
 TESTFLAGS ?=
 
 check: all
-	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd xdp xdp-examples tc-examples ecmp container install
+	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd netns xdp xdp-examples tc-examples ecmp container install
 
 # Compile-only checks of every field and command and of the error messages;
 # needs no root (the few commands that create maps are skipped without it).
