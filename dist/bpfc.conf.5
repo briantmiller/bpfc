@@ -62,6 +62,41 @@ The bpfc binary. Must be absolute.
 .TP
 .BI state_dir " = " /run/bpfc
 Where the state file, PID file and failure logs live.
+.SH NETWORK NAMESPACES
+A bpfcd started with
+.BI \-n " name"
+reads
+.I /etc/bpfc/netns/<name>/bpfc.conf
+instead. When that file does not exist, the settings above except the paths
+come from
+.IR /etc/bpfc/bpfc.conf .
+Paths default to
+.I /etc/bpfc/netns/<name>/interfaces.d
+(config_dir),
+.I /run/bpfc/netns/<name>
+(state_dir) and
+.I /sys/fs/bpf/netns/<name>
+(map_dir). Two more settings say where the namespace is; they are only valid in
+a namespace's own file, and only one of them may be set:
+.TP
+.BI netns_path " = " /path
+A network namespace file, or a symbolic link (or chain of links) to one, such
+as
+.IR /run/netns/<x> ,
+.I /proc/<pid>/ns/net
+or a link a container runtime hook maintains. Absolute. Followed again every
+second, so pointing the link elsewhere moves bpfcd's programs to the new
+namespace. Default:
+.IR /run/netns/<name> .
+.TP
+.BI netns_veth " = " interface
+The host-side end of a veth pair whose other end is in the namespace, for
+example a pod's or container's veth. bpfcd follows the peer: a new veth of that
+name in another namespace moves the programs there.
+.PP
+See
+.BR bpfcd (8),
+.BR "Network namespaces" .
 .SH ENVIRONMENT
 Each setting can be overridden by an environment variable named
 .B BPFCD_

@@ -9,7 +9,9 @@
 # Must run as root (reads pinned eBPF maps).
 
 BPFC=${BPFC:-bpfc}
-CONF=/etc/bpfc/bpfc.conf
+CONF=${BPFC_CONF:-/etc/bpfc/bpfc.conf}
+NETNS=
+ORIG_ARGS=("$@")
 CONFIG_DIR=""
 MAP_DIR=""
 ONELINE=0
@@ -706,8 +708,9 @@ print_json() {   # pretty-printed like FRR (2-space indent), no jq needed
 cmd=show
 parse_opts() {
     local o OPTIND=1
-    while getopts "m:c:1djh" o; do
+    while getopts "m:c:n:1djh" o; do
         case "$o" in
+            n) NETNS="$OPTARG" ;;
             m) MAP_DIR="$OPTARG" ;;
             c) CONFIG_DIR="$OPTARG" ;;
             1) ONELINE=1; MODE=kv ;;
@@ -722,7 +725,8 @@ parse_opts() {
 # long forms
 args=()
 for a in "$@"; do
-    case "$a" in --detail) args+=(-d) ;; --json) args+=(-j) ;; --help) args+=(-h) ;; *) args+=("$a") ;; esac
+    case "$a" in --detail) args+=(-d) ;; --json) args+=(-j) ;; --help) args+=(-h) ;; --netns) args+=(-n) ;;
+                 --netns=*) args+=(-n "${a#*=}") ;; *) args+=("$a") ;; esac
 done
 set -- "${args[@]}"
 # options may come before or after set/unset
@@ -731,6 +735,24 @@ if [ "$1" = set ] || [ "$1" = unset ]; then
     cmd=$1; shift
     parse_opts "$@"; shift $SHIFT
 fi
+# -n NETNS: run again inside network namespace NETNS through "bpfcctl exec",
+# which also sets BPFC_CONFIG_DIR, BPFC_MAP_DIR, BPFC_STATE_DIR and BPFC_CONF
+# to that namespace's paths (see bpfcd(8), NETWORK NAMESPACES).
+netns_reexec() {
+    local ns=$1; shift
+    [ -n "$ns" ] || return 0
+    [ "${BPFC_IN_NETNS:-}" = "$ns" ] && return 0
+    local ctl=${BPFCCTL:-}
+    if [ -z "$ctl" ]; then
+        ctl=$(command -v bpfcctl 2>/dev/null) || ctl=$(cd "$(dirname "$0")" && pwd)/../bpfcd/bpfcctl
+    fi
+    [ -x "$ctl" ] || { echo "Error: -n needs bpfcctl (not found; set BPFCCTL=)" >&2; exit 1; }
+    exec "$ctl" -n "$ns" exec -- "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$@"
+}
+netns_reexec "$NETNS" "${ORIG_ARGS[@]}"
+# Inside a namespace (or with BPFC_* set) those paths come first.
+[ -n "$MAP_DIR" ] || MAP_DIR=${BPFC_MAP_DIR:-}
+[ -n "$CONFIG_DIR" ] || CONFIG_DIR=${BPFC_CONFIG_DIR:-}
 [ -n "$MAP_DIR" ] || MAP_DIR=$(conf_get map_dir)
 [ -n "$MAP_DIR" ] || MAP_DIR=/sys/fs/bpf
 [ -n "$CONFIG_DIR" ] || CONFIG_DIR=$(conf_get config_dir)

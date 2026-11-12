@@ -1,8 +1,10 @@
-.TH BPFCD 8 "October 2026" "bpfc" "System Administration"
+.TH BPFCD 8 "November 2026" "bpfc" "System Administration"
 .SH NAME
 bpfcd \- keep bpfc programs attached to network interfaces
 .SH SYNOPSIS
 .B bpfcd
+.RB [ \-n
+.IR netns ]
 .RB [ \-c
 .IR config ]
 .RB [ \-b ]
@@ -184,11 +186,113 @@ and each program gets the kernel name
 The program id and tag bpfc reported are recorded in
 .I /run/bpfc/state
 next to the file path and hash.
+.SS Network namespaces
+One
+.B bpfcd
+manages one network namespace. Started with
+.BI \-n " name"
+it manages namespace
+.I name
+instead of the one it was started in, with its own configuration:
+.EX
+/etc/bpfc/netns/<name>/bpfc.conf
+/etc/bpfc/netns/<name>/interfaces.d/<interface>/ingress/<priority>.bpfc
+.EE
+.PP
+Everything described above (templates, XDP, reload, external changes)
+works the same inside the namespace. Run one instance per namespace, usually as
+.BR bpfcd-netns@<name>.service ,
+next to
+.B bpfcd.service
+for the host.
+.PP
+.B Configuration.
+If
+.I /etc/bpfc/netns/<name>/bpfc.conf
+does not exist,
+.I /etc/bpfc/bpfc.conf
+supplies the behavior settings (on_external_change, reinstall_limit,
+remove_on_stop, compile_timeout, log_level, bpfc_path) but never its paths,
+which belong to the host's bpfcd. Paths the namespace's file does not set
+default to
+.IR /etc/bpfc/netns/<name>/interfaces.d ,
+.I /run/bpfc/netns/<name>
+(state) and
+.I /sys/fs/bpf/netns/<name>
+(pinned maps). Maps get their own directory because bpffs is shared by every
+namespace: two namespaces using the same map names would otherwise share
+their contents. bpfcd creates the map directory.
+.PP
+.B Finding the namespace.
+By default the namespace is
+.IR /run/netns/<name> ,
+as created by
+.BR "ip netns add" .
+Two settings in the namespace's
+.I bpfc.conf
+replace that (see
+.BR bpfc.conf (5)):
+.TP 4
+.BI netns_path " = " /path
+A namespace file such as
+.I /run/netns/x
+or
+.IR /proc/<pid>/ns/net ,
+or a symbolic link to one. Symlinks, chains of them included, are followed
+again on every check, so whatever creates the namespace can point the link at
+a new one.
+.TP
+.BI netns_veth " = " ifname
+The host side of a veth pair: the namespace is whichever one holds its peer,
+such as a pod or container. bpfcd finds it through a
+.I /run/netns
+entry or a process inside it, so no name has to be registered anywhere.
+.PP
+.B Following it.
+bpfcd checks the namespace every second.
+.IP \(bu 2
+Not there (yet): bpfcd starts anyway, shows its programs as
+.B pending-iface
+and waits. Nothing is installed in the namespace bpfcd started in.
+.IP \(bu
+Gone (the path no longer exists, the veth was deleted, or nothing but bpfcd
+is left in it): the programs are left as they are and bpfcd stops holding
+the namespace, so the kernel can free it. It waits for it to come back.
+.IP \(bu
+Replaced (the path or veth now leads to a different namespace): bpfcd
+removes its programs from the old namespace and installs them in the new one.
+.PP
+A reload (SIGHUP) also looks for a missing namespace at once. A restarted
+bpfcd adopts the programs still running only if the namespace is the one in
+its saved state.
+.PP
+.B Tools.
+.BR bpfcctl (8)
+and the bpfc-scripts tools take
+.BI \-n " name"
+too.
+.B bpfcctl \-n
+.I name
+.B exec
+.I command
+runs a command inside the namespace with its paths in
+.BR BPFC_ *
+variables.
 .SH OPTIONS
+.TP
+.BI \-n ", " \-\-netns " name"
+Manage network namespace
+.IR name ;
+see
+.BR "Network namespaces" .
+Names are 1-64 characters of
+.BR A\-Z " " a\-z " " 0\-9 " " _ " " . " " \- .
 .TP
 .BI \-c ", " \-\-config " file"
 Configuration file (default
-.IR /etc/bpfc/bpfc.conf ).
+.IR /etc/bpfc/bpfc.conf ,
+or the namespace's with
+.BR \-n ).
 .TP
 .BR \-b ", " \-\-background
 Detach and log to syslog, for systems without systemd. Without it,
@@ -238,6 +342,10 @@ reads the same variables.
 When set (by systemd, or by podman with
 .BR \-\-sdnotify=container ),
 bpfcd reports readiness and status through it.
+.TP
+.B BPFCD_NETNS
+(container entrypoint only) the same as
+.BR \-n .
 .SH SIGNALS
 .TP
 .B SIGHUP

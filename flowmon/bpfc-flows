@@ -4,7 +4,9 @@
 set -euo pipefail
 
 BPFC_BIN=${BPFC_BIN:-bpfc}
-STATE_FILE=${STATE_FILE:-/run/bpfc/bpfc-flows.prev.json}
+STATE_FILE=${STATE_FILE:-${BPFC_STATE_DIR:-/run/bpfc}/bpfc-flows.prev.json}
+MAP_DIR=${BPFC_MAP_DIR:-}; NETNS=
+ORIG_ARGS=("$@")
 WATCH=0; FORMAT=table; SORT=bps-total; REVERSE=0; LIMIT=0; ACTIVE=60; SHOW_L2=0
 FILTERS=()
 usage() { cat <<'USAGE'
@@ -20,7 +22,10 @@ Usage: bpfc-flows [options]
   -l2, --l2                include ingress/egress MAC and EtherType columns in table output
   --json | --csv          emit machine-readable output (default: table; L2 fields always included)
   --bpfc PATH             path to bpfc binary (default: BPFC_BIN or bpfc)
-  --state PATH            prior-snapshot state path (default: /run/bpfc/bpfc-flows.prev.json)
+  --state PATH            prior-snapshot state path (default: /run/bpfc/bpfc-flows.prev.json,
+                          or the -n namespace's state directory)
+  -m, --map-dir DIR       pinned map directory (default: map_dir in /etc/bpfc/bpfc.conf, else /sys/fs/bpf)
+  -n, --netns NAME        network namespace NAME: run inside it, with its map directory
   -h, --help              show this help
 
 Notes: source/destination metadata is fixed by the first observed packet for a
@@ -41,10 +46,31 @@ while (($#)); do
     --csv) FORMAT=csv; shift;;
     --bpfc) BPFC_BIN=${2:?missing path}; shift 2;;
     --state) STATE_FILE=${2:?missing path}; shift 2;;
+    -m|--map-dir) MAP_DIR=${2:?missing directory}; shift 2;;
+    -n|--netns) NETNS=${2:?missing namespace}; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "bpfc-flows: unknown option: $1" >&2; usage >&2; exit 2;;
   esac
 done
+# -n NETNS: run again inside network namespace NETNS through "bpfcctl exec",
+# which also sets BPFC_CONFIG_DIR, BPFC_MAP_DIR, BPFC_STATE_DIR and BPFC_CONF
+# to that namespace's paths (see bpfcd(8), NETWORK NAMESPACES).
+netns_reexec() {
+    local ns=$1; shift
+    [ -n "$ns" ] || return 0
+    [ "${BPFC_IN_NETNS:-}" = "$ns" ] && return 0
+    local ctl=${BPFCCTL:-}
+    if [ -z "$ctl" ]; then
+        ctl=$(command -v bpfcctl 2>/dev/null) || ctl=$(cd "$(dirname "$0")" && pwd)/../bpfcd/bpfcctl
+    fi
+    [ -x "$ctl" ] || { echo "Error: -n needs bpfcctl (not found; set BPFCCTL=)" >&2; exit 1; }
+    exec "$ctl" -n "$ns" exec -- "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$@"
+}
+netns_reexec "$NETNS" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+if [ -z "$MAP_DIR" ] && [ -r /etc/bpfc/bpfc.conf ]; then
+  MAP_DIR=$(sed -n 's/^[[:space:]]*map_dir[[:space:]]*=[[:space:]]*\([^#]*\).*/\1/p' /etc/bpfc/bpfc.conf | tail -n 1 | sed 's/[[:space:]]*$//')
+fi
+MAP_DIR=${MAP_DIR:-/sys/fs/bpf}
 [[ $WATCH =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo 'watch interval must be numeric' >&2; exit 2; }
 [[ $ACTIVE =~ ^[0-9]+$ ]] || { echo 'active window must be an integer' >&2; exit 2; }
 
@@ -57,7 +83,7 @@ dump_once() {
   trap 'rm -rf "$work"' RETURN
   local m
   for m in "${MAPS[@]}"; do
-    "$BPFC_BIN" -r "$m" 2>/dev/null >"$work/$m" || :
+    "$BPFC_BIN" -m "$MAP_DIR" -r "$m" 2>/dev/null >"$work/$m" || :
   done
   BPFC_FLOWS_WORK="$work" BPFC_FLOWS_STATE="$STATE_FILE" BPFC_FLOWS_FORMAT="$FORMAT" \
   BPFC_FLOWS_SORT="$SORT" BPFC_FLOWS_REVERSE="$REVERSE" BPFC_FLOWS_LIMIT="$LIMIT" \

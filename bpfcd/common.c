@@ -250,14 +250,30 @@ static int parse_int(const char *v, int lo, int hi, int *out) {
 /* Settings that can be given in bpfc.conf and, upper-cased with a BPFCD_ prefix, in the environment. */
 static const char *const config_keys[] = {
     "bpfc_path", "config_dir", "state_dir", "map_dir", "on_external_change",
-    "remove_on_stop", "reinstall_limit", "compile_timeout", "log_level", NULL};
+    "remove_on_stop", "reinstall_limit", "compile_timeout", "log_level",
+    "netns_path", "netns_veth", NULL};
 
 /* Applies one setting. Returns 0, -1 for an unknown key, -2 for an invalid value. */
 static int config_set(struct config *c, const char *k, const char *v) {
     if (!strcmp(k, "bpfc_path")) snprintf(c->bpfc_path, sizeof(c->bpfc_path), "%s", v);
-    else if (!strcmp(k, "config_dir")) snprintf(c->config_dir, sizeof(c->config_dir), "%s", v);
-    else if (!strcmp(k, "state_dir")) snprintf(c->state_dir, sizeof(c->state_dir), "%s", v);
-    else if (!strcmp(k, "map_dir")) snprintf(c->map_dir, sizeof(c->map_dir), "%s", v);
+    else if (!strcmp(k, "config_dir")) {
+        snprintf(c->config_dir, sizeof(c->config_dir), "%s", v);
+        c->set |= CFG_SET_CONFIG_DIR;
+    } else if (!strcmp(k, "state_dir")) {
+        snprintf(c->state_dir, sizeof(c->state_dir), "%s", v);
+        c->set |= CFG_SET_STATE_DIR;
+    } else if (!strcmp(k, "map_dir")) {
+        snprintf(c->map_dir, sizeof(c->map_dir), "%s", v);
+        c->set |= CFG_SET_MAP_DIR;
+    } else if (!strcmp(k, "netns_path")) {
+        if (v[0] != '/') return -2;
+        snprintf(c->netns_path, sizeof(c->netns_path), "%s", v);
+        c->set |= CFG_SET_NETNS_PATH;
+    } else if (!strcmp(k, "netns_veth")) {
+        if (!valid_ifname(v)) return -2;
+        snprintf(c->netns_veth, sizeof(c->netns_veth), "%s", v);
+        c->set |= CFG_SET_NETNS_VETH;
+    }
     else if (!strcmp(k, "on_external_change")) {
         if (!strcmp(v, "reinstall")) c->on_external_change = EXT_REINSTALL;
         else if (!strcmp(v, "log")) c->on_external_change = EXT_LOG;
@@ -278,6 +294,92 @@ static int config_check(const struct config *c, const char *src, char *err, size
         snprintf(err, errlen, "%s: bpfc_path must be an absolute path", src);
         return -1;
     }
+    if ((c->set & CFG_SET_NETNS_PATH) && (c->set & CFG_SET_NETNS_VETH)) {
+        snprintf(err, errlen, "%s: netns_path and netns_veth are alternatives; set one", src);
+        return -1;
+    }
+    return 0;
+}
+
+const char *conf_root(void) {
+    const char *r = getenv("BPFC_CONF_ROOT");
+    return r && *r ? r : DEFAULT_CONF_ROOT;
+}
+
+const char *run_root(void) {
+    const char *r = getenv("BPFC_RUN_ROOT");
+    return r && *r ? r : DEFAULT_STATE_DIR;
+}
+
+int netns_name_valid(const char *name) {
+    size_t n = strlen(name);
+    if (n == 0 || n > NETNS_NAME_MAX || name[0] == '.' || name[0] == '-') return 0;
+    for (const char *p = name; *p; p++)
+        if (!isalnum((unsigned char)*p) && *p != '_' && *p != '.' && *p != '-') return 0;
+    return 1;
+}
+
+int config_resolve(const char *netns, const char *conf_override, struct config *c,
+                   char *conf_used, size_t conf_used_len, char *err, size_t errlen) {
+    char path[PATH_MAX];
+    config_defaults(c);
+    const char *root = conf_root();
+    snprintf(c->config_dir, sizeof(c->config_dir), "%s/interfaces.d", root);
+    snprintf(c->state_dir, sizeof(c->state_dir), "%s", run_root());
+
+    if (!netns || !*netns) {
+        if (conf_override) snprintf(path, sizeof(path), "%s", conf_override);
+        else snprintf(path, sizeof(path), "%s/bpfc.conf", root);
+        if (conf_used) snprintf(conf_used, conf_used_len, "%s", path);
+        if (config_load(path, c, err, errlen) < 0 || config_apply_env(c, err, errlen) < 0) return -1;
+        if (c->set & (CFG_SET_NETNS_PATH | CFG_SET_NETNS_VETH)) {
+            snprintf(err, errlen, "%s: netns_path and netns_veth only apply to a namespace's own "
+                     "bpfc.conf (%s/netns/<name>/bpfc.conf, used with -n <name>)", path, root);
+            return -1;
+        }
+        return 0;
+    }
+
+    if (!netns_name_valid(netns)) {
+        snprintf(err, errlen, "invalid network namespace name '%s': use 1-%d characters of "
+                 "A-Z a-z 0-9 _ . - (not starting with '.' or '-')", netns, NETNS_NAME_MAX);
+        return -1;
+    }
+    snprintf(c->netns, sizeof(c->netns), "%s", netns);
+
+    char nsconf[PATH_MAX];
+    snprintf(nsconf, sizeof(nsconf), "%s/netns/%s/bpfc.conf", root, netns);
+    if (conf_override || access(nsconf, F_OK) == 0) {
+        const char *p = conf_override ? conf_override : nsconf;
+        if (conf_used) snprintf(conf_used, conf_used_len, "%s", p);
+        if (config_load(p, c, err, errlen) < 0) return -1;
+    } else {
+        /* No bpfc.conf of its own: borrow the global file's behavior, not its paths. */
+        struct config g;
+        config_defaults(&g);
+        snprintf(path, sizeof(path), "%s/bpfc.conf", root);
+        if (conf_used) snprintf(conf_used, conf_used_len, "%s (fallback)", path);
+        if (config_load(path, &g, err, errlen) < 0) return -1;
+        if (g.set & (CFG_SET_NETNS_PATH | CFG_SET_NETNS_VETH)) {
+            snprintf(err, errlen, "%s: netns_path and netns_veth belong in %s", path, nsconf);
+            return -1;
+        }
+        snprintf(c->bpfc_path, sizeof(c->bpfc_path), "%s", g.bpfc_path);
+        c->on_external_change = g.on_external_change;
+        c->remove_on_stop = g.remove_on_stop;
+        c->reinstall_limit = g.reinstall_limit;
+        c->compile_timeout = g.compile_timeout;
+        c->log_level = g.log_level;
+    }
+    if (config_apply_env(c, err, errlen) < 0) return -1;
+
+    if (!(c->set & CFG_SET_CONFIG_DIR))
+        snprintf(c->config_dir, sizeof(c->config_dir), "%s/netns/%s/interfaces.d", root, netns);
+    if (!(c->set & CFG_SET_STATE_DIR))
+        snprintf(c->state_dir, sizeof(c->state_dir), "%s/netns/%s", run_root(), netns);
+    /* Pinned maps live on bpffs, which every namespace shares: keep each namespace's apart. */
+    if (!(c->set & CFG_SET_MAP_DIR))
+        snprintf(c->map_dir, sizeof(c->map_dir), "%s/netns/%s", DEFAULT_MAP_ROOT, netns);
     return 0;
 }
 
@@ -622,6 +724,13 @@ int state_write(const char *path, const struct daemon_info *di,
     put_enc(f, "config_dir", di->config_dir);
     if (di->bpfc_path[0]) put_enc(f, "bpfc_path", di->bpfc_path);
     put_enc(f, "on_external_change", di->on_external_change == EXT_LOG ? "log" : "reinstall");
+    if (di->netns[0]) {
+        put_enc(f, "netns", di->netns);
+        put_enc(f, "netns_status", di->netns_status);
+        put_enc(f, "netns_target", di->netns_target);
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)di->netns_dev); put_enc(f, "netns_dev", num);
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)di->netns_ino); put_enc(f, "netns_ino", num);
+    }
     fputc('\n', f);
 
     for (int i = 0; i < nslots; i++) {
@@ -692,6 +801,11 @@ int state_read(const char *path, struct daemon_info *di, struct slot **slots_out
                 else if (!strcmp(k, "config_dir")) snprintf(di->config_dir, sizeof(di->config_dir), "%s", val);
                 else if (!strcmp(k, "bpfc_path")) snprintf(di->bpfc_path, sizeof(di->bpfc_path), "%s", val);
                 else if (!strcmp(k, "on_external_change")) di->on_external_change = strcmp(val, "log") ? EXT_REINSTALL : EXT_LOG;
+                else if (!strcmp(k, "netns")) snprintf(di->netns, sizeof(di->netns), "%s", val);
+                else if (!strcmp(k, "netns_status")) snprintf(di->netns_status, sizeof(di->netns_status), "%s", val);
+                else if (!strcmp(k, "netns_target")) snprintf(di->netns_target, sizeof(di->netns_target), "%s", val);
+                else if (!strcmp(k, "netns_dev")) di->netns_dev = strtoull(val, NULL, 10);
+                else if (!strcmp(k, "netns_ino")) di->netns_ino = strtoull(val, NULL, 10);
                 continue;
             }
             if (!strcmp(k, "iface")) snprintf(s->iface, sizeof(s->iface), "%s", val);

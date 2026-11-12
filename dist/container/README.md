@@ -68,6 +68,10 @@ podman run -d --name bpfcd --network host \
 
 Capabilities may not be enough on their own. The runtime's default seccomp profile and SELinux (`container_t`) can also block the `bpf()` system call. Validate this variant on your hosts before using it; if loads fail with "Operation not permitted", add `--security-opt label=type:spc_t` or return to `--privileged`.
 
+## Another network namespace
+
+`-e BPFCD_NETNS=<name>` (or `bpfcd -n <name>` as the command) makes the container manage network namespace `<name>` rather than its own, configured from `/etc/bpfc/netns/<name>/` exactly as on a host. Name the namespace with `BPFCD_NETNS_PATH` (a namespace file or symlink the container can see, for example under a mounted `/run/netns`) or `BPFCD_NETNS_VETH` (a host-side veth: needs `--network host` and `--pid host`, because the peer's namespace is found through the processes in it). Then `podman exec bpfcd bpfcctl -n <name>` shows its status.
+
 ## Kubernetes / OpenShift
 
 Run it as a DaemonSet with `hostNetwork: true`, a `privileged` security context, and `hostPath` volumes for `/sys/fs/bpf` and the state directory. Deliver the program files from a ConfigMap. A ConfigMap's keys cannot contain `/`, so lay out the `<iface>/<direction>/<priority>.bpfc` tree with `items` entries whose `path` is, for example, `eth0/ingress/100.bpfc`. bpfcd does not watch for ConfigMap updates; send it SIGHUP (for example from a sidecar or `kubectl exec ... bpfcctl reload`) after a change.

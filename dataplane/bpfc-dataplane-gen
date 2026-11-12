@@ -87,10 +87,12 @@ Usage: $(basename "$0") -i <interface> [--profile NAME] [settings...]
 Writes <outdir>/<interface>/egress/*.bpfc and ingress/*.bpfc.
 
   -i, --interface IF       interface to generate for
-  -o, --outdir DIR         default /etc/bpfc/interfaces.d (use - for stdout)
+  -o, --outdir DIR         default /etc/bpfc/interfaces.d, or the -n namespace's (- for stdout)
   -P, --prefix NAME        map name prefix (1-10 of A-Z a-z 0-9 _ .), default
                            dp + 8 characters hashed from the interface name
   -m, --map-dir DIR        pinned maps, for --remove-maps (default /sys/fs/bpf)
+  -n, --netns NAME         for network namespace NAME: run inside it, with its
+                           program and map directories as defaults
       --map-prefix         print the map prefix for -i (and --prefix) and exit
       --remove-maps        delete the interface's pinned maps from --map-dir
                            (also those of generator v2, dp_<interface>_*);
@@ -257,7 +259,30 @@ list_profiles() {
 
 # ---------------------------------------------------------------- command line
 
-IFACE=""; OUTDIR=/etc/bpfc/interfaces.d; PREFIX=""; PRIO=100; MAP_DIR=/sys/fs/bpf
+# -n NETNS: run again inside network namespace NETNS through "bpfcctl exec",
+# which also sets BPFC_CONFIG_DIR, BPFC_MAP_DIR, BPFC_STATE_DIR and BPFC_CONF
+# to that namespace's paths (see bpfcd(8), NETWORK NAMESPACES).
+netns_reexec() {
+    local ns=$1; shift
+    [ -n "$ns" ] || return 0
+    [ "${BPFC_IN_NETNS:-}" = "$ns" ] && return 0
+    local ctl=${BPFCCTL:-}
+    if [ -z "$ctl" ]; then
+        ctl=$(command -v bpfcctl 2>/dev/null) || ctl=$(cd "$(dirname "$0")" && pwd)/../bpfcd/bpfcctl
+    fi
+    [ -x "$ctl" ] || { echo "Error: -n needs bpfcctl (not found; set BPFCCTL=)" >&2; exit 1; }
+    exec "$ctl" -n "$ns" exec -- "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$@"
+}
+
+NETNS=; _prev=
+for _a in "$@"; do
+    case $_prev in -n|--netns) NETNS=$_a ;; esac
+    case $_a in --netns=*) NETNS=${_a#*=} ;; esac
+    _prev=$_a
+done
+netns_reexec "$NETNS" "$@"
+
+IFACE=""; OUTDIR=${BPFC_CONFIG_DIR:-/etc/bpfc/interfaces.d}; PREFIX=""; PRIO=100; MAP_DIR=${BPFC_MAP_DIR:-/sys/fs/bpf}
 PRINT_PREFIX=0; REMOVE_MAPS=0
 PROFILE=""; SHOW=""; SAVE=""; DESCRIPTION=""; LIST=0; HINTS=0
 while [ $# -gt 0 ]; do
@@ -270,6 +295,7 @@ while [ $# -gt 0 ]; do
         -o|--outdir) need "$@"; OUTDIR=$val ;;
         -P|--prefix) need "$@"; PREFIX=$val ;;
         -m|--map-dir) need "$@"; MAP_DIR=$val ;;
+        -n|--netns) need "$@" ;;   # handled above
         --map-prefix) PRINT_PREFIX=1 ;;
         --remove-maps) REMOVE_MAPS=1 ;;
         -b|--priority) need "$@"; PRIO=$val ;;
