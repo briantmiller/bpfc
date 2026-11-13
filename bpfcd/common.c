@@ -226,6 +226,30 @@ void config_defaults(struct config *c) {
     c->reinstall_limit = 5;
     c->compile_timeout = 30;
     c->log_level = LOG_LVL_INFO;
+    snprintf(c->rest_owner, sizeof(c->rest_owner), "%s", DEFAULT_REST_OWNER);
+    c->rest_mode = DEFAULT_REST_MODE;
+    snprintf(c->rest_dir, sizeof(c->rest_dir), "%s", DEFAULT_REST_DIR);
+}
+
+/* rest_socket_owner syntax: [user][:group], each a name ([A-Za-z_][A-Za-z0-9_.-]*, at most 32) or a number. */
+static int owner_part_valid(const char *s, size_t n) {
+    if (n == 0 || n > 32) return 0;
+    int digits = 1;
+    for (size_t i = 0; i < n; i++) if (!isdigit((unsigned char)s[i])) digits = 0;
+    if (digits) return 1;
+    if (!isalpha((unsigned char)s[0]) && s[0] != '_') return 0;
+    for (size_t i = 1; i < n; i++)
+        if (!isalnum((unsigned char)s[i]) && s[i] != '_' && s[i] != '.' && s[i] != '-') return 0;
+    return 1;
+}
+
+static int owner_spec_valid(const char *v) {
+    const char *colon = strchr(v, ':');
+    if (!colon) return owner_part_valid(v, strlen(v));
+    if (strchr(colon + 1, ':')) return 0;
+    size_t ul = (size_t)(colon - v), gl = strlen(colon + 1);
+    if (ul == 0 && gl == 0) return 0;
+    return (ul == 0 || owner_part_valid(v, ul)) && (gl == 0 || owner_part_valid(colon + 1, gl));
 }
 
 static int parse_bool(const char *v, int *out) {
@@ -251,7 +275,7 @@ static int parse_int(const char *v, int lo, int hi, int *out) {
 static const char *const config_keys[] = {
     "bpfc_path", "config_dir", "state_dir", "map_dir", "on_external_change",
     "remove_on_stop", "reinstall_limit", "compile_timeout", "log_level",
-    "netns_path", "netns_veth", NULL};
+    "netns_path", "netns_veth", "rest_socket", "rest_socket_owner", "rest_socket_mode", "rest_dir", NULL};
 
 /* Applies one setting. Returns 0, -1 for an unknown key, -2 for an invalid value. */
 static int config_set(struct config *c, const char *k, const char *v) {
@@ -274,6 +298,24 @@ static int config_set(struct config *c, const char *k, const char *v) {
         snprintf(c->netns_veth, sizeof(c->netns_veth), "%s", v);
         c->set |= CFG_SET_NETNS_VETH;
     }
+    else if (!strcmp(k, "rest_socket")) {
+        /* empty: the REST API is off */
+        if (v[0] && (v[0] != '/' || strlen(v) > REST_SOCKET_MAX)) return -2;
+        snprintf(c->rest_socket, sizeof(c->rest_socket), "%s", v);
+    } else if (!strcmp(k, "rest_socket_owner")) {
+        if (!owner_spec_valid(v) || strlen(v) >= sizeof(c->rest_owner)) return -2;
+        snprintf(c->rest_owner, sizeof(c->rest_owner), "%s", v);
+    } else if (!strcmp(k, "rest_socket_mode")) {
+        char *end;
+        errno = 0;
+        long m = strtol(v, &end, 8);
+        if (errno || *end || end == v || m < 0 || m > 0777) return -2;
+        c->rest_mode = (int)m;
+    } else if (!strcmp(k, "rest_dir")) {
+        if (v[0] != '/') return -2;
+        snprintf(c->rest_dir, sizeof(c->rest_dir), "%s", v);
+        c->set |= CFG_SET_REST_DIR;
+    }
     else if (!strcmp(k, "on_external_change")) {
         if (!strcmp(v, "reinstall")) c->on_external_change = EXT_REINSTALL;
         else if (!strcmp(v, "log")) c->on_external_change = EXT_LOG;
@@ -294,6 +336,11 @@ static int config_check(const struct config *c, const char *src, char *err, size
         snprintf(err, errlen, "%s: bpfc_path must be an absolute path", src);
         return -1;
     }
+    if (!strcmp(c->rest_dir, c->config_dir)) {
+        snprintf(err, errlen, "%s: rest_dir must differ from config_dir (%s): the REST API writes "
+                 "only its own directory", src, c->config_dir);
+        return -1;
+    }
     if ((c->set & CFG_SET_NETNS_PATH) && (c->set & CFG_SET_NETNS_VETH)) {
         snprintf(err, errlen, "%s: netns_path and netns_veth are alternatives; set one", src);
         return -1;
@@ -311,6 +358,57 @@ const char *run_root(void) {
     return r && *r ? r : DEFAULT_STATE_DIR;
 }
 
+const char *lib_root(void) {
+    const char *r = getenv("BPFC_LIB_ROOT");
+    return r && *r ? r : DEFAULT_LIB_ROOT;
+}
+
+/* Looks name up in an /etc/passwd-style file: field 3 (uid or gid). Returns 0 or -1. */
+static int id_from_file(const char *file, const char *name, unsigned long *id) {
+    FILE *f = fopen(file, "r");
+    if (!f) return -1;
+    char line[1024];
+    size_t nl = strlen(name);
+    int rc = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, name, nl) || line[nl] != ':') continue;
+        char *p = strchr(line + nl + 1, ':');      /* skip the password field */
+        if (!p) break;
+        char *end;
+        errno = 0;
+        unsigned long v = strtoul(p + 1, &end, 10);
+        if (!errno && end != p + 1 && *end == ':') { *id = v; rc = 0; }
+        break;
+    }
+    fclose(f);
+    return rc;
+}
+
+static int resolve_part(const char *s, size_t n, const char *file, const char *what, unsigned long *out,
+                        char *err, size_t errlen) {
+    char name[64];
+    snprintf(name, sizeof(name), "%.*s", (int)n, s);
+    int digits = 1;
+    for (size_t i = 0; i < n; i++) if (!isdigit((unsigned char)name[i])) digits = 0;
+    if (digits) { *out = strtoul(name, NULL, 10); return 0; }
+    if (id_from_file(file, name, out) == 0) return 0;
+    snprintf(err, errlen, "rest_socket_owner: no %s '%s' in %s (use a number for accounts from a "
+             "directory service)", what, name, file);
+    return -1;
+}
+
+int rest_owner_resolve(const char *spec, uid_t *uid, gid_t *gid, char *err, size_t errlen) {
+    unsigned long u = 0, g = 0;
+    const char *colon = strchr(spec, ':');
+    size_t ul = colon ? (size_t)(colon - spec) : strlen(spec);
+    if (ul && resolve_part(spec, ul, "/etc/passwd", "user", &u, err, errlen) < 0) return -1;
+    if (colon && colon[1] && resolve_part(colon + 1, strlen(colon + 1), "/etc/group", "group", &g, err, errlen) < 0)
+        return -1;
+    *uid = (uid_t)u;
+    *gid = (gid_t)g;
+    return 0;
+}
+
 int netns_name_valid(const char *name) {
     size_t n = strlen(name);
     if (n == 0 || n > NETNS_NAME_MAX || name[0] == '.' || name[0] == '-') return 0;
@@ -326,6 +424,7 @@ int config_resolve(const char *netns, const char *conf_override, struct config *
     const char *root = conf_root();
     snprintf(c->config_dir, sizeof(c->config_dir), "%s/interfaces.d", root);
     snprintf(c->state_dir, sizeof(c->state_dir), "%s", run_root());
+    snprintf(c->rest_dir, sizeof(c->rest_dir), "%s/interfaces.d", lib_root());
 
     if (!netns || !*netns) {
         if (conf_override) snprintf(path, sizeof(path), "%s", conf_override);
@@ -337,7 +436,7 @@ int config_resolve(const char *netns, const char *conf_override, struct config *
                      "bpfc.conf (%s/netns/<name>/bpfc.conf, used with -n <name>)", path, root);
             return -1;
         }
-        return 0;
+        return config_check(c, path, err, errlen);
     }
 
     if (!netns_name_valid(netns)) {
@@ -377,10 +476,12 @@ int config_resolve(const char *netns, const char *conf_override, struct config *
         snprintf(c->config_dir, sizeof(c->config_dir), "%s/netns/%s/interfaces.d", root, netns);
     if (!(c->set & CFG_SET_STATE_DIR))
         snprintf(c->state_dir, sizeof(c->state_dir), "%s/netns/%s", run_root(), netns);
+    if (!(c->set & CFG_SET_REST_DIR))
+        snprintf(c->rest_dir, sizeof(c->rest_dir), "%s/netns/%s/interfaces.d", lib_root(), netns);
     /* Pinned maps live on bpffs, which every namespace shares: keep each namespace's apart. */
     if (!(c->set & CFG_SET_MAP_DIR))
         snprintf(c->map_dir, sizeof(c->map_dir), "%s/netns/%s", DEFAULT_MAP_ROOT, netns);
-    return 0;
+    return config_check(c, conf_used && *conf_used ? conf_used : "configuration", err, errlen);
 }
 
 int config_load(const char *path, struct config *c, char *err, size_t errlen) {
@@ -731,6 +832,8 @@ int state_write(const char *path, const struct daemon_info *di,
         snprintf(num, sizeof(num), "%llu", (unsigned long long)di->netns_dev); put_enc(f, "netns_dev", num);
         snprintf(num, sizeof(num), "%llu", (unsigned long long)di->netns_ino); put_enc(f, "netns_ino", num);
     }
+    if (di->rest_dir[0]) put_enc(f, "rest_dir", di->rest_dir);
+    if (di->rest_socket[0]) put_enc(f, "rest_socket", di->rest_socket);
     fputc('\n', f);
 
     for (int i = 0; i < nslots; i++) {
@@ -806,6 +909,8 @@ int state_read(const char *path, struct daemon_info *di, struct slot **slots_out
                 else if (!strcmp(k, "netns_target")) snprintf(di->netns_target, sizeof(di->netns_target), "%s", val);
                 else if (!strcmp(k, "netns_dev")) di->netns_dev = strtoull(val, NULL, 10);
                 else if (!strcmp(k, "netns_ino")) di->netns_ino = strtoull(val, NULL, 10);
+                else if (!strcmp(k, "rest_dir")) snprintf(di->rest_dir, sizeof(di->rest_dir), "%s", val);
+                else if (!strcmp(k, "rest_socket")) snprintf(di->rest_socket, sizeof(di->rest_socket), "%s", val);
                 continue;
             }
             if (!strcmp(k, "iface")) snprintf(s->iface, sizeof(s->iface), "%s", val);

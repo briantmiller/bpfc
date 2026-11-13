@@ -1,5 +1,5 @@
 VERSION   ?= 0.1.1
-RELEASE   ?= 5
+RELEASE   ?= 6
 
 CC        ?= gcc
 CFLAGS    ?= -O2 -g
@@ -30,8 +30,13 @@ DESTDIR   ?=
 TARGET     = bpfc
 DAEMON     = bpfcd/bpfcd
 CTL        = bpfcd/bpfcctl
-COMMON_SRC = bpfcd/common.c bpfcd/netns.c
-COMMON_HDR = bpfcd/common.h bpfcd/netns.h
+COMMON_SRC = bpfcd/common.c bpfcd/netns.c bpfcd/json.c
+COMMON_HDR = bpfcd/common.h bpfcd/netns.h bpfcd/json.h
+# The REST API's HTTP server: bpfcd only.
+HTTP_SRC   = bpfcd/http.c
+HTTP_HDR   = bpfcd/http.h
+SYSUSERSDIR ?= $(PREFIX)/lib/sysusers.d
+LOCALSTATEDIR ?= /var/lib
 DAEMON_CFLAGS = $(WARN) -Wno-format-truncation -DBPFC_VERSION='"$(VERSION)"'
 
 # Everything that goes into the source tarball used by `make rpm`.
@@ -42,15 +47,15 @@ RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
 TARBALL    = bpfc-$(VERSION).tar.gz
 
-.PHONY: check-compile check-dataplane check-ecmp check-all all clean install install-scripts dist rpm srpm check
+.PHONY: fuzz check-compile check-dataplane check-ecmp check-all all clean install install-scripts dist rpm srpm check
 
 all: $(TARGET) $(DAEMON) $(CTL)
 
 $(TARGET): bpfc.c
 	$(CC) $(CFLAGS) $(WARN) $(FEATURES) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfc.c
 
-$(DAEMON): bpfcd/bpfcd.c $(COMMON_SRC) $(COMMON_HDR)
-	$(CC) $(CFLAGS) $(DAEMON_CFLAGS) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfcd/bpfcd.c $(COMMON_SRC)
+$(DAEMON): bpfcd/bpfcd.c $(COMMON_SRC) $(COMMON_HDR) $(HTTP_SRC) $(HTTP_HDR)
+	$(CC) $(CFLAGS) $(DAEMON_CFLAGS) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfcd/bpfcd.c $(COMMON_SRC) $(HTTP_SRC)
 
 $(CTL): bpfcd/bpfcctl.c $(COMMON_SRC) $(COMMON_HDR)
 	$(CC) $(CFLAGS) $(DAEMON_CFLAGS) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfcd/bpfcctl.c $(COMMON_SRC)
@@ -69,6 +74,9 @@ install: all install-scripts
 	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/interfaces.d
 	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/netns
 	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/include
+	install -d -m 0755 $(DESTDIR)$(LOCALSTATEDIR)/bpfc/interfaces.d
+	install -d -m 0755 $(DESTDIR)$(LOCALSTATEDIR)/bpfc/netns
+	install -D -m 0644 dist/bpfc.sysusers $(DESTDIR)$(SYSUSERSDIR)/bpfc.conf
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/ingress
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/egress
 	install -m 0644 dist/examples/interfaces.d/eth0/ingress/*.bpfc $(DESTDIR)$(DOCDIR)/examples/interfaces.d/eth0/ingress/
@@ -143,7 +151,7 @@ srpm: $(TARBALL)
 TESTFLAGS ?=
 
 check: all
-	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd netns xdp xdp-examples tc-examples ecmp container install
+	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd netns rest xdp xdp-examples tc-examples ecmp container install
 
 # Compile-only checks of every field and command and of the error messages;
 # needs no root (the few commands that create maps are skipped without it).
@@ -160,6 +168,13 @@ check-dataplane: $(TARGET)
 check-all: all
 	bash tests/run-tests.sh $(TESTFLAGS)
 
+# Feeds the HTTP and JSON parsers random and mutated input under ASan/UBSan.
+FUZZ_ITERS ?= 200000
+fuzz:
+	$(CC) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(DAEMON_CFLAGS) -Ibpfcd \
+	    -o tests/fuzz-rest tests/fuzz-rest.c bpfcd/http.c bpfcd/json.c bpfcd/common.c
+	./tests/fuzz-rest $(FUZZ_ITERS)
+
 clean:
-	rm -f $(TARGET) $(DAEMON) $(CTL) output.bpf $(TARBALL)
+	rm -f $(TARGET) $(DAEMON) $(CTL) output.bpf $(TARBALL) tests/fuzz-rest
 	rm -rf $(RPMTOP) .dist

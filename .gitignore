@@ -5,3 +5,4 @@ output.bpf
 rpmbuild/
 bpfc-*.tar.gz
 **/__pycache__/
+tests/fuzz-rest

@@ -12,6 +12,7 @@ bpfc \- Pure C eBPF bytecode compiler and direct network fabric loader
 .RB [ \-n
 .IR name ]
 .RB [ \-I ]
+.RB [ \-T ]
 .RB [ \-m
 .IR map_dir ]
 .RB [ \-v ]
@@ -102,6 +103,19 @@ Search \fIdir\fR for include files, before the default \fI/etc/bpfc/include\fR. 
 .TP
 .B \-M
 Print the program file and every file it includes, one per line, and exit. \fBbpfcd\fR(8) uses this to notice changes to included files.
+.TP
+.B \-T
+Check the program: compile it and load it into the kernel so the verifier
+checks it, then exit without attaching it. With
+.B \-i
+the interface only supplies \fB$IFNAME\fR, \fB$IFINDEX\fR and the other
+interface constants; nothing on it changes. Maps that are already pinned in the
+map directory are used as they are; maps that do not exist yet are created
+without pinning them, and disappear when the check ends; a pinned map whose
+definition differs from the program's is left in place (a warning says that
+attaching the program would replace it). Needs the same privileges as
+attaching. \fBbpfcd\fR(8) uses this to check programs written through its
+REST socket before installing them.
 .TP
 .B \-v
 Verbose compiler output.

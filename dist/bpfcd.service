@@ -20,6 +20,11 @@ RestartSec=2s
 RuntimeDirectory=bpfc
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
+# /var/lib/bpfc/interfaces.d holds programs written through the REST socket
+# (rest_socket in bpfc.conf; off by default). It survives reboots, as
+# /etc/bpfc does. Suggested socket: rest_socket = /run/bpfc/bpfcd.sock
+StateDirectory=bpfc
+StateDirectoryMode=0755
 
 # Pre-5.11 kernels charge BPF maps and programs to RLIMIT_MEMLOCK.
 LimitMEMLOCK=infinity
@@ -28,7 +33,8 @@ NoNewPrivileges=yes
 ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
+# CAP_CHOWN: giving the REST socket its owner (rest_socket_owner).
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_CHOWN
 
 [Install]
 WantedBy=multi-user.target

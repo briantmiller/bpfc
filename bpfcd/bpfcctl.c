@@ -2,6 +2,7 @@
  * bpfcctl - shows what bpfcd has installed and lets you inspect programs.
  *
  *   bpfcctl [status] [-a] [-l]            programs per interface, checked against the kernel
+ *   bpfcctl status --json                 the same as JSON (bpfcd's REST GET / plus kernel checks)
  *   bpfcctl show <iface> <dir> <prio>     metadata, source file and failure log
  *   bpfcctl show ... --bytecode           plus the kernel's translated bytecode
  *   bpfcctl reload [--no-wait]            SIGHUP bpfcd and report the outcome
@@ -12,6 +13,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "netns.h"
+#include "json.h"
 
 #include <ctype.h>
 
@@ -78,10 +80,17 @@ static void fmt_time(time_t t, char *out, size_t len) {
     strftime(out, len, "%Y-%m-%d %H:%M:%S", &tm);
 }
 
-/* Path relative to the config dir when it lives inside it, to keep tables narrow. */
-static const char *short_path(const char *path, const char *config_dir) {
-    size_t n = strlen(config_dir);
-    if (n && !strncmp(path, config_dir, n) && path[n] == '/') return path + n + 1;
+/* Path relative to the config dir when it lives inside it, to keep tables narrow;
+ * files written through the REST API (rest_dir) are marked "rest:". */
+static const char *short_path(const char *path, const struct daemon_info *di) {
+    static char buf[PATH_MAX + 8];
+    size_t n = strlen(di->config_dir);
+    if (n && !strncmp(path, di->config_dir, n) && path[n] == '/') return path + n + 1;
+    n = strlen(di->rest_dir);
+    if (n && !strncmp(path, di->rest_dir, n) && path[n] == '/') {
+        snprintf(buf, sizeof(buf), "rest:%s", path + n + 1);
+        return buf;
+    }
     return path;
 }
 
@@ -227,6 +236,8 @@ static int cmd_status(int show_all, int long_fmt) {
     }
     printf("programs: %s    external changes: %s\n", di.config_dir,
            di.on_external_change == EXT_LOG ? "log" : "reinstall");
+    if (di.rest_socket[0])
+        printf("rest:     %s, programs in %s (\"rest:\" below)\n", di.rest_socket, di.rest_dir);
     if (!kernel_ok) printf("%skernel not checked: %s%s\n", C_DIM, kernel_note, C_OFF);
     printf("\n");
 
@@ -254,7 +265,7 @@ static int cmd_status(int show_all, int long_fmt) {
             printf("%-*s  %-7s  %5s  %s%-19s%s  %6s  %-16s  %s%-8s%s  %s%s%s%s\n", wif, s->iface,
                    dir_name(s->dir), pr, status_color(s->status), status_name(s->status), C_OFF,
                    prog, s->tag[0] ? s->tag : "-", kc, kw, C_OFF,
-                   short_path(s->path, di.config_dir), C_YELLOW, mark, C_OFF);
+                   short_path(s->path, &di), C_YELLOW, mark, C_OFF);
             if (s->error[0])
                 printf("%*s%s-> %s%s\n", wif + 2, "", C_DIM, s->error, C_OFF);
             if (long_fmt && s->status == ST_INSTALLED) {
@@ -313,6 +324,110 @@ static int cmd_status(int show_all, int long_fmt) {
     free(slots);
     /* Exit status lets scripts and monitoring use `bpfcctl status -q`-style checks. */
     return !alive ? 3 : problems ? 2 : 0;
+}
+
+/* ======================= status --json ======================= */
+
+/* Per program, beyond what bpfcd reports: the kernel cross-check and whether the file changed since. */
+static void json_slot_extra(struct jbuf *b, const struct slot *s, void *arg) {
+    (void)arg;
+    const char *color;
+    const char *kw = kernel_check(s, &color);
+    jb_kstr(b, "kernel", kernel_ok ? kw : NULL);
+    int fs = file_state(s);
+    jb_kstr(b, "file_state", fs == 1 ? "modified" : fs < 0 ? "deleted" : "unchanged");
+}
+
+/* Appends one instance's status object to b; returns the status command's exit status. */
+static int status_json(struct jbuf *b, int show_all) {
+    struct daemon_info di;
+    struct slot *slots = NULL;
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof(path), "%s/%s", state_dir(), STATE_FILE_NAME);
+    int n = state_read(path, &di, &slots);
+    if (n < 0) {
+        jb_obj(b);
+        jb_kstr(b, "netns", cfg.netns[0] ? cfg.netns : NULL);
+        jb_key(b, "error");
+        jb_obj(b);
+        jb_kstr(b, "state_file", path);
+        jb_kstr(b, "message", n == -ENOENT ? "no state: bpfcd has not run yet" : strerror(-n));
+        jb_obj_end(b);
+        jb_obj_end(b);
+        return n == -ENOENT ? 3 : 1;
+    }
+    snprintf(daemon_bpfc, sizeof(daemon_bpfc), "%s", di.bpfc_path[0] ? di.bpfc_path : cfg.bpfc_path);
+    int alive = daemon_alive(di.pid);
+    int kproblems = 0;
+    for (int i = 0; i < n; i++) {
+        const char *color;
+        const char *kw = kernel_check(&slots[i], &color);
+        if (slots[i].status == ST_INSTALLED && kernel_ok && strcmp(kw, "ok")) kproblems++;
+    }
+    struct json_status_ctx ctx = {.config_dir = di.config_dir, .rest_dir = di.rest_dir, .extra = json_slot_extra};
+    jb_obj(b);
+    jb_key(b, "bpfcd");
+    json_daemon(b, &di, alive);
+    jb_kstr(b, "kernel_checked", kernel_ok ? "yes" : kernel_note);
+    jb_key(b, "summary");
+    json_summary(b, slots, n, kproblems);
+    jb_key(b, "programs");
+    jb_arr(b);
+    for (int i = 0; i < n; i++) json_slot(b, &slots[i], &ctx);
+    jb_arr_end(b);
+    if (show_all && kernel_ok) {
+        /* Filters and XDP programs bpfcd is not responsible for, as in status -a. */
+        jb_key(b, "unmanaged");
+        jb_arr(b);
+        struct if_nameindex *ifs = if_nameindex();
+        for (struct if_nameindex *p = ifs; p && p->if_index; p++) {
+            for (int dir = DIR_INGRESS; dir <= DIR_XDP; dir++) {
+                const struct kview *v = kernel_view((int)p->if_index, dir);
+                if (!v || v->n <= 0) continue;
+                for (int j = 0; j < v->n; j++) {
+                    const struct tc_filter *f = &v->f[j];
+                    int managed = 0;
+                    for (int i = 0; i < n; i++)
+                        if (slots[i].status == ST_INSTALLED && !strcmp(slots[i].iface, p->if_name) &&
+                            slots[i].dir == dir && slots[i].prio == f->prio && slots[i].prog_id == f->prog_id)
+                            managed = 1;
+                    if (managed) continue;
+                    jb_obj(b);
+                    jb_kstr(b, "interface", p->if_name);
+                    jb_kstr(b, "direction", dir_name(dir));
+                    if (dir == DIR_XDP) jb_knull(b, "priority");
+                    else jb_kint(b, "priority", f->prio);
+                    jb_kstr(b, "kind", f->kind);
+                    if (f->prog_id) jb_kint(b, "prog_id", f->prog_id);
+                    else jb_knull(b, "prog_id");
+                    jb_kstr(b, "name", f->name[0] ? f->name : NULL);
+                    jb_obj_end(b);
+                }
+            }
+        }
+        if (ifs) if_freenameindex(ifs);
+        jb_arr_end(b);
+    }
+    jb_obj_end(b);
+    int problems = kproblems;
+    for (int i = 0; i < n; i++) if (json_status_is_problem(slots[i].status)) problems++;
+    free(slots);
+    return !alive ? 3 : problems ? 2 : 0;
+}
+
+static int print_json(struct jbuf *b) {
+    if (b->oom) { fprintf(stderr, "bpfcctl: out of memory\n"); return 1; }
+    fwrite(b->s, 1, b->len, stdout);
+    return 0;
+}
+
+static int cmd_status_json(int show_all) {
+    struct jbuf b;
+    jb_init(&b, 1);
+    int rc = status_json(&b, show_all);
+    if (print_json(&b)) rc = 1;
+    jb_free(&b);
+    return rc;
 }
 
 /* ======================= show ======================= */
@@ -655,7 +770,10 @@ static int load_cfg(const char *netns) {
 static int cmd_status(int show_all, int long_fmt);
 
 /* status for the default namespace and every namespace with bpfcd state under the run root. */
-static int cmd_status_all(int show_all, int long_fmt) {
+static int cmd_status_all(int show_all, int long_fmt, int json) {
+    struct jbuf jb;
+    jb_init(&jb, 1);
+    if (json) { jb_obj(&jb); jb_key(&jb, "instances"); jb_arr(&jb); }
     int worst = 0, sections = 0;
     char nsdir[PATH_MAX];
     snprintf(nsdir, sizeof(nsdir), "%s/netns", run_root());
@@ -677,13 +795,26 @@ static int cmd_status_all(int show_all, int long_fmt) {
         char st[PATH_MAX + 32];
         snprintf(st, sizeof(st), "%s/%s", cfg.state_dir, STATE_FILE_NAME);
         if (i < 0 && access(st, F_OK) < 0) continue;     /* no bpfcd in the default namespace */
-        if (sections++) printf("\n");
-        printf("%s==== %s ====%s\n", C_BOLD, i < 0 ? "default namespace" : names[i], C_OFF);
+        sections++;
         enter_cfg_netns();
-        int rc = cmd_status(show_all, long_fmt);
+        int rc;
+        if (json) {
+            rc = status_json(&jb, show_all);
+        } else {
+            if (sections > 1) printf("\n");
+            printf("%s==== %s ====%s\n", C_BOLD, i < 0 ? "default namespace" : names[i], C_OFF);
+            rc = cmd_status(show_all, long_fmt);
+        }
         if (rc > worst) worst = rc;
     }
-    if (!sections) printf("No bpfcd state found (default namespace or %s/*).\n", nsdir);
+    if (json) {
+        jb_arr_end(&jb);
+        jb_obj_end(&jb);
+        if (print_json(&jb)) worst = 1;
+        jb_free(&jb);
+    } else if (!sections) {
+        printf("No bpfcd state found (default namespace or %s/*).\n", nsdir);
+    }
     return worst;
 }
 
@@ -709,6 +840,8 @@ static void print_env(int with_file) {
     shell_quote("BPFC_STATE_DIR", state_dir());
     shell_quote("BPFC_MAP_DIR", cfg.map_dir[0] ? cfg.map_dir : DEFAULT_MAP_ROOT);
     shell_quote("BPFC_BPFC", cfg.bpfc_path);
+    shell_quote("BPFC_REST_DIR", cfg.rest_dir);
+    shell_quote("BPFC_REST_SOCKET", cfg.rest_socket);
     if (with_file && cfg.netns[0]) {
         struct netns_loc loc;
         int rc = netns_locate(&cfg, host_rtnl, &loc);
@@ -749,6 +882,8 @@ static int cmd_exec(int argc, char **argv) {
     setenv("BPFC_STATE_DIR", state_dir(), 1);
     setenv("BPFC_MAP_DIR", cfg.map_dir[0] ? cfg.map_dir : DEFAULT_MAP_ROOT, 1);
     setenv("BPFC_BPFC", cfg.bpfc_path, 1);
+    setenv("BPFC_REST_DIR", cfg.rest_dir, 1);
+    setenv("BPFC_REST_SOCKET", cfg.rest_socket, 1);
     setenv("BPFC_NETNS_FILE", loc.witness, 1);
     if (netns_enter_for_exec(loc.fd) < 0) return 1;
     netns_loc_close(&loc);
@@ -764,9 +899,10 @@ static int cmd_exec(int argc, char **argv) {
 static void usage(void) {
     printf("Usage: bpfcctl [options] [command]\n\n"
            "Commands:\n"
-           "  status [-a] [-l]               programs managed by bpfcd (default command)\n"
+           "  status [-a] [-l] [-j]          programs managed by bpfcd (default command)\n"
            "      -a, --all                  also list TC filters and XDP programs bpfcd does not manage\n"
            "      -l, --long                 include install time, size and hash\n"
+           "      -j, --json                 as JSON (the shape of bpfcd's REST GET /, plus kernel checks)\n"
            "  show <iface> <dir> <prio>      details, source and failure output for one program\n"
            "  show <iface> xdp               the same for the interface's XDP program\n"
            "      -b, --bytecode             also print the kernel's translated bytecode\n"
@@ -785,13 +921,14 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
-    int show_all = 0, long_fmt = 0, bytecode = 0, nowait = 0, all_netns = 0;
+    int show_all = 0, long_fmt = 0, bytecode = 0, nowait = 0, all_netns = 0, json = 0;
     const char *color = "auto";
     enum { OPT_NOWAIT = 256, OPT_ALL_NETNS };
     static const struct option longopts[] = {
         {"config", required_argument, 0, 'c'}, {"state-dir", required_argument, 0, 's'},
         {"netns", required_argument, 0, 'n'}, {"all-netns", no_argument, 0, OPT_ALL_NETNS},
         {"all", no_argument, 0, 'a'}, {"long", no_argument, 0, 'l'}, {"bytecode", no_argument, 0, 'b'},
+        {"json", no_argument, 0, 'j'},
         {"no-wait", no_argument, 0, OPT_NOWAIT}, {"color", required_argument, 0, 'C'},
         {"version", no_argument, 0, 'V'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
 
@@ -814,7 +951,7 @@ int main(int argc, char **argv) {
     }
     int o;
     /* "+" would stop at the command; we want options anywhere, so permute (GNU default). */
-    while ((o = getopt_long(opt_argc, argv, "c:s:n:albVh", longopts, NULL)) != -1) {
+    while ((o = getopt_long(opt_argc, argv, "c:s:n:albjVh", longopts, NULL)) != -1) {
         switch (o) {
         case 'c': conf_override = optarg; break;
         case 'n': netns_arg = optarg; break;
@@ -823,6 +960,7 @@ int main(int argc, char **argv) {
         case 'a': show_all = 1; break;
         case 'l': long_fmt = 1; break;
         case 'b': bytecode = 1; break;
+        case 'j': json = 1; break;
         case OPT_NOWAIT: nowait = 1; break;
         case 'C': color = optarg; break;
         case 'V': printf("bpfcctl %s\n", BPFC_VERSION); return 0;
@@ -848,12 +986,13 @@ int main(int argc, char **argv) {
     char **args = argv + optind;
     if (all_netns) {
         if (strcmp(cmd, "status")) { fprintf(stderr, "bpfcctl: --all-netns applies to status\n"); return 2; }
-        return cmd_status_all(show_all, long_fmt);
+        return cmd_status_all(show_all, long_fmt, json);
     }
     if (!strcmp(cmd, "env")) return cmd_env();
     if (!strcmp(cmd, "exec")) return cmd_exec(rest, args);
     if (!strcmp(cmd, "status") || !strcmp(cmd, "show")) enter_cfg_netns();
-    if (!strcmp(cmd, "status")) return cmd_status(show_all, long_fmt);
+    if (json && strcmp(cmd, "status")) { fprintf(stderr, "bpfcctl: --json applies to status\n"); return 2; }
+    if (!strcmp(cmd, "status")) return json ? cmd_status_json(show_all) : cmd_status(show_all, long_fmt);
     if (!strcmp(cmd, "show")) return cmd_show(rest, args, bytecode);
     if (!strcmp(cmd, "reload")) return cmd_reload(!nowait);
     if (!strcmp(cmd, "help")) { usage(); return 0; }

@@ -6,7 +6,8 @@ bpfcctl \- show and inspect programs managed by bpfcd
 .RI [ options ]
 .RB [ status
 .RB [ \-a ]
-.RB [ \-l ]]
+.RB [ \-l ]
+.RB [ \-j ]]
 .br
 .B bpfcctl
 .RI [ options ]
@@ -121,6 +122,32 @@ Also list TC filters and XDP programs on any interface that bpfcd does not manag
 .TP
 .BR \-l ", " \-\-long
 Add install time, instruction count, hash and ifindex.
+.TP
+.BR \-j ", " \-\-json
+Print JSON instead: the object bpfcd's REST API returns for
+.B GET /
+.RB ( bpfcd ,
+.BR summary ,
+.BR programs ;
+see
+.BR bpfcd (8),
+.BR "REST API" ),
+with each program's
+.B kernel
+check and
+.B file_state
+.RB ( unchanged ,
+.BR modified ,
+.BR deleted )
+added, and with
+.B \-a
+an
+.B unmanaged
+list. With
+.BR \-\-all\-netns ,
+.B {"instances": [...]}
+holds one such object per instance. The exit status is the same as without
+.BR \-j .
 .RE
 .TP
 .BI show " iface direction priority"
@@ -163,6 +190,10 @@ when the global file stands in),
 .BR BPFC_STATE_DIR ,
 .BR BPFC_MAP_DIR ,
 .BR BPFC_BPFC ,
+.B BPFC_REST_DIR
+(programs written through the REST socket),
+.B BPFC_REST_SOCKET
+(empty when the API is off),
 and with
 .B \-n
 .B BPFC_NETNS_FILE

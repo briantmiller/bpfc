@@ -210,6 +210,11 @@ struct { char name[32]; int fd; int is_buf; int is_array; int percpu; uint32_t e
 int num_maps = 0;
 
 char bpf_map_dir[255] = BPF_FS_DIR;
+/* -T: load into the kernel to have it verified, then exit without attaching.
+ * Pinned maps are only looked up: new ones are created unpinned (and go away
+ * with the process), and one pinned with a different definition is left in
+ * place instead of being replaced. */
+int check_only = 0;
 extern char bpf_prog_name[16];
 uint16_t target_tc_protocol = ETH_P_ALL;
 
@@ -4754,6 +4759,7 @@ int get_pinned_map_fd(const char *pin_path) {
  * and can be shared with other eBPF programs.
  */
 int pin_map_fd(int fd, const char *pin_path) {
+    if (check_only) return 0;   /* -T: the map lives only as long as this check */
     union bpf_attr attr = {
         .pathname = (unsigned long)pin_path,
         .bpf_fd   = fd,
@@ -4780,6 +4786,12 @@ static int map_info(int fd, struct bpf_map_info *info) {
  * regenerating a program with a bigger ring or window takes effect.
  */
 static int replace_pinned(const char *pin_path, int fd, const char *name, const char *why) {
+    if (check_only) {
+        /* -T: check against a fresh unpinned map; the pinned one stays as it is. */
+        fprintf(stderr, "Warning: map '%s' %s; attaching this program will replace the pinned map\n", name, why);
+        close(fd);
+        return -1;
+    }
     fprintf(stderr, "Warning: map '%s' %s; replacing the pinned map\n", name, why);
     close(fd);
     if (unlink(pin_path) < 0) {
@@ -7147,6 +7159,7 @@ void help(const char *arg0) {
         "-p <priority>"		,"attachment priority, lower first; an existing program at this priority is replaced atomically",
         "-n <name>"		,"name the program (kernel name: last 15 chars of [A-Za-z0-9_.]) and TC filter (full name)",
         "-I"			,"print a BPFC_INFO line with the program id and tag after attaching",
+        "-T"			,"check: compile and have the kernel verify the program, then exit without attaching it or pinning maps",
         "-m <dir>"		,"specify directory for BPF maps",
         "-r <map>"		,"dump contents of specified map",
         "-w <map> <key> <value>"	,"write a 64-bit value under key in a pinned 8-byte map (e.g. runtime settings)",
@@ -9200,6 +9213,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i],"-c")==0) clean = 1;
         else if (strcmp(argv[i],"-D")==0) delete_prio = 1;
         else if (strcmp(argv[i],"-I")==0) show_info = 1;
+        else if (strcmp(argv[i],"-T")==0) check_only = 1;
         else if (strcmp(argv[i],"-n")==0) set_prog_name(argv[++i]);
         else if (strcmp(argv[i],"-p")==0) pri = atoi(argv[++i]);
         else if (strcmp(argv[i],"-v")==0) verbose_mode = 1;
@@ -9234,6 +9248,10 @@ int main(int argc, char **argv) {
     }
     if (pri < 0 || pri > 65535) {
         fprintf(stderr, "Error: priority must be between 0 and 65535\n");
+        return 1;
+    }
+    if (check_only && (clean || delete_prio)) {
+        fprintf(stderr, "Error: -T checks a program; it cannot be combined with -c or -D\n");
         return 1;
     }
     if ((clean || delete_prio) && !iface) {
@@ -9372,6 +9390,19 @@ int main(int argc, char **argv) {
     }
     xdp_finish();
 
+    if (check_only) {
+        /* -T: the verifier's verdict, nothing attached. -i only supplies $IFNAME and friends. */
+        int fd = load_bpf_prog_mem();
+        if (fd < 0) {
+            fprintf(stderr, "Error: kernel rejected program: %s\n", strerror(errno));
+            return 1;
+        }
+        if (show_info)
+            print_prog_info(fd, iface ? iface : "-", dir, pri);
+        printf("Checked %d instructions: the kernel accepts the program (not attached)\n", prog_idx);
+        close(fd);
+        return 0;
+    }
     if (iface) {
         //union bpf_attr a = {.prog_type=BPF_PROG_TYPE_SCHED_CLS, .insns=(unsigned long)prog, .insn_cnt=prog_idx, .license=(unsigned long)"GPL"};
         //int fd = syscall(__NR_bpf, BPF_PROG_LOAD, &a, sizeof(a));
