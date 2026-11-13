@@ -278,6 +278,135 @@ too.
 runs a command inside the namespace with its paths in
 .BR BPFC_ *
 variables.
+.SS REST API
+With
+.B rest_socket
+set in
+.BR bpfc.conf (5)
+(it is off by default), bpfcd serves HTTP/1.1 on that unix socket. The socket
+gets the owner and mode of
+.B rest_socket_owner
+and
+.B rest_socket_mode
+(default
+.B root:bpfc
+and
+.BR 0660 ).
+That is the only access control: whoever can connect can read and change
+programs, and so load programs into the kernel as root. Add users to the
+.B bpfc
+group to let them in. Requests and replies are JSON
+.RB ( "Content-Type: application/json" ).
+.PP
+Programs written through the socket are files in
+.B rest_dir
+.RI ( /var/lib/bpfc/interfaces.d ,
+or
+.I /var/lib/bpfc/netns/<name>/interfaces.d
+with
+.BR \-n ),
+laid out like
+.IR /etc/bpfc/interfaces.d .
+bpfcd reads both trees. A file in
+.B rest_dir
+overrides the file at the same place in
+.I /etc/bpfc/interfaces.d
+(same interface or template, direction and priority); the precedence
+between an interface, its kind and
+.B %all%
+then applies as usual. The API never changes
+.IR /etc/bpfc .
+Files in
+.B rest_dir
+stay in effect when the socket is turned off.
+.TP
+.B GET /
+The daemon, a summary and every program, like
+.BR "bpfcctl status" .
+.TP
+.B GET /interfaces
+Every interface, and every template with files or programs.
+.TP
+.BI "GET /interfaces/" if
+One interface (or
+.BR %all% ,
+.BI % kind %\fR):
+whether it exists, its ifindex, kind, MTU, flags and MAC address, its
+programs and its files.
+.TP
+.BI "GET /interfaces/" if / dir
+The same for one direction
+.RB ( ingress " or " egress ).
+.TP
+.BI "GET /interfaces/" if / dir / prio
+The program file: a JSON array with one string per line. The
+.B X\-Bpfc\-File
+and
+.B X\-Bpfc\-Source
+.RB ( rest " or " config )
+headers say which file it is. 404 when neither tree has it.
+.TP
+.BI "POST /interfaces/" if / dir / prio
+Writes the body, a JSON array of strings, one per line, as the file in
+.B rest_dir
+and installs it.
+.B PUT
+is the same. The program is checked first with
+.B bpfc \-T
+(compiled and verified by the kernel, nothing attached) on one interface it
+applies to; if the check fails, nothing changes and the reply is 422 with
+bpfc's output. If installing still fails somewhere, the previous file (or no
+file) is put back and installed again, and the reply is 422 with the failure
+output. The program at that priority is briefly absent while that happens. A
+write rescans both trees, as a reload does. An empty array writes an empty
+file, which excludes the priority on that interface. 201 for a new file,
+otherwise 200.
+.TP
+.BI "POST /interfaces/" if / dir / prio ?dry\-run
+Checks the program on every interface it would apply to, and changes
+nothing.
+.TP
+.BI "DELETE /interfaces/" if / dir / prio
+Removes the file from
+.B rest_dir
+(and the program, or the
+.I /etc/bpfc/interfaces.d
+file it overrode comes back). 409 for a file that is only in
+.IR /etc/bpfc/interfaces.d .
+.TP
+.BI /interfaces/ if /xdp
+The interface's XDP program file, with the same methods.
+.PP
+Write
+.B %all%
+and
+.BI % kind %
+as
+.B %25all%25
+and
+.BI %25 kind %25
+in URLs (a literal
+.B %
+works too when it is not followed by two hex digits). Errors are
+.BR "{\(dqerror\(dq: {\(dqstatus\(dq: N, \(dqmessage\(dq: \(dq...\(dq}}" .
+Each connection carries one request; bodies need a
+.B Content\-Length
+(at most 1 MiB; no chunked bodies); a request must arrive within 10 seconds;
+32 connections at a time. bpfcd handles one request at a time, and a write
+waits for bpfc, so requests can wait up to
+.B compile_timeout
+behind one another. Writes are logged with the client's uid and pid.
+.PP
+Example:
+.PP
+.nf
+.RS
+curl \-\-unix\-socket /run/bpfc/bpfcd.sock http://localhost/interfaces/eth0
+curl \-\-unix\-socket /run/bpfc/bpfcd.sock \-X POST \e
+    \-d '["match tcp;", "  match tcp\-dst 23;", "    drop"]' \e
+    http://localhost/interfaces/eth0/ingress/10
+.RE
+.fi
 .SH OPTIONS
 .TP
 .BI \-n ", " \-\-netns " name"
@@ -362,6 +491,9 @@ Settings.
 .TP
 .I /etc/bpfc/interfaces.d/
 Program files.
+.TP
+.I /var/lib/bpfc/interfaces.d/
+Program files written through the REST socket (rest_dir).
 .TP
 .I /run/bpfc/state
 Current state, read by

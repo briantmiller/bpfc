@@ -16,6 +16,12 @@
  *   interfaces so that removed/replaced programs are reinstalled or logged
  *   (on_external_change in bpfc.conf).
  * - The current view is written to <state_dir>/state for bpfcctl.
+ * - Programs come from two trees with the same layout: config_dir
+ *   (/etc/bpfc/interfaces.d, edited by hand) and rest_dir
+ *   (/var/lib/bpfc/interfaces.d, written through the REST socket). A file in
+ *   rest_dir overrides the file at the same place in config_dir.
+ * - With rest_socket set, an HTTP server on that unix socket shows the status
+ *   and reads, writes and deletes rest_dir files; see the REST API section.
  * - With -n <name>, all of this happens inside network namespace <name>,
  *   configured from /etc/bpfc/netns/<name>/; see netns.c for how the
  *   namespace is found and the NETNS section below for following it.
@@ -26,6 +32,8 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "netns.h"
+#include "json.h"
+#include "http.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -40,6 +48,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -137,10 +146,10 @@ static void filter_name(const struct slot *s, char *out, size_t len) {
     snprintf(out, len, FILTER_NAME_PREFIX "%s/%s/%d", s->iface, dir_name(s->dir), s->prio);
 }
 
-static void write_state(void) {
-    char path[PATH_MAX + 32];
-    snprintf(path, sizeof(path), "%s/%s", cfg.state_dir, STATE_FILE_NAME);
-    qsort(slots, nslots, sizeof(*slots), slot_cmp);
+static char rest_serving[REST_SOCKET_MAX + 1];      /* REST socket being served (REST API section) */
+
+/* The daemon record of the state file, from the current settings. */
+static void fill_dinfo(void) {
     dinfo.on_external_change = cfg.on_external_change;
     snprintf(dinfo.config_dir, sizeof(dinfo.config_dir), "%s", cfg.config_dir);
     snprintf(dinfo.bpfc_path, sizeof(dinfo.bpfc_path), "%s", cfg.bpfc_path);
@@ -151,6 +160,15 @@ static void write_state(void) {
         dinfo.netns_dev = cur.dev;
         dinfo.netns_ino = cur.ino;
     }
+    snprintf(dinfo.rest_dir, sizeof(dinfo.rest_dir), "%s", cfg.rest_dir);
+    snprintf(dinfo.rest_socket, sizeof(dinfo.rest_socket), "%s", rest_serving);
+}
+
+static void write_state(void) {
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof(path), "%s/%s", cfg.state_dir, STATE_FILE_NAME);
+    qsort(slots, nslots, sizeof(*slots), slot_cmp);
+    fill_dinfo();
     int rc = state_write(path, &dinfo, slots, nslots);
     if (rc < 0) logmsg(LOG_LVL_ERR, "cannot write %s: %s", path, strerror(-rc));
     state_dirty = 0;
@@ -409,10 +427,14 @@ static int file_trusted(const char *path, const struct stat *st) {
  * devices only). An empty file at a more specific level means "nothing at
  * this priority on this interface" (status excluded).
  */
+enum { LAYER_CONFIG = 0, LAYER_REST = 1 };
+
 struct source {
     char scope[IFNAMSIZ + 24];
     int dir, prio;
     char path[PATH_MAX];
+    int layer;                  /* LAYER_REST: from rest_dir */
+    char overrides[PATH_MAX];   /* the config_dir file a rest_dir file stands in for, if any */
     int64_t mtime_ns;
     char sha256[65];
     int has_includes;
@@ -446,7 +468,7 @@ static int file_is_empty(const char *path) {
     return empty;
 }
 
-static void scan_file(const char *scope, int dir, const char *dirpath, const char *fname) {
+static void scan_file(const char *scope, int dir, const char *dirpath, const char *fname, int layer) {
     int prio = dir == DIR_XDP ? 0 : parse_prio_name(fname);
     if (prio < 0) {
         const char *dot = strrchr(fname, '.');
@@ -457,6 +479,12 @@ static void scan_file(const char *scope, int dir, const char *dirpath, const cha
     }
     char path[PATH_MAX];
     if ((size_t)snprintf(path, sizeof(path), "%s/%s", dirpath, fname) >= sizeof(path)) return;
+    /* rest_dir is scanned first: its file wins over this one. */
+    struct source *rsrc = layer == LAYER_CONFIG ? source_find(scope, dir, prio) : NULL;
+    if (rsrc && rsrc->seen && rsrc->layer == LAYER_REST) {
+        snprintf(rsrc->overrides, sizeof(rsrc->overrides), "%s", path);
+        return;
+    }
     struct stat st;
     if (stat(path, &st) < 0 || !S_ISREG(st.st_mode)) {
         logmsg(LOG_LVL_WARN, "%s: ignored, not a regular file", path);
@@ -480,11 +508,15 @@ static void scan_file(const char *scope, int dir, const char *dirpath, const cha
         src->dir = dir;
         src->prio = prio;
     }
+    /* A file that moved between the trees is hashed again even with the same mtime. */
+    int moved = strcmp(src->path, path) != 0;
     snprintf(src->path, sizeof(src->path), "%s", path);
+    src->layer = layer;
+    src->overrides[0] = '\0';
 
     /* Per bpfcd(8): only hash when the mtime moved; reload only when the hash differs too.
      * A program with includes is always re-hashed: an included file may have changed. */
-    if (src->mtime_ns != mtime || !src->sha256[0] || src->has_includes) {
+    if (moved || src->mtime_ns != mtime || !src->sha256[0] || src->has_includes) {
         src->empty = file_is_empty(path);
         char hex[65];
         int rc;
@@ -557,21 +589,19 @@ static void expand(void) {
     }
 }
 
-static void scan_dir(void) {
-    for (int i = 0; i < nsources; i++) sources[i].seen = 0;
-
-    DIR *top = opendir(cfg.config_dir);
+/* Reads one program tree (config_dir or rest_dir). Returns -errno if it cannot be opened. */
+static int scan_tree(const char *root, int layer) {
+    DIR *top = opendir(root);
     if (!top) {
-        if (errno == ENOENT)
-            logmsg(LOG_LVL_WARN, "%s does not exist; no programs configured", cfg.config_dir);
-        else
-            logmsg(LOG_LVL_ERR, "cannot open %s: %s", cfg.config_dir, strerror(errno));
+        int e = errno;
+        if (e != ENOENT) logmsg(LOG_LVL_ERR, "cannot open %s: %s", root, strerror(e));
+        return -e;
     }
     struct dirent *de;
-    while (top && (de = readdir(top))) {
+    while ((de = readdir(top))) {
         if (de->d_name[0] == '.') continue;
         char ifdir[PATH_MAX];
-        if ((size_t)snprintf(ifdir, sizeof(ifdir), "%s/%s", cfg.config_dir, de->d_name) >= sizeof(ifdir)) continue;
+        if ((size_t)snprintf(ifdir, sizeof(ifdir), "%s/%s", root, de->d_name) >= sizeof(ifdir)) continue;
         struct stat st;
         if (stat(ifdir, &st) < 0 || !S_ISDIR(st.st_mode)) continue;
         if (de->d_name[0] == '%' ? !valid_template_name(de->d_name) : !valid_ifname(de->d_name)) {
@@ -588,8 +618,8 @@ static void scan_dir(void) {
             }
             struct dirent *fe;
             while ((fe = readdir(d))) {
-                if (fe->d_name[0] == '.') continue;
-                scan_file(de->d_name, dir, ddir, fe->d_name);
+                if (fe->d_name[0] == '.') continue;   /* also the REST API's temporary files */
+                scan_file(de->d_name, dir, ddir, fe->d_name, layer);
             }
             closedir(d);
         }
@@ -597,9 +627,18 @@ static void scan_dir(void) {
         char xpath[PATH_MAX];
         struct stat xst;
         if ((size_t)snprintf(xpath, sizeof(xpath), "%s/xdp.bpfc", ifdir) < sizeof(xpath) && lstat(xpath, &xst) == 0)
-            scan_file(de->d_name, DIR_XDP, ifdir, "xdp.bpfc");
+            scan_file(de->d_name, DIR_XDP, ifdir, "xdp.bpfc", layer);
     }
-    if (top) closedir(top);
+    closedir(top);
+    return 0;
+}
+
+static void scan_dir(void) {
+    for (int i = 0; i < nsources; i++) sources[i].seen = 0;
+    /* rest_dir first: its files override config_dir's (scan_file). It may well not exist. */
+    int have_rest = scan_tree(cfg.rest_dir, LAYER_REST) == 0;
+    if (scan_tree(cfg.config_dir, LAYER_CONFIG) == -ENOENT && !have_rest)
+        logmsg(LOG_LVL_WARN, "%s does not exist; no programs configured", cfg.config_dir);
     for (int i = 0; i < nsources;) {
         if (!sources[i].seen) { sources[i] = sources[--nsources]; continue; }
         i++;
@@ -1108,6 +1147,772 @@ static void ns_start_timer(void) {
     timerfd_settime(nstfd, 0, &its, NULL);
 }
 
+/* ======================= REST API ======================= */
+
+/*
+ * With rest_socket set, bpfcd serves HTTP on that unix socket (http.c). Anyone
+ * who can connect may read and change programs: access is the socket's owner
+ * and mode (rest_socket_owner, rest_socket_mode). Resources:
+ *
+ *   GET    /                                   daemon, summary and every program (as bpfcctl status)
+ *   GET    /interfaces                         every interface and scope with programs or files
+ *   GET    /interfaces/<if>                    one interface (or %all%, %<kind>%): details, programs, files
+ *   GET    /interfaces/<if>/<ingress|egress>   its programs and files in one direction
+ *   GET    /interfaces/<if>/<dir>/<prio>       the program file, as a JSON array of lines
+ *   POST   (same; PUT is the same)             write the file in rest_dir and install it
+ *   DELETE (same)                              remove the rest_dir file
+ *   .../interfaces/<if>/xdp                    the XDP program file (no priority)
+ *
+ * A write is checked first (bpfc -T, on one interface the file applies to)
+ * and only then replaces the file. If installing it still fails anywhere,
+ * the previous file is put back and reinstalled, and the reply is 422.
+ * ?dry-run (or ?dry-run=true) checks on every interface the file would apply
+ * to and changes nothing. Writes rescan both trees, like a reload.
+ */
+
+static struct http_server *rest_srv;
+static char rest_owner_cur[sizeof(cfg.rest_owner)];
+static int rest_mode_cur;
+static dev_t rest_sock_dev;
+static ino_t rest_sock_ino;
+
+static void rest_handle(const struct http_request *req, struct http_response *resp);
+
+static void rest_stop(void) {
+    if (!rest_srv) return;
+    http_server_free(rest_srv);
+    rest_srv = NULL;
+    /* Only our own socket: another bpfcd may have taken the path over. */
+    struct stat st;
+    if (lstat(rest_serving, &st) == 0 && st.st_dev == rest_sock_dev && st.st_ino == rest_sock_ino)
+        unlink(rest_serving);
+    logmsg(LOG_LVL_INFO, "rest: no longer serving %s", rest_serving);
+    rest_serving[0] = '\0';
+    state_dirty = 1;
+}
+
+static void rest_start(void) {
+    if (!cfg.rest_socket[0]) return;
+    uid_t uid;
+    gid_t gid;
+    char err[600];
+    snprintf(rest_owner_cur, sizeof(rest_owner_cur), "%s", cfg.rest_owner);
+    rest_mode_cur = cfg.rest_mode;
+    if (rest_owner_resolve(cfg.rest_owner, &uid, &gid, err, sizeof(err)) < 0) {
+        logmsg(LOG_LVL_ERR, "rest: %s; not serving %s", err, cfg.rest_socket);
+        return;
+    }
+    int fd = http_listen(cfg.rest_socket, uid, gid, (unsigned)cfg.rest_mode, err, sizeof(err));
+    if (fd < 0) { logmsg(LOG_LVL_ERR, "rest: %s; the REST API is off", err); return; }
+    rest_srv = http_server_new(fd, rest_handle);
+    if (!rest_srv) { close(fd); unlink(cfg.rest_socket); logmsg(LOG_LVL_ERR, "rest: out of memory"); return; }
+    struct stat st;
+    if (stat(cfg.rest_socket, &st) == 0) { rest_sock_dev = st.st_dev; rest_sock_ino = st.st_ino; }
+    snprintf(rest_serving, sizeof(rest_serving), "%s", cfg.rest_socket);
+    int rc = mkdir_p(cfg.rest_dir, 0755);
+    if (rc < 0) logmsg(LOG_LVL_WARN, "rest: cannot create %s: %s", cfg.rest_dir, strerror(-rc));
+    logmsg(LOG_LVL_INFO, "rest: serving %s (owner %s, mode %04o); programs written to %s",
+           rest_serving, cfg.rest_owner, cfg.rest_mode, cfg.rest_dir);
+    state_dirty = 1;
+}
+
+/* After a reload: (re)open the socket when its settings changed, or when it could not be opened before. */
+static void rest_reconfigure(void) {
+    if (!strcmp(cfg.rest_socket, rest_serving) && !strcmp(cfg.rest_owner, rest_owner_cur) &&
+        cfg.rest_mode == rest_mode_cur && (rest_srv || !cfg.rest_socket[0]))
+        return;
+    /* A new owner that does not resolve keeps the socket that works. */
+    uid_t u;
+    gid_t g;
+    char err[600];
+    if (rest_srv && cfg.rest_socket[0] && rest_owner_resolve(cfg.rest_owner, &u, &g, err, sizeof(err)) < 0) {
+        logmsg(LOG_LVL_ERR, "rest: %s; still serving %s as before", err, rest_serving);
+        snprintf(rest_owner_cur, sizeof(rest_owner_cur), "%s", cfg.rest_owner);   /* log it once */
+        rest_mode_cur = cfg.rest_mode;
+        return;
+    }
+    rest_stop();
+    rest_start();
+}
+
+/* ---- helpers ---- */
+
+static const struct json_status_ctx *rest_ctx(void) {
+    static struct json_status_ctx c;
+    c.config_dir = cfg.config_dir;
+    c.rest_dir = cfg.rest_dir;
+    return &c;
+}
+
+/* <scope>/<dir>/<prio>.bpfc, or <scope>/xdp.bpfc */
+static void prog_rel(char *out, size_t n, const char *scope, int dir, int prio) {
+    if (dir == DIR_XDP) snprintf(out, n, "%s/xdp.bpfc", scope);
+    else snprintf(out, n, "%s/%s/%d.bpfc", scope, dir_name(dir), prio);
+}
+
+static int is_regular(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* Reads a whole file (at most max bytes). Returns 0, -EFBIG, or -errno. */
+static int read_file(const char *path, char **out, size_t *len, size_t max) {
+    *out = NULL;
+    *len = 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    size_t cap = 4096, n = 0;
+    char *b = malloc(cap + 1);
+    if (!b) { close(fd); return -ENOMEM; }
+    for (;;) {
+        if (n == cap) {
+            if (cap >= max) { free(b); close(fd); return -EFBIG; }
+            cap *= 2;
+            char *nb = realloc(b, cap + 1);
+            if (!nb) { free(b); close(fd); return -ENOMEM; }
+            b = nb;
+        }
+        ssize_t r = read(fd, b + n, cap - n);
+        if (r < 0) { if (errno == EINTR) continue; int e = -errno; free(b); close(fd); return e; }
+        if (r == 0) break;
+        n += (size_t)r;
+    }
+    close(fd);
+    if (n > max) { free(b); return -EFBIG; }
+    b[n] = '\0';
+    *out = b;
+    *len = n;
+    return 0;
+}
+
+/* Writes data to path atomically (temporary file in the same directory, then rename), mode 0644. */
+static int write_file_atomic(const char *path, const char *data, size_t len) {
+    char tmp[PATH_MAX + 64];
+    const char *slash = strrchr(path, '/');
+    if (!slash) return -EINVAL;
+    snprintf(tmp, sizeof(tmp), "%.*s/.%s.rest-%d.tmp", (int)(slash - path), path, slash + 1, (int)getpid());
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (fd < 0) return -errno;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, data + off, len - off);
+        if (w < 0) { if (errno == EINTR) continue; int e = -errno; close(fd); unlink(tmp); return e; }
+        off += (size_t)w;
+    }
+    if (fchmod(fd, 0644) < 0 || fsync(fd) < 0) { int e = -errno; close(fd); unlink(tmp); return e; }
+    if (close(fd) < 0) { int e = -errno; unlink(tmp); return e; }
+    if (rename(tmp, path) < 0) { int e = -errno; unlink(tmp); return e; }
+    return 0;
+}
+
+/* Removes <rest_dir>/<scope>/<dir> and <rest_dir>/<scope> once they are empty. */
+static void prune_rest_dirs(const char *scope, int dir) {
+    char p[PATH_MAX + 64];
+    if (dir != DIR_XDP) {
+        snprintf(p, sizeof(p), "%s/%s/%s", cfg.rest_dir, scope, dir_name(dir));
+        rmdir(p);
+    }
+    snprintf(p, sizeof(p), "%s/%s", cfg.rest_dir, scope);
+    rmdir(p);
+}
+
+/* Is slot s (one interface) driven by files of scope at dir/prio? An interface scope is its own name. */
+static int slot_in_scope(const struct slot *s, const char *scope) {
+    if (scope[0] != '%') return !strcmp(s->iface, scope);
+    char sc[IFNAMSIZ + 40];
+    json_file_scope(s->path, s->dir, sc, sizeof(sc));
+    return !strcmp(sc, scope);
+}
+
+static void json_source(struct jbuf *b, const struct source *src) {
+    jb_obj(b);
+    jb_kstr(b, "direction", dir_name(src->dir));
+    if (src->dir == DIR_XDP) jb_knull(b, "priority");
+    else jb_kint(b, "priority", src->prio);
+    jb_kstr(b, "file", src->path);
+    jb_kstr(b, "source", src->layer == LAYER_REST ? "rest" : "config");
+    jb_kbool(b, "empty", src->empty);
+    jb_kstr(b, "overrides", src->overrides[0] ? src->overrides : NULL);
+    jb_obj_end(b);
+}
+
+static int source_cmp(const void *a, const void *b) {
+    const struct source *x = *(const struct source *const *)a, *y = *(const struct source *const *)b;
+    if (x->dir != y->dir) return x->dir - y->dir;
+    return x->prio - y->prio;
+}
+
+/* "files": the sources of one scope (and direction, unless dir < 0), in order. */
+static void json_sources_of(struct jbuf *b, const char *scope, int dir) {
+    const struct source **list = malloc((nsources ? nsources : 1) * sizeof(*list));
+    int n = 0;
+    for (int i = 0; list && i < nsources; i++)
+        if (!strcmp(sources[i].scope, scope) && (dir < 0 || sources[i].dir == dir)) list[n++] = &sources[i];
+    if (list) qsort(list, n, sizeof(*list), source_cmp);
+    jb_arr(b);
+    for (int i = 0; i < n; i++) json_source(b, list[i]);
+    jb_arr_end(b);
+    free(list);
+}
+
+/* "programs": the slots of one scope (and direction, unless dir < 0; and priority, unless prio < 0). */
+static void json_slots_of(struct jbuf *b, const char *scope, int dir, int prio) {
+    jb_arr(b);
+    for (int i = 0; i < nslots; i++) {
+        const struct slot *s = &slots[i];
+        if ((dir >= 0 && s->dir != dir) || (prio >= 0 && s->prio != prio) || !slot_in_scope(s, scope)) continue;
+        json_slot(b, s, rest_ctx());
+    }
+    jb_arr_end(b);
+}
+
+/* Link details from the kernel: flags, MTU and MAC address (in the managed namespace). */
+static void json_link_details(struct jbuf *b, const char *name) {
+    const struct link_info *li = ns_active() ? link_by_name(name) : NULL;
+    jb_kbool(b, "present", li != NULL);
+    if (!li) {
+        jb_knull(b, "ifindex");
+        jb_knull(b, "kind");
+        return;
+    }
+    jb_kint(b, "ifindex", li->index);
+    jb_kstr(b, "kind", li->kind);
+    jb_kint(b, "type", li->type);
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", name);
+    if (ioctl(fd, SIOCGIFFLAGS, &ifr) == 0) {
+        jb_kbool(b, "up", !!(ifr.ifr_flags & IFF_UP));
+        jb_kbool(b, "running", !!(ifr.ifr_flags & IFF_RUNNING));
+    }
+    if (ioctl(fd, SIOCGIFMTU, &ifr) == 0) jb_kint(b, "mtu", ifr.ifr_mtu);
+    if (li->type == ARPHRD_ETHER_ && ioctl(fd, SIOCGIFHWADDR, &ifr) == 0) {
+        const unsigned char *m = (const unsigned char *)ifr.ifr_hwaddr.sa_data;
+        char mac[18];
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+        jb_kstr(b, "mac", mac);
+    }
+    close(fd);
+}
+
+/* ---- checking a program with bpfc -T ---- */
+
+struct check {
+    char iface[IFNAMSIZ];       /* empty: checked without an interface */
+    int ok;
+    unsigned insns, verified;
+    char summary[512];
+    char *out;
+    size_t outlen;
+};
+
+static void run_check(const char *file, const char *iface, int dir, int prio, struct check *c) {
+    memset(c, 0, sizeof(*c));
+    if (iface) snprintf(c->iface, sizeof(c->iface), "%s", iface);
+    char pr[16];
+    snprintf(pr, sizeof(pr), "%d", prio);
+    char *argv[16];
+    int a = 0;
+    argv[a++] = cfg.bpfc_path;
+    argv[a++] = "-T";
+    argv[a++] = "-I";
+    argv[a++] = "-d"; argv[a++] = (char *)dir_name(dir);
+    if (dir != DIR_XDP) { argv[a++] = "-p"; argv[a++] = pr; }
+    if (iface) { argv[a++] = "-i"; argv[a++] = (char *)iface; }
+    if (cfg.map_dir[0]) { argv[a++] = "-m"; argv[a++] = cfg.map_dir; }
+    argv[a++] = "-f"; argv[a++] = (char *)file;
+    argv[a] = NULL;
+    struct run_result r;
+    int rc = run_capture(argv, &r, cfg.compile_timeout, cfg.state_dir);
+    c->ok = rc == 0 && r.exit_code == 0;
+    if (rc == 0 && r.out) {
+        const char *info = strstr(r.out, "BPFC_INFO ");
+        const char *q;
+        if (info && (q = strstr(info, " insns="))) c->insns = (unsigned)strtoul(q + 7, NULL, 10);
+        if (info && (q = strstr(info, " verified="))) c->verified = (unsigned)strtoul(q + 10, NULL, 10);
+        c->out = r.out;
+        c->outlen = r.outlen;
+    } else {
+        free(r.out);
+    }
+    if (!c->ok) {
+        if (rc < 0) snprintf(c->summary, sizeof(c->summary), "cannot run %s: %s", cfg.bpfc_path, strerror(-rc));
+        else summarize_failure(&r, c->summary, sizeof(c->summary));
+    }
+}
+
+/* bpfc's output without the BPFC_INFO line. */
+static void json_check(struct jbuf *b, const struct check *c) {
+    jb_obj(b);
+    jb_kstr(b, "interface", c->iface[0] ? c->iface : NULL);
+    jb_kbool(b, "ok", c->ok);
+    if (c->insns) jb_kint(b, "insns", c->insns);
+    if (c->verified) jb_kint(b, "verified_insns", c->verified);
+    jb_kstr(b, "error", c->ok ? NULL : c->summary);
+    jb_key(b, "output");
+    jb_arr(b);
+    const char *p = c->out, *end = c->out ? c->out + c->outlen : NULL;
+    while (p && p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        size_t l = nl ? (size_t)(nl - p) : (size_t)(end - p);
+        if (strncmp(p, "BPFC_INFO ", 10)) jb_strn(b, p, l);
+        p += l + (nl ? 1 : 0);
+    }
+    jb_arr_end(b);
+    jb_obj_end(b);
+}
+
+/*
+ * Interfaces a file of scope at dir/prio would be installed on now: the
+ * interface itself, or each interface of the kind (or every interface) that
+ * has no more specific file at that priority. Returns how many (at most max).
+ */
+static int check_targets(const char *scope, int dir, int prio, char (*out)[IFNAMSIZ], int max) {
+    if (!ns_active()) return 0;
+    if (scope[0] != '%') {
+        if (!link_by_name(scope) || max < 1) return 0;
+        snprintf(out[0], IFNAMSIZ, "%s", scope);
+        return 1;
+    }
+    int n = 0;
+    for (int l = 0; l < nlinks && n < max; l++) {
+        const struct link_info *li = &links[l];
+        char kscope[sizeof(li->kind) + 2];
+        snprintf(kscope, sizeof(kscope), "%%%s%%", li->kind);
+        if (source_find(li->name, dir, prio)) continue;
+        if (!strcmp(scope, "%all%")) {
+            if (source_find(kscope, dir, prio)) continue;
+        } else if (strcmp(scope, kscope)) {
+            continue;
+        }
+        snprintf(out[n++], IFNAMSIZ, "%s", li->name);
+    }
+    return n;
+}
+
+/* ---- handlers ---- */
+
+static void rest_get_root(struct http_response *resp) {
+    fill_dinfo();
+    qsort(slots, nslots, sizeof(*slots), slot_cmp);
+    struct jbuf *b = &resp->body;
+    jb_obj(b);
+    jb_key(b, "bpfcd");
+    json_daemon(b, &dinfo, 1);
+    jb_key(b, "summary");
+    json_summary(b, slots, nslots, 0);
+    jb_key(b, "programs");
+    jb_arr(b);
+    for (int i = 0; i < nslots; i++) json_slot(b, &slots[i], rest_ctx());
+    jb_arr_end(b);
+    jb_obj_end(b);
+}
+
+static int name_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
+
+static void rest_get_interfaces(struct http_response *resp) {
+    /* Interfaces that exist, and scopes that have files or programs. */
+    typedef char name_t[IFNAMSIZ + 24];
+    int cap = nlinks + nsources + nslots + 1, n = 0;
+    name_t *names = calloc((size_t)cap, sizeof(name_t));
+    if (!names) { http_error(resp, 500, "out of memory"); return; }
+#define ADD_NAME(x) do { int _d = 0; for (int _j = 0; _j < n; _j++) if (!strcmp(names[_j], (x))) { _d = 1; break; } \
+                         if (!_d) snprintf(names[n++], sizeof(name_t), "%s", (x)); } while (0)
+    if (ns_active()) for (int i = 0; i < nlinks; i++) ADD_NAME(links[i].name);
+    for (int i = 0; i < nsources; i++) ADD_NAME(sources[i].scope);
+    for (int i = 0; i < nslots; i++) ADD_NAME(slots[i].iface);
+#undef ADD_NAME
+    qsort(names, (size_t)n, sizeof(name_t), name_cmp);
+    struct jbuf *b = &resp->body;
+    jb_obj(b);
+    jb_key(b, "interfaces");
+    jb_arr(b);
+    for (int i = 0; i < n; i++) {
+        int progs = 0, files = 0;
+        for (int j = 0; j < nslots; j++) if (slot_in_scope(&slots[j], names[i])) progs++;
+        for (int j = 0; j < nsources; j++) if (!strcmp(sources[j].scope, names[i])) files++;
+        jb_obj(b);
+        jb_kstr(b, "name", names[i]);
+        jb_kbool(b, "template", names[i][0] == '%');
+        if (names[i][0] != '%') {
+            const struct link_info *li = ns_active() ? link_by_name(names[i]) : NULL;
+            jb_kbool(b, "present", li != NULL);
+            if (li) { jb_kint(b, "ifindex", li->index); jb_kstr(b, "kind", li->kind); }
+            else { jb_knull(b, "ifindex"); jb_knull(b, "kind"); }
+        }
+        jb_kint(b, "programs", progs);
+        jb_kint(b, "files", files);
+        jb_obj_end(b);
+    }
+    jb_arr_end(b);
+    jb_obj_end(b);
+    free(names);
+}
+
+static void rest_get_interface(struct http_response *resp, const char *name, int dir) {
+    struct jbuf *b = &resp->body;
+    jb_obj(b);
+    jb_kstr(b, "name", name);
+    jb_kbool(b, "template", name[0] == '%');
+    if (dir >= 0) jb_kstr(b, "direction", dir_name(dir));
+    if (name[0] != '%') json_link_details(b, name);
+    jb_key(b, "programs");
+    json_slots_of(b, name, dir, -1);
+    jb_key(b, "files");
+    json_sources_of(b, name, dir);
+    jb_obj_end(b);
+}
+
+static void rest_get_file(struct http_response *resp, const char *scope, int dir, int prio) {
+    char rel[IFNAMSIZ + 64], rpath[PATH_MAX + 80], cpath[PATH_MAX + 80];
+    prog_rel(rel, sizeof(rel), scope, dir, prio);
+    snprintf(rpath, sizeof(rpath), "%s/%s", cfg.rest_dir, rel);
+    snprintf(cpath, sizeof(cpath), "%s/%s", cfg.config_dir, rel);
+    const char *path = is_regular(rpath) ? rpath : is_regular(cpath) ? cpath : NULL;
+    if (!path) {
+        const struct slot *s = scope[0] != '%' ? slot_find(scope, dir, prio) : NULL;
+        if (s && s->path[0])
+            http_error(resp, 404, "no file %s; the program at %s %s%s%.0d comes from %s", rel, scope,
+                       dir_name(dir), dir == DIR_XDP ? "" : " ", dir == DIR_XDP ? 0 : prio, s->path);
+        else
+            http_error(resp, 404, "no file %s in %s or %s", rel, cfg.rest_dir, cfg.config_dir);
+        return;
+    }
+    char *data;
+    size_t len;
+    int rc = read_file(path, &data, &len, 16 * 1024 * 1024);
+    if (rc < 0) { http_error(resp, 500, "cannot read %s: %s", path, strerror(-rc)); return; }
+    jb_lines(&resp->body, data, len);
+    free(data);
+    http_add_header(resp, "X-Bpfc-File", path);
+    http_add_header(resp, "X-Bpfc-Source", path == rpath ? "rest" : "config");
+}
+
+static int query_flag(const char *query, const char *name) {
+    char v[16];
+    if (!http_query_get(query, name, v, sizeof(v))) return 0;
+    return strcasecmp(v, "false") && strcmp(v, "0") && strcasecmp(v, "no");
+}
+
+static void rest_put_file(const struct http_request *req, struct http_response *resp,
+                          const char *scope, int dir, int prio) {
+    char **lines;
+    int nl;
+    char err[256];
+    if (json_parse_lines(req->body, req->body_len, &lines, &nl, err, sizeof(err)) < 0) {
+        http_error(resp, 400, "%s", err);
+        return;
+    }
+    /* The program text: the lines, each ending in a newline. */
+    size_t total = 0;
+    for (int i = 0; i < nl; i++) total += strlen(lines[i]) + 1;
+    char *text = malloc(total + 1);
+    if (!text) { json_lines_free(lines, nl); http_error(resp, 500, "out of memory"); return; }
+    size_t off = 0;
+    for (int i = 0; i < nl; i++) {
+        size_t l = strlen(lines[i]);
+        memcpy(text + off, lines[i], l);
+        text[off + l] = '\n';
+        off += l + 1;
+    }
+    text[off] = '\0';
+    json_lines_free(lines, nl);
+    int dry = query_flag(req->query, "dry-run") || query_flag(req->query, "dry_run");
+
+    char rel[IFNAMSIZ + 64], target[PATH_MAX + 80], cpath[PATH_MAX + 80], tmp[PATH_MAX + 128], dirpath[PATH_MAX + 80];
+    prog_rel(rel, sizeof(rel), scope, dir, prio);
+    snprintf(target, sizeof(target), "%s/%s", cfg.rest_dir, rel);
+    snprintf(cpath, sizeof(cpath), "%s/%s", cfg.config_dir, rel);
+    snprintf(dirpath, sizeof(dirpath), "%s", target);
+    *strrchr(dirpath, '/') = '\0';
+    snprintf(tmp, sizeof(tmp), "%s/.%s.rest-%d.check", dirpath, strrchr(target, '/') + 1, (int)getpid());
+    int rc = mkdir_p(dirpath, 0755);
+    /* The candidate sits next to the target, so relative includes resolve the same. */
+    if (rc == 0) rc = write_file_atomic(tmp, text, off);
+    if (rc < 0) {
+        http_error(resp, 500, "cannot write %s: %s", tmp, strerror(-rc));
+        free(text);
+        return;
+    }
+    int empty = file_is_empty(tmp);
+    int overrides = is_regular(cpath);
+
+    /* Check first: nothing changes for a program the kernel would refuse. */
+    char (*targets)[IFNAMSIZ] = calloc((size_t)(nlinks ? nlinks : 1), IFNAMSIZ);
+    int ntargets = targets ? check_targets(scope, dir, prio, targets, nlinks) : 0;
+    int nchecks = empty ? 0 : dry ? (ntargets ? ntargets : 1) : 1;
+    struct check *checks = calloc((size_t)(nchecks ? nchecks : 1), sizeof(*checks));
+    int failed = -1;
+    for (int i = 0; checks && i < nchecks; i++) {
+        run_check(tmp, ntargets ? targets[i] : NULL, dir, prio, &checks[i]);
+        if (!checks[i].ok && failed < 0) failed = i;
+    }
+    struct jbuf *b = &resp->body;
+    if (!checks) { http_error(resp, 500, "out of memory"); goto out_tmp; }
+
+    if (dry || failed >= 0) {
+        resp->status = failed >= 0 ? 422 : 200;
+        jb_obj(b);
+        jb_kbool(b, "ok", failed < 0);
+        if (dry) jb_kbool(b, "dry_run", 1);
+        if (failed >= 0) {
+            char msg[700];
+            snprintf(msg, sizeof(msg), "the program was rejected%s%s: %s", checks[failed].iface[0] ? " on " : "",
+                     checks[failed].iface, checks[failed].summary);
+            jb_kstr(b, "error", msg);
+            if (!dry) jb_kbool(b, "changed", 0);
+        }
+        jb_kstr(b, "file", target);
+        jb_kstr(b, "overrides", overrides ? cpath : NULL);
+        jb_kbool(b, "empty", empty);
+        if (!ntargets && !dry) jb_kstr(b, "note", "no interface uses this file now; checked without one");
+        if (dry && !empty) {
+            jb_key(b, "applies_to");
+            jb_arr(b);
+            for (int i = 0; i < ntargets; i++) jb_str(b, targets[i]);
+            jb_arr_end(b);
+        }
+        jb_key(b, "checks");
+        jb_arr(b);
+        for (int i = 0; i < nchecks; i++) json_check(b, &checks[i]);
+        jb_arr_end(b);
+        jb_obj_end(b);
+        goto out_tmp;
+    }
+
+    /* Commit: keep the old file for a rollback, then swap the checked one in. */
+    char *old = NULL;
+    size_t oldlen = 0;
+    int had_old = read_file(target, &old, &oldlen, 16 * 1024 * 1024) == 0;
+    int changed = !had_old || oldlen != off || memcmp(old, text, off);
+    if (rename(tmp, target) < 0) {
+        http_error(resp, 500, "cannot write %s: %s", target, strerror(errno));
+        free(old);
+        goto out_tmp;
+    }
+    scan_dir();
+    apply(0);
+    schedule_verify();
+    state_dirty = 1;
+
+    /* Did it install everywhere it applies? */
+    int nfail = 0;
+    for (int i = 0; i < nslots; i++) if (!strcmp(slots[i].path, target) && slots[i].status == ST_FAILED) nfail++;
+    if (nfail) {
+        /* The reply lists the failures first: their logs are gone once the rollback reinstalls. */
+        char (*fifs)[IFNAMSIZ] = calloc((size_t)nfail, IFNAMSIZ);
+        int k = 0;
+        const struct slot *f0 = NULL;
+        for (int i = 0; i < nslots && !f0; i++)
+            if (!strcmp(slots[i].path, target) && slots[i].status == ST_FAILED) f0 = &slots[i];
+        char first[700];
+        snprintf(first, sizeof(first), "installing failed on %s: %s", f0->iface, f0->error);
+        resp->status = 422;
+        jb_obj(b);
+        jb_kbool(b, "ok", 0);
+        jb_kstr(b, "error", first);
+        jb_kstr(b, "file", target);
+        jb_key(b, "failures");
+        jb_arr(b);
+        for (int i = 0; i < nslots; i++) {
+            const struct slot *s = &slots[i];
+            if (strcmp(s->path, target) || s->status != ST_FAILED) continue;
+            if (fifs) snprintf(fifs[k++], IFNAMSIZ, "%s", s->iface);
+            char lp[PATH_MAX + 64];
+            error_log_path(lp, sizeof(lp), cfg.state_dir, s->iface, s->dir, s->prio);
+            char *log = NULL;
+            size_t loglen = 0;
+            read_file(lp, &log, &loglen, MAX_CAPTURE + 4096);
+            jb_obj(b);
+            jb_kstr(b, "interface", s->iface);
+            jb_kstr(b, "error", s->error);
+            jb_key(b, "output");
+            jb_lines(b, log ? log : "", loglen);
+            jb_obj_end(b);
+            free(log);
+        }
+        jb_arr_end(b);
+
+        int rb = had_old ? write_file_atomic(target, old, oldlen) : (unlink(target) < 0 ? -errno : 0);
+        if (!had_old) prune_rest_dirs(scope, dir);
+        if (rb < 0) logmsg(LOG_LVL_ERR, "rest: cannot restore %s: %s", target, strerror(-rb));
+        scan_dir();
+        apply(0);
+        schedule_verify();
+        logmsg(LOG_LVL_WARN, "rest: %s: %s; %s", target, first,
+               rb < 0 ? "restoring the previous file failed" : had_old ? "the previous file is back" : "removed it again");
+        jb_kbool(b, "rolled_back", rb == 0);
+        jb_kstr(b, "restored", rb == 0 ? (had_old ? "previous file" : "no file (there was none)") : NULL);
+        jb_key(b, "programs");
+        jb_arr(b);
+        for (int i = 0; i < nslots; i++) {
+            const struct slot *s = &slots[i];
+            if (s->dir != dir || s->prio != prio) continue;
+            for (int j = 0; fifs && j < k; j++) if (!strcmp(s->iface, fifs[j])) { json_slot(b, s, rest_ctx()); break; }
+        }
+        jb_arr_end(b);
+        jb_obj_end(b);
+        free(fifs);
+        free(old);
+        goto out;
+    }
+
+    resp->status = had_old ? 200 : 201;
+    jb_obj(b);
+    jb_kbool(b, "ok", 1);
+    jb_kstr(b, "file", target);
+    jb_kbool(b, "created", !had_old);
+    jb_kbool(b, "changed", changed);
+    jb_kstr(b, "overrides", overrides ? cpath : NULL);
+    jb_kbool(b, "empty", empty);
+    int nprogs = 0, npending = 0;
+    for (int i = 0; i < nslots; i++)
+        if (!strcmp(slots[i].path, target)) { nprogs++; if (slots[i].status == ST_PENDING) npending++; }
+    if (!ns_active())
+        jb_kstr(b, "note", "the network namespace is not there yet; the program is installed when it is");
+    else if (!nprogs)
+        jb_kstr(b, "note", "no interface uses this file now (none matches, or a more specific file wins); "
+                           "it is installed when one does");
+    else if (npending == nprogs)
+        jb_kstr(b, "note", "the interface is not present; the program is installed when it appears");
+    jb_key(b, "checks");
+    jb_arr(b);
+    for (int i = 0; i < nchecks; i++) json_check(b, &checks[i]);
+    jb_arr_end(b);
+    jb_key(b, "programs");
+    jb_arr(b);
+    for (int i = 0; i < nslots; i++) if (!strcmp(slots[i].path, target)) json_slot(b, &slots[i], rest_ctx());
+    jb_arr_end(b);
+    jb_obj_end(b);
+    free(old);
+    goto out;
+
+out_tmp:
+    unlink(tmp);
+    if (!is_regular(target)) prune_rest_dirs(scope, dir);   /* directories made only for the check */
+out:
+    for (int i = 0; checks && i < nchecks; i++) free(checks[i].out);
+    free(checks);
+    free(targets);
+    free(text);
+}
+
+static void rest_delete_file(struct http_response *resp, const char *scope, int dir, int prio) {
+    char rel[IFNAMSIZ + 64], target[PATH_MAX + 80], cpath[PATH_MAX + 80];
+    prog_rel(rel, sizeof(rel), scope, dir, prio);
+    snprintf(target, sizeof(target), "%s/%s", cfg.rest_dir, rel);
+    snprintf(cpath, sizeof(cpath), "%s/%s", cfg.config_dir, rel);
+    struct stat st;
+    if (lstat(target, &st) < 0) {
+        if (is_regular(cpath))
+            http_error(resp, 409, "%s is in config_dir; the REST API only removes files in %s", cpath, cfg.rest_dir);
+        else
+            http_error(resp, 404, "no file %s in %s", rel, cfg.rest_dir);
+        return;
+    }
+    if (unlink(target) < 0) { http_error(resp, 500, "cannot remove %s: %s", target, strerror(errno)); return; }
+    prune_rest_dirs(scope, dir);
+    scan_dir();
+    apply(0);
+    schedule_verify();
+    state_dirty = 1;
+    struct jbuf *b = &resp->body;
+    jb_obj(b);
+    jb_kbool(b, "ok", 1);
+    jb_kstr(b, "deleted", target);
+    jb_kstr(b, "now_from", is_regular(cpath) ? cpath : NULL);
+    jb_key(b, "programs");
+    json_slots_of(b, scope, dir, prio);
+    jb_obj_end(b);
+}
+
+/* ---- routing ---- */
+
+#define REST_MAX_SEGS 5
+
+static void rest_route(const struct http_request *req, struct http_response *resp) {
+    char seg[REST_MAX_SEGS][IFNAMSIZ + 40];
+    int ns = 0;
+    for (const char *p = req->path; *p; ) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *e = strchr(p, '/');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (ns == REST_MAX_SEGS) { http_error(resp, 404, "no such resource"); return; }
+        if (http_unescape(p, l, seg[ns], sizeof(seg[ns])) < 0) {
+            http_error(resp, 400, "invalid path segment (too long, or an encoded '/' or NUL)");
+            return;
+        }
+        ns++;
+        p += l;
+    }
+    const char *m = req->method;
+    int get = !strcmp(m, "GET") || !strcmp(m, "HEAD");
+    if (ns == 0) {
+        if (!get) { http_add_header(resp, "Allow", "GET, HEAD"); http_error(resp, 405, "/ is read-only"); return; }
+        rest_get_root(resp);
+        return;
+    }
+    if (strcmp(seg[0], "interfaces")) {
+        http_error(resp, 404, "no such resource; try / or /interfaces");
+        return;
+    }
+    if (ns == 1) {
+        if (!get) { http_add_header(resp, "Allow", "GET, HEAD"); http_error(resp, 405, "read-only resource"); return; }
+        rest_get_interfaces(resp);
+        return;
+    }
+    const char *name = seg[1];
+    if (!(name[0] == '%' ? valid_template_name(name) : valid_ifname(name))) {
+        http_error(resp, 404, "'%s' is not a valid interface name, %%all%% or %%<kind>%%", name);
+        return;
+    }
+    if (ns == 2) {
+        if (!get) { http_add_header(resp, "Allow", "GET, HEAD"); http_error(resp, 405, "read-only resource"); return; }
+        rest_get_interface(resp, name, -1);
+        return;
+    }
+    int dir = dir_parse(seg[2]);
+    if (dir < 0) { http_error(resp, 404, "'%s' is not ingress, egress or xdp", seg[2]); return; }
+    int prio = 0;
+    if (dir == DIR_XDP) {
+        if (ns != 3) { http_error(resp, 404, "the XDP program has no priority: use /interfaces/%s/xdp", name); return; }
+    } else if (ns == 3) {
+        if (!get) { http_add_header(resp, "Allow", "GET, HEAD"); http_error(resp, 405, "read-only resource; add /<priority>"); return; }
+        rest_get_interface(resp, name, dir);
+        return;
+    } else {
+        if (ns > 4) { http_error(resp, 404, "no such resource"); return; }
+        const char *p = seg[3];
+        long v = 0;
+        int okp = *p && *p != '0';
+        for (; okp && *p; p++) {
+            if (*p < '0' || *p > '9') okp = 0;
+            else if ((v = v * 10 + (*p - '0')) > 65535) okp = 0;
+        }
+        if (!okp || v < 1) { http_error(resp, 404, "priority must be 1-65535 without leading zeros"); return; }
+        prio = (int)v;
+    }
+    if (get) rest_get_file(resp, name, dir, prio);
+    else if (!strcmp(m, "POST") || !strcmp(m, "PUT")) rest_put_file(req, resp, name, dir, prio);
+    else if (!strcmp(m, "DELETE")) rest_delete_file(resp, name, dir, prio);
+    else {
+        http_add_header(resp, "Allow", "GET, HEAD, POST, PUT, DELETE");
+        http_error(resp, 405, "method %s not allowed here", m);
+    }
+}
+
+static void rest_handle(const struct http_request *req, struct http_response *resp) {
+    rest_route(req, resp);
+    int mutating = strcmp(req->method, "GET") && strcmp(req->method, "HEAD");
+    logmsg(mutating ? LOG_LVL_INFO : LOG_LVL_DEBUG, "rest: %s %s%s%s from uid %d pid %d: %d", req->method,
+           req->path, req->query ? "?" : "", req->query ? req->query : "", (int)req->peer_uid,
+           (int)req->peer_pid, resp->status);
+    if (state_dirty) write_state();
+}
+
 /* ======================= lifecycle ======================= */
 
 static int acquire_pidfile(void) {
@@ -1147,6 +1952,7 @@ static void shutdown_daemon(void) {
             set_status(&slots[i], ST_PENDING, "bpfcd stopped (remove_on_stop)");
         }
     }
+    rest_stop();
     dinfo.pid = 0;
     write_state();
     release_pidfile();
@@ -1190,8 +1996,11 @@ static int reload_config_file(void) {
         int rc = mkdir_p(nc.map_dir, 0700);
         if (rc < 0) logmsg(LOG_LVL_WARN, "cannot create map directory %s: %s", nc.map_dir, strerror(-rc));
     }
+    if (strcmp(nc.rest_dir, cfg.rest_dir))
+        logmsg(LOG_LVL_INFO, "rest_dir changed to %s; programs in %s no longer apply", nc.rest_dir, cfg.rest_dir);
     cfg = nc;
     log_set_level(cfg.log_level);
+    rest_reconfigure();
     if (ns_moved && cfg.netns[0]) {
         logmsg(LOG_LVL_INFO, "netns %s: netns_path/netns_veth changed; looking for the namespace again", cfg.netns);
         ns_check(0);
@@ -1204,7 +2013,19 @@ static int check_only(void) {
     load_links();
     scan_dir();
     qsort(slots, nslots, sizeof(*slots), slot_cmp);
-    printf("config:   %s\nprograms: %s\n", conf_path, cfg.config_dir);
+    printf("config:   %s\nprograms: %s\n          %s (REST, overrides the above)\n", conf_path, cfg.config_dir,
+           cfg.rest_dir);
+    if (cfg.rest_socket[0]) {
+        uid_t u;
+        gid_t g;
+        char err[512];
+        int rc = rest_owner_resolve(cfg.rest_owner, &u, &g, err, sizeof(err));
+        printf("rest:     %s (owner %s = %u:%u, mode %04o)%s%s\n", cfg.rest_socket, cfg.rest_owner,
+               rc == 0 ? (unsigned)u : 0, rc == 0 ? (unsigned)g : 0, cfg.rest_mode, rc < 0 ? "\n          error: " : "",
+               rc < 0 ? err : "");
+    } else {
+        printf("rest:     off (no rest_socket)\n");
+    }
     if (cfg.netns[0]) {
         printf("netns:    %s\nstate:    %s\nmaps:     %s\n", cfg.netns, cfg.state_dir, cfg.map_dir);
         struct netns_loc loc;
@@ -1356,19 +2177,24 @@ int main(int argc, char **argv) {
         verify_all();
     }
     dinfo.last_reload = time(NULL);
+    rest_start();
     write_state();
     notify_status("READY=1\n");
 
     int running = 1;
     while (running) {
-        struct pollfd pfd[4] = {
+        struct pollfd pfd[4 + HTTP_MAX_POLLFDS] = {
             {.fd = sigfd, .events = POLLIN}, {.fd = nlfd, .events = POLLIN}, {.fd = tfd, .events = POLLIN},
             {.fd = nstfd, .events = POLLIN}};   /* negative fds (no monitor, no namespace) are skipped */
-        if (poll(pfd, 4, -1) < 0) {
+        struct http_server *polled = rest_srv;
+        int nh = polled ? http_pollfds(polled, pfd + 4, HTTP_MAX_POLLFDS) : 0;
+        if (poll(pfd, 4 + nh, polled ? http_timeout_ms(polled) : -1) < 0) {
             if (errno == EINTR) continue;
             logmsg(LOG_LVL_ERR, "poll: %s", strerror(errno));
             break;
         }
+        /* REST first: a reload below may replace the server these pollfds belong to. */
+        if (polled) http_process(polled, pfd + 4, nh);
         if (pfd[1].revents & POLLIN) handle_netlink();
         if (pfd[2].revents & POLLIN) {
             uint64_t exp;

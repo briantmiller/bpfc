@@ -97,6 +97,43 @@ name in another namespace moves the programs there.
 See
 .BR bpfcd (8),
 .BR "Network namespaces" .
+.SH REST API
+.TP
+.BI rest_socket " = " /run/bpfc/bpfcd.sock
+Serve the REST API (see
+.BR bpfcd (8),
+.BR "REST API" )
+on this unix socket. Absolute, at most 107 bytes. Empty (the default): off.
+A stale socket at the path is replaced; any other file there is left alone and
+the API stays off. For a namespace, use its own file, for example
+.IR /run/bpfc/netns/<name>/bpfcd.sock .
+.TP
+.BI rest_socket_owner " = " root:bpfc
+Owner of the socket:
+.IB user : group\fR,
+.I user
+or
+.BI : group\fR;
+names from
+.I /etc/passwd
+and
+.IR /etc/group ,
+or numbers (for accounts from a directory service). A missing part is root.
+.TP
+.BI rest_socket_mode " = " 0660
+Permission bits of the socket, in octal. Everyone who can connect can read
+and change programs.
+.TP
+.BI rest_dir " = " /var/lib/bpfc/interfaces.d
+Where programs written through the API are kept. Files here override the
+file at the same place in
+.BR config_dir ,
+which must be a different directory. Default in a namespace:
+.IR /var/lib/bpfc/netns/<name>/interfaces.d .
+.PP
+These are paths, so a namespace without its own bpfc.conf does not take them
+from the global file: its REST API is off unless set there (or through
+.BR BPFCD_REST_SOCKET ).
 .SH ENVIRONMENT
 Each setting can be overridden by an environment variable named
 .B BPFCD_

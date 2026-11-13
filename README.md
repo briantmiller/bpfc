@@ -78,6 +78,15 @@ bpfcctl show eth0 ingress 100 --bytecode
 * **Tracking**: each program's id and tag are recorded with its file path and hash in `/run/bpfc/state`; filters are named `bpfcd:<iface>/<dir>/<prio>`.
 * **Network namespaces**: `bpfcd -n <name>` (usually `systemctl enable --now bpfcd-netns@<name>`) manages namespace `<name>` from `/etc/bpfc/netns/<name>/` (`bpfc.conf`, `interfaces.d/`), with its own state (`/run/bpfc/netns/<name>`) and pinned maps (`/sys/fs/bpf/netns/<name>`). The namespace is `/run/netns/<name>`, or `netns_path` (a namespace file or a symlink to one, re-followed every second), or `netns_veth` (the namespace holding the peer of a host-side veth: a pod or container). bpfcd waits for a namespace that is not there yet, moves its programs when the path or veth comes to point at another namespace, and lets a deleted one be freed. `bpfcctl -n <name>`, `bpfcctl --all-netns` and the `-n` option of the bpfc-scripts tools work on it; `bpfcctl -n <name> exec <command>` runs a command inside it.
 
+* **REST API** (off by default): with `rest_socket = /run/bpfc/bpfcd.sock` in `bpfc.conf`, bpfcd serves HTTP on that unix socket (owner `root:bpfc`, mode `0660`: add users to the `bpfc` group; whoever can connect can change programs). `GET /` is the status as JSON; `GET /interfaces/<if>` one interface; `/interfaces/<if>/<ingress|egress>/<prio>` (and `/interfaces/<if>/xdp`) is a program file as a JSON array of lines: `GET` reads it, `POST`/`PUT` writes and installs it, `DELETE` removes it. Writes are checked with `bpfc -T` first and rolled back if installing fails; `?dry-run` only checks. Written files live in `/var/lib/bpfc/interfaces.d` and override the same file in `/etc/bpfc/interfaces.d`. `bpfcctl status --json` prints the same status locally.
+
+```bash
+curl --unix-socket /run/bpfc/bpfcd.sock http://localhost/interfaces/eth0
+curl --unix-socket /run/bpfc/bpfcd.sock -X POST -d '["match tcp;", "  match tcp-dst 23;", "    drop"]' \
+     http://localhost/interfaces/eth0/ingress/10
+curl --unix-socket /run/bpfc/bpfcd.sock -X DELETE http://localhost/interfaces/eth0/ingress/10
+```
+
 ```bash
 mkdir -p /etc/bpfc/netns/pod1/interfaces.d/eth0/ingress
 echo 'netns_veth = veth3f2a1c' > /etc/bpfc/netns/pod1/bpfc.conf   # the pod's host-side veth

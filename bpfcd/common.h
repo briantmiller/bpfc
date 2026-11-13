@@ -12,6 +12,7 @@
 #include <time.h>
 #include <net/if.h>
 #include <limits.h>
+#include <sys/types.h>
 
 #ifndef BPFC_VERSION
 #define BPFC_VERSION "0.0.0"
@@ -23,6 +24,11 @@
 #define DEFAULT_STATE_DIR   "/run/bpfc"
 #define DEFAULT_BPFC_PATH   "/usr/sbin/bpfc"
 #define DEFAULT_MAP_ROOT    "/sys/fs/bpf"
+#define DEFAULT_LIB_ROOT    "/var/lib/bpfc"      /* programs written through the REST socket */
+#define DEFAULT_REST_DIR    DEFAULT_LIB_ROOT "/interfaces.d"
+#define DEFAULT_REST_OWNER  "root:bpfc"
+#define DEFAULT_REST_MODE   0660
+#define REST_SOCKET_MAX     107                 /* sun_path holds 108 bytes with the NUL */
 #define NETNS_RUN_DIR       "/run/netns"        /* where `ip netns add` names namespaces */
 #define NETNS_NAME_MAX      64
 #define STATE_FILE_NAME     "state"
@@ -72,6 +78,11 @@ struct config {
     char netns[NETNS_NAME_MAX + 1];
     char netns_path[PATH_MAX];   /* netns_path: a namespace file, symlinks followed on every check */
     char netns_veth[IFNAMSIZ];   /* netns_veth: the namespace holding this host veth's peer */
+    /* REST API (off unless rest_socket is set) */
+    char rest_socket[REST_SOCKET_MAX + 1];  /* unix socket to serve HTTP on */
+    char rest_owner[128];        /* "user:group", "user" or ":group"; names or numbers */
+    int rest_mode;               /* permission bits of the socket */
+    char rest_dir[PATH_MAX];     /* where programs written through the API live */
     unsigned set;                /* CFG_SET_* bits: settings given explicitly (file or environment) */
 };
 
@@ -81,6 +92,7 @@ enum {
     CFG_SET_MAP_DIR    = 1u << 2,
     CFG_SET_NETNS_PATH = 1u << 3,
     CFG_SET_NETNS_VETH = 1u << 4,
+    CFG_SET_REST_DIR   = 1u << 5,
 };
 
 void config_defaults(struct config *c);
@@ -102,6 +114,14 @@ int config_apply_env(struct config *c, char *err, size_t errlen);
  */
 const char *conf_root(void);
 const char *run_root(void);
+/* Root of the REST program tree (/var/lib/bpfc); BPFC_LIB_ROOT overrides it, for tests. */
+const char *lib_root(void);
+/*
+ * Resolves rest_socket_owner ("user:group", "user", ":group"; names from
+ * /etc/passwd and /etc/group, or numbers). A missing part is root (0).
+ * Returns 0, or -1 with a message in err.
+ */
+int rest_owner_resolve(const char *spec, uid_t *uid, gid_t *gid, char *err, size_t errlen);
 
 /* Namespace names: 1-64 characters of [A-Za-z0-9_.-], not starting with '.' or '-'. */
 int netns_name_valid(const char *name);
@@ -205,6 +225,8 @@ struct daemon_info {
     char netns_status[16];      /* "active" or "waiting" (netns only) */
     char netns_target[512];     /* what the namespace was found through, or why it was not */
     uint64_t netns_dev, netns_ino;   /* identity of the namespace being managed (0: none) */
+    char rest_dir[PATH_MAX];    /* programs written through the REST socket */
+    char rest_socket[REST_SOCKET_MAX + 1];  /* the socket, when serving */
 };
 
 /* Atomically writes the state file (temp file + rename). Returns 0 or -errno. */

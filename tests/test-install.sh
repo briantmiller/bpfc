@@ -34,6 +34,9 @@ for p in dataplane/profiles/*.profile; do
 done
 check "every built-in profile installed in /usr/share/bpfc/dataplane/profiles${missing:+ (missing:$missing)}" [ -z "$missing" ]
 check "local profile directory /etc/bpfc/dataplane/profiles.d" test -d "$R/etc/bpfc/dataplane/profiles.d"
+check "REST program directories /var/lib/bpfc/interfaces.d and netns" eval \
+	'test -d "$R/var/lib/bpfc/interfaces.d" && test -d "$R/var/lib/bpfc/netns"'
+check "sysusers.d declares the bpfc group" grep -q '^g bpfc' "$R/usr/lib/sysusers.d/bpfc.conf"
 check "XDP and TC examples in the bpfc docs" eval \
 	'test -f "$R/usr/share/doc/bpfc/examples/xdp/router.bpfc" && test -f "$R/usr/share/doc/bpfc/examples/xdp/ip-lib.bpfc" && test -f "$R/usr/share/doc/bpfc/examples/tc/policer.bpfc"'
 check "dataplane DESIGN.md and examples in the bpfc-scripts docs" eval \
@@ -86,6 +89,10 @@ else
 		done
 		check "bpfc itself has no dataplane files" eval '! grep -q dataplane "$T/core"'
 		check "bpfc itself has the binaries" eval 'grep -qx /usr/sbin/bpfc "$T/core" && grep -qx /usr/sbin/bpfcd "$T/core"'
+		check "bpfc owns /var/lib/bpfc/interfaces.d and the sysusers file" eval \
+			'grep -qx /var/lib/bpfc/interfaces.d "$T/core" && grep -qx /usr/lib/sysusers.d/bpfc.conf "$T/core"'
+		rpm -qp --scripts "$rpmf" > "$T/scripts" 2>/dev/null
+		check "bpfc creates the bpfc group before installing" grep -q 'groupadd -r bpfc' "$T/scripts"
 		missing=
 		for p in dataplane/profiles/*.profile; do
 			grep -qx "/usr/share/bpfc/dataplane/profiles/$(basename "$p")" "$T/files" || missing="$missing $(basename "$p")"

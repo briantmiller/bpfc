@@ -22,6 +22,11 @@ RestartSec=2s
 RuntimeDirectory=bpfc/netns/%i
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
+# /var/lib/bpfc/netns/%i/interfaces.d: programs written through this
+# instance's REST socket (rest_socket in its own bpfc.conf, e.g.
+# /run/bpfc/netns/%i/bpfcd.sock; off by default).
+StateDirectory=bpfc/netns/%i
+StateDirectoryMode=0755
 
 LimitMEMLOCK=infinity
 
@@ -31,7 +36,8 @@ ProtectHome=yes
 # netns_path and its symlinks must not live in /tmp: this service has its own.
 PrivateTmp=yes
 # CAP_SYS_ADMIN also covers setns() into the namespace.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
+# CAP_CHOWN: giving the REST socket its owner (rest_socket_owner).
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_CHOWN
 
 [Install]
 WantedBy=multi-user.target

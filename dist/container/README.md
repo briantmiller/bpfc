@@ -53,6 +53,9 @@ The image also runs other commands in place of the daemon, for example `podman r
 | `BPFCD_STATE_DIR` | state directory |
 | `BPFCD_LOG_LEVEL` | `error`, `warning`, `info`, `debug` |
 | `BPFCD_COMPILE_TIMEOUT` | seconds per bpfc run |
+| `BPFCD_REST_SOCKET` | REST API socket (off when unset) |
+| `BPFCD_REST_SOCKET_OWNER`, `BPFCD_REST_SOCKET_MODE` | its owner (`user:group`, names or numbers) and mode |
+| `BPFCD_REST_DIR` | where programs written through the API are kept |
 
 `bpfcctl` reads the same variables, so `podman exec` finds a relocated state directory. `BPFCD_SKIP_CHECKS=1` skips the entrypoint's privilege checks.
 
@@ -71,6 +74,10 @@ Capabilities may not be enough on their own. The runtime's default seccomp profi
 ## Another network namespace
 
 `-e BPFCD_NETNS=<name>` (or `bpfcd -n <name>` as the command) makes the container manage network namespace `<name>` rather than its own, configured from `/etc/bpfc/netns/<name>/` exactly as on a host. Name the namespace with `BPFCD_NETNS_PATH` (a namespace file or symlink the container can see, for example under a mounted `/run/netns`) or `BPFCD_NETNS_VETH` (a host-side veth: needs `--network host` and `--pid host`, because the peer's namespace is found through the processes in it). Then `podman exec bpfcd bpfcctl -n <name>` shows its status.
+
+## REST API
+
+`-e BPFCD_REST_SOCKET=/run/bpfc/bpfcd.sock` turns on bpfcd's REST API (see `bpfcd(8)`, REST API). To reach it from the host or from other containers, put the socket in a mounted directory, for example `-v /run/bpfc-api:/run/bpfc` (state and socket) or a separate mount with `BPFCD_REST_SOCKET` pointing into it. The socket is owned by `root:bpfc` (the image's `bpfc` group, created by the package); set `BPFCD_REST_SOCKET_OWNER` to a numeric `uid:gid` that means something on the host, and `BPFCD_REST_SOCKET_MODE`. Programs written through the API are kept in `/var/lib/bpfc/interfaces.d`: mount a volume there (`-v bpfc-rest:/var/lib/bpfc`) so they survive the container. `podman exec bpfcd bpfcctl status --json` gives the same status without the socket.
 
 ## Kubernetes / OpenShift
 

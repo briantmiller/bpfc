@@ -2,6 +2,7 @@
 
 # Fallbacks so the spec also builds where systemd-rpm-macros is unavailable.
 %{!?_unitdir: %global _unitdir /usr/lib/systemd/system}
+%{!?_sysusersdir: %global _sysusersdir /usr/lib/sysusers.d}
 
 # rpmbuild --with static: statically linked binaries that run in any image,
 # whatever its libc (used for builds made outside RHEL).
@@ -23,6 +24,8 @@ BuildRequires:  systemd-rpm-macros
 %if %{with static}
 BuildRequires:  glibc-static
 %endif
+# groupadd, for the bpfc group (REST socket access) on RHEL 9.
+Requires(pre):  shadow-utils
 # Ordering only, not a dependency: the package installs and runs without
 # systemd (containers); the unit file is simply unused there.
 %{?systemd_ordering}
@@ -79,7 +82,14 @@ interface's bandwidth.
     PREFIX=%{_prefix} SBINDIR=%{_sbindir} MANDIR=%{_mandir} DATADIR=%{_datadir} \
     DOCDIR=%{_docdir}/%{name} CONTAINER_DOCDIR=%{_docdir}/%{name}-container \
     SCRIPTS_DOCDIR=%{_docdir}/%{name}-scripts \
-    UNITDIR=%{_unitdir} SYSCONFDIR=%{_sysconfdir}
+    UNITDIR=%{_unitdir} SYSCONFDIR=%{_sysconfdir} \
+    SYSUSERSDIR=%{_sysusersdir} LOCALSTATEDIR=%{_localstatedir}/lib
+
+%pre
+# The group that may use bpfcd's REST socket (rest_socket_owner = root:bpfc).
+# Also declared in sysusers.d, which rpm 4.19 (RHEL 10) applies by itself.
+getent group bpfc >/dev/null || groupadd -r bpfc
+exit 0
 
 %post
 %{?systemd_post:%systemd_post bpfcd.service}
@@ -116,6 +126,10 @@ fi
 %dir %{_sysconfdir}/bpfc/interfaces.d
 %dir %{_sysconfdir}/bpfc/netns
 %dir %{_sysconfdir}/bpfc/include
+%{_sysusersdir}/bpfc.conf
+%dir %{_localstatedir}/lib/bpfc
+%dir %{_localstatedir}/lib/bpfc/interfaces.d
+%dir %{_localstatedir}/lib/bpfc/netns
 
 %files container
 %{_sbindir}/bpfcd-entrypoint
@@ -136,6 +150,24 @@ fi
 
 %changelog
 * Wed Nov 11 2026 bpfc maintainers <brun064@gmail.com> - @VERSION@-@RELEASE@
+- REST API: with rest_socket set in bpfc.conf (off by default), bpfcd serves
+  HTTP on that unix socket, owned by rest_socket_owner (default root:bpfc)
+  with rest_socket_mode (default 0660). GET / and /interfaces[/<if>[/<dir>]]
+  return status as JSON; /interfaces/<if>/<ingress|egress>/<prio> and
+  /interfaces/<if>/xdp read (GET), write and install (POST/PUT) and delete
+  (DELETE) a program file as a JSON array of lines. Writes are checked
+  first, rolled back if installing fails, and ?dry-run only checks
+- Programs written through the API live in rest_dir
+  (/var/lib/bpfc/interfaces.d; per namespace
+  /var/lib/bpfc/netns/<name>/interfaces.d) and override the file at the same
+  place in /etc/bpfc/interfaces.d
+- New bpfc group (REST socket access); bpfcd units get StateDirectory and
+  CAP_CHOWN
+- bpfc -T: compile and have the kernel verify a program without attaching it
+  or pinning maps
+- bpfcctl status --json (-j); bpfcctl env: BPFC_REST_DIR, BPFC_REST_SOCKET
+
+* Wed Nov 11 2026 bpfc maintainers <brun064@gmail.com> - 0.1.1-5
 - Network namespaces: bpfcd -n <name> manages a namespace configured from
   /etc/bpfc/netns/<name>/ (bpfc.conf, interfaces.d); without its own
   bpfc.conf it takes the global file's behavior settings, never its paths.

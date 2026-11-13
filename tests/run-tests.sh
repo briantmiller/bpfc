@@ -22,7 +22,7 @@
 
 cd "$(dirname "$0")/.." || exit 1
 
-ALL="compile preprocessor stack bpfc util loops nat mpls mpls-xdp frag mpls-frag throttle cve-2026-98432 bpfcd netns container install verifier-budget xdp xdp-examples tc-examples ecmp dataplane dataplane-udp pytest"
+ALL="compile preprocessor stack bpfc util loops nat mpls mpls-xdp frag mpls-frag throttle cve-2026-98432 bpfcd netns rest container install verifier-budget xdp xdp-examples tc-examples ecmp dataplane dataplane-udp pytest"
 FAILURES_ONLY=0
 VERBOSE=0
 LOGDIR=
