@@ -1,58 +1,218 @@
-# BPFC IPv4 flow monitor - TC ingress.
-# Uses 15 scalar maps, below BPFC's per-program 16-map compiler limit.
+# BPFC IPv4 flow monitor, TC ingress and egress (egress/10.bpfc includes this
+# file). Read with bpfc-flows(8).
+#
+# One flow is keyed by the symmetric flow key, the TOS byte and, for ICMP, the
+# ICMP type. Maps shared by both hooks: FM_FIRST, FM_LAST, FM_ADDR, FM_META.
+# Per hook ($H = I on ingress, E on egress) there are 12 more, so a program
+# uses exactly 16 maps, BPFC's per-program limit.
+#
+# TCP tracking: for every TCP segment with payload, per direction of the flow
+# and per interface (so a packet seen at ingress on eth0 and again at egress on
+# eth1, or on a bond and its slave, is not mistaken for a retransmission):
+#   - payload below the highest sequence seen, not filling a recorded hole:
+#       retransmission of data that already passed here (loss downstream of
+#       this point, or a spurious retransmission)
+#   - sequence above the highest seen: a hole; the missing bytes are counted
+#       as loss upstream of this point
+#   - payload filling the hole within FM_REORDER_MS: reordering; the loss
+#       counted for it is taken back
+#   - payload filling the hole later: retransmission repairing upstream loss
+# Counters are keyed by flow key, bit 63 set for the direction opposite to the
+# first packet seen (FM_ADDR's source).
+
+name flowmon $HOOK: IPv4 flow and TCP loss monitor;
+
+# A hole filled within this many milliseconds is reordering, not loss
+# (-s FM_REORDER_MS=n; the clock ticks every 1.048576 ms).
+const FM_REORDER_MS 10;
+
+when $HOOK == egress;
+  const H E;
+otherwise;
+  const H I;
+end-when;
+
+# Flows the maps hold (-s FM_FLOWS=n). The TCP maps hold two entries per flow
+# (one per direction), so they get twice as many. Changing it replaces the
+# pinned maps, and with them the counters.
+const FM_FLOWS 10000;
+hash-map FM_FIRST $FM_FLOWS;
+hash-map FM_LAST $FM_FLOWS;
+hash-map FM_ADDR $FM_FLOWS;
+hash-map FM_META $FM_FLOWS;
+hash-map FM_BYTES_$H $FM_FLOWS;
+hash-map FM_PKTS_$H $FM_FLOWS;
+hash-map FM_LOC_$H $FM_FLOWS;
+hash-map FM_SMAC_$H $FM_FLOWS;
+hash-map FM_DMAC_$H $FM_FLOWS;
+hash-map FM_TSEQ_$H $(FM_FLOWS * 2);
+hash-map FM_THOLE_$H $(FM_FLOWS * 2);
+hash-map FM_TDATA_$H $(FM_FLOWS * 2);
+hash-map FM_RTXP_$H $(FM_FLOWS * 2);
+hash-map FM_RTXB_$H $(FM_FLOWS * 2);
+hash-map FM_LOSSP_$H $(FM_FLOWS * 2);
+hash-map FM_LOSSB_$H $(FM_FLOWS * 2);
+
+# D = S (8-byte variables)
+define MOV D S;
+  calc xor $D %$D; calc or $D %$S;
+end-define;
+
 match ip;
   decl KEY 8; get flow-key KEY symmetric;
   decl TOS 1; get ip-tos TOS;
-  decl MIX 8; calc or MIX %TOS; calc lsh MIX 48; calc xor KEY %MIX;
+  decl TMP 8; calc or TMP %TOS; calc lsh TMP 48; calc xor KEY %TMP;
 
   decl ICTYPE 1;
   match icmp;
-    decl L4OFF 2; get l4-off L4OFF; get bytes %L4OFF 1 ICTYPE;
-    decl IMIX 8; calc or IMIX %ICTYPE; calc lsh IMIX 40; calc xor KEY %IMIX;
+    decl L4OFF 2; get l4-off L4OFF; get bytes %L4OFF 1 ICTYPE; free L4OFF;
+    calc xor TMP %TMP; calc or TMP %ICTYPE; calc lsh TMP 40; calc xor KEY %TMP;
   end-match;
 
   decl NOW 8; get time NOW;
   decl LEN 4; get len LEN;
   decl IFIDX 4; get skb-ifindex IFIDX;
-  decl INIDX 4; get skb-ingress INIDX;
+  decl SIP 4; get ip-src SIP;
 
   # Preserve first-observed L3/L4 source/destination orientation and metadata.
   decl OLD 8; get map FM_FIRST %KEY OLD;
   if OLD eq 0;
     set map FM_FIRST %KEY %NOW;
-    decl SIP 4; get ip-src SIP; set map FM_SRCIP %KEY %SIP;
-    decl DIP 4; get ip-dst DIP; set map FM_DSTIP %KEY %DIP;
+    # FM_ADDR: source address in bits 63:32, destination in bits 31:0.
+    decl ADDR 8; calc or ADDR %SIP; calc lsh ADDR 32;
+    decl DIP 4; get ip-dst DIP; calc or ADDR %DIP; free DIP;
+    set map FM_ADDR %KEY %ADDR; free ADDR;
 
     # FM_META: proto[7:0], TOS[15:8], ICMP type[23:16], source port[39:24], destination port[55:40].
-    decl META 8; decl TMP 8;
-    decl PROTO 1; get ip-proto PROTO; calc or META %PROTO;
-    calc or TMP %TOS; calc lsh TMP 8; calc or META %TMP;
+    decl META 8;
+    decl PROTO 1; get ip-proto PROTO; calc or META %PROTO; free PROTO;
+    calc xor TMP %TMP; calc or TMP %TOS; calc lsh TMP 8; calc or META %TMP;
     calc xor TMP %TMP; calc or TMP %ICTYPE; calc lsh TMP 16; calc or META %TMP;
+    decl PORT 2;
     match tcp;
-      decl SPORT 2; get tcp-src SPORT; calc xor TMP %TMP; calc or TMP %SPORT; calc lsh TMP 24; calc or META %TMP;
-      decl DPORT 2; get tcp-dst DPORT; calc xor TMP %TMP; calc or TMP %DPORT; calc lsh TMP 40; calc or META %TMP;
+      get tcp-src PORT; calc xor TMP %TMP; calc or TMP %PORT; calc lsh TMP 24; calc or META %TMP;
+      get tcp-dst PORT; calc xor TMP %TMP; calc or TMP %PORT; calc lsh TMP 40; calc or META %TMP;
     end-match;
     match udp;
-      decl USPORT 2; get udp-src USPORT; calc xor TMP %TMP; calc or TMP %USPORT; calc lsh TMP 24; calc or META %TMP;
-      decl UDPORT 2; get udp-dst UDPORT; calc xor TMP %TMP; calc or TMP %UDPORT; calc lsh TMP 40; calc or META %TMP;
+      get udp-src PORT; calc xor TMP %TMP; calc or TMP %PORT; calc lsh TMP 24; calc or META %TMP;
+      get udp-dst PORT; calc xor TMP %TMP; calc or TMP %PORT; calc lsh TMP 40; calc or META %TMP;
     end-match;
-    set map FM_META %KEY %META;
+    free PORT;
+    set map FM_META %KEY %META; free META;
   end-if;
+  free OLD;
 
-  calc-map add FM_I_BYTES %KEY %LEN;
+  calc-map add FM_BYTES_$H %KEY %LEN;
+  calc-map add FM_PKTS_$H %KEY 1;
   set map FM_LAST %KEY %NOW;
 
-  # FM_I_LOC: current ifindex in upper 32 bits, skb ingress_ifindex in lower 32.
-  decl LOC 8; calc or LOC %IFIDX; calc lsh LOC 32; calc or LOC %INIDX; set map FM_I_LOC %KEY %LOC;
+  # FM_LOC: current ifindex in bits 63:32, skb ingress_ifindex in bits 31:0.
+  decl INIDX 4; get skb-ingress INIDX;
+  calc xor TMP %TMP; calc or TMP %IFIDX; calc lsh TMP 32; calc or TMP %INIDX; set map FM_LOC_$H %KEY %TMP;
+  free INIDX;
 
+  # FM_SMAC: EtherType in bits 63:48, source MAC in 47:0.
+  # FM_DMAC: VLAN ID in bits 59:48, destination MAC in 47:0.
   when $L3OFF == 14;
-    decl SMAC 8; get src-mac SMAC; set map FM_I_SMAC %KEY %SMAC;
-    decl DMAC 8; get dst-mac DMAC; set map FM_I_DMAC %KEY %DMAC;
-    # FM_I_L2: EtherType in bits 47:32, VLAN ID in bits 11:0.
-    decl ETYPE 2; get eth-proto ETYPE;
-    decl VLAN 4; get vlan-id VLAN;
-    decl L2 8; calc or L2 %ETYPE; calc lsh L2 32; calc or L2 %VLAN; set map FM_I_L2 %KEY %L2;
+    decl MAC 8; decl L2 8;
+    get src-mac MAC; decl ETYPE 2; get eth-proto ETYPE;
+    calc or L2 %ETYPE; calc lsh L2 48; calc or L2 %MAC; set map FM_SMAC_$H %KEY %L2; free ETYPE;
+    calc xor MAC %MAC; get dst-mac MAC; decl VLAN 4; get vlan-id VLAN;
+    calc xor L2 %L2; calc or L2 %VLAN; calc lsh L2 48; calc or L2 %MAC; set map FM_DMAC_$H %KEY %L2;
+    free VLAN; free MAC; free L2;
   otherwise;
-    set map FM_I_SMAC %KEY 0; set map FM_I_DMAC %KEY 0; set map FM_I_L2 %KEY 0;
+    set map FM_SMAC_$H %KEY 0; set map FM_DMAC_$H %KEY 0;
   end-when;
+
+  match tcp;
+    decl PLEN 2; get payload-len PLEN;
+    if PLEN gt 0;
+      # Counter key CK: flow key, bit 63 = reverse direction.
+      decl CK 8; get map FM_ADDR %KEY CK; calc rsh CK 32;
+      decl DIR 8;
+      if CK ne %SIP; calc or DIR 1; calc lsh DIR 63; end-if;
+      MOV CK KEY; calc xor CK %DIR; free DIR;
+      calc-map add FM_TDATA_$H %CK %PLEN;
+
+      # State key TK: directional flow key and the interface.
+      decl TK 8; get flow-key TK;
+      calc xor TMP %TMP; calc or TMP %IFIDX; calc lsh TMP 32; calc xor TK %TMP;
+
+      decl SEQ 8; decl S4 4; get tcp-seq S4; calc or SEQ %S4; free S4;
+      decl END 8; MOV END SEQ; calc add END %PLEN; calc lsh END 32; calc rsh END 32;
+
+      # FM_TSEQ: hole end in bits 63:32, highest sequence seen in 31:0.
+      # FM_THOLE: valid in bit 63, hole time (ms ticks) in 62:32, hole start in 31:0.
+      decl MAXE 8; get map FM_TSEQ_$H %TK MAXE;
+      decl HHI 8; MOV HHI MAXE; calc rsh HHI 32;
+      calc lsh MAXE 32; calc rsh MAXE 32;
+      decl HLO 8; get map FM_THOLE_$H %TK HLO;
+      decl HT 8; MOV HT HLO; calc rsh HT 32;
+      decl VALID 8; MOV VALID HT; calc rsh VALID 31;
+      calc and HT 0x7fffffff;
+      calc lsh HLO 32; calc rsh HLO 32;
+      decl TICK 8; MOV TICK NOW; calc rsh TICK 20; calc and TICK 0x7fffffff;
+
+      if VALID eq 0;
+        # First segment of this direction here.
+        MOV MAXE END; MOV HLO END; MOV HHI END;
+      else;
+        if SEQ seq-gt %MAXE;
+          # Hole [MAXE, SEQ): bytes missing upstream (or reordered).
+          MOV TMP SEQ; calc sub TMP %MAXE; calc lsh TMP 32; calc rsh TMP 32;
+          calc-map add FM_LOSSP_$H %CK 1;
+          calc-map add FM_LOSSB_$H %CK %TMP;
+          MOV HLO MAXE; MOV HHI SEQ; MOV HT TICK;
+        end-if;
+        if SEQ seq-lt %MAXE;
+          # Old data: a hole fill, or a retransmission of data seen here.
+          decl FILL 1;
+          if HLO ne %HHI;
+            if SEQ seq-ge %HLO;
+              if SEQ seq-lt %HHI;
+                calc or FILL 1;
+              end-if;
+            end-if;
+          end-if;
+          if FILL eq 1;
+            # FEND = min(END, HHI); TMP = filled bytes
+            decl FEND 8; MOV FEND END;
+            if END seq-gt %HHI; MOV FEND HHI; end-if;
+            MOV TMP FEND; calc sub TMP %SEQ; calc lsh TMP 32; calc rsh TMP 32;
+            # Shrink the hole from the front or the back.
+            if SEQ seq-le %HLO;
+              MOV HLO FEND;
+            else;
+              if END seq-ge %HHI; MOV HHI SEQ; end-if;
+            end-if;
+            free FEND;
+            decl AGE 8; MOV AGE TICK; calc sub AGE %HT; calc and AGE 0x7fffffff;
+            if AGE le $FM_REORDER_MS;
+              # Reordering: take the loss back (and the hole, once closed).
+              decl NEG 8; calc sub NEG %TMP;
+              calc-map add FM_LOSSB_$H %CK %NEG;
+              if HLO eq %HHI;
+                calc xor NEG %NEG; calc sub NEG 1;
+                calc-map add FM_LOSSP_$H %CK %NEG;
+              end-if;
+              free NEG;
+            else;
+              # Retransmission repairing upstream loss.
+              calc-map add FM_RTXP_$H %CK 1;
+              calc-map add FM_RTXB_$H %CK %PLEN;
+            end-if;
+            free AGE;
+          else;
+            calc-map add FM_RTXP_$H %CK 1;
+            calc-map add FM_RTXB_$H %CK %PLEN;
+          end-if;
+          free FILL;
+        end-if;
+        if END seq-gt %MAXE; MOV MAXE END; end-if;
+      end-if;
+
+      calc lsh HHI 32; calc or HHI %MAXE; set map FM_TSEQ_$H %TK %HHI;
+      calc or HT 0x80000000; calc lsh HT 32; calc or HT %HLO; set map FM_THOLE_$H %TK %HT;
+    end-if;
+  end-match;
 end-match;

@@ -4723,16 +4723,19 @@ static void kernel_obj_name(char dst[16], const char *name) {
     dst[i] = '\0';
 }
 
+/* Entries of a map used without a declaration (LRU hash map). */
+#define DEFAULT_MAP_ENTRIES 10000
+
 /*
- * Creates a generic 64-bit BPF Hash Map inside the kernel.
+ * Creates a 64-bit LRU hash map of <entries> inside the kernel.
  * Returns the File Descriptor (FD) on success, or -1 on failure.
  */
-int create_bpf_map(const char *name) {
+int create_bpf_map_sized(const char *name, uint32_t entries) {
     union bpf_attr attr = {
         .map_type    = BPF_MAP_TYPE_LRU_HASH,
         .key_size    = 8,     // 64-bit keys
         .value_size  = 8,     // 64-bit values
-        .max_entries = 10000, // Arbitrary upper limit for state tracking
+        .max_entries = entries,
     };
    
     kernel_obj_name(attr.map_name, name);
@@ -4742,6 +4745,7 @@ int create_bpf_map(const char *name) {
     }
     return fd;
 }
+int create_bpf_map(const char *name) { return create_bpf_map_sized(name, DEFAULT_MAP_ENTRIES); }
 
 /*
  * Retrieves an existing Map FD by reading it from the BPF filesystem.
@@ -4867,6 +4871,53 @@ int get_or_create_array_map(const char *name, uint32_t entries) {
     return fd;
 }
 
+/*
+ * hash-map <NAME> <entries>
+ * The default map (LRU hash of 64-bit keys and values) with <entries>
+ * instead of 10000, for tables that must hold more (or, on small systems,
+ * fewer) entries. Like array-map it comes before the map's first use; a
+ * pinned map of another size or type is replaced. A program that uses the
+ * map without declaring it keeps the pinned size.
+ */
+int get_or_create_hash_map(const char *name, uint32_t entries) {
+    check_map_name(name);
+    if (entries == 0 || entries > (1U << 24)) {
+        fprintf(stderr, "Error: hash-map '%s' needs 1-16777216 entries\n", name);
+        exit(1);
+    }
+    for (int i = 0; i < num_maps; i++) {
+        if (strcmp(maps[i].name, name)) continue;
+        if (maps[i].is_buf || maps[i].is_array || maps[i].entries != entries) {
+            fprintf(stderr, "Error: hash-map '%s' must come before the map is first used, and once per size\n", name);
+            exit(1);
+        }
+        return maps[i].fd;
+    }
+    char pin_path[256];
+    snprintf(pin_path, sizeof(pin_path), "%s/%s", bpf_map_dir, name);
+    int fd = get_pinned_map_fd(pin_path);
+    if (fd >= 0) {
+        struct bpf_map_info info;
+        if (map_info(fd, &info) == 0 &&
+            (info.type != BPF_MAP_TYPE_LRU_HASH || info.key_size != 8 || info.value_size != 8 ||
+             info.max_entries != entries)) {
+            char why[96];
+            if (info.type != BPF_MAP_TYPE_LRU_HASH || info.key_size != 8 || info.value_size != 8)
+                snprintf(why, sizeof(why), "is pinned as another kind of map");
+            else
+                snprintf(why, sizeof(why), "is pinned with %u entries, declared with %u", info.max_entries, entries);
+            fd = replace_pinned(pin_path, fd, name, why);
+        }
+    }
+    if (fd < 0) {
+        fd = create_bpf_map_sized(name, entries);
+        if (fd < 0) exit(1);
+        if (pin_map_fd(fd, pin_path) < 0) perror("Error pinning bpf map");
+    }
+    register_map(name, fd, 0, 0, 0, entries, 8);
+    return fd;
+}
+
 /* Looks up a Map FD by name. If it doesn't exist, creates it and pins it globally. */
 int get_or_create_map(const char *name) {
     check_map_name(name);
@@ -4883,14 +4934,15 @@ int get_or_create_map(const char *name) {
     int fd = get_pinned_map_fd(pin_path);
     
     int is_array = 0;
-    uint32_t entries = 10000;
+    uint32_t entries = DEFAULT_MAP_ENTRIES;
     if (fd >= 0) {
         if (verbose_mode) printf("[!] Found existing pinned map '%s' at %s (FD: %d)\n", name, pin_path, fd);
-        /* An array map declared by another program of the same dataplane. */
+        /* An array map, or a hash map of another size, declared by another
+         * program of the same dataplane: use it as it is. */
         struct bpf_map_info info;
-        if (map_info(fd, &info) == 0 && info.type == BPF_MAP_TYPE_ARRAY && info.value_size == 8) {
-            is_array = 1;
+        if (map_info(fd, &info) == 0) {
             entries = info.max_entries;
+            if (info.type == BPF_MAP_TYPE_ARRAY && info.value_size == 8) is_array = 1;
         }
     } else {
         // 4. If it doesn't exist globally, create it in the kernel...
@@ -6684,6 +6736,113 @@ void dump_map_contents(const char *map_name, const char *map_dir) {
     close(fd);
 }
 
+/*
+ * -R <map>[,<map>...]: the maps joined on their keys, for scripts that read
+ * several maps of the same keys (one table of flows, say). One line per key
+ * found in any of the maps, in the order first seen (the first map's keys
+ * first): the key (0x and 16 hex digits), then for each map its value (0x
+ * hex) or - where it has none. The first line is "# key <map> ...". Only
+ * maps of 64-bit keys and values (the default hash maps); a map that is not
+ * pinned is a column of - (with a warning), so a script works across program
+ * versions. A key iterated twice (LRU maps restart when the current key is
+ * evicted) is listed once. Exit status 1 when no map could be opened.
+ */
+#define JOIN_MAX_MAPS 64
+struct keyset { uint64_t *keys; uint64_t *slot; uint8_t *used; size_t n, cap, nslots; };
+
+static uint64_t key_hash(uint64_t k) {
+    k ^= k >> 33; k *= 0xff51afd7ed558ccdULL; k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL; k ^= k >> 33;
+    return k;
+}
+static void keyset_rehash(struct keyset *ks, size_t nslots) {
+    uint64_t *slot = calloc(nslots, sizeof(*slot));
+    uint8_t *used = calloc(nslots, 1);
+    if (!slot || !used) { perror("calloc"); exit(1); }
+    for (size_t i = 0; i < ks->n; i++) {
+        size_t h = key_hash(ks->keys[i]) & (nslots - 1);
+        while (used[h]) h = (h + 1) & (nslots - 1);
+        used[h] = 1; slot[h] = ks->keys[i];
+    }
+    free(ks->slot); free(ks->used);
+    ks->slot = slot; ks->used = used; ks->nslots = nslots;
+}
+static void keyset_add(struct keyset *ks, uint64_t k) {
+    if (2 * (ks->n + 1) > ks->nslots) keyset_rehash(ks, ks->nslots ? ks->nslots * 2 : 1024);
+    size_t h = key_hash(k) & (ks->nslots - 1);
+    while (ks->used[h]) {
+        if (ks->slot[h] == k) return;
+        h = (h + 1) & (ks->nslots - 1);
+    }
+    ks->used[h] = 1; ks->slot[h] = k;
+    if (ks->n == ks->cap) {
+        ks->cap = ks->cap ? ks->cap * 2 : 1024;
+        ks->keys = realloc(ks->keys, ks->cap * sizeof(*ks->keys));
+        if (!ks->keys) { perror("realloc"); exit(1); }
+    }
+    ks->keys[ks->n++] = k;
+}
+
+int dump_maps_joined(const char *list, const char *map_dir) {
+    char buf[4096];
+    snprintf(buf, sizeof(buf), "%s", list);
+    char *names[JOIN_MAX_MAPS];
+    int fds[JOIN_MAX_MAPS], n = 0, open_maps = 0;
+    for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        if (!*tok) continue;
+        if (n == JOIN_MAX_MAPS) { fprintf(stderr, "Error: -R takes at most %d maps\n", JOIN_MAX_MAPS); return 1; }
+        names[n++] = tok;
+    }
+    if (n == 0) { fprintf(stderr, "Error: -R needs map names, separated by commas\n"); return 1; }
+
+    struct keyset ks = {0};
+    for (int m = 0; m < n; m++) {
+        char pin_path[512];
+        snprintf(pin_path, sizeof(pin_path), "%s/%s", map_dir ? map_dir : BPF_FS_DIR, names[m]);
+        fds[m] = get_pinned_map_fd(pin_path);
+        if (fds[m] < 0) {
+            fprintf(stderr, "Warning: map '%s' is not pinned in %s\n", names[m], map_dir ? map_dir : BPF_FS_DIR);
+            continue;
+        }
+        struct bpf_map_info info;
+        if (map_info(fds[m], &info) == 0 &&
+            (info.key_size != 8 || info.value_size != 8 || info.type == BPF_MAP_TYPE_PERCPU_HASH ||
+             info.type == BPF_MAP_TYPE_LRU_PERCPU_HASH || info.type == BPF_MAP_TYPE_PERCPU_ARRAY)) {
+            fprintf(stderr, "Error: map '%s' does not have 64-bit keys and values; -R joins only those\n", names[m]);
+            return 1;
+        }
+        open_maps++;
+        uint64_t key, next;
+        int res = bpf_map_get_next_key_user(fds[m], NULL, &next);
+        while (res == 0) {
+            keyset_add(&ks, next);
+            key = next;
+            res = bpf_map_get_next_key_user(fds[m], &key, &next);
+        }
+    }
+    if (!open_maps) { fprintf(stderr, "Error: none of the maps could be opened\n"); return 1; }
+
+    static char out[1 << 16];
+    setvbuf(stdout, out, _IOFBF, sizeof(out));
+    printf("# key");
+    for (int m = 0; m < n; m++) printf(" %s", names[m]);
+    putchar('\n');
+    for (size_t i = 0; i < ks.n; i++) {
+        uint64_t v;
+        printf("0x%016llx", (unsigned long long)ks.keys[i]);
+        for (int m = 0; m < n; m++) {
+            if (fds[m] >= 0 && bpf_map_lookup_elem_user(fds[m], &ks.keys[i], &v) == 0)
+                printf(" 0x%llx", (unsigned long long)v);
+            else
+                fputs(" -", stdout);
+        }
+        putchar('\n');
+    }
+    fflush(stdout);
+    for (int m = 0; m < n; m++) if (fds[m] >= 0) close(fds[m]);
+    free(ks.keys); free(ks.slot); free(ks.used);
+    return 0;
+}
+
 /* --- Netlink Loaders --- */
 
 #ifndef SOL_NETLINK
@@ -7162,6 +7321,7 @@ void help(const char *arg0) {
         "-T"			,"check: compile and have the kernel verify the program, then exit without attaching it or pinning maps",
         "-m <dir>"		,"specify directory for BPF maps",
         "-r <map>"		,"dump contents of specified map",
+        "-R <map>[,<map>...]"	,"print maps of 64-bit keys joined on their keys: key, then each map's value or -",
         "-w <map> <key> <value>"	,"write a 64-bit value under key in a pinned 8-byte map (e.g. runtime settings)",
         "-f <file>"		,"read command instructions from file, - for STDIN",
         "-E"			,"print the program after include, const, define, repeat and when are expanded, then exit",
@@ -7239,6 +7399,7 @@ void help(const char *arg0) {
 	"xor-packet-keyed <MAP> <key> <len> ..."	,"same for a shared buffer entry; atomic, so several CPUs can fold into one buffer",
 	"zero-buffer[-keyed] <MAP> [key] <len> [dst]"	,"zero len bytes (rounded up to 8) of a buffer entry",
 	"array-map <MAP> <entries>"		,"declare an array of 64-bit values, keys 0..entries-1 (never evicted, unlike the default hash maps)",
+	"hash-map <MAP> <entries>"		,"declare the default LRU hash map with entries instead of 10000",
 	"calc-map <op> <MAP> <key> <val> [OLD]"	,"atomic add, or, and, xor or xchg on a map value (created as 0); OLD gets the previous value",
 	"calc-csum <tcp|udp> <VAR> [l3 [max]]"	,"compute the correct TCP/UDP checksum of the IPv4 packet at offset l3 into VAR, without changing it",
 	"recalc-tcp-csum [l3 [max]]"		,"recompute and write the TCP checksum (any IHL, length from the IP header); also recalc-udp-csum",
@@ -8169,6 +8330,8 @@ static int process_cmd_1(char *cmd, const char *dir) {
                                            t > 3 ? (uint32_t)strtoul(a3, NULL, 0) : 0, 1);
 	} else if (strcmp(op, "array-map")==0 && t > 2) {
             get_or_create_array_map(a1, (uint32_t)strtoul(a2, NULL, 0));
+	} else if (strcmp(op, "hash-map")==0 && t > 2) {
+            get_or_create_hash_map(a1, (uint32_t)strtoul(a2, NULL, 0));
 	} else if (strcmp(op, "calc-map")==0 && t > 4) {
             // Syntax: calc-map <add|or|and|xor|xchg> <MAP> <key|%VAR> <val|%VAR> [OLD_VAR]
             compile_calc_map(a1, get_or_create_map(a2), a3, tok[4], t > 5 ? tok[5] : NULL);
@@ -8327,7 +8490,7 @@ static const char *pp_reserved[] = {
     "calc-csum", "calc-map", "clone", "continue", "debug-log", "dec-reg-loop", "decap-gre",
     "decap-mpls", "decl", "del-bytes", "del-head-bytes", "del-l2-bytes", "drop", "else",
     "encap-gre", "encap-mpls", "end-if", "end-match", "fib-lookup", "fib-lookup6", "fill-bytes",
-    "free", "get", "goto", "if", "insert-l2", "ip-defrag", "ip-frag", "label", "load-packet",
+    "free", "get", "goto", "hash-map", "if", "insert-l2", "ip-defrag", "ip-frag", "label", "load-packet",
     "load-packet-keyed", "loop", "loop-reg", "match", "pop-eth", "pop-mac-bytes", "pop-net-bytes",
     "pop-vlan", "push-eth", "push-mac-bytes", "push-net-bytes", "push-qinq", "push-vlan",
     "recalc-tcp-csum", "recalc-udp-csum", "reclassify", "redirect", "remove-l2", "tx",
@@ -9272,13 +9435,13 @@ int main(int argc, char **argv) {
     int pri = 0;
     char *iface = NULL, *dir = "ingress", *instr = NULL; int clean = 0;
     char *filename = NULL;
-    char *read_map = NULL;
+    char *read_map = NULL, *join_maps = NULL;
     char *write_map = NULL, *write_key = NULL, *write_val = NULL;
     int delete_prio = 0, show_info = 0, expand_only = 0, list_files = 0;
     for (int i = 1; i < argc; i++) {
         /* Options that take a value must not run past the end of argv. */
         int needs_arg = !strcmp(argv[i],"-i") || !strcmp(argv[i],"-d") || !strcmp(argv[i],"-p") ||
-                        !strcmp(argv[i],"-m") || !strcmp(argv[i],"-r") || !strcmp(argv[i],"-f") ||
+                        !strcmp(argv[i],"-m") || !strcmp(argv[i],"-r") || !strcmp(argv[i],"-R") || !strcmp(argv[i],"-f") ||
                         !strcmp(argv[i],"-n") || !strcmp(argv[i],"-s") || !strcmp(argv[i],"-L");
         if (needs_arg && i + 1 >= argc) {
             fprintf(stderr, "Error: option %s requires an argument\n", argv[i]);
@@ -9295,6 +9458,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i],"-v")==0) verbose_mode = 1;
         else if (strcmp(argv[i],"-m")==0) snprintf(bpf_map_dir, sizeof(bpf_map_dir), "%s", argv[++i]);
         else if (strcmp(argv[i],"-r")==0) read_map = argv[++i];
+        else if (strcmp(argv[i],"-R")==0) join_maps = argv[++i];
         else if (strcmp(argv[i],"-w")==0) {
             if (i + 3 >= argc) { fprintf(stderr, "Error: -w requires <map> <key> <value>\n"); return 1; }
             write_map = argv[++i]; write_key = argv[++i]; write_val = argv[++i];
@@ -9313,6 +9477,8 @@ int main(int argc, char **argv) {
         dump_map_contents(read_map, bpf_map_dir);
         return 0;
     }
+    if (join_maps)
+        return dump_maps_joined(join_maps, bpf_map_dir);
     if(strcmp(dir, "ingress") && strcmp(dir, "egress") && strcmp(dir, "xdp")) {
         fprintf(stderr, "Error: direction must be 'ingress', 'egress' or 'xdp', not '%s'\n", dir);
         return 1;

@@ -295,4 +295,34 @@ for p in "set map M 1 5" "get map M 1 V" "calc-map add M 1 1" "calc-map xchg M 1
 	else test_fail "CC-map-$n ($p)"; echo "$out" | grep -v -i pin | head -3 | sed 's/^/    /'; fi
 done
 
+# hash-map: the size of a default (LRU hash) map; pinned maps need a bpffs
+mkdir -p "$TMP/bpf"
+if ! mount -t bpf bpf "$TMP/bpf" 2>/dev/null; then
+	test_skip "CC-hash-map (cannot mount bpffs)"
+	tests_exit
+fi
+trap 'umount "$TMP/bpf" 2>/dev/null; rm -rf "$TMP"; rm -f "$TESTS_FAILED_FILE"' EXIT
+M="-m $TMP/bpf"
+hm() { "$BPFC" $M "$@" 2>&1; }
+check CC-hash-map            eval 'hm "hash-map HM 8; set map HM 1 5" | grep -q Compiled'
+check CC-hash-map-resize     eval 'hm "hash-map HM 16; set map HM 1 5" | grep -q "is pinned with 8 entries, declared with 16; replacing"'
+check CC-hash-map-same       eval '! hm "hash-map HM 16; set map HM 1 5" | grep -q Warning'
+check CC-hash-map-undeclared eval 'hm "set map HM 2 6" | grep -q Compiled && ! hm "hash-map HM 16; get map HM 2 V" | grep -q Warning'
+check CC-hash-map-after-use  eval 'hm "set map HM2 1 1; hash-map HM2 32" | grep -q "must come before"'
+check CC-hash-map-range      eval 'hm "hash-map HM3 0" | grep -q "needs 1-16777216 entries"'
+check CC-hash-map-array      eval 'hm "array-map HA 4; set map HA 1 1" >/dev/null && hm "hash-map HA 4; set map HA 1 1" | grep -q "pinned as another kind of map"'
+
+# -R: maps joined on their keys
+"$BPFC" $M "get map HJ 1 V" >/dev/null 2>&1        # creates HJ
+for w in "HM 1 5" "HM 2 6" "HM 0x10 7" "HJ 2 9" "HJ 0x10 0xab"; do "$BPFC" $M -w $w >/dev/null; done
+R=$("$BPFC" $M -R HM,HJ,NOPE 2>/dev/null)
+check CC-join-header         eval '[ "$(echo "$R" | head -1)" = "# key HM HJ NOPE" ]'
+check CC-join-both           eval 'echo "$R" | grep -qx "0x0000000000000010 0x7 0xab -"'
+check CC-join-one            eval 'echo "$R" | grep -qx "0x0000000000000002 0x6 0x9 -" && echo "$R" | grep -qx "0x0000000000000001 0x5 - -"'
+check CC-join-keys-once      eval '[ $(echo "$R" | grep -c "^0x") -eq 3 ]'
+check CC-join-missing-warns  eval '"$BPFC" $M -R HM,NOPE 2>&1 >/dev/null | grep -q "NOPE.*not pinned"'
+check CC-join-none           eval '! "$BPFC" $M -R NOPE,NOPE2 >/dev/null 2>&1'
+check CC-join-buffer-refused eval '"$BPFC" $M "buffer-map B 512; save-packet B 64" >/dev/null 2>&1; ! "$BPFC" $M -R HM,B >/dev/null 2>&1'
+rm -f output.bpf
+
 tests_exit

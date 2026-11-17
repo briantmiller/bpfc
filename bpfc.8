@@ -93,6 +93,11 @@ Directory for pinned maps (default \fI/sys/fs/bpf\fR). A map is pinned there und
 .BI \-r " map"
 Print the contents of a pinned map and exit.
 .TP
+.BI \-R " map\fR[\fB,\fImap\fR...]"
+Print several pinned maps of 64-bit keys and values joined on their keys, and exit: a line
+.B "# key"
+followed by the map names, then one line per key found in any of the maps (each key once, in the order first seen): the key as \fB0x\fR and 16 hex digits, then each map's value in hex, or \fB\-\fR where that map has no entry. A map that is not pinned is a column of \fB\-\fR, with a warning; the exit status is 1 when none can be opened. Meant for scripts that read one table spread over several maps (\fBbpfc-flows\fR).
+.TP
 .BI \-w " map key value"
 Write a 64-bit \fIvalue\fR under \fIkey\fR in a pinned 8-byte map (for example a program's runtime settings) and exit. Numbers may be decimal or 0x hexadecimal.
 .TP
@@ -268,6 +273,9 @@ Serial-number comparison of 32-bit wrapping counters (TCP sequence numbers).
 .TP
 .BI "array-map " "map entries"
 Declare \fImap\fR as an array of \fIentries\fR 64-bit values with keys 0..\fIentries\fR\-1, instead of the default LRU hash map of 10000 entries. Entries are never evicted and start at 0; a key out of range reads as 0 and is not stored. Works with \fBget map\fR, \fBset map\fR, \fBcalc-map\fR, \fB\-r\fR and \fB\-w\fR. A pinned map of another size is replaced.
+.TP
+.BI "hash-map " "map entries"
+Declare \fImap\fR as the default LRU hash map (64-bit keys and values), with \fIentries\fR (1\-16777216) instead of 10000. Like \fBarray-map\fR it comes before the map's first use; a pinned map of another size or kind is replaced (losing its contents). A program that uses the map without declaring it uses the pinned map as it is, whatever its size.
 .SS Buffer Maps
 .TP
 .BI "buffer-map " "map [value_size]"

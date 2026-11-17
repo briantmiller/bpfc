@@ -1,28 +1,40 @@
 #!/usr/bin/env bash
-# bpfc-flows - display BPFC flow-monitor maps.  Requires bash and Python 3
-# standard library only.  Run as root or an account permitted to read bpffs.
+# bpfc-flows - display BPFC flow-monitor maps.  Pure bash (4.4 or later): besides
+# bash it runs only bpfc (-R, which joins the maps), sort(1) to order the flows,
+# and mkdir/mv for the state file.  Run as root or an account permitted to read bpffs (and /proc/timer_list,
+# the monotonic clock the maps' timestamps use; /proc/uptime otherwise).
 set -euo pipefail
+shopt -s nullglob
 
 BPFC_BIN=${BPFC_BIN:-bpfc}
-STATE_FILE=${STATE_FILE:-${BPFC_STATE_DIR:-/run/bpfc}/bpfc-flows.prev.json}
+STATE_FILE=${STATE_FILE:-${BPFC_STATE_DIR:-/run/bpfc}/bpfc-flows.prev}
 MAP_DIR=${BPFC_MAP_DIR:-}; NETNS=
 ORIG_ARGS=("$@")
-WATCH=0; FORMAT=table; SORT=bps-total; REVERSE=0; LIMIT=0; ACTIVE=60; SHOW_L2=0
+WATCH=0; FORMAT=table; SORT=bps-total; REVERSE=0; LIMIT=0; ACTIVE=60; SHOW_L2=0; SHOW_TCP=0
 FILTERS=()
 usage() { cat <<'USAGE'
 Usage: bpfc-flows [options]
   -w, --watch SEC         refresh every SEC seconds (default active window: 60 sec)
   --active SEC            show flows seen during the last SEC seconds (0 disables age filtering)
   --sort FIELD            bps-in|bps-out|bps-total|bytes-in|bytes-out|bytes-total|
-                          packets-in|packets-out|last-seen|src|dst|proto|sport|dport|vlan|dscp|ingress|egress
-  --reverse               reverse the selected sort
+                          packets-in|packets-out|packets-total|last-seen|src|dst|proto|
+                          sport|dport|vlan|dscp|ingress|egress|retrans|retrans-pct|loss|loss-pct
+  --reverse               reverse the selected sort (default: largest/latest first)
   --limit N               display at most N flows after filtering/sorting
-  --filter FIELD=VALUE    repeatable. Fields: src,dst,proto,dscp,sport,dport,icmp,vlan,
-                          ingress,egress,mac,ethertype,min-bps-in,min-bps-out,min-bps-total
-  -l2, --l2                include ingress/egress MAC and EtherType columns in table output
-  --json | --csv          emit machine-readable output (default: table; L2 fields always included)
+  --filter FIELD=VALUE    repeatable; all must match. Fields:
+                            src, dst            address, CIDR (10.0.0.0/8) or substring
+                            proto               name (tcp) or number (6)
+                            dscp                number or name (ef, af41, cs1)
+                            sport, dport, icmp, vlan, ethertype   number (decimal or 0x)
+                            ingress, egress, mac                  substring
+                            min-bps-in, min-bps-out, min-bps-total  bits/s, K/M/G suffix
+                            min-retrans, min-loss             all-time retransmissions / loss events
+                            min-retrans-pct, min-loss-pct     current sample, percent (0.5)
+  -l2, --l2               include ingress/egress MAC and EtherType columns in table output
+  -t, --tcp               include all-time TCP retransmission and loss columns in table output
+  --json | --csv          emit machine-readable output (default: table; all fields included)
   --bpfc PATH             path to bpfc binary (default: BPFC_BIN or bpfc)
-  --state PATH            prior-snapshot state path (default: /run/bpfc/bpfc-flows.prev.json,
+  --state PATH            prior-snapshot state path (default: /run/bpfc/bpfc-flows.prev,
                           or the -n namespace's state directory)
   -m, --map-dir DIR       pinned map directory (default: map_dir in /etc/bpfc/bpfc.conf, else /sys/fs/bpf)
   -n, --netns NAME        network namespace NAME: run inside it, with its map directory
@@ -30,7 +42,19 @@ Usage: bpfc-flows [options]
 
 Notes: source/destination metadata is fixed by the first observed packet for a
 flow. In/out mean TC ingress/egress observations on this host, not necessarily
-wire-unique packets on stacked bridge/bond devices.
+wire-unique packets on stacked bridge/bond devices; packets are GRO/GSO packets
+as the hook sees them. Rates are since the previous sample (the previous run,
+or the previous refresh with -w).
+
+TCP (per direction: fwd = SRC to DST, rev = DST to SRC; the hook that saw more
+payload of that direction):
+  retrans  segments carrying payload already seen here (loss downstream of this
+           host, or spurious), or filling a hole after the reorder window
+           (repairing loss upstream). RTX% = retransmitted / all payload bytes.
+  loss     holes in the sequence space: bytes that never passed here (loss
+           upstream of this host). Holes filled within the reorder window
+           (FM_REORDER_MS, default 10 ms) are reordering and not counted.
+           LOSS% = missing bytes / bytes the sender sent once.
 USAGE
 }
 while (($#)); do
@@ -42,6 +66,7 @@ while (($#)); do
     --limit) LIMIT=${2:?missing limit}; shift 2;;
     --filter) FILTERS+=("${2:?missing filter}"); shift 2;;
     -l2|--l2) SHOW_L2=1; shift;;
+    -t|--tcp) SHOW_TCP=1; shift;;
     --json) FORMAT=json; shift;;
     --csv) FORMAT=csv; shift;;
     --bpfc) BPFC_BIN=${2:?missing path}; shift 2;;
@@ -52,166 +77,538 @@ while (($#)); do
     *) echo "bpfc-flows: unknown option: $1" >&2; usage >&2; exit 2;;
   esac
 done
+die() { echo "bpfc-flows: $*" >&2; exit 2; }
+
 # -n NETNS: run again inside network namespace NETNS through "bpfcctl exec",
 # which also sets BPFC_CONFIG_DIR, BPFC_MAP_DIR, BPFC_STATE_DIR and BPFC_CONF
 # to that namespace's paths (see bpfcd(8), NETWORK NAMESPACES).
 netns_reexec() {
-    local ns=$1; shift
-    [ -n "$ns" ] || return 0
-    [ "${BPFC_IN_NETNS:-}" = "$ns" ] && return 0
-    local ctl=${BPFCCTL:-}
-    if [ -z "$ctl" ]; then
-        ctl=$(command -v bpfcctl 2>/dev/null) || ctl=$(cd "$(dirname "$0")" && pwd)/../bpfcd/bpfcctl
-    fi
-    [ -x "$ctl" ] || { echo "Error: -n needs bpfcctl (not found; set BPFCCTL=)" >&2; exit 1; }
-    exec "$ctl" -n "$ns" exec -- "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$@"
+  local ns=$1; shift
+  [ -n "$ns" ] || return 0
+  [ "${BPFC_IN_NETNS:-}" = "$ns" ] && return 0
+  local ctl=${BPFCCTL:-} here=.
+  [[ $0 == */* ]] && here=${0%/*}
+  here=$(cd "$here" && pwd)
+  if [ -z "$ctl" ]; then
+    ctl=$(command -v bpfcctl 2>/dev/null) || ctl=$here/../bpfcd/bpfcctl
+  fi
+  [ -x "$ctl" ] || { echo "Error: -n needs bpfcctl (not found; set BPFCCTL=)" >&2; exit 1; }
+  exec "$ctl" -n "$ns" exec -- "$here/${0##*/}" "$@"
 }
 netns_reexec "$NETNS" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+
 if [ -z "$MAP_DIR" ] && [ -r /etc/bpfc/bpfc.conf ]; then
-  MAP_DIR=$(sed -n 's/^[[:space:]]*map_dir[[:space:]]*=[[:space:]]*\([^#]*\).*/\1/p' /etc/bpfc/bpfc.conf | tail -n 1 | sed 's/[[:space:]]*$//')
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ $line =~ ^[[:space:]]*map_dir[[:space:]]*=[[:space:]]*([^#]*) ]]; then
+      MAP_DIR=${BASH_REMATCH[1]%"${BASH_REMATCH[1]##*[![:space:]]}"}
+    fi
+  done < /etc/bpfc/bpfc.conf
 fi
 MAP_DIR=${MAP_DIR:-/sys/fs/bpf}
-[[ $WATCH =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo 'watch interval must be numeric' >&2; exit 2; }
-[[ $ACTIVE =~ ^[0-9]+$ ]] || { echo 'active window must be an integer' >&2; exit 2; }
+[[ $WATCH =~ ^[0-9]+([.][0-9]+)?$ ]] || die 'watch interval must be numeric'
+[[ $ACTIVE =~ ^[0-9]+$ ]] || die 'active window must be an integer'
+[[ $LIMIT =~ ^[0-9]+$ ]] || die 'limit must be an integer'
+ACTIVE=$((10#$ACTIVE)); LIMIT=$((10#$LIMIT))
 
-MAPS=(FM_FIRST FM_LAST FM_SRCIP FM_DSTIP FM_META
-      FM_I_BYTES FM_I_LAST FM_I_LOC FM_I_SMAC FM_I_DMAC FM_I_L2
-      FM_E_BYTES FM_E_LAST FM_E_LOC FM_E_SMAC FM_E_DMAC FM_E_L2)
+# ---------------------------------------------------------------- fields
+# Output fields, in order (build_rows fills them in this order).
+FNAMES=(flow_key src dst protocol protocol_number tos dscp dscp_name
+  sport dport icmp_type first_seen_ns last_seen_ns age_seconds
+  bytes_in bytes_out bytes_total packets_in packets_out packets_total
+  bps_in bps_out bps_total pps_in pps_out sample_seconds
+  ingress_interface ingress_ifindex ingress_skb_ingress
+  egress_interface egress_ifindex egress_skb_ingress
+  ingress_src_mac ingress_dst_mac ingress_ethertype ingress_vlan
+  egress_src_mac egress_dst_mac egress_ethertype egress_vlan)
+NBASE=${#FNAMES[@]}
+FNAMES+=(tcp_retrans_pkts tcp_loss_events tcp_retrans_pct_now tcp_loss_pct_now)
+TCP_DIR_FIELDS=(hook data_bytes retrans_pkts retrans_bytes retrans_pct loss_events loss_bytes
+  loss_pct retrans_pkts_now retrans_pct_now loss_events_now loss_bytes_now loss_pct_now)
+for d in fwd rev; do for f in "${TCP_DIR_FIELDS[@]}"; do FNAMES+=("tcp_${d}_$f"); done; done
+JFMT='  {\n'
+for i in "${!FNAMES[@]}"; do
+  (( i == ${#FNAMES[@]} - 1 )) && JFMT+="    \"${FNAMES[i]}\": %s\n  }" || JFMT+="    \"${FNAMES[i]}\": %s,\n"
+done
+
+# --sort FIELD -> variable of build_rows holding the key, and sort type (g numeric, s string)
+declare -A SORT_VAR=([bps-in]=bps_in [bps-out]=bps_out [bps-total]=bps_total
+  [bytes-in]=bi [bytes-out]=bo [bytes-total]=bt [packets-in]=pi [packets-out]=po
+  [packets-total]=pt [last-seen]=last [src]=src_num [dst]=dst_num [proto]=proto
+  [sport]=sport [dport]=dport [vlan]=vlan [dscp]=dscp [ingress]=iifn [egress]=eifn
+  [retrans]=rtx_all [retrans-pct]=rtx100 [loss]=loss_all [loss-pct]=loss100)
+[[ -n ${SORT_VAR[$SORT]:-} ]] || die "unknown sort field: $SORT"
+SORT_KEY=${SORT_VAR[$SORT]}
+case $SORT_KEY in proto|iifn|eifn) SORT_TYPE=s;; *) SORT_TYPE=g;; esac
+
+declare -A DSCP_NAME=([0]=0 [1]=LE [8]=CS1 [10]=AF11 [12]=AF12 [14]=AF13 [16]=CS2 [18]=AF21
+  [20]=AF22 [22]=AF23 [24]=CS3 [26]=AF31 [28]=AF32 [30]=AF33 [32]=CS4 [34]=AF41 [36]=AF42
+  [38]=AF43 [40]=CS5 [46]=EF [48]=CS6 [56]=CS7)
+declare -A DSCP_NUM=()
+for n in "${!DSCP_NAME[@]}"; do v=${DSCP_NAME[$n]}; DSCP_NUM[${v,,}]=$n; done
+DSCP_NUM[cs0]=0; DSCP_NUM[df]=0; DSCP_NUM[be]=0
+
+# ---------------------------------------------------------------- helpers
+# Helpers return their result in REPLY (no subshells).
+ipv4_num() {   # dotted quad -> integer, or fail
+  local IFS=. a b c d
+  [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  read -r a b c d <<<"$1"
+  (( 10#$a < 256 && 10#$b < 256 && 10#$c < 256 && 10#$d < 256 )) || return 1
+  REPLY=$(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
+}
+# Decimal number, optionally with K/M/G (x1000) or a fraction (two digits kept), to
+# hundredths: 1.5 -> 150, 2M -> 200000000.
+num100() {
+  local s=${1^^} m=1
+  case $s in *K) m=1000;; *M) m=1000000;; *G) m=1000000000;; esac
+  s=${s%[KMG]}
+  [[ $s =~ ^([0-9]+)(\.([0-9]{0,2})[0-9]*)?$ ]] || return 1
+  local frac=${BASH_REMATCH[3]:-}; frac=${frac}00
+  REPLY=$(( (10#${BASH_REMATCH[1]} * 100 + 10#${frac:0:2}) * m ))
+}
+rate_str() {
+  local n=$1
+  if   (( n >= 1000000000 )); then printf -v REPLY '%d.%02dGb/s' $((n / 1000000000)) $((n / 10000000 % 100))
+  elif (( n >= 1000000 ));    then printf -v REPLY '%d.%02dMb/s' $((n / 1000000)) $((n / 10000 % 100))
+  elif (( n >= 1000 ));       then printf -v REPLY '%d.%02dKb/s' $((n / 1000)) $((n / 10 % 100))
+  else REPLY="${n}b/s"; fi
+}
+json_str() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\t'/\\t}; s=${s//$'\n'/\\n}
+  REPLY="\"$s\""
+}
+csv_str() {
+  local s=$1
+  if [[ $s == *[,\"$'\n']* ]]; then s=${s//\"/\"\"}; REPLY="\"$s\""; else REPLY=$s; fi
+}
+
+
+# ---------------------------------------------------------------- filters
+FILT_F=(); FILT_V=()
+for f in ${FILTERS[@]+"${FILTERS[@]}"}; do
+  [[ $f == *=* ]] || die "invalid filter (use FIELD=VALUE): $f"
+  a=${f%%=*}; a=${a,,}; b=${f#*=}; b=${b,,}
+  case $a in
+    src|dst)
+      if [[ $b == */* ]]; then
+        bits=${b#*/}
+        ipv4_num "${b%/*}" && [[ $bits =~ ^[0-9]{1,2}$ ]] && (( 10#$bits <= 32 )) || die "invalid IPv4 CIDR filter: $f"
+        bits=$((10#$bits)); mask=$(( bits ? (0xffffffff << (32 - bits)) & 0xffffffff : 0 ))
+        b="cidr $(( REPLY & mask )) $mask"
+      elif ipv4_num "$b"; then b="addr $REPLY"
+      else b="sub $b"; fi;;
+    proto) if [[ $b =~ ^[0-9]+$ ]]; then b="num $((10#$b))"; else b="sub $b"; fi;;
+    ingress|egress|mac) ;;
+    dscp|sport|dport|icmp|vlan|ethertype)
+      if [[ $a == dscp && -n ${DSCP_NUM[$b]:-} ]]; then b=${DSCP_NUM[$b]}
+      elif [[ $b =~ ^0x[0-9a-f]+$ ]]; then b=$((b))
+      elif [[ $b =~ ^[0-9]+$ ]]; then b=$((10#$b))
+      else die "invalid numeric filter value: $f"; fi;;
+    min-bps-in|min-bps-out|min-bps-total|min-retrans|min-loss)
+      num100 "$b" || die "invalid numeric filter value: $f"; b=$(( REPLY / 100 ));;
+    min-retrans-pct|min-loss-pct)
+      num100 "$b" || die "invalid numeric filter value: $f"; b=$REPLY;;
+    *) die "unknown filter field: $a";;
+  esac
+  FILT_F+=("$a"); FILT_V+=("$b")
+done
+
+# Called from build_rows: reads its row variables. Succeeds when all filters match.
+row_matches() {
+  local i a b v t1 t2 t3
+  for i in "${!FILT_F[@]}"; do
+    a=${FILT_F[i]}; b=${FILT_V[i]}
+    case $a in
+      src|dst)
+        read -r t1 t2 t3 <<<"$b"
+        [[ $a == src ]] && v=$src_num || v=$dst_num
+        case $t1 in
+          cidr) (( (v & t3) == t2 )) || return 1;;
+          addr) (( v == t2 )) || return 1;;
+          sub)  [[ ${!a} == *"$t2"* ]] || return 1;;
+        esac;;
+      proto)
+        read -r t1 t2 <<<"$b"
+        if [[ $t1 == num ]]; then (( pnum == t2 )) || return 1
+        else [[ ${proto,,} == *"$t2"* ]] || return 1; fi;;
+      ingress) [[ ${iifn,,} == *"$b"* ]] || return 1;;
+      egress) [[ ${eifn,,} == *"$b"* ]] || return 1;;
+      mac) [[ "$ismac $idmac $esmac $edmac" == *"$b"* ]] || return 1;;
+      dscp) (( dscp == b )) || return 1;;
+      sport) (( sport == b )) || return 1;;
+      dport) (( dport == b )) || return 1;;
+      icmp) (( ictype == b )) || return 1;;
+      vlan) (( vlan == b )) || return 1;;
+      ethertype) (( (ietype ? ietype : eetype) == b )) || return 1;;
+      min-bps-in) (( bps_in >= b )) || return 1;;
+      min-bps-out) (( bps_out >= b )) || return 1;;
+      min-bps-total) (( bps_total >= b )) || return 1;;
+      min-retrans) (( rtx_all >= b )) || return 1;;
+      min-loss) (( loss_all >= b )) || return 1;;
+      min-retrans-pct) (( rtx100 >= b )) || return 1;;
+      min-loss-pct) (( loss100 >= b )) || return 1;;
+    esac
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- data
+# The maps, in the column order build_rows uses (F[0] .. F[23]).
+MAPS=(FM_FIRST FM_LAST FM_ADDR FM_META)
+for h in I E; do for m in BYTES PKTS LOC SMAC DMAC TDATA RTXP RTXB LOSSP LOSSB; do MAPS+=("FM_${m}_$h"); done; done
+ZEROS20=(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)
+
+# bash reads a pipe one byte at a time, so the map dump goes through a file when one
+# can be created (exclusively, in the state directory or TMPDIR).
+DUMP=
+make_dump_file() {
+  local d
+  for d in "${STATE_FILE%/*}" "${TMPDIR:-/tmp}"; do
+    [[ -d $d ]] || mkdir -p "$d" 2>/dev/null || continue
+    DUMP="$d/.bpfc-flows.$$.$RANDOM"
+    if (set -C; : > "$DUMP") 2>/dev/null; then trap 'rm -f "$DUMP"' EXIT; return 0; fi
+  done
+  DUMP=
+}
+make_dump_file
+
+# ROW[key] = the values of MAPS for that key, - where a map has none
+# (bpfc -R joins the maps on their keys).
+declare -A ROW=()
+NO_ROW=$(printf -- '- %.0s' "${MAPS[@]}")
+load_maps() {
+  local l
+  local -a L
+  local list; list=$(IFS=,; echo "${MAPS[*]}")
+  if [[ -n $DUMP ]]; then
+    "$BPFC_BIN" -m "$MAP_DIR" -R "$list" > "$DUMP" 2>/dev/null || :
+    mapfile -t L < "$DUMP"
+  else
+    mapfile -t L < <("$BPFC_BIN" -m "$MAP_DIR" -R "$list" 2>/dev/null || :)
+  fi
+  ROW=()
+  # "# key FM_FIRST ...", then "0x<key> <value|-> ..."
+  for l in "${L[@]}"; do [[ $l == 0x* ]] && ROW[${l%% *}]=${l#* }; done
+}
+mono_ns() {
+  local line up
+  if [[ -r /proc/timer_list ]]; then
+    while read -r line; do
+      if [[ $line =~ ^now\ at\ ([0-9]+)\ nsecs ]]; then NOW_NS=${BASH_REMATCH[1]}; return 0; fi
+    done < /proc/timer_list
+  fi
+  read -r up _ < /proc/uptime
+  NOW_NS=$(( 10#${up%.*} * 1000000000 + 10#${up#*.} * 10000000 ))
+}
+declare -A IFNAME=()
+load_ifnames() {
+  local d idx
+  IFNAME=()
+  for d in /sys/class/net/*/; do
+    read -r idx < "${d}ifindex" 2>/dev/null || continue
+    d=${d%/}; IFNAME[$idx]=${d##*/}
+  done
+}
+
+# Previous sample: PREV[key] = "time bytesI bytesE pktsI pktsE", then for the
+# directions fwd, rev and the hooks I, E: TDATA RTXP RTXB LOSSP LOSSB.
+declare -A PREV=(); PREV_LOADED=0
+STATE_MAGIC='# bpfc-flows state 2'
+load_state() {
+  local line k rest
+  PREV=()
+  [[ -r $STATE_FILE ]] || return 0
+  { read -r line && [[ $line == "$STATE_MAGIC" ]] || return 0
+    while read -r k rest; do [[ -z $k ]] || PREV[$k]=$rest; done
+  } < "$STATE_FILE"
+}
+save_state() {
+  local tmp="$STATE_FILE.$$"
+  [[ -d ${STATE_FILE%/*} ]] || mkdir -p "${STATE_FILE%/*}" 2>/dev/null || return 0
+  { printf '%s\n' "$STATE_MAGIC"; (( ${#STATE_LINES[@]} == 0 )) || printf '%s\n' "${STATE_LINES[@]}"; } > "$tmp" 2>/dev/null &&
+    mv -f "$tmp" "$STATE_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
+}
+
+# One pass over the flows: ROWS[n] is the row formatted for FORMAT, SK[n] its
+# sort key. Bash runs each command slowly, so the per-flow work is kept to a few
+# large arithmetic commands; missing map entries read as 0 there.
+#
+# cv / pv / dv (current, previous, delta): 0 bytes in, 1 bytes out, 2 packets in,
+# 3 packets out, then fwd ingress 4-8, fwd egress 9-13, rev ingress 14-18 and rev
+# egress 19-23, each TDATA RTXP RTXB LOSSP LOSSB.
+DELTA_EXPR=
+for (( i = 0; i < 24; i++ )); do DELTA_EXPR+="dv[$i] = cv[$i] - pv[$((i + 1))], dv[$i] < 0 && (dv[$i] = 0), "; done
+DELTA_EXPR+='1'
+case $FORMAT in json) NA=null QS='"';; csv) NA='' QS='';; *) NA=- QS='';; esac
+NA_TAIL=(); for (( i = NBASE; i < ${#FNAMES[@]}; i++ )); do NA_TAIL+=("$NA"); done
+
+build_rows() {
+  local k rk r last age now=$NOW_NS elapsed us i v n x iin ein
+  local src dst src_num dst_num pnum proto tos dscp dname ictype sport dport first
+  local bi bo bt pi po pt bps_in bps_out bps_total pps_in pps_out sample
+  local iif iifn iinn eif eifn einn ismac idmac ietype ivlan esmac edmac eetype evlan vlan
+  local rtx_all loss_all rtx100 loss100 fb rb fhook rhook
+  local fD fRp fRb fLp fLb rD rRp rRb rLp rLb fR fL rR rL fRn fLn rRn rLn fden rden
+  local -a cv pv dv RV T P F G
+  NROWS=0; STATE_LINES=(); ROWS=(); SK=()
+  set +u
+  for k in "${!ROW[@]}"; do
+    F=(${ROW[$k]})
+    [[ ${F[1]} != - ]] || continue               # a reverse-direction key (TCP counters only)
+    F=("${F[@]/#-/0}")
+    (( last = F[1] )) || continue
+    (( age = now - last, age < 0 && (age = 0),
+       v = F[3], pnum = v & 255, tos = (v >> 8) & 255, ictype = (v >> 16) & 255,
+       sport = (v >> 24) & 0xffff, dport = (v >> 40) & 0xffff,
+       bi = F[4], bo = F[14], pi = F[5], po = F[15], 1 ))
+    cv=("$bi" "$bo" "$pi" "$po" "${ZEROS20[@]}")
+    if (( pnum == 6 )); then
+      printf -v rk '0x%016x' $(( k ^ (1 << 63) ))
+      G=(${ROW[$rk]:-$NO_ROW}); G=("${G[@]/#-/0}")
+      (( cv[4] = F[9], cv[5] = F[10], cv[6] = F[11],
+         cv[7] = F[12], cv[8] = F[13],
+         cv[9] = F[19], cv[10] = F[20], cv[11] = F[21],
+         cv[12] = F[22], cv[13] = F[23],
+         cv[14] = G[9], cv[15] = G[10], cv[16] = G[11],
+         cv[17] = G[12], cv[18] = G[13],
+         cv[19] = G[19], cv[20] = G[20], cv[21] = G[21],
+         cv[22] = G[22], cv[23] = G[23], 1 ))
+    fi
+    STATE_LINES+=("$k $now ${cv[*]}")
+    (( ACTIVE == 0 || age <= ACTIVE * 1000000000 )) || continue
+
+    # Deltas against this flow's previous sample (pv[0] is its time).
+    pv=(${PREV[$k]})
+    if (( ${#pv[@]} == 25 && pv[0] < now )); then elapsed=$(( now - pv[0] )); else elapsed=0; pv=(0 "${cv[@]}"); fi
+    (( $DELTA_EXPR ))
+
+    (( v = F[2], src_num = (v >> 32) & 0xffffffff, dst_num = v & 0xffffffff,
+       dscp = tos >> 2, first = F[0], bt = bi + bo, pt = pi + po,
+       v = F[6], iif = (v >> 32) & 0xffffffff, iin = v & 0xffffffff,
+       v = F[16], eif = (v >> 32) & 0xffffffff, ein = v & 0xffffffff,
+       ismac = F[7], ietype = (ismac >> 48) & 0xffff, ismac &= 0xffffffffffff,
+       idmac = F[8], ivlan = (idmac >> 48) & 0xfff, idmac &= 0xffffffffffff,
+       esmac = F[17], eetype = (esmac >> 48) & 0xffff, esmac &= 0xffffffffffff,
+       edmac = F[18], evlan = (edmac >> 48) & 0xfff, edmac &= 0xffffffffffff,
+       vlan = ivlan ? ivlan : evlan, us = elapsed / 1000, us < 1 && (us = 1),
+       bps_in = dv[0] < 1000000000000 ? dv[0] * 8000000 / us : dv[0] / us * 8000000,
+       bps_out = dv[1] < 1000000000000 ? dv[1] * 8000000 / us : dv[1] / us * 8000000,
+       bps_total = bps_in + bps_out, 1 ))
+    printf -v src '%d.%d.%d.%d' $(( src_num >> 24 )) $(( (src_num >> 16) & 255 )) $(( (src_num >> 8) & 255 )) $(( src_num & 255 ))
+    printf -v dst '%d.%d.%d.%d' $(( dst_num >> 24 )) $(( (dst_num >> 16) & 255 )) $(( (dst_num >> 8) & 255 )) $(( dst_num & 255 ))
+    case $pnum in 1) proto=ICMP;; 6) proto=TCP;; 17) proto=UDP;; *) proto=$pnum;; esac
+    dname=${DSCP_NAME[$dscp]:-$dscp}
+    iifn=${IFNAME[$iif]:-if$iif}; iinn=${IFNAME[$iin]:-if$iin}
+    eifn=${IFNAME[$eif]:-if$eif}; einn=${IFNAME[$ein]:-if$ein}
+    if (( elapsed )); then
+      printf -v x '%d.%02d %d.%02d %d.%03d' $(( dv[2] * 100000000 / us / 100 )) $(( dv[2] * 100000000 / us % 100 )) \
+        $(( dv[3] * 100000000 / us / 100 )) $(( dv[3] * 100000000 / us % 100 )) $(( elapsed / 1000000000 )) $(( elapsed / 1000000 % 1000 ))
+      P=($x); pps_in=${P[0]}; pps_out=${P[1]}; sample=${P[2]}
+    else
+      bps_in=0; bps_out=0; bps_total=0; pps_in=0.00; pps_out=0.00; sample=
+    fi
+    for x in ismac idmac esmac edmac; do
+      v=${!x}
+      if (( v )); then printf -v "$x" '%02x:%02x:%02x:%02x:%02x:%02x' $((v & 255)) $(((v >> 8) & 255)) \
+        $(((v >> 16) & 255)) $(((v >> 24) & 255)) $(((v >> 32) & 255)) $(((v >> 40) & 255))
+      else printf -v "$x" ''; fi
+    done
+    (( iif )) || iifn=; (( iin )) || iinn=; (( eif )) || eifn=; (( ein )) || einn=
+
+    # TCP, per direction, from the hook that saw more of its payload. P holds
+    # percentages in hundredths (-1: none), formatted below.
+    rtx_all=-1; loss_all=-1; rtx100=-1; loss100=-1; T=()
+    if (( pnum == 6 )); then
+      (( fb = cv[9] > cv[4] ? 9 : 4, rb = cv[19] > cv[14] ? 19 : 14,
+         fD = cv[fb], fRp = cv[fb + 1], fRb = cv[fb + 2], fLp = cv[fb + 3], fLb = cv[fb + 4],
+         rD = cv[rb], rRp = cv[rb + 1], rRb = cv[rb + 2], rLp = cv[rb + 3], rLb = cv[rb + 4],
+         fLp < 0 && (fLp = 0), fLb < 0 && (fLb = 0), rLp < 0 && (rLp = 0), rLb < 0 && (rLb = 0),
+         rtx_all = fRp + rRp, loss_all = fLp + rLp,
+         fR = fD > 0 ? fRb * 10000 / fD : -1, rR = rD > 0 ? rRb * 10000 / rD : -1,
+         fden = fD - fRb + fLb, rden = rD - rRb + rLb,
+         fL = fden > 0 ? fLb * 10000 / fden : -1, rL = rden > 0 ? rLb * 10000 / rden : -1,
+         fden = dv[fb] - dv[fb + 2] + dv[fb + 4], rden = dv[rb] - dv[rb + 2] + dv[rb + 4],
+         fRn = elapsed && dv[fb] > 0 ? dv[fb + 2] * 10000 / dv[fb] : -1,
+         rRn = elapsed && dv[rb] > 0 ? dv[rb + 2] * 10000 / dv[rb] : -1,
+         fLn = elapsed && fden > 0 ? dv[fb + 4] * 10000 / fden : -1,
+         rLn = elapsed && rden > 0 ? dv[rb + 4] * 10000 / rden : -1,
+         rtx100 = fRn > rRn ? fRn : rRn, loss100 = fLn > rLn ? fLn : rLn, 1 ))
+      printf -v x '%d.%02d ' $((fR / 100)) $((fR % 100)) $((fL / 100)) $((fL % 100)) \
+        $((rR / 100)) $((rR % 100)) $((rL / 100)) $((rL % 100)) $((fRn / 100)) $((fRn % 100)) \
+        $((fLn / 100)) $((fLn % 100)) $((rRn / 100)) $((rRn % 100)) $((rLn / 100)) $((rLn % 100)) \
+        $((rtx100 / 100)) $((rtx100 % 100)) $((loss100 / 100)) $((loss100 % 100))
+      P=($x); P=("${P[@]/#0.-1/$NA}")
+      (( fb == 9 )) && fhook=${QS}out$QS || fhook=${QS}in$QS
+      (( rb == 19 )) && rhook=${QS}out$QS || rhook=${QS}in$QS
+      (( fD )) || fhook=$NA; (( rD )) || rhook=$NA
+      T=("$rtx_all" "$loss_all" "${P[8]}" "${P[9]}"
+         "$fhook" "$fD" "$fRp" "$fRb" "${P[0]}" "$fLp" "$fLb" "${P[1]}")
+      if (( elapsed )); then T+=("${dv[fb + 1]}" "${P[4]}" "${dv[fb + 3]}" "${dv[fb + 4]}" "${P[5]}")
+      else T+=("$NA" "$NA" "$NA" "$NA" "$NA"); fi
+      T+=("$rhook" "$rD" "$rRp" "$rRb" "${P[2]}" "$rLp" "$rLb" "${P[3]}")
+      if (( elapsed )); then T+=("${dv[rb + 1]}" "${P[6]}" "${dv[rb + 3]}" "${dv[rb + 4]}" "${P[7]}")
+      else T+=("$NA" "$NA" "$NA" "$NA" "$NA"); fi
+    fi
+
+    if (( ${#FILT_F[@]} )); then row_matches || continue; fi
+
+    v=${!SORT_KEY}; [[ -n $v || $SORT_TYPE == s ]] || v=-1
+    SK[NROWS]=$v
+    printf -v n '%d.%03d' $(( age / 1000000000 )) $(( age / 1000000 % 1000 ))
+    case $FORMAT in
+      json|csv)
+        if [[ $FORMAT == json ]]; then
+          for x in iifn iinn eifn einn; do
+            v=${!x}
+            if [[ -z $v ]]; then printf -v "$x" null
+            elif [[ $v == *[\"\\]* ]]; then json_str "$v"; printf -v "$x" '%s' "$REPLY"
+            else printf -v "$x" '"%s"' "$v"; fi
+          done
+          for x in ismac idmac esmac edmac; do
+            if [[ -n ${!x} ]]; then printf -v "$x" '"%s"' "${!x}"; else printf -v "$x" null; fi
+          done
+          [[ -n $sample ]] || sample=null
+        else
+          for x in iifn iinn eifn einn; do [[ ${!x} != *[,\"]* ]] || { csv_str "${!x}"; printf -v "$x" '%s' "$REPLY"; }; done
+        fi
+        RV=("$QS$k$QS" "$QS$src$QS" "$QS$dst$QS" "$QS$proto$QS" "$pnum" "$tos" "$dscp" "$QS$dname$QS"
+            "$sport" "$dport" "$ictype" "$first" "$last" "$n"
+            "$bi" "$bo" "$bt" "$pi" "$po" "$pt" "$bps_in" "$bps_out" "$bps_total" "$pps_in" "$pps_out" "$sample"
+            "$iifn" "$iif" "$iinn" "$eifn" "$eif" "$einn"
+            "$ismac" "$idmac" "$ietype" "$ivlan" "$esmac" "$edmac" "$eetype" "$evlan")
+        if (( pnum == 6 )); then RV+=("${T[@]}"); else RV+=("${NA_TAIL[@]}"); fi
+        if [[ $FORMAT == json ]]; then printf -v r "$JFMT" "${RV[@]}"
+        else IFS=,; r="${RV[*]}"; IFS=$' \t\n'; fi;;
+      *)
+        table_row; r=$REPLY;;
+    esac
+    ROWS[NROWS]=$r
+    NROWS=$(( NROWS + 1 ))
+  done
+  set -u
+}
+
+# Table cells of the current build_rows row, joined with \x1f, in REPLY.
+table_row() {
+  local -a c
+  local x y iv ev
+  c=("$src" "$dst" "$proto")
+  case $proto in
+    TCP|UDP) c+=("$sport" "$dport");;
+    ICMP) c+=(- "$ictype");;
+    *) c+=(- -);;
+  esac
+  c+=("$dname")
+  (( ietype )) && iv=$ivlan || iv=-
+  (( eetype )) && ev=$evlan || ev=-
+  [[ $iv == "$ev" ]] && c+=("$iv") || c+=("$iv/$ev")
+  c+=("${iifn:--}" "${eifn:--}" "${n%??}s")
+  if (( SHOW_L2 )); then
+    for x in i e; do
+      iv=${x}etype; ev=${x}vlan
+      if (( ${!iv} )); then
+        printf -v y '0x%04x v%d' "${!iv}" "${!ev}"
+        iv=${x}smac; ev=${x}dmac
+        [[ -z ${!iv}${!ev} ]] || y="${!iv:--}->${!ev:--} $y"
+        c+=("$y")
+      else c+=(-); fi
+    done
+  fi
+  rate_str "$bps_in"; c+=("$REPLY"); rate_str "$bps_out"; c+=("$REPLY")
+  if (( pnum == 6 )); then
+    c+=("${T[2]}" "${T[3]}")
+    # T: 4 totals, then fwd and rev, 13 fields each
+    (( SHOW_TCP )) && c+=("${T[6]}/${T[19]}" "${T[8]}/${T[21]}" "${T[9]}/${T[22]}" "${T[11]}/${T[24]}")
+  else
+    c+=(- -)
+    (( SHOW_TCP )) && c+=(- - - -)
+  fi
+  track_widths
+  local IFS=$'\x1f'; REPLY="${c[*]}"
+}
+
+# ORDER: row indexes, sorted and limited.
+order_rows() {
+  local i k=1,1
+  ORDER=()
+  (( NROWS )) || return 0
+  [[ $SORT_TYPE == g ]] && k+=g
+  (( REVERSE )) || k+=r                  # key options override a global -r
+  mapfile -t ORDER < <(for (( i = 0; i < NROWS; i++ )); do printf '%s\t%d\n' "${SK[i]}" "$i"; done |
+    LC_ALL=C sort -s -t $'\t' -k "$k" | while IFS=$'\t' read -r _ i; do printf '%s\n' "$i"; done)
+  if (( LIMIT && ${#ORDER[@]} > LIMIT )); then ORDER=("${ORDER[@]:0:LIMIT}"); fi
+}
+
+out_json() {
+  local i sep=
+  if (( ${#ORDER[@]} == 0 )); then echo '[]'; return; fi
+  echo '['
+  for i in "${ORDER[@]}"; do printf '%s%s' "$sep" "${ROWS[i]}"; sep=$',\n'; done
+  printf '\n]\n'
+}
+out_csv() {
+  local i
+  (IFS=,; echo "${FNAMES[*]}")
+  for i in ${ORDER[@]+"${ORDER[@]}"}; do printf '%s\n' "${ROWS[i]}"; done
+}
+# Table columns; track_widths (made here) keeps TW, the widest cell of each.
+TABLE_HDR=(SRC DST P SPORT DPORT/TYPE DSCP VLAN INGRESS EGRESS AGE)
+(( SHOW_L2 )) && TABLE_HDR+=(IN-L2 OUT-L2)
+TABLE_HDR+=(IN-BPS OUT-BPS RTX% LOSS%)
+(( SHOW_TCP )) && TABLE_HDR+=(RTX:F/R RTX%:F/R LOSS:F/R LOSS%:F/R)
+x=
+for i in "${!TABLE_HDR[@]}"; do x+="\${#c[$i]} > TW[$i] && (TW[$i] = \${#c[$i]}), "; done
+eval "track_widths() { (( ${x}1 )); }"
+TW=(); for i in "${!TABLE_HDR[@]}"; do TW[i]=${#TABLE_HDR[i]}; done
+out_table() {
+  local -a row
+  local i j x fmt=
+  for j in "${!TW[@]}"; do
+    (( TW[j] <= 44 )) || TW[j]=44
+    if (( j < ${#TW[@]} - 1 )); then fmt+="%-${TW[j]}.${TW[j]}s  "; else fmt+="%.${TW[j]}s\n"; fi
+  done
+  printf "$fmt" "${TABLE_HDR[@]}"
+  row=(); for j in "${!TW[@]}"; do printf -v x '%*s' "${TW[j]}" ''; row+=("${x// /-}"); done
+  printf "$fmt" "${row[@]}"
+  set -f
+  for i in ${ORDER[@]+"${ORDER[@]}"}; do
+    IFS=$'\x1f'; row=(${ROWS[i]}); IFS=$' \t\n'
+    printf "$fmt" "${row[@]}"
+  done
+  set +f
+  if [[ -n $SAMPLE ]]; then x="${SAMPLE}s"; else x='none (first sample)'; fi
+  echo "Flows: ${#ORDER[@]}  active-window: ${ACTIVE}s  rate-sample: $x"
+}
 
 dump_once() {
-  local work; work=$(mktemp -d)
-  trap 'rm -rf "$work"' RETURN
-  local m
-  for m in "${MAPS[@]}"; do
-    "$BPFC_BIN" -m "$MAP_DIR" -r "$m" 2>/dev/null >"$work/$m" || :
-  done
-  BPFC_FLOWS_WORK="$work" BPFC_FLOWS_STATE="$STATE_FILE" BPFC_FLOWS_FORMAT="$FORMAT" \
-  BPFC_FLOWS_SORT="$SORT" BPFC_FLOWS_REVERSE="$REVERSE" BPFC_FLOWS_LIMIT="$LIMIT" \
-  BPFC_FLOWS_ACTIVE="$ACTIVE" BPFC_FLOWS_SHOW_L2="$SHOW_L2" BPFC_FLOWS_FILTERS="$(printf '%s\n' "${FILTERS[@]-}")" \
-  python3 - <<'PY'
-import csv, ipaddress, json, os, re, sys, time
-from pathlib import Path
-work=Path(os.environ['BPFC_FLOWS_WORK']); state_path=Path(os.environ['BPFC_FLOWS_STATE'])
-fmt=os.environ['BPFC_FLOWS_FORMAT']; sort=os.environ['BPFC_FLOWS_SORT']; reverse=os.environ['BPFC_FLOWS_REVERSE']=='1'
-limit=int(os.environ['BPFC_FLOWS_LIMIT']); active=int(os.environ['BPFC_FLOWS_ACTIVE'])
-show_l2=os.environ.get('BPFC_FLOWS_SHOW_L2','0')=='1'
-filters=[x for x in os.environ.get('BPFC_FLOWS_FILTERS','').splitlines() if x]
-pat=re.compile(r'Key:\s+0x([0-9a-fA-F]{16})\s+->\s+Value:\s+0x([0-9a-fA-F]{16})')
-def dump(n):
- d={}
- p=work/n
- if p.exists():
-  for line in p.read_text(errors='replace').splitlines():
-   m=pat.search(line)
-   if m: d[int(m.group(1),16)]=int(m.group(2),16)
- return d
-maps={p.name:dump(p.name) for p in work.iterdir()}
-def get(n,k): return maps.get(n,{}).get(k,0)
-def ipv4(v):
- try: return str(ipaddress.IPv4Address(v & 0xffffffff))
- except: return '0.0.0.0'
-def mac(v):
- return '—' if not v else ':'.join(f'{(v>>s)&255:02x}' for s in range(0,48,8))
-def iface(v):
- if not v: return '—'
- try:
-  return Path('/sys/class/net').joinpath(next(p.name for p in Path('/sys/class/net').iterdir() if p.is_dir() and int((p/'ifindex').read_text())==v)).name
- except Exception: return f'if{v}'
-def proto(v): return {1:'ICMP',6:'TCP',17:'UDP'}.get(v,str(v))
-def dscp_name(v):
- names={0:'0',1:'LE',8:'CS1',10:'AF11',12:'AF12',14:'AF13',16:'CS2',18:'AF21',20:'AF22',22:'AF23',24:'CS3',26:'AF31',28:'AF32',30:'AF33',32:'CS4',34:'AF41',36:'AF42',38:'AF43',40:'CS5',46:'EF',48:'CS6',56:'CS7'}
- return names.get(v,str(v))
-def vlan_display(r):
- iv=str(r['ingress_vlan']) if r['ingress_ethertype'] else '—'
- ev=str(r['egress_vlan']) if r['egress_ethertype'] else '—'
- return iv if iv==ev else f'{iv}/{ev}'
-try: old=json.loads(state_path.read_text())
-except Exception: old={}
-now=time.monotonic_ns(); wall=time.time(); rows=[]
-keys=set().union(*[set(v) for v in maps.values()]) if maps else set()
-for k in keys:
- last=get('FM_LAST',k)
- if not last: continue
- age=max(0,(now-last)/1e9)
- if active and age>active: continue
- ib,ob=get('FM_I_BYTES',k),get('FM_E_BYTES',k)
- meta=get('FM_META',k); iloc=get('FM_I_LOC',k); eloc=get('FM_E_LOC',k); il2=get('FM_I_L2',k); el2=get('FM_E_L2',k)
- prev=old.get(str(k),{}); elapsed=max((now-prev.get('t',now))/1e9,1e-9)
- bi=max(0,(ib-prev.get('ib',ib))*8/elapsed); bo=max(0,(ob-prev.get('ob',ob))*8/elapsed)
- pnum=meta & 0xff; tos=(meta>>8)&0xff; ict=(meta>>16)&0xff; sport=(meta>>24)&0xffff; dport=(meta>>40)&0xffff
- iif=(iloc>>32)&0xffffffff; iin=iloc&0xffffffff; eif=(eloc>>32)&0xffffffff; ein=eloc&0xffffffff
- r={'flow_key':f'0x{k:016x}','src':ipv4(get('FM_SRCIP',k)),'dst':ipv4(get('FM_DSTIP',k)),
-    'protocol':proto(pnum),'protocol_number':pnum,'tos':tos,'dscp':tos>>2,'dscp_name':dscp_name(tos>>2),
-    'sport':sport,'dport':dport,'icmp_type':ict,
-    'first_seen_ns':get('FM_FIRST',k),'last_seen_ns':last,'age_seconds':round(age,3),
-    'bytes_in':ib,'bytes_out':ob,'bytes_total':ib+ob,
-    'bps_in':bi,'bps_out':bo,'bps_total':bi+bo,
-    'ingress_interface':iface(iif),'ingress_ifindex':iif,'ingress_skb_ingress':iface(iin),
-    'egress_interface':iface(eif),'egress_ifindex':eif,'egress_skb_ingress':iface(ein),
-    'ingress_src_mac':mac(get('FM_I_SMAC',k)),'ingress_dst_mac':mac(get('FM_I_DMAC',k)),
-    'ingress_ethertype':(il2>>32)&0xffff,'ingress_vlan':il2&0xfff,
-    'egress_src_mac':mac(get('FM_E_SMAC',k)),'egress_dst_mac':mac(get('FM_E_DMAC',k)),
-    'egress_ethertype':(el2>>32)&0xffff,'egress_vlan':el2&0xfff}
- rows.append(r)
-def match(r,f):
- if '=' not in f: raise SystemExit(f'Invalid filter (use FIELD=VALUE): {f}')
- a,b=f.split('=',1); a=a.lower(); b=b.lower()
- if a in ('src','dst'):
-  value=r[a]
-  if '/' in b:
-   try: return ipaddress.ip_address(value) in ipaddress.ip_network(b, strict=False)
-   except ValueError: raise SystemExit(f'Invalid IPv4 CIDR filter: {f}')
-  return b in value.lower()
- if a in ('proto','ingress','egress','mac'):
-  vals={'proto':r['protocol'],'ingress':r['ingress_interface'],'egress':r['egress_interface'],
-        'mac':r['ingress_src_mac']+' '+r['ingress_dst_mac']+' '+r['egress_src_mac']+' '+r['egress_dst_mac']}[a]
-  return b in vals.lower()
- nums={'dscp':r['dscp'],'sport':r['sport'],'dport':r['dport'],'icmp':r['icmp_type'],'vlan':r['ingress_vlan'] or r['egress_vlan'],
-       'ethertype':r['ingress_ethertype'] or r['egress_ethertype'],'min-bps-in':r['bps_in'],'min-bps-out':r['bps_out'],'min-bps-total':r['bps_total']}
- if a in nums:
-  try: return nums[a] >= float(b) if a.startswith('min-') else nums[a] == int(b,0)
-  except ValueError: raise SystemExit(f'Invalid numeric filter value: {f}')
- raise SystemExit(f'Unknown filter field: {a}')
-for f in filters: rows=[r for r in rows if match(r,f)]
-keysort={'bps-in':'bps_in','bps-out':'bps_out','bps-total':'bps_total','bytes-in':'bytes_in','bytes-out':'bytes_out','bytes-total':'bytes_total','last-seen':'last_seen_ns','src':'src','dst':'dst','proto':'protocol','sport':'sport','dport':'dport','vlan':'ingress_vlan','dscp':'dscp','ingress':'ingress_interface','egress':'egress_interface'}.get(sort)
-if not keysort: raise SystemExit(f'Unknown sort field: {sort}')
-rows.sort(key=lambda r:r[keysort],reverse=not reverse)
-if limit: rows=rows[:limit]
-new={str(int(r['flow_key'],16)):{'t':now,'ib':r['bytes_in'],'ob':r['bytes_out']} for r in rows}
-state_path.parent.mkdir(parents=True,exist_ok=True); state_path.write_text(json.dumps(new))
-def rate(n):
- for u,x in [('Gb/s',1e9),('Mb/s',1e6),('Kb/s',1e3)]:
-  if n>=x:return f'{n/x:.2f}{u}'
- return f'{n:.0f}b/s'
-if fmt=='json': print(json.dumps(rows,indent=2)); sys.exit()
-if fmt=='csv':
- if rows:
-  w=csv.DictWriter(sys.stdout,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
- sys.exit()
-headers=['SRC','DST','P','SPORT','DPORT/TYPE','DSCP','VLAN','INGRESS','EGRESS','AGE']
-if show_l2: headers += ['IN-L2','OUT-L2']
-headers += ['IN-BPS','OUT-BPS']
-body=[]
-for r in rows:
- port=str(r['icmp_type']) if r['protocol']=='ICMP' else str(r['dport']) if r['protocol'] in ('TCP','UDP') else '—'
- il2=f"{r['ingress_src_mac']}→{r['ingress_dst_mac']} 0x{r['ingress_ethertype']:04x} v{r['ingress_vlan']}" if r['ingress_ethertype'] else '—'
- ol2=f"{r['egress_src_mac']}→{r['egress_dst_mac']} 0x{r['egress_ethertype']:04x} v{r['egress_vlan']}" if r['egress_ethertype'] else '—'
- row=[r['src'],r['dst'],r['protocol'],str(r['sport']) if r['protocol'] in ('TCP','UDP') else '—',port,r['dscp_name'],vlan_display(r),r['ingress_interface'],r['egress_interface'],f"{r['age_seconds']:.1f}s"]
- if show_l2: row += [il2,ol2]
- row += [rate(r['bps_in']),rate(r['bps_out'])]
- body.append(row)
-width=[len(h) for h in headers]
-for row in body:
- for i,x in enumerate(row): width[i]=min(max(width[i],len(x)),44)
-def fmtrow(row): return '  '.join((x[:width[i]-1]+'…' if len(x)>width[i] else x).ljust(width[i]) for i,x in enumerate(row))
-print(fmtrow(headers)); print(fmtrow(['-'*w for w in width]))
-for row in body: print(fmtrow(row))
-print(f'Flows: {len(rows)}  active-window: {active}s  rate-sample: current snapshot')
-PY
+  local t=0 k line
+  load_maps; load_ifnames; mono_ns
+  (( PREV_LOADED )) || { load_state; PREV_LOADED=1; }
+  for k in "${!PREV[@]}"; do t=${PREV[$k]%% *}; break; done
+  SAMPLE=
+  if (( t && t < NOW_NS )); then
+    printf -v SAMPLE '%d.%01d' $(( (NOW_NS - t) / 1000000000 )) $(( (NOW_NS - t) / 100000000 % 10 ))
+  fi
+  build_rows
+  order_rows
+  PREV=()
+  for line in ${STATE_LINES[@]+"${STATE_LINES[@]}"}; do PREV[${line%% *}]=${line#* }; done
+  save_state
+  case $FORMAT in
+    json) out_json;;
+    csv) out_csv;;
+    *) out_table;;
+  esac
 }
-if (( WATCH )); then
-  while :; do clear; dump_once; sleep "$WATCH"; done
+
+if [[ ! $WATCH =~ ^0*([.]0*)?$ ]]; then
+  exec {SLEEP_FD}<> <(:) 2>/dev/null || SLEEP_FD=
+  while :; do
+    printf '\033[H\033[2J'
+    dump_once                            # keeps the previous sample in memory
+    if [[ -n $SLEEP_FD ]]; then read -rt "$WATCH" -u "$SLEEP_FD" _ || :; else sleep "$WATCH"; fi
+  done
 else
   dump_once
 fi
-

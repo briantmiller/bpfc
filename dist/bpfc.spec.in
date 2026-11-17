@@ -163,6 +163,29 @@ fi
   records it in its state (also for programs that fail) and logs it;
   bpfcctl status shows it in a NAME column, bpfcctl show and the REST API
   JSON ("name") include it
+- bpfc: hash-map <map> <entries> declares the default LRU hash map with
+  another size than 10000 (a pinned map of another size is replaced)
+- bpfc -R <map>[,<map>...]: pinned maps of 64-bit keys joined on their keys,
+  one line per key with each map's value or -, for scripts
+- flowmon: TCP retransmissions and loss per flow and direction. Payload
+  already seen is a retransmission; a hole in the sequence space is loss
+  upstream of the host, taken back when it fills within FM_REORDER_MS
+  (default 10 ms, reordering). Packet counters per hook. One program for
+  both hooks (egress/10.bpfc includes ingress/10.bpfc). Maps: FM_SRCIP and
+  FM_DSTIP become FM_ADDR, FM_I_<x>/FM_E_<x> become FM_<x>_I/FM_<x>_E, the
+  EtherType and VLAN move into FM_SMAC/FM_DMAC; 16 maps per program, sized
+  by FM_FLOWS (default 10000 flows; the TCP maps hold twice as many)
+- bpfc-flows: pure bash, no Python; reads the maps with one bpfc -R. New
+  columns RTX% and LOSS% (since the previous sample), -t/--tcp for
+  all-time retransmission and loss per direction, tcp_* and
+  packets_*/pps_* fields in --json and --csv, sorts packets-*, retrans,
+  retrans-pct, loss, loss-pct and filters min-retrans, min-loss,
+  min-retrans-pct, min-loss-pct; dscp filters take names; a full address
+  in src=/dst= matches exactly (was a substring); src and dst sort by
+  address. JSON has null for a missing MAC or interface (was "—"); CSV
+  always has its header. The state file is bpfc-flows.prev (not JSON) and
+  keeps every flow, so filtering no longer resets rates; -w keeps it in
+  memory
 
 * Wed Nov 11 2026 bpfc maintainers <brun064@gmail.com> - 0.1.1-6
 - REST API: with rest_socket set in bpfc.conf (off by default), bpfcd serves

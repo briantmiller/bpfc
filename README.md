@@ -39,6 +39,7 @@ sudo ./bpfc -i <interface> -d xdp -D
 | `-n <name>` | Name the TC filter and the kernel program (shown by `tc filter show` and `bpftool prog`). |
 | `-I` | Print a `BPFC_INFO id=... tag=...` line after attaching, and first a `BPFC_NAME <text>` line for a program with a `name`. |
 | `-r <map>` | Dump the contents of a pinned map. |
+| `-R <map>[,<map>...]` | Print pinned maps joined on their keys: `# key <map>...`, then per key the key and each map's value (`-` where it has none). For scripts. |
 | `-w <map> <key> <value>` | Write a 64-bit value into a pinned map (e.g. runtime settings). |
 | `-v` | Verbose mode. Prints a trace of jump offset calculations and block resolutions. |
 | `-E` | Print the program after `include`, `const`, `define`, `repeat` and `when` are expanded, then exit. |
@@ -247,6 +248,7 @@ Allows persistent data storage across packets and network interfaces.
 * `buffer-map <MAP_NAME> [size]` / `shared-buffer-map <MAP_NAME> [entries [size]]` - Declare a buffer map with smaller values (default 18000 bytes, 10000 shared entries) before using it. A copy at a constant offset may fill the rest of the entry; with a variable offset, offset and length are each capped at size/2. A pinned map of other sizes is replaced.
 * Map names are pinned as `<map_dir>/<MAP_NAME>`: 1-31 characters, no `/`. The kernel keeps the last 15 characters of `[A-Za-z0-9_.]` as the map's own name (other characters become `_`), so names of 15 such characters or fewer show unchanged in `bpftool`.
 * `array-map <MAP_NAME> <entries>` - Declare an array of 64-bit values (keys 0..entries-1) instead of the default 10000-entry LRU hash map: never evicts, all entries start at 0. Works with `get map`, `set map`, `calc-map`, `-r` and `-w`. A pinned map of another size is replaced.
+* `hash-map <MAP_NAME> <entries>` - Declare the default LRU hash map with `entries` (1-16777216) instead of 10000. Comes before the map's first use; a pinned map of another size is replaced. Programs that use the map without declaring it take it as pinned.
 * `tcp-option <kind | %VAR> <OFF_VAR> [LEN_VAR]` - Walks the TCP options (IPv4, any IHL) and sets `OFF_VAR` to the frame offset of the first option of that kind and `LEN_VAR` to its length byte; both 0 if there is none. Read or change the option with `get bytes` / `set bytes` / `fill-bytes` at `%OFF_VAR`.
 * `fill-bytes <offset | %VAR> <len | %VAR> <byte | %VAR>` - Overwrite 1-64 packet bytes with one value (e.g. 1 to turn TCP options into NOPs). Nothing is written when the length is 0 or over 64, or the range is outside the packet. Checksums are not updated: on egress, locally sent TCP/UDP still has its checksum completed after the program (over the bytes as rewritten), so leave it; for forwarded or received packets follow with `recalc-tcp-csum`.
 * `calc-map <add|or|and|xor|xchg> <MAP_NAME> <key | %VAR> <val | %VAR> [OLD_VAR]` - Atomic update of a 64-bit map value (created as 0); `OLD_VAR` receives the previous value. Safe when several CPUs update the same key, unlike `get map` + `set map`.
