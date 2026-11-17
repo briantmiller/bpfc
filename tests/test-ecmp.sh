@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-to-end tests of the bandwidth-aware ECMP layer (ecmp/). Needs root.
+# End-to-end tests of the bandwidth-aware ECMP layer (programs/ecmp/). Needs root.
 #
 #   H --eth0-- R --eth1-- N (10.1.0.2)   member
 #              +--eth2-- N (10.2.0.2)   member
@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.." || exit 1
 require_root ecmp
 require_cmds ecmp ip python3 tc gawk
 
-BPFC=$PWD/bpfc; GEN=$PWD/ecmp/bpfc-ecmp-gen; STATUS=$PWD/ecmp/bpfc-ecmp-status
+BPFC=$PWD/bpfc; GEN=$PWD/programs/ecmp/bpfc-ecmp-gen; STATUS=$PWD/programs/ecmp/bpfc-ecmp-status
 [ -x "$BPFC" ] || { test_fail "bpfc is built"; tests_exit; }
 T=$(mktemp -d /tmp/bpfc-ecmp.XXXXXX)
 R="ip netns exec ecR"; H="ip netns exec ecH"
@@ -48,7 +48,7 @@ grep -q 'role=selector' "$T/g0/a/ingress/400.bpfc"; check "generator: a member c
 "$GEN" -o "$T/g1" -M a=1g -M b=2g -I c,a --mode l3 >/dev/null 2>&1; diff -r "$T/g0" "$T/g1" >/dev/null
 check "generator: output is reproducible" test $? -eq 0
 "$GEN" --list-profiles | grep -q wan; check "generator: lists profiles" test $? -eq 0
-"$GEN" --profile-dir "$PWD/ecmp/profiles" --show-profile wan | grep -q 'shed.*profile wan'; check "generator: shows a profile" test $? -eq 0
+"$GEN" --profile-dir "$PWD/programs/ecmp/profiles" --show-profile wan | grep -q 'shed.*profile wan'; check "generator: shows a profile" test $? -eq 0
 
 # ---------------------------------------------------------------- topology
 ip netns del ecR 2>/dev/null; ip netns del ecH 2>/dev/null

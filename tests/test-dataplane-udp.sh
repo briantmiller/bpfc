@@ -18,8 +18,8 @@
 cd "$(dirname "$0")/.." || exit 1
 source tests/lib.sh
 BPFC=$PWD/bpfc
-GEN=$PWD/dataplane/bpfc-dataplane-gen
-STATUS="env BPFC=$PWD/bpfc $PWD/dataplane/bpfc-dataplane-status"
+GEN=$PWD/programs/dataplane/bpfc-dataplane-gen
+STATUS="env BPFC=$PWD/bpfc $PWD/programs/dataplane/bpfc-dataplane-status"
 KEEP=0; [ "$1" = "-k" ] && KEEP=1
 require_root "dataplane-udp"
 for t in ip ethtool ping nc nft cmp python3; do command -v $t >/dev/null || { test_skip "dataplane-udp (missing $t)"; exit 0; }; done

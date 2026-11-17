@@ -126,9 +126,9 @@ See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)`. Build an RPM (RHEL 9/10) with `
 
 ## Dataplane: FEC, ARQ, in-band telemetry and bandwidth probing
 
-`dataplane/bpfc-dataplane-gen` generates bpfc programs for a point-to-point link (both ends run them): every IPv4 packet gets an 8-byte shim with a sequence number and timestamp, after the Ethernet header (EtherType 0x88B5) on a Layer-2 link, or inside UDP (`--carrier udp`: an outer IPv4/UDP header to the peer, for routed paths, the internet and NAT; `--carrier udp-inline`: UDP after the packet's own IP header, for a private routed WAN) for the remote prefixes given with `--protect`. The receiver measures loss, reordering, duplicates, jitter and queueing delay (no clock synchronisation needed) and reports back once a second. When loss crosses a threshold the sender adds XOR parity (forward error correction), scaled to the loss, and turns it off again after a cool-down; lost packets are also retransmitted from a short buffer (ARQ), and packet-pair probes estimate the link capacity (probe trains and a median on links that deliver in frames, such as Starlink: `--probe-train 20ms --capacity-percentile 50`, set in the `leo` profile). Each interface has its own maps.
+`programs/dataplane/bpfc-dataplane-gen` generates bpfc programs for a point-to-point link (both ends run them): every IPv4 packet gets an 8-byte shim with a sequence number and timestamp, after the Ethernet header (EtherType 0x88B5) on a Layer-2 link, or inside UDP (`--carrier udp`: an outer IPv4/UDP header to the peer, for routed paths, the internet and NAT; `--carrier udp-inline`: UDP after the packet's own IP header, for a private routed WAN) for the remote prefixes given with `--protect`. The receiver measures loss, reordering, duplicates, jitter and queueing delay (no clock synchronisation needed) and reports back once a second. When loss crosses a threshold the sender adds XOR parity (forward error correction), scaled to the loss, and turns it off again after a cool-down; lost packets are also retransmitted from a short buffer (ARQ), and packet-pair probes estimate the link capacity (probe trains and a median on links that deliver in frames, such as Starlink: `--probe-train 20ms --capacity-percentile 50`, set in the `leo` profile). Each interface has its own maps.
 
-Both come in the optional `bpfc-scripts` package (`dnf install bpfc-scripts`; `make install` installs it too, or `make install-scripts` alone): `bpfc-dataplane-gen` and `bpfc-dataplane-status` in `/usr/sbin`, the built-in profiles in `/usr/share/bpfc/dataplane/profiles/`, and DESIGN.md with example programs in `/usr/share/doc/bpfc-scripts/dataplane/`. Both tools are bash scripts; from a source tree they also run in place (`dataplane/bpfc-dataplane-gen` finds `dataplane/profiles/` next to it).
+Both come in the optional `bpfc-programs` package (`dnf install bpfc-programs`; `make install` installs it too, or `make install-programs` alone): `bpfc-dataplane-gen` and `bpfc-dataplane-status` in `/usr/sbin`, the built-in profiles in `/usr/share/bpfc/dataplane/profiles/`, and DESIGN.md with example programs in `/usr/share/doc/bpfc-programs/dataplane/`. Both tools are bash scripts; from a source tree they also run in place (`programs/dataplane/bpfc-dataplane-gen` finds `programs/dataplane/profiles/` next to it).
 
 Profiles set the defaults for a kind of link (`direct`, `wan`, `geo`, `leo` built in; your own in `/etc/bpfc/dataplane/profiles.d/`), and `--link-rate` / `--rtt` size the retransmit ring and windows.
 
@@ -147,7 +147,7 @@ bpfc-dataplane-gen -i wan0 --profile leo --carrier udp --peer 203.0.113.10 --pro
 bpfc-dataplane-gen -i eth0 --profile leo --carrier udp --peer learn --protect 10.2.0.0/16          # public side
 ```
 
-See [dataplane/DESIGN.md](dataplane/DESIGN.md) for the wire format, the algorithms and the limits; `make check-dataplane` (root) runs its end-to-end tests (`dataplane`, `dataplane-udp`, `verifier-budget`).
+See [programs/dataplane/DESIGN.md](programs/dataplane/DESIGN.md) for the wire format, the algorithms and the limits; `make check-dataplane` (root) runs its end-to-end tests (`dataplane`, `dataplane-udp`, `verifier-budget`).
 
 ### Bandwidth-aware ECMP (`bpfc-ecmp-gen`)
 
@@ -168,7 +168,7 @@ bpfc-ecmp-status bw wg0 80m            # new bandwidth, at once (an outside esti
 bpfc-ecmp-status set shed 60           # thresholds and timers at run time
 ```
 
-Every packet re-checks that its flow's interface is still a member of the route, so a withdrawn next hop is noticed on the next packet. See [ecmp/DESIGN.md](ecmp/DESIGN.md); `make check-ecmp` (root) runs the end-to-end tests.
+Every packet re-checks that its flow's interface is still a member of the route, so a withdrawn next hop is noticed on the next packet. See [programs/ecmp/DESIGN.md](programs/ecmp/DESIGN.md); `make check-ecmp` (root) runs the end-to-end tests.
 
 ---
 

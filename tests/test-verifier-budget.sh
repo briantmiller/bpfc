@@ -21,7 +21,7 @@ source tests/lib.sh
 require_root "verifier-budget"
 
 BPFC=$PWD/bpfc
-GEN=$PWD/dataplane/bpfc-dataplane-gen
+GEN=$PWD/programs/dataplane/bpfc-dataplane-gen
 LIMIT=1000000
 BUDGET_PCT=${BUDGET_PCT:-85}
 NS=bpfcvb

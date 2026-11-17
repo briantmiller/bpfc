@@ -51,15 +51,20 @@ no systemd. It checks the container's capabilities, prepares bpffs for
 pinned maps and execs bpfcd in the foreground. Includes an example
 Containerfile and run instructions.
 
-%package scripts
-Summary:        Program generators for bpfc: the FEC/ARQ dataplane and bandwidth-aware ECMP
+%package programs
+Summary:        Programs built on bpfc: the FEC/ARQ dataplane, bandwidth-aware ECMP, flow monitoring
 BuildArch:      noarch
 Requires:       %{name} = %{version}-%{release}
+# Was bpfc-scripts up to 0.1.1-6: an update replaces it.
+Obsoletes:      %{name}-scripts < %{version}-%{release}
+Provides:       %{name}-scripts = %{version}-%{release}
 Requires:       bash
 Requires:       coreutils
 Requires:       gawk
 
-%description scripts
+%description programs
+Everything in the source tree's programs/ folder: generators and tools that
+build on bpfc, with their profiles, design notes and example programs.
 bpfc-dataplane-gen generates an FEC/ARQ dataplane (forward error
 correction, retransmission, loss and capacity measurement) for a link as
 bpfc programs that bpfcd installs, over Layer 2 or UDP, from built-in or
@@ -81,7 +86,8 @@ interface's bandwidth.
 %make_install VERSION=%{version} \
     PREFIX=%{_prefix} SBINDIR=%{_sbindir} MANDIR=%{_mandir} DATADIR=%{_datadir} \
     DOCDIR=%{_docdir}/%{name} CONTAINER_DOCDIR=%{_docdir}/%{name}-container \
-    SCRIPTS_DOCDIR=%{_docdir}/%{name}-scripts \
+    PROGRAMS_DOCDIR=%{_docdir}/%{name}-programs \
+    PROGRAMS_FILELIST=$PWD/programs.files \
     UNITDIR=%{_unitdir} SYSCONFDIR=%{_sysconfdir} \
     SYSUSERSDIR=%{_sysusersdir} LOCALSTATEDIR=%{_localstatedir}/lib
 
@@ -135,21 +141,25 @@ fi
 %{_sbindir}/bpfcd-entrypoint
 %{_docdir}/%{name}-container/
 
-%files scripts
-%{_sbindir}/bpfc-dataplane-gen
-%{_sbindir}/bpfc-dataplane-status
-%{_sbindir}/bpfc-ecmp-gen
-%{_sbindir}/bpfc-ecmp-status
-%{_sbindir}/bpfc-flows
-%dir %{_sysconfdir}/bpfc/ecmp
-%dir %{_sysconfdir}/bpfc/ecmp/profiles.d
-%dir %{_sysconfdir}/bpfc/dataplane
-%dir %{_sysconfdir}/bpfc/dataplane/profiles.d
+# programs.files, written by `make install-programs`: each program's tools
+# in sbin and its /etc/bpfc/<name>/profiles.d, whatever programs/ holds.
+%files programs -f programs.files
 %{_datadir}/bpfc/
-%{_docdir}/%{name}-scripts/
+%{_docdir}/%{name}-programs/
 
 %changelog
-* Wed Nov 11 2026 bpfc maintainers <brun064@gmail.com> - @VERSION@-@RELEASE@
+* Mon Nov 16 2026 bpfc maintainers <brun064@gmail.com> - @VERSION@-@RELEASE@
+- bpfc-scripts is renamed bpfc-programs (it obsoletes and provides
+  bpfc-scripts, so an update replaces it); its docs move to
+  /usr/share/doc/bpfc-programs
+- The dataplane, ecmp and flowmon sources move to programs/ in the source
+  tree. Whatever is in programs/<name>/ is packaged without being listed:
+  executables go to /usr/sbin, profiles/ to /usr/share/bpfc/<name>/profiles
+  (with /etc/bpfc/<name>/profiles.d), *.md and examples/ to the docs
+- make install-scripts is now make install-programs; SCRIPTS_DOCDIR is
+  PROGRAMS_DOCDIR
+
+* Wed Nov 11 2026 bpfc maintainers <brun064@gmail.com> - 0.1.1-6
 - REST API: with rest_socket set in bpfc.conf (off by default), bpfcd serves
   HTTP on that unix socket, owned by rest_socket_owner (default root:bpfc)
   with rest_socket_mode (default 0660). GET / and /interfaces[/<if>[/<dir>]]

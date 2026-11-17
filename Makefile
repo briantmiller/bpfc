@@ -1,5 +1,5 @@
 VERSION   ?= 0.1.1
-RELEASE   ?= 6
+RELEASE   ?= 7
 
 CC        ?= gcc
 CFLAGS    ?= -O2 -g
@@ -22,7 +22,7 @@ MANDIR    ?= $(PREFIX)/share/man
 DATADIR   ?= $(PREFIX)/share
 DOCDIR    ?= $(PREFIX)/share/doc/bpfc
 CONTAINER_DOCDIR ?= $(PREFIX)/share/doc/bpfc-container
-SCRIPTS_DOCDIR ?= $(PREFIX)/share/doc/bpfc-scripts
+PROGRAMS_DOCDIR ?= $(PREFIX)/share/doc/bpfc-programs
 SYSCONFDIR ?= /etc
 UNITDIR   ?= $(PREFIX)/lib/systemd/system
 DESTDIR   ?=
@@ -41,13 +41,13 @@ DAEMON_CFLAGS = $(WARN) -Wno-format-truncation -DBPFC_VERSION='"$(VERSION)"'
 
 # Everything that goes into the source tarball used by `make rpm`.
 DIST_FILES = Makefile LICENSE README.md bpfc.8 bpfc.c test.sh tests \
-             bpfcd/*.c bpfcd/*.h dist dataplane ecmp flowmon
+             bpfcd/*.c bpfcd/*.h dist programs
 
 RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
 TARBALL    = bpfc-$(VERSION).tar.gz
 
-.PHONY: fuzz check-compile check-dataplane check-ecmp check-all all clean install install-scripts dist rpm srpm check
+.PHONY: fuzz check-compile check-dataplane check-ecmp check-all all clean install install-programs dist rpm srpm check
 
 all: $(TARGET) $(DAEMON) $(CTL)
 
@@ -60,7 +60,7 @@ $(DAEMON): bpfcd/bpfcd.c $(COMMON_SRC) $(COMMON_HDR) $(HTTP_SRC) $(HTTP_HDR)
 $(CTL): bpfcd/bpfcctl.c $(COMMON_SRC) $(COMMON_HDR)
 	$(CC) $(CFLAGS) $(DAEMON_CFLAGS) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfcd/bpfcctl.c $(COMMON_SRC)
 
-install: all install-scripts
+install: all install-programs
 	install -D -m 0755 $(TARGET) $(DESTDIR)$(SBINDIR)/bpfc
 	install -D -m 0755 $(DAEMON) $(DESTDIR)$(SBINDIR)/bpfcd
 	install -D -m 0755 $(CTL) $(DESTDIR)$(SBINDIR)/bpfcctl
@@ -91,36 +91,53 @@ install: all install-scripts
 	install -D -m 0644 dist/container/README.md $(DESTDIR)$(CONTAINER_DOCDIR)/README.md
 	install -D -m 0644 dist/container/Containerfile $(DESTDIR)$(CONTAINER_DOCDIR)/Containerfile
 
-# The bpfc-scripts package: the dataplane generator and status tool, the
-# built-in profiles, design notes and examples. Plain bash and text.
-# The generator looks for the built-in profiles in DATADIR.
-install-scripts:
-	install -d -m 0755 $(DESTDIR)$(SBINDIR)
-	sed 's,/usr/share/bpfc/dataplane/profiles,$(DATADIR)/bpfc/dataplane/profiles,' \
-	    dataplane/bpfc-dataplane-gen > $(DESTDIR)$(SBINDIR)/bpfc-dataplane-gen
-	chmod 0755 $(DESTDIR)$(SBINDIR)/bpfc-dataplane-gen
-	install -D -m 0755 dataplane/bpfc-dataplane-status $(DESTDIR)$(SBINDIR)/bpfc-dataplane-status
-	install -d -m 0755 $(DESTDIR)$(DATADIR)/bpfc/dataplane/profiles
-	install -m 0644 dataplane/profiles/*.profile $(DESTDIR)$(DATADIR)/bpfc/dataplane/profiles/
-	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/dataplane/profiles.d
-	install -D -m 0644 dataplane/DESIGN.md $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/DESIGN.md
-	install -d -m 0755 $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/examples/interfaces.d/eth0/ingress
-	install -d -m 0755 $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/examples/interfaces.d/eth0/egress
-	install -m 0644 dataplane/examples/interfaces.d/eth0/ingress/*.bpfc $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/examples/interfaces.d/eth0/ingress/
-	install -m 0644 dataplane/examples/interfaces.d/eth0/egress/*.bpfc $(DESTDIR)$(SCRIPTS_DOCDIR)/dataplane/examples/interfaces.d/eth0/egress/
-	sed 's,/usr/share/bpfc/ecmp/profiles,$(DATADIR)/bpfc/ecmp/profiles,' \
-	    ecmp/bpfc-ecmp-gen > $(DESTDIR)$(SBINDIR)/bpfc-ecmp-gen
-	chmod 0755 $(DESTDIR)$(SBINDIR)/bpfc-ecmp-gen
-	install -D -m 0755 ecmp/bpfc-ecmp-status $(DESTDIR)$(SBINDIR)/bpfc-ecmp-status
-	install -d -m 0755 $(DESTDIR)$(DATADIR)/bpfc/ecmp/profiles
-	install -m 0644 ecmp/profiles/*.profile $(DESTDIR)$(DATADIR)/bpfc/ecmp/profiles/
-	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/ecmp/profiles.d
-	install -D -m 0644 ecmp/DESIGN.md $(DESTDIR)$(SCRIPTS_DOCDIR)/ecmp/DESIGN.md
-	install -D -m 0755 flowmon/bpfc-flows $(DESTDIR)$(SBINDIR)/bpfc-flows
-	install -d -m 0755 $(DESTDIR)$(SCRIPTS_DOCDIR)/flowmon/examples/interfaces.d/\%all\%/ingress
-	install -d -m 0755 $(DESTDIR)$(SCRIPTS_DOCDIR)/flowmon/examples/interfaces.d/\%all\%/egress
-	install -m 0644 flowmon/examples/interfaces.d/\%all\%/ingress/*.bpfc $(DESTDIR)$(SCRIPTS_DOCDIR)/flowmon/examples/interfaces.d/\%all\%/ingress/
-	install -m 0644 flowmon/examples/interfaces.d/\%all\%/egress/*.bpfc $(DESTDIR)$(SCRIPTS_DOCDIR)/flowmon/examples/interfaces.d/\%all\%/egress/
+# The bpfc-programs package: everything under programs/, one subfolder per
+# program, picked up by what it contains (nothing to list here or in the
+# spec when a program is added):
+#   programs/<name>/<executable file>    -> SBINDIR
+#   programs/<name>/profiles/*.profile   -> DATADIR/bpfc/<name>/profiles, and
+#                                           SYSCONFDIR/bpfc/<name>/profiles.d
+#                                           is created for local profiles
+#   programs/<name>/*.md                 -> PROGRAMS_DOCDIR/<name>/
+#   programs/<name>/examples/            -> PROGRAMS_DOCDIR/<name>/examples/
+# A tool that names /usr/share/bpfc/<name>/ is told where DATADIR put it.
+# PROGRAMS_FILELIST, when set, receives the RPM %files entries for what was
+# installed outside DATADIR/bpfc and PROGRAMS_DOCDIR (the spec uses it).
+PROGRAMS_FILELIST ?=
+
+install-programs:
+	@set -e; \
+	list='$(PROGRAMS_FILELIST)'; [ -z "$$list" ] || : > "$$list"; \
+	install -d -m 0755 $(DESTDIR)$(SBINDIR) $(DESTDIR)$(DATADIR)/bpfc $(DESTDIR)$(PROGRAMS_DOCDIR); \
+	for dir in programs/*/; do \
+		[ -d "$$dir" ] || continue; \
+		dir=$${dir%/}; name=$${dir#programs/}; \
+		for f in "$$dir"/*; do \
+			[ -f "$$f" ] || continue; \
+			case $$f in \
+			*.md) install -D -m 0644 "$$f" "$(DESTDIR)$(PROGRAMS_DOCDIR)/$$name/$${f##*/}"; continue ;; \
+			esac; \
+			[ -x "$$f" ] || continue; \
+			dst="$(DESTDIR)$(SBINDIR)/$${f##*/}"; \
+			if [ '$(DATADIR)' != /usr/share ] && grep -q "/usr/share/bpfc/$$name/" "$$f"; then \
+				sed "s,/usr/share/bpfc/$$name/,$(DATADIR)/bpfc/$$name/,g" "$$f" > "$$dst"; \
+				chmod 0755 "$$dst"; \
+			else \
+				install -m 0755 "$$f" "$$dst"; \
+			fi; \
+			[ -z "$$list" ] || echo "$(SBINDIR)/$${f##*/}" >> "$$list"; \
+		done; \
+		if ls "$$dir"/profiles/*.profile >/dev/null 2>&1; then \
+			install -d -m 0755 "$(DESTDIR)$(DATADIR)/bpfc/$$name/profiles" "$(DESTDIR)$(SYSCONFDIR)/bpfc/$$name/profiles.d"; \
+			install -m 0644 "$$dir"/profiles/*.profile "$(DESTDIR)$(DATADIR)/bpfc/$$name/profiles/"; \
+			[ -z "$$list" ] || printf '%%dir %s\n' "$(SYSCONFDIR)/bpfc/$$name" "$(SYSCONFDIR)/bpfc/$$name/profiles.d" >> "$$list"; \
+		fi; \
+		if [ -d "$$dir/examples" ]; then \
+			(cd "$$dir" && find examples -type f) | while IFS= read -r f; do \
+				install -D -m 0644 "$$dir/$$f" "$(DESTDIR)$(PROGRAMS_DOCDIR)/$$name/$$f"; \
+			done; \
+		fi; \
+	done
 
 dist: $(TARBALL)
 

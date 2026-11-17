@@ -14,10 +14,10 @@
 
 cd "$(dirname "$0")/.." || exit 1
 BPFC=$PWD/bpfc
-GEN=$PWD/dataplane/bpfc-dataplane-gen
+GEN=$PWD/programs/dataplane/bpfc-dataplane-gen
 # map prefix of each test interface (dp + hash of the name, see the generator)
 for i in dpa0 dpa1 dpb0 dpb1 dps0 dps1; do declare "MP_$i=$($GEN -i $i --map-prefix)"; done
-STATUS="env BPFC=$PWD/bpfc $PWD/dataplane/bpfc-dataplane-status"
+STATUS="env BPFC=$PWD/bpfc $PWD/programs/dataplane/bpfc-dataplane-status"
 KEEP=0; [ "$1" = "-k" ] && KEEP=1
 
 RED='\e[31m'; GREEN='\e[32m'; NC='\e[0m'

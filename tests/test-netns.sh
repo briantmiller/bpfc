@@ -232,14 +232,14 @@ check "remove_on_stop inside a namespace"              eval 'none_in bnt-c eth0 
 
 # ------------------------------------------------------------------ scripts
 echo "scripts"
-check "bpfc-dataplane-status -n uses its config_dir"   eval 'BPFC=$BPFC $TOP/dataplane/bpfc-dataplane-status -n bnt-a 2>&1 | grep -q "$E/netns/bnt-a/interfaces.d"'
-check "bpfc-ecmp-status -n uses its map_dir"           eval 'BPFC=$BPFC $TOP/ecmp/bpfc-ecmp-status -n bnt-a 2>&1 | grep -q "/sys/fs/bpf/netns/bnt-a"'
-check "bpfc-flows -n runs inside it"                   eval 'BPFC_BIN=$BPFC $TOP/flowmon/bpfc-flows -n bnt-a --json >/dev/null 2>&1 && test -e $T/run/netns/bnt-a/bpfc-flows.prev.json'
+check "bpfc-dataplane-status -n uses its config_dir"   eval 'BPFC=$BPFC $TOP/programs/dataplane/bpfc-dataplane-status -n bnt-a 2>&1 | grep -q "$E/netns/bnt-a/interfaces.d"'
+check "bpfc-ecmp-status -n uses its map_dir"           eval 'BPFC=$BPFC $TOP/programs/ecmp/bpfc-ecmp-status -n bnt-a 2>&1 | grep -q "/sys/fs/bpf/netns/bnt-a"'
+check "bpfc-flows -n runs inside it"                   eval 'BPFC_BIN=$BPFC $TOP/programs/flowmon/bpfc-flows -n bnt-a --json >/dev/null 2>&1 && test -e $T/run/netns/bnt-a/bpfc-flows.prev.json'
 ip -n bnt-a tuntap add bnt-tun mode tun 2>/dev/null; ip -n bnt-a link add m1 type veth peer name m1p; ip -n bnt-a link add m2 type veth peer name m2p
 if ip -n bnt-a link show bnt-tun >/dev/null 2>&1; then
-	check "bpfc-ecmp-gen -n sees the namespace's devices" eval '$TOP/ecmp/bpfc-ecmp-gen -n bnt-a -M m1=10M -M m2=10M -I bnt-tun -o - 2>&1 | grep -q "only Ethernet interfaces"'
+	check "bpfc-ecmp-gen -n sees the namespace's devices" eval '$TOP/programs/ecmp/bpfc-ecmp-gen -n bnt-a -M m1=10M -M m2=10M -I bnt-tun -o - 2>&1 | grep -q "only Ethernet interfaces"'
 fi
-check "bpfc-dataplane-gen -n defaults to its dirs"     eval '$TOP/dataplane/bpfc-dataplane-gen -n bnt-a -i eth0 --remove-maps | grep -q "/sys/fs/bpf/netns/bnt-a"'
+check "bpfc-dataplane-gen -n defaults to its dirs"     eval '$TOP/programs/dataplane/bpfc-dataplane-gen -n bnt-a -i eth0 --remove-maps | grep -q "/sys/fs/bpf/netns/bnt-a"'
 
 echo
 echo -e "netns tests: ${GREEN}$PASS passed${NC}, $([ $FAIL -eq 0 ] && echo 0 || echo -e "${RED}$FAIL failed${NC}")"

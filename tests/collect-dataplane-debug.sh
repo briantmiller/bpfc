@@ -72,13 +72,13 @@ A ping -c 2 -W 3 -s 1464 -M do -q 10.77.2.2 | tail -2
 sec "dataplane status"
 for x in "$NSA dps0" "$NSB dps1"; do
     set -- $x
-    env BPFC=$BPFC dataplane/bpfc-dataplane-status -m $MAPS -c $CONF/$1 -d $2
-    env BPFC=$BPFC dataplane/bpfc-dataplane-status -m $MAPS -c $CONF/$1 -j $2
-    env BPFC=$BPFC dataplane/bpfc-dataplane-status -m $MAPS -c $CONF/$1 -1 $2
+    env BPFC=$BPFC programs/dataplane/bpfc-dataplane-status -m $MAPS -c $CONF/$1 -d $2
+    env BPFC=$BPFC programs/dataplane/bpfc-dataplane-status -m $MAPS -c $CONF/$1 -j $2
+    env BPFC=$BPFC programs/dataplane/bpfc-dataplane-status -m $MAPS -c $CONF/$1 -1 $2
 done
 
 sec "raw counters"
-P0=$(dataplane/bpfc-dataplane-gen -i dps0 --map-prefix); P1=$(dataplane/bpfc-dataplane-gen -i dps1 --map-prefix)
+P0=$(programs/dataplane/bpfc-dataplane-gen -i dps0 --map-prefix); P1=$(programs/dataplane/bpfc-dataplane-gen -i dps1 --map-prefix)
 for m in ${P0}_tx ${P0}_rx ${P1}_tx ${P1}_rx; do
     printf "%s: " $m
     $BPFC -m $MAPS -r $m 2>&1 | while read -r _ _ k _ _ v; do
