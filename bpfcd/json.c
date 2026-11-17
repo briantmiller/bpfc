@@ -399,6 +399,7 @@ void json_slot(struct jbuf *b, const struct slot *s, const struct json_status_ct
     if (s->dir == DIR_XDP) jb_knull(b, "priority");
     else jb_kint(b, "priority", s->prio);
     jb_kstr(b, "status", status_name(s->status));
+    jb_kstr(b, "name", s->name[0] ? s->name : NULL);
     jb_kstr(b, "file", s->path);
     jb_kstr(b, "source", json_file_source(s->path, c));
     jb_kstr(b, "template", scope[0] == '%' ? scope : NULL);

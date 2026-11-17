@@ -212,6 +212,13 @@ static const char *status_color(int st) {
     }
 }
 
+/* Columns a name takes in a terminal: UTF-8 continuation bytes take none. */
+static int utf8_width(const char *s) {
+    int w = 0;
+    for (; *s; s++) if (((unsigned char)*s & 0xC0) != 0x80) w++;
+    return w;
+}
+
 /* ======================= status ======================= */
 
 static int cmd_status(int show_all, int long_fmt) {
@@ -247,10 +254,18 @@ static int cmd_status(int show_all, int long_fmt) {
         printf("No programs configured. Add files as %s/<interface|%%all%%|%%<kind>%%>/<ingress|egress>/<priority>.bpfc\n"
                "or %s/<interface|%%all%%|%%<kind>%%>/xdp.bpfc and run: %s\n", cd, cd, reload_cmd());
     } else {
-        int wif = 5;
-        for (int i = 0; i < n; i++) if ((int)strlen(slots[i].iface) > wif) wif = (int)strlen(slots[i].iface);
-        printf("%s%-*s  %-7s  %5s  %-19s  %6s  %-16s  %-8s  %s%s\n", C_BOLD, wif, "IFACE", "DIR", "PRIO",
-               "STATUS", "PROG", "TAG", "KERNEL", "FILE", C_OFF);
+        int wif = 5, wname = 0;
+        for (int i = 0; i < n; i++) {
+            if ((int)strlen(slots[i].iface) > wif) wif = (int)strlen(slots[i].iface);
+            int w = utf8_width(slots[i].name);
+            if (w > wname) wname = w;
+        }
+        /* NAME (the programs' name commands) only when some program has one */
+        if (wname && wname < 4) wname = 4;
+        char hname[16] = "";
+        if (wname) snprintf(hname, sizeof(hname), "NAME  ");
+        printf("%s%-*s  %-7s  %5s  %s%*s%-19s  %6s  %-16s  %-8s  %s%s\n", C_BOLD, wif, "IFACE", "DIR", "PRIO",
+               hname, wname ? wname - 4 : 0, "", "STATUS", "PROG", "TAG", "KERNEL", "FILE", C_OFF);
         for (int i = 0; i < n; i++) {
             struct slot *s = &slots[i];
             const char *kc;
@@ -262,8 +277,10 @@ static int cmd_status(int show_all, int long_fmt) {
             if (fs != 0) pending_reload = 1;
             char pr[8] = "-";
             if (s->dir != DIR_XDP) snprintf(pr, sizeof(pr), "%d", s->prio);
-            printf("%-*s  %-7s  %5s  %s%-19s%s  %6s  %-16s  %s%-8s%s  %s%s%s%s\n", wif, s->iface,
-                   dir_name(s->dir), pr, status_color(s->status), status_name(s->status), C_OFF,
+            const char *nm = wname ? (s->name[0] ? s->name : "-") : "";
+            printf("%-*s  %-7s  %5s  %s%*s%s%s%-19s%s  %6s  %-16s  %s%-8s%s  %s%s%s%s\n", wif, s->iface,
+                   dir_name(s->dir), pr, nm, wname ? wname - utf8_width(nm) : 0, "", wname ? "  " : "",
+                   status_color(s->status), status_name(s->status), C_OFF,
                    prog, s->tag[0] ? s->tag : "-", kc, kw, C_OFF,
                    short_path(s->path, &di), C_YELLOW, mark, C_OFF);
             if (s->error[0])
@@ -609,6 +626,7 @@ static int cmd_show(int argc, char **argv, int bytecode) {
     int fs = file_state(s);
     if (s->dir == DIR_XDP) printf("%s%s xdp%s\n", C_BOLD, s->iface, C_OFF);
     else printf("%s%s %s priority %d%s\n", C_BOLD, s->iface, dir_name(s->dir), s->prio, C_OFF);
+    printf("  name:       %s\n", s->name[0] ? s->name : "-");
     printf("  status:     %s%s%s%s%s\n", status_color(s->status), status_name(s->status), C_OFF,
            s->error[0] ? " -- " : "", s->error);
     printf("  file:       %s%s\n", s->path,

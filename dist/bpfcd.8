@@ -183,9 +183,16 @@ and each program gets the kernel name
 .IB iface _ direction _ priority
 (its last 15 characters, visible in
 .BR "bpftool prog" ).
-The program id and tag bpfc reported are recorded in
+The program id and tag bpfc reported, and the program's name (its
+.B name
+instruction, from bpfc's
+.B BPFC_NAME
+line, also for a program that then failed), are recorded in
 .I /run/bpfc/state
-next to the file path and hash.
+next to the file path and hash, and the name is in the install log line and
+the REST API's
+.B \(dqname\(dq
+fields.
 .SS Network namespaces
 One
 .B bpfcd

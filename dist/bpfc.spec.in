@@ -158,6 +158,11 @@ fi
   (with /etc/bpfc/<name>/profiles.d), *.md and examples/ to the docs
 - make install-scripts is now make install-programs; SCRIPTS_DOCDIR is
   PROGRAMS_DOCDIR
+- bpfc: name <text> gives a program a name for people (no code is
+  generated; bpfc -I prints it as BPFC_NAME <text> before compiling). bpfcd
+  records it in its state (also for programs that fail) and logs it;
+  bpfcctl status shows it in a NAME column, bpfcctl show and the REST API
+  JSON ("name") include it
 
 * Wed Nov 11 2026 bpfc maintainers <brun064@gmail.com> - 0.1.1-6
 - REST API: with rest_socket set in bpfc.conf (off by default), bpfcd serves

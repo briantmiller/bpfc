@@ -8335,7 +8335,7 @@ static const char *pp_reserved[] = {
     "shared-buffer-map", "start-loop", "strip-l2", "tcp-option", "xor-packet", "xor-packet-keyed",
     "zero-buffer", "zero-buffer-keyed",
     "include", "const", "define", "end-define", "repeat", "end-repeat", "break-repeat",
-    "next-repeat", "when", "otherwise", "end-when", "UNIQUE", NULL
+    "next-repeat", "when", "otherwise", "end-when", "name", "UNIQUE", NULL
 };
 
 static void *pp_grow(void *p, int *cap, int need, size_t sz) {
@@ -8878,6 +8878,74 @@ static int pp_find_close(int i, int end, const char *open, const char *close, co
 
 static int pp_expand(int start, int end, const struct pp_scope *sc, int depth);
 
+/*
+ * name <text>: the program's friendly name, for bpfcd and bpfcctl. It
+ * generates no code; bpfc -I prints it as "BPFC_NAME <text>". The name of
+ * the file being compiled wins over a name in a file it includes (so a
+ * library may carry a name of its own); two different names at the same
+ * level are an error unless a higher level names the program.
+ */
+#define PP_PROG_NAME_MAX 64     /* bytes; bpfcd's BPFC_PROG_NAME_MAX */
+static char pp_prog_name[PP_PROG_NAME_MAX + 1];
+static int pp_name_level = -1;          /* include level of pp_prog_name; -1: none */
+static struct pp_cmd pp_name_at;        /* where it was given */
+static char pp_name_other[PP_PROG_NAME_MAX + 1];  /* a different name at the same level */
+static struct pp_cmd pp_name_other_at;
+static int pp_inc_level;                /* 0 in the file being compiled, +1 per include */
+
+static int pp_name(const struct pp_cmd *c, const struct pp_scope *sc) {
+    char *x = pp_subst(pp_rest(c->text), sc, c);
+    if (!x) return -1;
+    /* one pair of surrounding double quotes is optional; spaces collapse */
+    char *v = x;
+    size_t n = strlen(v);
+    if (n >= 2 && v[0] == '"' && v[n - 1] == '"') { v[n - 1] = 0; v++; }
+    char norm[PP_PROG_NAME_MAX + 1];
+    size_t o = 0;
+    int rc = -1;
+    for (const unsigned char *p = (const unsigned char *)v; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f || *p == '"') {
+            pp_err(c, *p == '"' ? "name: a quote can only surround the whole name"
+                                : "name: control characters are not allowed");
+            goto out;
+        }
+        if (*p == ' ' && (o == 0 || norm[o - 1] == ' ' || o == PP_PROG_NAME_MAX)) continue;
+        if (o == PP_PROG_NAME_MAX) { pp_err(c, "name: longer than %d bytes", PP_PROG_NAME_MAX); goto out; }
+        norm[o++] = (char)*p;
+    }
+    while (o && norm[o - 1] == ' ') o--;
+    norm[o] = 0;
+    if (!o) { pp_err(c, "usage: name <text>"); goto out; }
+
+    if (pp_name_level < 0 || pp_inc_level < pp_name_level) {
+        memcpy(pp_prog_name, norm, o + 1);
+        pp_name_level = pp_inc_level;
+        pp_name_at = *c;
+        pp_name_other[0] = 0;
+    } else if (pp_inc_level == pp_name_level && strcmp(norm, pp_prog_name) && !pp_name_other[0]) {
+        memcpy(pp_name_other, norm, o + 1);
+        pp_name_other_at = *c;
+    }
+    rc = 0;
+out:
+    free(x);
+    return rc;
+}
+
+/* The program's name after pp_run(), or NULL; reports two names at one level. */
+static const char *pp_name_result(int *err) {
+    *err = 0;
+    if (pp_name_level < 0) return NULL;
+    if (pp_name_other[0]) {
+        pp_err(&pp_name_other_at, "name '%s' conflicts with name '%s' given at %s:%d%s",
+               pp_name_other, pp_prog_name, pp_name_at.file, pp_name_at.line,
+               pp_name_level ? " (both in included files: name the program in the file itself)" : "");
+        *err = 1;
+        return NULL;
+    }
+    return pp_prog_name;
+}
+
 static int pp_include(const struct pp_cmd *c, const char *arg, int depth) {
     char path[4096];
     size_t n = strlen(arg);
@@ -8934,7 +9002,10 @@ static int pp_include(const struct pp_cmd *c, const char *arg, int depth) {
     int last = pp_ncmds;
     free(text);
     /* Included files start with no names bound: only consts and macros. */
-    return pp_expand(first, last, NULL, depth + 1);
+    pp_inc_level++;
+    int r = pp_expand(first, last, NULL, depth + 1);
+    pp_inc_level--;
+    return r;
 }
 
 static int pp_define(int i, int end) {
@@ -9067,6 +9138,8 @@ static int pp_expand(int start, int end, const struct pp_scope *sc, int depth) {
             int r = pp_include(&c, arg, depth);
             free(arg);
             if (r) return -1;
+        } else if (!strcmp(w, "name")) {
+            if (pp_name(&c, sc)) return -1;
         } else if (!strcmp(w, "const")) {
             const char *rest = pp_rest(c.text);
             char name[PP_NAME_MAX];
@@ -9188,6 +9261,9 @@ char *pp_run(const char *src, const char *file) {
     }
     int first = pp_split(src, pp_strdup(name));
     if (pp_expand(first, pp_ncmds, NULL, 0)) return NULL;
+    int err;
+    pp_name_result(&err);
+    if (err) return NULL;
     return pp_out ? pp_out : pp_strdup("");
 }
 
@@ -9325,6 +9401,16 @@ int main(int argc, char **argv) {
 
     instr = pp_run(instr, filename);
     if (!instr) return 1;
+    /* -I: the program's name (the name command), before compiling, so it is
+     * known even when the kernel rejects the program. */
+    {
+        int err;
+        const char *pname = pp_name_result(&err);
+        if (show_info && pname) {
+            printf("BPFC_NAME %s\n", pname);
+            fflush(stdout);
+        }
+    }
     if (list_files) {
         pp_print_files(stdout);
         return 0;

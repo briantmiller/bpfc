@@ -57,8 +57,13 @@ column shows
 .TP
 .B status
 The default. One line per program (interface, direction and priority): interface, direction, priority,
+the program's name (the NAME column, only when some program has a
+.B name
+instruction; see
+.BR bpfc (8)),
 status, kernel program id and tag, a kernel check, and the file. Errors are
-printed under the line they belong to. Statuses are:
+printed under the line they belong to. A program that failed to compile or
+load still shows its name, as long as bpfc got past preprocessing. Statuses are:
 .RS
 .TP 22
 .B installed

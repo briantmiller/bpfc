@@ -88,7 +88,7 @@ reload() { $BPFCCTL -c "$T/etc/bpfc.conf" reload >/dev/null; }
 
 ip link del $A 2>/dev/null; ip link del $B 2>/dev/null
 mkdir -p "$CFG/$A/ingress" "$CFG/$A/egress" "$CFG/$B/ingress" "$T/run"
-printf '# drop tcp\nmatch tcp;\n\tdrop\n' > "$CFG/$A/ingress/10.bpfc"
+printf '# drop tcp\nname Drop TCP;\nmatch tcp;\n\tdrop\n' > "$CFG/$A/ingress/10.bpfc"
 printf 'match udp; drop\n'                > "$CFG/$A/ingress/20.bpfc"
 printf 'match icmp; drop\n'               > "$CFG/$A/egress/10.bpfc"
 printf 'match arp; drop\n'                > "$CFG/$B/ingress/5.bpfc"
@@ -108,6 +108,12 @@ check "error log saved"                        test -s "$T/run/errors/$A.egress.
 check "leading-zero file name ignored"         eval '! grep -q "prio=10 path=[^ ]*/010.bpfc" $T/run/state'
 check "filter carries bpfcd name"              eval 'tc filter show dev $A ingress | grep -q "bpfcd:$A/ingress/10"'
 check "bpfcctl status exits 2 (a failure)"     eval '$BPFCCTL -s $T/run status >/dev/null; [ $? -eq 2 ]'
+check "program name recorded in the state"     eval 'grep -q "iface=$A dir=ingress prio=10 .* name=Drop%20TCP " $T/run/state'
+check "bpfcctl status shows the name"          eval '$BPFCCTL -s $T/run status | grep -Eq "^$A +ingress +10 +Drop TCP +installed "'
+check "bpfcctl status: - for a program without one" eval '$BPFCCTL -s $T/run status | grep -Eq "^$A +egress +10 +- +installed "'
+check "bpfcctl show shows the name"            eval '$BPFCCTL -s $T/run show $A ingress 10 | grep -q "^  name: *Drop TCP$"'
+check "status JSON has the name"               eval '$BPFCCTL -s $T/run status --json | grep -q "\"name\": *\"Drop TCP\""'
+check "install logged with the name"           grep -q 'installed .*/10.bpfc "Drop TCP"' "$T/log"
 # Non-root users must see a root-owned daemon as running (kill(pid, 0) gives EPERM, not ESRCH).
 if id nobody >/dev/null 2>&1; then
 	chmod 755 "$T"
@@ -158,11 +164,12 @@ check "world-writable include refused"         is_status $A egress 50 failed
 rm "$CFG/$A/egress/50.bpfc"; chmod o-w "$T/lib/blk.bpfc"; reload
 
 ID20=$(prog_at $A ingress 20)
-printf 'start-loop; loop-reg\n' > "$CFG/$A/ingress/20.bpfc"; reload
+printf 'name Bad loop; start-loop; loop-reg\n' > "$CFG/$A/ingress/20.bpfc"; reload
 check "verifier rejection marked failed"       is_status $A ingress 20 failed
 check "old program removed, not kept"          no_prog $A ingress 20
 check "verifier reason recorded"               eval 'grep -q "error=verifier%20rejected%20program:%20R7%20!read_ok" $T/run/state'
 check "bpfcctl show prints failure output"     eval '$BPFCCTL -s $T/run show $A ingress 20 | grep -q "VERIFIER REJECTION"'
+check "rejected program keeps its name"        eval '$BPFCCTL -s $T/run status | grep -Eq "^$A +ingress +20 +Bad loop +failed "'
 printf 'match udp; drop\n' > "$CFG/$A/ingress/20.bpfc"; reload
 
 echo "external changes (reinstall policy)"
@@ -209,6 +216,9 @@ start_daemon
 check "running programs adopted, not reloaded" eventually same_id $A ingress 10 "$ID10"
 check "file deleted while stopped is removed"  eventually no_prog $A egress 40
 check "bpfcctl show --bytecode disassembles"   eval '$BPFCCTL -s $T/run show $A/ingress/10 --bytecode | grep -q "exit"'
+check "adopted program keeps its name"         eval 'grep -q "iface=$A dir=ingress prio=10 .* name=Drop%20TCP " $T/run/state'
+printf 'match tcp; drop\n' > "$CFG/$A/ingress/10.bpfc"; reload
+check "name removed from the file is cleared"  eval '! grep -q "name=Drop%20TCP" $T/run/state'
 stop_daemon
 write_conf reinstall yes
 start_daemon

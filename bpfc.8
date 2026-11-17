@@ -77,6 +77,10 @@ After attaching, print one line describing the program:
 .EX
 BPFC_INFO id=<id> tag=<tag> insns=<n> iface=<if> dir=<dir> prio=<p> proto=<0xNNNN> name=<name> [verified=<n>]
 .EE
+(\fBname\fR here is the kernel program name, see \fB\-n\fR.) A program with a \fBname\fR instruction first gets, right after preprocessing and so even when compiling or loading then fails, the line
+.EX
+BPFC_NAME <text>
+.EE
 For XDP programs \fBdir\fR is \fBxdp\fR and \fBprio\fR is 0.
 \fBverified\fR (kernel 5.16 and later) is the number of instructions the verifier processed; the kernel rejects a program that reaches 1,000,000.
 .TP
@@ -145,6 +149,9 @@ Define \fB$\fINAME\fR. A number or constant expression is stored as a number, an
 .TP
 \fBdefine\fR \fINAME\fR [\fIPARAM\fR ...] ; ... ; \fBend-define\fR
 Define a macro, used as an instruction: \fINAME arg ...\fR. In the body, \fB$\fIPARAM\fR is the argument and \fB$UNIQUE\fR a number unique to each use (for labels). The body sees only its parameters and consts. A macro may not be named after a bpfc instruction.
+.TP
+.BI "name " text
+The program's name, for people: \fBbpfcd\fR records it and \fBbpfcctl status\fR and the REST API show it. It generates no code and is printed only by \fB\-I\fR (as \fBBPFC_NAME\fR); it does not change the filter or kernel program name (\fB\-n\fR). \fItext\fR is the rest of the instruction, up to 64 bytes, with runs of spaces collapsed; one pair of surrounding double quotes is optional; \fB$\fR substitution applies, so \fBname guard on $IFNAME\fR works in a template. It cannot contain \fB;\fR. Giving the same name again is allowed. A name in the file being compiled wins over one in a file it includes, so a library may have its own name; two different names in the same file, or in two included files when the program has none of its own, are an error. A \fBname\fR in a branch \fBwhen\fR drops is ignored.
 .TP
 .BI "include " file
 Read \fIfile\fR here, once per program. A relative name is looked up next to the including file, then in the \fB\-L\fR directories, then in \fI/etc/bpfc/include\fR. World-writable files are refused.

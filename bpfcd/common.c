@@ -775,7 +775,7 @@ int run_capture(char *const argv[], struct run_result *r, int timeout_s, const c
  *   # comment
  *   daemon pid=.. started=.. last_reload=.. reload_count=.. version=.. config_dir=.. on_external_change=..
  *   slot iface=.. dir=.. prio=.. path=.. mtime_ns=.. sha256=.. status=.. ifindex=..
- *        prog_id=.. tag=.. insns=.. installed_at=.. changed_at=.. error=..
+ *        prog_id=.. tag=.. insns=.. [name=..] installed_at=.. changed_at=.. error=..
  * Unknown keys are ignored so newer daemons stay readable by older tools.
  */
 
@@ -850,6 +850,7 @@ int state_write(const char *path, const struct daemon_info *di,
         snprintf(num, sizeof(num), "%u", s->prog_id); put_enc(f, "prog_id", num);
         put_enc(f, "tag", s->tag);
         snprintf(num, sizeof(num), "%u", s->insns); put_enc(f, "insns", num);
+        if (s->name[0]) put_enc(f, "name", s->name);
         snprintf(num, sizeof(num), "%lld", (long long)s->installed_at); put_enc(f, "installed_at", num);
         snprintf(num, sizeof(num), "%lld", (long long)s->changed_at); put_enc(f, "changed_at", num);
         put_enc(f, "error", s->error);
@@ -924,6 +925,7 @@ int state_read(const char *path, struct daemon_info *di, struct slot **slots_out
             else if (!strcmp(k, "prog_id")) s->prog_id = (uint32_t)strtoul(val, NULL, 10);
             else if (!strcmp(k, "tag")) snprintf(s->tag, sizeof(s->tag), "%s", val);
             else if (!strcmp(k, "insns")) s->insns = (uint32_t)strtoul(val, NULL, 10);
+            else if (!strcmp(k, "name")) snprintf(s->name, sizeof(s->name), "%s", val);
             else if (!strcmp(k, "installed_at")) s->installed_at = (time_t)atoll(val);
             else if (!strcmp(k, "changed_at")) s->changed_at = (time_t)atoll(val);
             else if (!strcmp(k, "error")) snprintf(s->error, sizeof(s->error), "%s", val);
@@ -935,6 +937,22 @@ int state_read(const char *path, struct daemon_info *di, struct slot **slots_out
     fclose(f);
     *slots_out = slots;
     return n;
+}
+
+void parse_name_line(const char *out, char *name, size_t namelen) {
+    name[0] = '\0';
+    for (const char *p = out; p && *p;) {
+        const char *nl = strchr(p, '\n');
+        size_t l = nl ? (size_t)(nl - p) : strlen(p);
+        if (l > 10 && !strncmp(p, "BPFC_NAME ", 10)) {
+            size_t n = l - 10;
+            if (n >= namelen) n = namelen - 1;
+            memcpy(name, p + 10, n);
+            name[n] = '\0';
+            return;
+        }
+        p = nl ? nl + 1 : NULL;
+    }
 }
 
 void error_log_path(char *out, size_t outlen, const char *state_dir,

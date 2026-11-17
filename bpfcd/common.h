@@ -31,6 +31,7 @@
 #define REST_SOCKET_MAX     107                 /* sun_path holds 108 bytes with the NUL */
 #define NETNS_RUN_DIR       "/run/netns"        /* where `ip netns add` names namespaces */
 #define NETNS_NAME_MAX      64
+#define BPFC_PROG_NAME_MAX  64                  /* the name command (bpfc's PP_PROG_NAME_MAX) */
 #define STATE_FILE_NAME     "state"
 #define PID_FILE_NAME       "bpfcd.pid"
 #define ERROR_DIR_NAME      "errors"
@@ -198,6 +199,7 @@ struct slot {
     uint32_t prog_id;
     char tag[17];
     uint32_t insns;
+    char name[BPFC_PROG_NAME_MAX + 1];  /* the program's name command; empty if none */
     time_t installed_at;      /* when the current program was attached */
     time_t changed_at;        /* last status change */
     char error[512];          /* short reason for failed / external states */
@@ -234,6 +236,10 @@ int state_write(const char *path, const struct daemon_info *di,
                 const struct slot *slots, int nslots);
 /* Reads a state file into a malloc'd slot array. Returns the count or -errno. */
 int state_read(const char *path, struct daemon_info *di, struct slot **slots_out);
+
+/* The text of bpfc -I's "BPFC_NAME <name>" line in out into name (empty if
+ * none). */
+void parse_name_line(const char *out, char *name, size_t namelen);
 
 /* Path of the saved bpfc output for a failed slot. */
 void error_log_path(char *out, size_t outlen, const char *state_dir,

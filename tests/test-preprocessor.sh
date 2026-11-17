@@ -130,6 +130,27 @@ expect_error PP-err-div0 'division by zero' 'set val X $(1 / 0)'
 expect_error PP-err-not-number "MAC is 'aa:bb', not a number" 'const MAC aa:bb; set val X $(MAC + 1)'
 expect_error PP-err-macro-trace 'in macro m called from <command line>:1' 'define m; set val X $Q; end-define; m'
 
+# ---------------- name ----------------
+# name generates no code; bpfc -I prints it first as "BPFC_NAME <text>".
+printf 'name Library;\nmatch tcp;\n' > "$TMP/nlib.bpfc"
+printf 'name Other library;\nmatch udp;\n' > "$TMP/nlib2.bpfc"
+expect_expand PP-name $'BPFC_NAME Port scan guard\nmatch tcp;\ndrop;' -I 'name Port scan guard; match tcp; drop'
+expect_expand PP-name-no-code $'match tcp;' 'name Port scan guard; match tcp'
+expect_expand PP-name-quoted $'BPFC_NAME Port scan guard\ndrop;' -I 'name   "Port   scan guard" ; drop'
+expect_expand PP-name-const $'BPFC_NAME guard on eth9\ndrop;' -I -s IFNAME=eth9 'name guard on $IFNAME; drop'
+expect_expand PP-name-repeated $'BPFC_NAME A\ndrop;' -I 'name A; drop; name A'
+expect_expand PP-name-when $'BPFC_NAME Yes\ndrop;' -I 'when 0; name No; otherwise; name Yes; end-when; drop'
+expect_expand PP-name-from-include $'BPFC_NAME Library\nmatch tcp;\ndrop;' -I 'include nlib.bpfc; drop'
+expect_expand PP-name-file-wins $'BPFC_NAME Main\nmatch tcp;\ndrop;' -I 'include nlib.bpfc; name Main; drop'
+expect_expand PP-name-file-wins-2 $'BPFC_NAME Main\nmatch tcp;\nmatch udp;' -I 'include nlib.bpfc; include nlib2.bpfc; name Main'
+expect_expand PP-name-64 "BPFC_NAME $(printf 'x%.0s' {1..64})" -I "name $(printf 'x%.0s' {1..64})"
+expect_error PP-err-name-twice "name 'B' conflicts with name 'A'" 'name A; name B; drop'
+expect_error PP-err-name-includes 'both in included files: name the program in the file itself' 'include nlib.bpfc; include nlib2.bpfc'
+expect_error PP-err-name-empty 'usage: name <text>' 'name ""; drop'
+expect_error PP-err-name-long 'name: longer than 64 bytes' "name $(printf 'x%.0s' {1..65})"
+expect_error PP-err-name-quote 'a quote can only surround the whole name' 'name a"b'
+expect_error PP-err-name-macro "'name' is a bpfc command" 'define name; end-define'
+
 # ---------------- bytecode ----------------
 # An unrolled repeat compiles to the same instructions as the same code written out.
 

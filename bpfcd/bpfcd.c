@@ -339,6 +339,8 @@ static void install_slot(struct slot *s, const char *why) {
     struct run_result r;
     int rc = run_capture(argv, &r, cfg.compile_timeout, cfg.state_dir);
     struct slot probe = *s;
+    /* The name is printed before compiling, so a rejected program has one too. */
+    if (rc == 0) parse_name_line(r.out, s->name, sizeof(s->name));
     if (rc == 0 && r.exit_code == 0 && parse_info_line(r.out, &probe) == 0) {
         s->prog_id = probe.prog_id;
         s->insns = probe.insns;
@@ -348,8 +350,9 @@ static void install_slot(struct slot *s, const char *why) {
         s->dirty = 0;
         set_status(s, ST_INSTALLED, NULL);
         clear_error_log(s);
-        logmsg(LOG_LVL_INFO, "%s %s prio %d: installed %s (%s; prog id %u, tag %s, %u insns)",
-               s->iface, dir_name(s->dir), s->prio, s->path, why, s->prog_id, s->tag, s->insns);
+        logmsg(LOG_LVL_INFO, "%s %s prio %d: installed %s%s%s%s (%s; prog id %u, tag %s, %u insns)",
+               s->iface, dir_name(s->dir), s->prio, s->path, s->name[0] ? " \"" : "", s->name,
+               s->name[0] ? "\"" : "", why, s->prog_id, s->tag, s->insns);
         free(r.out);
         return;
     }
@@ -696,6 +699,7 @@ static void apply(int is_reload) {
                 s->prog_id = 0;
                 s->tag[0] = '\0';
                 s->insns = 0;
+                s->name[0] = '\0';
                 s->ifindex = 0;
                 logmsg(LOG_LVL_INFO, "%s %s prio %d: excluded by the empty file %s",
                        s->iface, dir_name(s->dir), s->prio, s->path);
@@ -843,6 +847,7 @@ static void adopt_previous_state(void) {
             s->prog_id = o->prog_id;
             snprintf(s->tag, sizeof(s->tag), "%s", o->tag);
             s->insns = o->insns;
+            snprintf(s->name, sizeof(s->name), "%s", o->name);
             s->ifindex = ifindex;
             s->installed_at = o->installed_at;
             s->changed_at = o->changed_at;
@@ -1403,6 +1408,7 @@ struct check {
     char iface[IFNAMSIZ];       /* empty: checked without an interface */
     int ok;
     unsigned insns, verified;
+    char name[BPFC_PROG_NAME_MAX + 1];
     char summary[512];
     char *out;
     size_t outlen;
@@ -1432,6 +1438,7 @@ static void run_check(const char *file, const char *iface, int dir, int prio, st
         const char *q;
         if (info && (q = strstr(info, " insns="))) c->insns = (unsigned)strtoul(q + 7, NULL, 10);
         if (info && (q = strstr(info, " verified="))) c->verified = (unsigned)strtoul(q + 10, NULL, 10);
+        parse_name_line(r.out, c->name, sizeof(c->name));
         c->out = r.out;
         c->outlen = r.outlen;
     } else {
@@ -1443,11 +1450,12 @@ static void run_check(const char *file, const char *iface, int dir, int prio, st
     }
 }
 
-/* bpfc's output without the BPFC_INFO line. */
+/* bpfc's output without the BPFC_INFO and BPFC_NAME lines. */
 static void json_check(struct jbuf *b, const struct check *c) {
     jb_obj(b);
     jb_kstr(b, "interface", c->iface[0] ? c->iface : NULL);
     jb_kbool(b, "ok", c->ok);
+    jb_kstr(b, "name", c->name[0] ? c->name : NULL);
     if (c->insns) jb_kint(b, "insns", c->insns);
     if (c->verified) jb_kint(b, "verified_insns", c->verified);
     jb_kstr(b, "error", c->ok ? NULL : c->summary);
@@ -1457,7 +1465,7 @@ static void json_check(struct jbuf *b, const struct check *c) {
     while (p && p < end) {
         const char *nl = memchr(p, '\n', (size_t)(end - p));
         size_t l = nl ? (size_t)(nl - p) : (size_t)(end - p);
-        if (strncmp(p, "BPFC_INFO ", 10)) jb_strn(b, p, l);
+        if (strncmp(p, "BPFC_INFO ", 10) && strncmp(p, "BPFC_NAME ", 10)) jb_strn(b, p, l);
         p += l + (nl ? 1 : 0);
     }
     jb_arr_end(b);
