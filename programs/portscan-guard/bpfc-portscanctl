@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# portscanctl.sh -- shell-only status and runtime control for portscan-guard.bpfc.
+# bpfc-portscanctl -- shell-only status and runtime control for portscan-guard bpfc.
+#
+# Install the portscan-guard bpfc file from examples/interfaces.d/eth0/ingress/10.bpfc to the appropriate interface
+*   subfolder in /etc/bpfc/interfaces.d/<interface>/ingress|egress
 #
 # Requires: Bash 4+, awk, sed, sort, and a Linux /proc filesystem.  It calls
 # bpfc -r/-w against the pinned maps and does not require Python.
 #
 # Examples:
-#   ./portscanctl.sh --bpfc ./bpfc --map-dir /sys/fs/bpf status
-#   ./portscanctl.sh --bpfc ./bpfc --map-dir /sys/fs/bpf set mode block
+#   bpfc-portscanctl --bpfc ./bpfc --map-dir /sys/fs/bpf status
+#   bpfc-portscanctl --bpfc ./bpfc --map-dir /sys/fs/bpf set mode block
 
 set -uo pipefail
 LC_ALL=C
@@ -22,7 +25,7 @@ MAP_DIR=${MAP_DIR:-/sys/fs/bpf}
 
 usage() {
   cat <<'USAGE'
-Usage: portscanctl.sh [--bpfc PATH] [--map-dir DIR] COMMAND [ARGUMENTS]
+Usage: bpfc-portscanctl [--bpfc PATH] [--map-dir DIR] COMMAND [ARGUMENTS]
 
 Inspect and manage bpfc portscan-guard pinned maps. Defaults:
   --bpfc     $BPFC or bpfc
