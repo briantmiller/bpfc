@@ -171,7 +171,8 @@ status|detail|counters|settings) [ -z "${ARGS[0]}" ] || FILTER_IF=${ARGS[0]} ;;
 esac
 
 [ ${#IFLIST[@]} -gt 0 ] || die "no linkcap programs in $CONFIG_DIR (bpfc-linkcap-gen -i IF)"
-NOW=$(now_ns)
+DUMP=$(mktemp "${TMPDIR:-/tmp}/bpfc-linkcap.XXXXXX") || die "cannot create a temporary file"
+trap 'rm -f "$DUMP"' EXIT
 FIRST=1
 case $CMD in counters|settings) JKEY=interfaces ;; *) JKEY=neighbors ;; esac
 [ "$FMT" = json ] && printf '{"%s":[' "$JKEY"
@@ -188,7 +189,11 @@ for IF in "${IFLIST[@]}"; do
             echo "@$m"
             dump "${m}_$P"
         done
-    } | "$AWK" -v ifname="$IF" -v link="$LINK" -v now="$NOW" -v defs="$DEFS" -v fmt="$FMT" \
+    } > "$DUMP"
+    # The clock is read after the maps: replies keep arriving while they are
+    # dumped, and one stamped after "now" would get a negative age.
+    NOW=$(now_ns)
+    "$AWK" -v ifname="$IF" -v link="$LINK" -v now="$NOW" -v defs="$DEFS" -v fmt="$FMT" \
                -v cmd="$CMD" -v first="$FIRST" '
 function hex(s) { return strtonum(s) }
 function mac(k,   i, b, o) {           # the key keeps the MAC in frame order, first byte lowest
@@ -294,6 +299,7 @@ END {
             cur_wire = cur_rate + cfg["overhead"] * cur_pk * 8000 / cur_iv
         }
         age = last_reply ? (now - last_reply) / 1e6 : ""
+        if (age != "" && age < 0) age = 0
         if (fmt == "table" && cmd == "status") {
             printf "%-10s %-19s %-9s %9s %9s %9s %7s %8s %8s %8s\n", ifname, nb, state, rate(cap), rate(lb), rate(cur_rate), (loss == "") ? "-" : sprintf("%.2f", loss), ms(cur_qd), ms(cur_rtt), (age == "") ? "-" : sprintf("%.0fms", age)
         } else if (fmt == "table") {
@@ -311,7 +317,7 @@ END {
     }
     if (out == 0 && fmt == "table") printf "%-10s (no neighbors yet)\n", ifname
     exit (out > 0) ? 0 : 3
-}'
+}' "$DUMP"
     rc=$?
     # status 3: the interface printed nothing (JSON stays well formed)
     [ $rc -eq 0 ] && FIRST=0
