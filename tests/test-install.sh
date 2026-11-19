@@ -44,10 +44,10 @@ for d in programs/*/; do
 		[ -f "$f" ] && PROG_PROFILES="$PROG_PROFILES $n/profiles/${f##*/}"
 	done
 done
-for n in dataplane ecmp flowmon; do
+for n in dataplane ecmp flowmon linkcap; do
 	check "programs/$n is there" test -d "programs/$n"
 done
-for f in bpfc-dataplane-gen bpfc-dataplane-status bpfc-ecmp-gen bpfc-ecmp-status bpfc-flows; do
+for f in bpfc-dataplane-gen bpfc-dataplane-status bpfc-ecmp-gen bpfc-ecmp-status bpfc-flows bpfc-linkcap-gen bpfc-linkcap-status; do
 	check "programs/ has the tool $f" eval 'case " $PROG_TOOLS " in *" $f "*) true ;; *) false ;; esac'
 done
 for f in $PROG_TOOLS; do
@@ -159,7 +159,7 @@ else
 			done < <(cd "programs/$n" && find examples -type f)
 			check "bpfc-programs has every example of $n${missing:+ (missing:$missing)}" [ -z "$missing" ]
 		done
-		check "bpfc itself has no files of a program" eval '! grep -qE "dataplane|ecmp|flowmon|bpfc-programs" "$T/core"'
+		check "bpfc itself has no files of a program" eval '! grep -qE "dataplane|ecmp|flowmon|linkcap|bpfc-programs" "$T/core"'
 		check "bpfc itself has the binaries" eval 'grep -qx /usr/sbin/bpfc "$T/core" && grep -qx /usr/sbin/bpfcd "$T/core"'
 		check "bpfc owns /var/lib/bpfc/interfaces.d and the sysusers file" eval \
 			'grep -qx /var/lib/bpfc/interfaces.d "$T/core" && grep -qx /usr/lib/sysusers.d/bpfc.conf "$T/core"'

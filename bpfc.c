@@ -435,6 +435,8 @@ void emit_ctx_ld(int size, int dst, int ctx, size_t off) {
         return;
     }
     else if (off == offsetof(struct __sk_buff, mark)) name = "XDP has no skb mark";
+    else if (off == offsetof(struct __sk_buff, priority)) name = "XDP has no skb priority";
+    else if (off == offsetof(struct __sk_buff, gso_segs)) name = "XDP has no GSO state (packets are single frames)";
     else if (off == offsetof(struct __sk_buff, hash)) name = "XDP has no skb hash";
     else if (off == offsetof(struct __sk_buff, protocol)) name = "XDP has no skb protocol (match the EtherType)";
     else if (off == offsetof(struct __sk_buff, tstamp)) name = "XDP has no skb timestamp";
@@ -7476,6 +7478,8 @@ void help(const char *arg0) {
 	"queue"			,"egress queue number",
 	"skb-mark"		,"firewall/packet mark",
 	"skb-hash"		,"software hash",
+	"skb-priority"		,"skb->priority: the qdisc class or band (prio/pfifo_fast band, an HTB class major:minor as 0xMMMMmmmm)",
+	"gso-segs"		,"segments in a GSO/GRO packet (1 for an ordinary one) - get/match only",
 	"skb-cb <0-4>"		,"context buffer scratch pad, 5 32-bit values can be stored and passed down the stack",
 	"skb-ifindex"		,"interface number - get/match only",
 	"dev-type"		,"device type (ARPHRD: 1 Ethernet, 772 loopback, 778 GRE, 65534 none) of the -i interface, known when compiling - get/match only",
@@ -7635,6 +7639,7 @@ static const struct { const char *f; char kind; uint64_t max; } field_kinds[] = 
     {"arp-ptype", 'n', 65535}, {"arp-oper", 'n', 65535}, {"protocol", 'n', 65535}, {"queue", 'n', 65535},
     {"ip-frag-off", 'n', 8191}, {"mpls-label", 'n', 1048575}, {"ip6-flow", 'n', 1048575},
     {"gre-key", 'n', 0xFFFFFFFFULL}, {"skb-mark", 'n', 0xFFFFFFFFULL}, {"skb-hash", 'n', 0xFFFFFFFFULL},
+    {"skb-priority", 'n', 0xFFFFFFFFULL}, {"gso-segs", 'n', 65535},
     {"len", 'n', 0xFFFFFFFFULL}, {"dev-type", 'n', 65535},
     {"tcp-src", 'r', 65535}, {"tcp-dst", 'r', 65535}, {"udp-src", 'r', 65535}, {"udp-dst", 'r', 65535},
     {"vlan-id", 'r', 4095},
@@ -7937,6 +7942,8 @@ static int process_cmd_1(char *cmd, const char *dir) {
 	    }
 	    else if (strcmp(f,"queue") == 0) compile_get_skb_field(offsetof(struct __sk_buff, queue_mapping), 0,0,var);
 	    else if (strcmp(f,"skb-mark") == 0) compile_get_skb_field(offsetof(struct __sk_buff, mark), 0,0,var);
+	    else if (strcmp(f,"skb-priority") == 0) compile_get_skb_field(offsetof(struct __sk_buff, priority), 0,0,var);
+	    else if (strcmp(f,"gso-segs") == 0) compile_get_skb_field(offsetof(struct __sk_buff, gso_segs), 0,0,var);
             else if (strcmp(f,"skb-hash") == 0) compile_get_skb_field(offsetof(struct __sk_buff, hash), 0,0,var);
             else if (strcmp(f,"skb-ingress") == 0) compile_get_skb_field(offsetof(struct __sk_buff, ingress_ifindex), 0,0,var);
             else if (strcmp(f,"skb-ifindex") == 0) compile_get_skb_field(offsetof(struct __sk_buff, ifindex), 0,0,var);
@@ -8000,6 +8007,7 @@ static int process_cmd_1(char *cmd, const char *dir) {
 	    else if (strcmp(f,"data") == 0) compile_set_skb_field(offsetof(struct __sk_buff, data), val);
 	    else if (strcmp(f,"len") == 0) compile_set_length(val);
 	    else if (strcmp(f,"skb-mark") == 0) compile_set_skb_field(offsetof(struct __sk_buff, mark), val);
+	    else if (strcmp(f,"skb-priority") == 0) compile_set_skb_field(offsetof(struct __sk_buff, priority), val);
             else if (strcmp(f,"skb-hash") == 0) compile_set_skb_hash(val);
             else if (strcmp(f,"protocol") == 0) compile_set_skb_proto(val);
             else if (strcmp(f,"skb-cb") == 0 && t > 3) {
@@ -8131,6 +8139,8 @@ static int process_cmd_1(char *cmd, const char *dir) {
 	    else if (strcmp(a1,"protocol")==0 && mv) compile_match_skb_proto_var(mv);
 	    else if (strcmp(a1,"protocol")==0) compile_match_skb_field(offsetof(struct __sk_buff, protocol), htons(strtoul(val, NULL, 0)), 0xFFFFFFFF, mv);
 	    else if (strcmp(a1,"skb-mark")==0) compile_match_skb_field(offsetof(struct __sk_buff, mark), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
+	    else if (strcmp(a1,"skb-priority")==0) compile_match_skb_field(offsetof(struct __sk_buff, priority), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
+	    else if (strcmp(a1,"gso-segs")==0) compile_match_skb_field(offsetof(struct __sk_buff, gso_segs), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-hash")==0) compile_match_skb_field(offsetof(struct __sk_buff, hash), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"skb-ifindex")==0) compile_match_skb_field(offsetof(struct __sk_buff, ifindex), strtoul(val, NULL, 0), 0xFFFFFFFF, mv);
             else if (strcmp(a1,"dev-type")==0 || strcmp(a1,"dev-kind")==0) compile_match_dev(a1, val);

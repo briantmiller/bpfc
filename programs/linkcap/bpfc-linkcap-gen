@@ -1,0 +1,911 @@
+#!/bin/bash
+# bpfc-linkcap-gen - generate the per-neighbor loss and capacity monitor
+# (linkcap) as bpfc programs for /etc/bpfc/interfaces.d.
+#
+# Every unicast IP packet leaving the interface is counted per neighbor (the
+# next hop's MAC on Ethernet, the tunnel's far end on a point-to-point link,
+# the outer address on multipoint GRE). At the report interval a clone of a
+# packet becomes a small report frame carrying the cumulative counters and a
+# timestamp; the neighbor answers with what it received by then, and the
+# sender works out loss, delivered rate, queueing delay and RTT per interval.
+# bpfc-linkcap-status turns those samples into a capacity estimate.
+#
+# Both ends must run it. See DESIGN.md.
+
+set -e
+VERSION=1
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+PROFILE_DIRS=(/etc/bpfc/linkcap/profiles.d /usr/share/bpfc/linkcap/profiles "$SELF_DIR/profiles")
+SAVE_DIR=/etc/bpfc/linkcap/profiles.d
+
+die()  { echo "Error: $*" >&2; exit 1; }
+warn() { echo "Warning: $*" >&2; }
+
+# ---------------------------------------------------------------- settings
+# key | kind | class | default | help
+#   class: structural (needs regenerating), runtime (also changeable with
+#          "bpfc-linkcap-status set"; the cfg index is in CFGIDX)
+SETTINGS='interval|dur|runtime|250ms|how often each neighbor gets a report (10ms - 60s)
+baseline-window|dur|runtime|60s|the queueing delay is measured above the lowest one-way delay in this window (pLEO paths change: shorter)
+delay-threshold|dur|runtime|10ms|queueing delay above this means the path is at capacity
+capacity-window|dur|runtime|15s|capacity and lower bound are taken over the samples in this window
+overhead|int:0:255|runtime|auto|bytes per packet added on the wire beyond the IP packet, for the wire rate (auto: from the link type)
+neighbors|int:1:4096|structural|64|neighbors tracked per interface (no reuse: see DESIGN.md)
+report-priority|int:0:4294967295|structural|7|skb->priority of reports and replies: a band or class the shaper does not limit (7 = TC_PRIO_CONTROL; an HTB class 1:10 is 0x10010)'
+declare -A CFGIDX=([interval]=0 [delay-threshold]=1 [baseline-window]=2 [capacity-window]=3 [overhead]=4)
+
+declare -A KIND CLASS DEF HELP VAL SRC
+KEYS=()
+while IFS='|' read -r k kind class def help; do
+    KEYS+=("$k"); KIND[$k]=$kind; CLASS[$k]=$class; DEF[$k]=$def; HELP[$k]=$help
+done <<< "$SETTINGS"
+is_key() { [ -n "${KIND[$1]+x}" ]; }
+
+usage() {
+cat <<EOF
+Usage: $(basename "$0") -i IF [-i IF ...] [options] [settings...]
+       $(basename "$0") --list-profiles | --show-profile NAME
+       $(basename "$0") --save-profile NAME [--description TEXT] [settings...]
+
+Writes <outdir>/<interface>/{ingress,egress}/<priority>.bpfc for each interface.
+
+  -i, --interface IF       an interface to measure (repeat, or separate with commas)
+      --link TYPE          eth, p2p or mgre (default: from the interface; needed
+                           when generating for an interface that is not there)
+      --gre-hlen N         mgre: GRE header bytes, 4 + 4 for each of key,
+                           checksum and sequence (default: from the interface)
+  -o, --outdir DIR         default /etc/bpfc/interfaces.d, or the -n namespace's (- for stdout)
+  -P, --prefix NAME        map name suffix (1-10 of A-Za-z0-9_.), default lc + 8
+                           base32 characters of SHA-256(interface)
+      --ingress-priority N TC priority of the ingress program (default 5: it
+                           must see packets before anything that drops them)
+      --egress-priority N  TC priority of the egress program (default 60000:
+                           it must come after anything that drops)
+  -p, --profile NAME       start from a profile (see --list-profiles)
+      --profile-dir DIR    also look for profiles in DIR (searched first)
+      --list-profiles      list the available profiles
+      --show-profile NAME  print every effective setting and where it comes from
+      --save-profile NAME  save --profile and the settings given as a new profile
+      --description TEXT   description for --save-profile
+      --map-prefix         print each interface's map suffix and exit
+      --setup-hints        print the offload settings and qdisc notes
+      --remove-maps        delete the pinned maps (remove the programs first)
+  -m, --map-dir DIR        pinned maps, for --remove-maps (default /sys/fs/bpf)
+  -n, --netns NAME         for network namespace NAME: run inside it, with its
+                           program and map directories as defaults
+
+Settings (--name value or --name=value; the same names in profiles):
+EOF
+    local k
+    for k in "${KEYS[@]}"; do
+        printf "  --%-16s %s [%s]\n" "$k" "${HELP[$k]}" "${DEF[$k]}"
+    done
+cat <<EOF
+Durations take us, ms, s or m (a bare number is ms).
+
+Both ends of every measured link must run it. TSO/GSO/GRO must be off on the
+measured interfaces (--setup-hints).
+EOF
+}
+
+# ---------------------------------------------------------------- units
+parse_dur_ns() {
+    local v=${1,,}
+    [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)(us|ms|s|m)?$ ]] || return 1
+    awk -v n="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[3]:-ms}" \
+        'BEGIN{m=(u=="us")?1e3:(u=="ms")?1e6:(u=="s")?1e9:6e10; printf "%.0f\n", n*m}'
+}
+valid_ifname() { [[ ${#1} -ge 1 && ${#1} -le 15 && "$1" != *[/:%[:space:]]* ]]; }
+
+check_value() {   # key value: dies if the value does not fit the key
+    local k=$1 v=$2 kind=${KIND[$1]} min max ns
+    case $kind in
+    dur)  ns=$(parse_dur_ns "$v") || die "--$k: not a duration: $v"
+          case $k in
+          interval) [ "$ns" -ge 10000000 ] && [ "$ns" -le 60000000000 ] || die "--interval: 10ms - 60s, not $v" ;;
+          *) [ "$ns" -ge 1000 ] && [ "$ns" -le 3600000000000 ] || die "--$k: 1us - 1h, not $v" ;;
+          esac ;;
+    int:*) [ "$k" = overhead ] && [ "$v" = auto ] && return 0
+          IFS=: read -r _ min max <<< "$kind"
+          [[ "$v" =~ ^(0x[0-9a-fA-F]+|[0-9]+)$ ]] && [ "$((v))" -ge "$min" ] && [ "$((v))" -le "$max" ] || die "--$k: $min-$max, not $v" ;;
+    esac
+}
+
+# -n NETNS: run again inside network namespace NETNS through "bpfcctl exec",
+# which also sets BPFC_CONFIG_DIR, BPFC_MAP_DIR, BPFC_STATE_DIR and BPFC_CONF
+# to that namespace's paths (see bpfcd(8), NETWORK NAMESPACES).
+netns_reexec() {
+    local ns=$1; shift
+    [ -n "$ns" ] || return 0
+    [ "${BPFC_IN_NETNS:-}" = "$ns" ] && return 0
+    local ctl=${BPFCCTL:-}
+    if [ -z "$ctl" ]; then
+        ctl=$(command -v bpfcctl 2>/dev/null) || ctl=$(cd "$(dirname "$0")" && pwd)/../../bpfcd/bpfcctl
+    fi
+    [ -x "$ctl" ] || { echo "Error: -n needs bpfcctl (not found; set BPFCCTL=)" >&2; exit 1; }
+    exec "$ctl" -n "$ns" exec -- "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$@"
+}
+
+ARGS=("$@")
+NETNS=
+for ((i = 0; i < ${#ARGS[@]}; i++)); do
+    case ${ARGS[i]} in
+    -n|--netns) NETNS=${ARGS[i+1]:-} ;;
+    --netns=*) NETNS=${ARGS[i]#*=} ;;
+    esac
+done
+netns_reexec "$NETNS" "${ARGS[@]}"
+
+# ---------------------------------------------------------------- profiles
+find_profile() {
+    local d
+    for d in "${PROFILE_DIRS[@]}"; do
+        [ -f "$d/$1.profile" ] && { echo "$d/$1.profile"; return 0; }
+    done
+    return 1
+}
+# load_profile NAME [depth]: key = value lines; "inherit NAME" first
+load_profile() {
+    local name=$1 depth=${2:-0} f line k v
+    [ "$depth" -le 8 ] || die "profile $name: inherit nested too deeply (loop?)"
+    f=$(find_profile "$name") || die "no profile $name (see --list-profiles)"
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%%#*}; line=$(echo "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [ -n "$line" ] || continue
+        if [[ "$line" =~ ^inherit[[:space:]]*=?[[:space:]]*([A-Za-z0-9_.-]+)$ ]]; then
+            load_profile "${BASH_REMATCH[1]}" $((depth + 1)); continue
+        fi
+        [[ "$line" =~ ^([a-z-]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || die "profile $name: bad line: $line"
+        k=${BASH_REMATCH[1]}; v=${BASH_REMATCH[2]}
+        case $k in
+        description) ;;
+        *) is_key "$k" || die "profile $name: unknown setting $k"
+           check_value "$k" "$v"; VAL[$k]=$v; SRC[$k]="profile $name" ;;
+        esac
+    done < "$f"
+}
+list_profiles() {
+    local d f n seen=" "
+    for d in "${PROFILE_DIRS[@]}"; do
+        for f in "$d"/*.profile; do
+            [ -f "$f" ] || continue
+            n=$(basename "$f" .profile)
+            [[ "$seen" == *" $n "* ]] && continue
+            seen+="$n "
+            printf "%-12s %s  (%s)\n" "$n" "$(sed -n 's/^[[:space:]]*description[[:space:]]*=[[:space:]]*//p' "$f" | head -1)" "$d"
+        done
+    done
+}
+
+# ---------------------------------------------------------------- arguments
+IFACES=(); LINK_ARG=; GRE_HLEN_ARG=
+OUTDIR=${BPFC_CONFIG_DIR:-/etc/bpfc/interfaces.d}; PREFIX_ARG=; MAP_DIR=${BPFC_MAP_DIR:-/sys/fs/bpf}
+IN_PRIO=5; EG_PRIO=60000
+PROFILE=; DESC=; ACTION=generate; ACTION_ARG=
+declare -A CLI
+
+for ((i = 0; i < ${#ARGS[@]}; i++)); do
+    case ${ARGS[i]} in
+    --profile-dir) PROFILE_DIRS=("${ARGS[i+1]}" "${PROFILE_DIRS[@]}") ;;
+    --profile-dir=*) PROFILE_DIRS=("${ARGS[i]#*=}" "${PROFILE_DIRS[@]}") ;;
+    esac
+done
+
+set -- "${ARGS[@]}"
+while [ $# -gt 0 ]; do
+    a=$1; v=
+    if [[ "$a" == --*=* ]]; then v=${a#*=}; a=${a%%=*}; set -- "$a" "$v" "${@:2}"; fi
+    need() { [ $# -ge 2 ] || die "$1 needs a value"; }
+    case $a in
+    -i|--interface) need "$@"; IFS=, read -ra _l <<< "$2"; IFACES+=("${_l[@]}"); shift 2 ;;
+    --link)         need "$@"; LINK_ARG=$2; shift 2 ;;
+    --gre-hlen)     need "$@"; GRE_HLEN_ARG=$2; shift 2 ;;
+    -o|--outdir)    need "$@"; OUTDIR=$2; shift 2 ;;
+    -P|--prefix)    need "$@"; PREFIX_ARG=$2; shift 2 ;;
+    --ingress-priority) need "$@"; IN_PRIO=$2; shift 2 ;;
+    --egress-priority)  need "$@"; EG_PRIO=$2; shift 2 ;;
+    -p|--profile)   need "$@"; PROFILE=$2; shift 2 ;;
+    --profile-dir)  shift 2 ;;
+    --list-profiles) ACTION=list; shift ;;
+    --show-profile) need "$@"; ACTION=show; ACTION_ARG=$2; shift 2 ;;
+    --save-profile) need "$@"; ACTION=save; ACTION_ARG=$2; shift 2 ;;
+    --description)  need "$@"; DESC=$2; shift 2 ;;
+    --map-prefix)   ACTION=prefix; shift ;;
+    --setup-hints)  ACTION=hints; shift ;;
+    --remove-maps)  ACTION=remove; shift ;;
+    -m|--map-dir)   need "$@"; MAP_DIR=$2; shift 2 ;;
+    -n|--netns)     shift 2 ;;   # handled above
+    -h|--help)      usage; exit 0 ;;
+    --*)            k=${a#--}; is_key "$k" || { usage >&2; die "unknown option $a"; }
+                    need "$@"; check_value "$k" "$2"; CLI[$k]=$2; shift 2 ;;
+    *)              usage >&2; die "unexpected argument $a" ;;
+    esac
+done
+
+[ "$ACTION" = list ] && { list_profiles; exit 0; }
+
+for k in "${KEYS[@]}"; do VAL[$k]=${DEF[$k]}; SRC[$k]=default; done
+[ "$ACTION" = show ] && PROFILE=$ACTION_ARG
+[ -z "$PROFILE" ] || load_profile "$PROFILE"
+for k in "${!CLI[@]}"; do VAL[$k]=${CLI[$k]}; SRC[$k]="command line"; done
+
+if [ "$ACTION" = show ]; then
+    for k in "${KEYS[@]}"; do printf "%-16s %-12s %-10s (%s)\n" "$k" "${VAL[$k]}" "${CLASS[$k]}" "${SRC[$k]}"; done
+    exit 0
+fi
+if [ "$ACTION" = save ]; then
+    [[ "$ACTION_ARG" =~ ^[A-Za-z0-9_.-]+$ ]] || die "profile names are A-Za-z0-9_.-"
+    mkdir -p "$SAVE_DIR"
+    f=$SAVE_DIR/$ACTION_ARG.profile
+    {
+        echo "# bpfc-linkcap profile, saved $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "description = ${DESC:-saved settings}"
+        [ -z "$PROFILE" ] || echo "inherit = $PROFILE"
+        for k in "${KEYS[@]}"; do [ -n "${CLI[$k]+x}" ] && echo "$k = ${CLI[$k]}"; done
+    } > "$f"
+    echo "saved $f"; exit 0
+fi
+
+[ ${#IFACES[@]} -gt 0 ] || { usage >&2; die "no interface (-i)"; }
+for IF in "${IFACES[@]}"; do valid_ifname "$IF" || die "not a valid interface name: $IF"; done
+[ -z "$PREFIX_ARG" ] || [ ${#IFACES[@]} -eq 1 ] || die "--prefix works with one interface"
+[ -z "$PREFIX_ARG" ] || [[ "$PREFIX_ARG" =~ ^[A-Za-z0-9_.]{1,10}$ ]] || die "--prefix: 1-10 of A-Za-z0-9_."
+for p in "$IN_PRIO" "$EG_PRIO"; do [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || die "priorities are 1-65535"; done
+
+# map_id <name>: "lc" + 8 base32 characters (a-z 2-7) of SHA-256(name), 40 bits
+map_id() {
+    local h n a=abcdefghijklmnopqrstuvwxyz234567 out="" i
+    h=$(printf '%s' "$1" | sha256sum); n=$((16#${h:0:10}))
+    for i in 1 2 3 4 5 6 7 8; do out=${a:$((n & 31)):1}$out; n=$((n >> 5)); done
+    echo "lc$out"
+}
+prefix_of() { [ -n "$PREFIX_ARG" ] && echo "$PREFIX_ARG" || map_id "$1"; }
+MAPS=(NB NK TX RX ST RG CF)
+
+if [ "$ACTION" = prefix ]; then
+    for IF in "${IFACES[@]}"; do echo "$IF $(prefix_of "$IF")"; done; exit 0
+fi
+if [ "$ACTION" = remove ]; then
+    for IF in "${IFACES[@]}"; do
+        P=$(prefix_of "$IF")
+        for m in "${MAPS[@]}"; do rm -f "$MAP_DIR/${m}_$P"; done
+        echo "removed the maps of $IF ($P)"
+    done
+    exit 0
+fi
+
+# ---------------------------------------------------------------- link type
+# detect_link IF: sets LINK (eth|p2p|mgre), GRE_HLEN, OVERHEAD_AUTO
+detect_link() {
+    local IF=$1 d kind=
+    LINK=$LINK_ARG; GRE_HLEN=${GRE_HLEN_ARG:-}; OVERHEAD_AUTO=0
+    d=$(ip -d link show dev "$IF" 2>/dev/null) || d=
+    if [ -z "$LINK" ]; then
+        [ -n "$d" ] || die "$IF: no such interface (use --link to generate for it anyway)"
+        if [[ "$d" == *"link/ether"* ]]; then LINK=eth
+        elif [[ "$d" =~ $'\n'[[:space:]]+gre[[:space:]]+remote[[:space:]]+any ]] ||
+             [[ "$d" =~ $'\n'[[:space:]]+gre[[:space:]]+remote[[:space:]]+0\.0\.0\.0 ]]; then LINK=mgre
+        else LINK=p2p
+        fi
+    fi
+    case $LINK in eth|p2p|mgre) ;; *) die "--link: eth, p2p or mgre, not $LINK" ;; esac
+    [[ "$d" =~ $'\n'[[:space:]]+([a-z0-9_]+)[[:space:]] ]] && kind=${BASH_REMATCH[1]}
+    if [ "$LINK" = mgre ] && [ -z "$GRE_HLEN" ]; then
+        [ -n "$d" ] || die "$IF: --gre-hlen is needed when the interface is not there"
+        GRE_HLEN=4
+        # the outgoing header (o-flags) decides where the inner packet starts
+        [[ "$d" =~ okey[[:space:]] ]] && GRE_HLEN=$((GRE_HLEN + 4))
+        [[ "$d" =~ ocsum ]] && GRE_HLEN=$((GRE_HLEN + 4))
+        [[ "$d" =~ oseq ]] && GRE_HLEN=$((GRE_HLEN + 4))
+    fi
+    if [ "$LINK" = mgre ]; then
+        [[ "$GRE_HLEN" =~ ^(4|8|12|16)$ ]] || die "--gre-hlen: 4, 8, 12 or 16"
+    fi
+    case $LINK in
+    eth)  OVERHEAD_AUTO=14 ;;
+    mgre) OVERHEAD_AUTO=$((20 + GRE_HLEN)) ;;
+    p2p)  case $kind in
+          gre|ipip|sit) OVERHEAD_AUTO=24 ;;
+          wireguard)    OVERHEAD_AUTO=60 ;;
+          *)  [[ "$d" == *"link/ppp"* ]] && OVERHEAD_AUTO=2 ;;
+          esac ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------------- program
+# The program body: bpfc, not expanded by the shell. The generator puts the
+# constants in front of it.
+PROGRAM_BODY=$(cat <<'EOF'
+# ------------------------------------------------------------------ maps
+#   NB  key -> slot + 1 (MAC; 1 on a point-to-point link; outer IPv4 on mGRE)
+#   NK  slot -> key
+#   TX  slot*2: packets sent to the neighbor, slot*2+1: IP bytes (cumulative)
+#   RX  slot*2, slot*2+1: the same, received from it
+#   ST  slot*16 + n: 0 last report (ns), 1 report sequence, 2 TX packets at
+#       the last report, 3 last reply sequence, 4-8 the last reply (tx
+#       packets, tx bytes, rx packets, rx bytes, rx time), 9/10 lowest
+#       one-way delay (current / previous half window), 11 start of the
+#       current half window, 12 last reply (ns), 13 samples taken, 14 last
+#       report answered (ns)
+#   RG  slot*RING*8 + i*8 + n: sample ring, 0 time (ms), 1 interval (us,
+#       receiver clock), 2 sent, 3 received (packets), 4 sent, 5 received
+#       (IP bytes), 6 queueing delay (us), 7 RTT (us)
+#   CF  0 interval (ns), 1 delay threshold (ns), 2 baseline window (ns),
+#       3 capacity window (ns), 4 overhead (+1; 0 = auto); 8 slots handed
+#       out, 9 round robin, 10 neighbors refused (table full), 11 report
+#       skipped (GSO packet), 12 reports sent, 13 replies sent, 14 replies
+#       received, 15 reports received, 16 stale replies, 17 counter resets
+hash-map NB_$P $(MAXN * 4);
+array-map NK_$P $MAXN;
+array-map TX_$P $(MAXN * 2);
+array-map RX_$P $(MAXN * 2);
+array-map ST_$P $(MAXN * 16);
+array-map RG_$P $(MAXN * RING * 8);
+array-map CF_$P 64;
+
+# Report / reply payload at $PO (frame offset; on mGRE relative to the inner
+# IPv4 header), eight 8-byte words in network order:
+#   0 0x4C43 | version 1 | type (1 report, 2 reply) | sequence (32 bits)
+#   1 key   2 tx packets   3 tx bytes   4 tx time (sender ns)
+#   5 rx packets   6 rx bytes   7 rx time (receiver ns)      (reply only)
+# The 128 bytes in front are zero: a clone of a locally sent TCP/UDP packet
+# can still be waiting for its checksum (offload), which lands there.
+
+decl NOW 8; get time NOW;
+decl WT 8; decl T 8; decl X 8; decl S 8; decl KEY 8; decl L 8; decl R 8;
+
+# PUTW OFF V: the 8-byte variable V at frame offset OFF, network order.
+define PUTW OFF V;
+  set val WT %$V; calc hton WT 64; set bytes $OFF 8 %WT;
+end-define;
+# GETW OFF V: the 8-byte word at OFF into V (host order).
+define GETW OFF V;
+  get bytes $OFF 8 $V;
+end-define;
+
+# SLOT: KEY -> S = slot + 1, 0 when the table is full.
+define SLOT;
+  get map NB_$P %KEY S;
+  if S eq 0;
+    calc-map add CF_$P 8 1 S;
+    if S lt $MAXN;
+      set map NK_$P %S %KEY;
+      calc add S 1;
+      set map NB_$P %KEY %S;
+    else;
+      calc-map add CF_$P 10 1;
+      set val S 0;
+    end-if;
+  end-if;
+end-define;
+
+# BUILD_REPORT HDR: the frame becomes a report for slot R: PO + 64 bytes long,
+# zero from HDR (nothing of the packet it was cloned from is left: trimming
+# and growing it again would bring the old bytes back), the payload at $PO.
+define BUILD_REPORT HDR;
+  set len $(PO + 64);
+  fill-bytes $HDR 64 0;
+  fill-bytes $(HDR + 64) $(PO - HDR - 64) 0;
+  fill-bytes $(PO + 40) 24 0;
+  set val T %R; calc mul T 16; calc add T 1;
+  calc-map add ST_$P %T 1 X;
+  calc add X 1; calc and X 0xFFFFFFFF;
+  set val T 0x4C430101; calc lsh T 32; calc or T %X;
+  PUTW $PO T;
+  get map NK_$P %R X; PUTW $(PO + 8) X;
+  set val T %R; calc mul T 2; get map TX_$P %T X; PUTW $(PO + 16) X;
+  calc add T 1; get map TX_$P %T X; PUTW $(PO + 24) X;
+  PUTW $(PO + 32) NOW;
+  calc-map add CF_$P 12 1;
+end-define;
+
+# TRIGGER PRE POST: before this packet is counted, see whether the next
+# neighbor in turn is due a report (interval passed, something sent to it
+# since the last one, and this packet can be cut down: not GSO). One CPU wins
+# the slot with an atomic exchange. PRE marks a clone of the packet as a
+# report for slot R to neighbor KEY, POST restores the packet.
+define TRIGGER PRE POST;
+  get map CF_$P 8 X;
+  if X gt $MAXN; set val X $MAXN; end-if;
+  if X gt 0;
+    calc-map add CF_$P 9 1 R;
+    calc mod R %X;
+    decl LAST 8; decl IV 8; decl C 8;
+    set val T %R; calc mul T 16;
+    get map ST_$P %T LAST;
+    get map CF_$P 0 IV;
+    if IV eq 0; set val IV $INTERVAL_NS; end-if;
+    set val X %NOW; calc sub X %LAST;
+    if X ge %IV;
+      set val C %R; calc mul C 2; get map TX_$P %C C;
+      calc add T 2; get map ST_$P %T X; calc sub T 2;
+      if C ne %X;
+        get gso-segs B4; set val X %B4;
+        if X le 1;
+          calc-map xchg ST_$P %T %NOW X;
+          if X eq %LAST;
+            calc add T 2; set map ST_$P %T %C;
+            get map NK_$P %R KEY;
+            $PRE;
+            clone $IFNAME egress;
+            $POST;
+          end-if;
+        else;
+          calc-map add CF_$P 11 1;
+        end-if;
+      end-if;
+    end-if;
+    free C; free IV; free LAST;
+  end-if;
+end-define;
+
+# COUNT M: one packet of L IP bytes for slot S (slot + 1). A GSO/GRO packet
+# counts as the packets it is made of; its bytes are its IP length, so the
+# headers of the segments after the first are not counted.
+define COUNT M;
+  set val T %S; calc sub T 1; calc mul T 2;
+  get gso-segs B4; set val X %B4;
+  if X eq 0; set val X 1; end-if;
+  calc-map add $M %T %X;
+  calc add T 1;
+  calc-map add $M %T %L;
+end-define;
+
+# ANSWER BASE: turn the report at BASE + $PO (W0 = its first word) from slot
+# S (slot + 1) into the reply, with what was received from it by now.
+define ANSWER BASE;
+  calc add W0 0x100000000;
+  PUTW $(BASE + PO) W0;
+  PUTW $(BASE + PO + 8) KEY;
+  set val T %S; calc sub T 1; calc mul T 2; get map RX_$P %T X; PUTW $(BASE + PO + 40) X;
+  calc add T 1; get map RX_$P %T X; PUTW $(BASE + PO + 48) X;
+  PUTW $(BASE + PO + 56) NOW;
+  set val T %S; calc sub T 1; calc mul T 16; calc add T 14; set map ST_$P %T %NOW;
+  calc-map add CF_$P 15 1;
+end-define;
+
+# REPLY_IN BASE: a reply from slot S (slot + 1): one sample into the ring.
+define REPLY_IN BASE;
+  decl B 8; set val B %S; calc sub B 1; calc mul B 16;
+  set val X %W0; calc and X 0xFFFFFFFF;
+  set val T %B; calc add T 3; get map ST_$P %T R;
+  decl OK 1; set val OK 1;
+  if R ne 0;
+    if X seq-le %R; set val OK 0; end-if;
+  end-if;
+  if OK eq 0;
+    calc-map add CF_$P 16 1;
+  else;
+    set map ST_$P %T %X;
+    decl TP 8; decl TB 8; decl TT 8; decl RP 8; decl RB 8; decl RT 8;
+    GETW $(BASE + PO + 16) TP; GETW $(BASE + PO + 24) TB; GETW $(BASE + PO + 32) TT;
+    GETW $(BASE + PO + 40) RP; GETW $(BASE + PO + 48) RB; GETW $(BASE + PO + 56) RT;
+    # one-way delay with the sign bit flipped, so later ones compare larger
+    decl OWD 8; set val OWD %RT; calc sub OWD %TT; calc xor OWD 0x8000000000000000;
+    decl MA 8; decl MB 8; decl BW 8;
+    set val T %B; calc add T 9; get map ST_$P %T MA;
+    calc add T 1; get map ST_$P %T MB;
+    calc add T 1; get map ST_$P %T X;
+    get map CF_$P 2 BW; if BW eq 0; set val BW $BASE_NS; end-if; calc rsh BW 1;
+    set val R %NOW; calc sub R %X;
+    if R gt %BW;
+      set map ST_$P %T %NOW;
+      set val MB %MA; set val MA %OWD;
+      calc sub T 1; set map ST_$P %T %MB;
+      calc sub T 1; set map ST_$P %T %MA;
+    else;
+      set val R 0;
+      if MA eq 0; set val R 1; end-if;
+      if OWD lt %MA; set val R 1; end-if;
+      if R eq 1;
+        set val MA %OWD;
+        calc sub T 2; set map ST_$P %T %MA;
+      end-if;
+    end-if;
+    if MB ne 0;
+      if MB lt %MA; set val MA %MB; end-if;
+    end-if;
+    calc sub OWD %MA;
+    # previous reply
+    decl PT 8; decl PB 8; decl PP 8; decl PQ 8; decl PR 8;
+    set val T %B; calc add T 4; get map ST_$P %T PT; set map ST_$P %T %TP;
+    calc add T 1; get map ST_$P %T PB; set map ST_$P %T %TB;
+    calc add T 1; get map ST_$P %T PP; set map ST_$P %T %RP;
+    calc add T 1; get map ST_$P %T PQ; set map ST_$P %T %RB;
+    calc add T 1; get map ST_$P %T PR; set map ST_$P %T %RT;
+    calc add T 4; set map ST_$P %T %NOW;
+    if PR ne 0;
+      set val OK 1;
+      if TP lt %PT; set val OK 0; end-if;
+      if TB lt %PB; set val OK 0; end-if;
+      if RP lt %PP; set val OK 0; end-if;
+      if RB lt %PQ; set val OK 0; end-if;
+      if RT le %PR; set val OK 0; end-if;
+      if OK eq 0;
+        calc-map add CF_$P 17 1;
+      else;
+        calc add T 1; calc-map add ST_$P %T 1 X;
+        calc mod X $RING; calc mul X 8;
+        set val T %B; calc div T 16; calc mul T $(RING * 8); calc add T %X;
+        set val X %NOW; calc div X 1000000; set map RG_$P %T %X;
+        calc add T 1; set val X %RT; calc sub X %PR; calc div X 1000; set map RG_$P %T %X;
+        calc add T 1; set val X %TP; calc sub X %PT; set map RG_$P %T %X;
+        calc add T 1; set val X %RP; calc sub X %PP; set map RG_$P %T %X;
+        calc add T 1; set val X %TB; calc sub X %PB; set map RG_$P %T %X;
+        calc add T 1; set val X %RB; calc sub X %PQ; set map RG_$P %T %X;
+        calc add T 1; set val X %OWD; calc div X 1000; set map RG_$P %T %X;
+        calc add T 1; set val X %NOW; calc sub X %TT; calc div X 1000; set map RG_$P %T %X;
+      end-if;
+    end-if;
+    calc-map add CF_$P 14 1;
+    free PR; free PQ; free PP; free PB; free PT; free BW; free MB; free MA; free OWD;
+    free RT; free RB; free RP; free TT; free TB; free TP;
+  end-if;
+  free OK; free B;
+end-define;
+
+decl W0 8;
+
+# ================================================================== Ethernet
+when $LINK == eth;
+  # ----------------------------------------------------------- egress
+  when $HOOK == egress;
+    # Our frames: a report draft (source MAC 4c:43:00:00 + slot) becomes the
+    # report; replies (cloned at ingress) pass. Neither is counted.
+    match eth-proto 0x88B6;
+      set skb-priority $PRIO;
+      get src-mac X;
+      set val T %X; calc rsh T 32;
+      if T eq 0x4C43;
+        set val R %X; calc and R 0xFFFF;
+        BUILD_REPORT 14;
+        set src-mac $IFMAC;
+      end-if;
+      continue;
+    end-match;
+    match ip; get ip-len B2; set val L %B2; end-match;
+    match ip6; RD 18 2 L; calc add L 40; end-match;
+    if L eq 0; continue; end-if;
+    get dst-mac KEY;
+    # the MAC is kept in frame order: its first byte is the low byte
+    set val T %KEY; calc and T 1;
+    if T eq 1; continue; end-if;
+    SLOT;
+    if S eq 0; continue; end-if;
+    decl A 8; decl E 8; decl F 8;
+    TRIGGER ETH_PRE ETH_POST;
+    COUNT TX_$P;
+    continue;
+  end-when;
+  # ----------------------------------------------------------- ingress
+  when $HOOK == ingress;
+    match eth-proto 0x88B6;
+      get len B4; set val X %B4;
+      if X lt $(PO + 64); drop; end-if;
+      GETW $PO W0;
+      set val T %W0; calc rsh T 32;
+      get src-mac KEY;
+      if T eq 0x4C430101;
+        SLOT;
+        if S eq 0; drop; end-if;
+        ANSWER 0;
+        set dst-mac %KEY;
+        set src-mac $IFMAC;
+        set skb-priority $PRIO;
+        clone $IFNAME egress;
+        calc-map add CF_$P 13 1;
+        drop;
+      end-if;
+      if T eq 0x4C430102;
+        get map NB_$P %KEY S;
+        if S eq 0; drop; end-if;
+        REPLY_IN 0;
+      end-if;
+      drop;
+    end-match;
+    match dst-mac $IFMAC;
+      match ip; get ip-len B2; set val L %B2; end-match;
+      match ip6; RD 18 2 L; calc add L 40; end-match;
+      if L ne 0;
+        get src-mac KEY;
+        SLOT;
+        if S ne 0; COUNT RX_$P; end-if;
+      end-if;
+    end-match;
+    continue;
+  end-when;
+end-when;
+
+# ======================================================= point-to-point (raw IP)
+when $LINK == p2p;
+  set val KEY 1;
+  when $HOOK == egress;
+    match ip;
+      RD 9 1 X;
+      # Our frames are IPv4 protocol 253; a report draft has the IP ID 0x4C43.
+      if X eq 253;
+        set skb-priority $PRIO;
+        RD 4 2 T;
+        if T eq 0x4C43;
+          set val R 0;
+          BUILD_REPORT 0;
+          IP_HEADER 0;
+        end-if;
+        continue;
+      end-if;
+      get ip-len B2; set val L %B2;
+    end-match;
+    match ip6; RD 4 2 L; calc add L 40; end-match;
+    if L eq 0; continue; end-if;
+    SLOT;
+    if S eq 0; continue; end-if;
+    decl A 8; decl E 8;
+    # reports are made from IPv4 packets only (skb->protocol stays the trigger's)
+    RD 0 1 X;
+    if X eq 0x45;
+      TRIGGER P2P_PRE P2P_POST;
+    end-if;
+    COUNT TX_$P;
+    continue;
+  end-when;
+  when $HOOK == ingress;
+    match ip;
+      RD 9 1 X;
+      if X eq 253;
+        get len B4; set val X %B4;
+        if X lt $(PO + 64); drop; end-if;
+        GETW $PO W0;
+        set val T %W0; calc rsh T 32;
+        if T eq 0x4C430101;
+          SLOT;
+          if S eq 0; drop; end-if;
+          ANSWER 0;
+          set skb-priority $PRIO;
+          clone $IFNAME egress;
+          calc-map add CF_$P 13 1;
+          drop;
+        end-if;
+        if T eq 0x4C430102;
+          get map NB_$P %KEY S;
+          if S eq 0; drop; end-if;
+          REPLY_IN 0;
+        end-if;
+        drop;
+      end-if;
+      get ip-len B2; set val L %B2;
+    end-match;
+    match ip6; RD 4 2 L; calc add L 40; end-match;
+    if L ne 0;
+      SLOT;
+      if S ne 0; COUNT RX_$P; end-if;
+    end-if;
+    continue;
+  end-when;
+end-when;
+
+# ============================================================ multipoint GRE
+# TC sees outer IPv4 | GRE | inner packet ($OG: where the inner one starts).
+# A clone sent out of the device loses the outer header (the kernel pulls
+# it), so a report or reply comes back through egress as a bare inner IPv4
+# packet, protocol 253, and gets its outer header here: the destination is
+# what ip_gre sends to; it builds the rest itself.
+when $LINK == mgre;
+  when $HOOK == egress;
+    RD 9 1 X;
+    if X eq 253;
+      set skb-priority $PRIO;
+      RD 4 2 T;
+      RD 12 4 KEY;
+      decl D 8; set val D 0;
+      if T eq 0x4C43;
+        set val R %KEY;
+        BUILD_REPORT 0;
+        IP_HEADER 0;
+        get map NK_$P %R D;
+      end-if;
+      if T eq 0x4C44;
+        set val D %KEY;
+        set bytes 4 2 0;
+        set bytes 12 4 0;
+      end-if;
+      if D ne 0;
+        add-head-bytes $OG;
+        set bytes 0 1 0x45;
+        set bytes 9 1 47;
+        calc hton D 32; set bytes 16 4 %D;
+      end-if;
+      continue;
+    end-if;
+    if X ne 47; continue; end-if;
+    RD $OG 1 X;
+    if X eq 0x45;
+      RD $(OG + 9) 1 T;
+      if T eq 253; continue; end-if;
+    end-if;
+    calc rsh X 4;
+    if X eq 4; RD $(OG + 2) 2 L; end-if;
+    if X eq 6; RD $(OG + 4) 2 L; calc add L 40; end-if;
+    if L eq 0; continue; end-if;
+    RD 16 4 KEY;
+    if KEY eq 0; continue; end-if;
+    set val T %KEY; calc rsh T 28;
+    if T eq 14; continue; end-if;
+    SLOT;
+    if S eq 0; continue; end-if;
+    decl A 8; decl E 8; decl F 8;
+    RD $OG 1 X;
+    if X eq 0x45;
+      TRIGGER MGRE_PRE MGRE_POST;
+    end-if;
+    COUNT TX_$P;
+    continue;
+  end-when;
+  when $HOOK == ingress;
+    RD 9 1 X;
+    if X ne 47; continue; end-if;
+    RD 12 4 KEY;
+    RD $OG 1 X;
+    if X eq 0x45;
+      RD $(OG + 9) 1 T;
+      if T eq 253;
+        get len B4; set val X %B4;
+        if X lt $(OG + PO + 64); drop; end-if;
+        GETW $(OG + PO) W0;
+        set val T %W0; calc rsh T 32;
+        if T eq 0x4C430101;
+          SLOT;
+          if S eq 0; drop; end-if;
+          ANSWER $OG;
+          set bytes $(OG + 4) 2 0x4C44;
+          set val X %KEY; calc hton X 32; set bytes $(OG + 12) 4 %X;
+          set skb-priority $PRIO;
+          clone $IFNAME egress;
+          calc-map add CF_$P 13 1;
+          drop;
+        end-if;
+        if T eq 0x4C430102;
+          get map NB_$P %KEY S;
+          if S eq 0; drop; end-if;
+          REPLY_IN $OG;
+        end-if;
+        drop;
+      end-if;
+    end-if;
+    calc rsh X 4;
+    if X eq 4; RD $(OG + 2) 2 L; end-if;
+    if X eq 6; RD $(OG + 4) 2 L; calc add L 40; end-if;
+    if L ne 0;
+      SLOT;
+      if S ne 0; COUNT RX_$P; end-if;
+    end-if;
+    continue;
+  end-when;
+end-when;
+EOF
+)
+
+# Link-specific pieces used by TRIGGER (PRE marks the clone, POST restores
+# the packet) and IP_HEADER (the fixed IPv4 header of a report on raw links).
+LINK_MACROS=$(cat <<'EOF'
+# RD OFF N V: N (1, 2 or 4) bytes at OFF into the 8-byte V, host order. (A
+# get into a larger variable would leave its upper bytes as they were.)
+decl B1 1; decl B2 2; decl B4 4;
+define RD OFF N V;
+  get bytes $OFF $N B$N; set val $V %B$N;
+end-define;
+# Ethernet: destination = the neighbor, source = 4c:43:00:00 + slot, EtherType 0x88B6.
+define ETH_PRE;
+  get bytes 0 8 A; RD 8 4 E; RD 12 2 F;
+  set dst-mac %KEY;
+  set val T 0x4C43; calc lsh T 32; calc or T %R; set src-mac %T;
+  set eth-proto 0x88B6;
+end-define;
+define ETH_POST;
+  calc hton A 64; set bytes 0 8 %A;
+  calc hton E 32; set bytes 8 4 %E;
+  calc hton F 16; set bytes 12 2 %F;
+end-define;
+# Point-to-point: IP ID 0x4C43, protocol 253.
+define P2P_PRE;
+  RD 4 2 A; RD 9 1 E;
+  set bytes 4 2 0x4C43; set bytes 9 1 253;
+end-define;
+define P2P_POST;
+  calc hton A 16; set bytes 4 2 %A; set bytes 9 1 %E;
+end-define;
+# mGRE: the inner IPv4 header gets ID 0x4C43, protocol 253, source = slot.
+define MGRE_PRE;
+  RD $(OG + 4) 2 A; RD $(OG + 9) 1 E; RD $(OG + 12) 4 F;
+  set bytes $(OG + 4) 2 0x4C43; set bytes $(OG + 9) 1 253;
+  set val T %R; calc hton T 32; set bytes $(OG + 12) 4 %T;
+end-define;
+define MGRE_POST;
+  calc hton A 16; set bytes $(OG + 4) 2 %A; set bytes $(OG + 9) 1 %E;
+  calc hton F 32; set bytes $(OG + 12) 4 %F;
+end-define;
+# IP_HEADER BASE: IPv4, total length PO + 64, DF, TTL 64, protocol 253,
+# addresses 0.0.0.0 (a neighbor without linkcap drops it as a martian).
+define IP_HEADER BASE;
+  set bytes $BASE 8 $IPW0;
+  set bytes $(BASE + 8) 8 $IPW1;
+  set bytes $(BASE + 16) 4 0;
+end-define;
+EOF
+)
+
+# IPv4 header words for IP_HEADER (total length PO + 64)
+ip_header_words() {
+    local tl=$1 sum ck
+    sum=$(( 0x4500 + tl + 0x0000 + 0x4000 + 0x40FD ))
+    while [ $sum -gt 65535 ]; do sum=$(( (sum & 0xFFFF) + (sum >> 16) )); done
+    ck=$(( ~sum & 0xFFFF ))
+    IPW0=$(printf '0x4500%04X00004000' "$tl")
+    IPW1=$(printf '0x40FD%04X00000000' "$ck")
+}
+
+# ---------------------------------------------------------------- generate
+PO=128; RING=64
+ip_header_words $((PO + 64))
+ns_of() { parse_dur_ns "$1"; }
+
+write_iface() {
+    local IF=$1 P dir hook prio f out
+    detect_link "$IF"
+    P=$(prefix_of "$IF")
+    local OH=${VAL[overhead]}; [ "$OH" = auto ] && OH=$OVERHEAD_AUTO
+    local OG=0; [ "$LINK" = mgre ] && OG=$((20 + GRE_HLEN))
+    local HDR="# linkcap: version=$VERSION iface=$IF prefix=$P link=$LINK gre_hlen=${GRE_HLEN:-0} profile=${PROFILE:-none} interval=${VAL[interval]} baseline_window=${VAL[baseline-window]} delay_threshold=${VAL[delay-threshold]} capacity_window=${VAL[capacity-window]} overhead=$OH neighbors=${VAL[neighbors]} report_priority=${VAL[report-priority]} ingress_prio=$IN_PRIO egress_prio=$EG_PRIO ring=$RING"
+    for hook in ingress egress; do
+        [ $hook = ingress ] && prio=$IN_PRIO || prio=$EG_PRIO
+        out=$(cat <<EOC
+$HDR
+# Generated by bpfc-linkcap-gen $(printf '%q ' "${ARGS[@]}")
+# Do not edit: regenerate. Runtime settings: bpfc-linkcap-status set.
+name linkcap $hook: per-neighbor loss and capacity ($LINK);
+const P $P;
+const LINK $LINK;
+const MAXN ${VAL[neighbors]};
+const RING $RING;
+const PO $PO;
+const OG $OG;
+const INTERVAL_NS $(ns_of "${VAL[interval]}");
+const BASE_NS $(ns_of "${VAL[baseline-window]}");
+const PRIO $((VAL[report-priority]));
+const IPW0 $IPW0;
+const IPW1 $IPW1;
+$LINK_MACROS
+$PROGRAM_BODY
+EOC
+)
+        if [ "$OUTDIR" = - ]; then
+            echo "### $IF/$hook/$prio.bpfc"; echo "$out"
+        else
+            dir=$OUTDIR/$IF/$hook
+            mkdir -p "$dir"
+            f=$dir/$prio.bpfc
+            printf '%s\n' "$out" > "$f.tmp" && mv "$f.tmp" "$f"
+            echo "wrote $f"
+        fi
+    done
+}
+
+if [ "$ACTION" = hints ]; then
+    for IF in "${IFACES[@]}"; do
+        detect_link "$IF"
+        cat <<EOF
+# $IF ($LINK): one skb must be one packet on the wire, at both ends
+ethtool -K $IF tso off gso off gro off 2>/dev/null || true
+EOF
+    done
+    cat <<EOF
+# Reports and replies carry skb->priority ${VAL[report-priority]}. Give it a band
+# or class the shaper does not limit, so the measured queueing delay is the
+# link's, not the local shaper's: with prio/pfifo_fast 7 (TC_PRIO_CONTROL)
+# is band 0; with HTB pass the class id (1:10 = 0x10010) as --report-priority.
+EOF
+    exit 0
+fi
+
+for IF in "${IFACES[@]}"; do write_iface "$IF"; done
+[ "$OUTDIR" = - ] || echo "now: systemctl reload bpfcd (or bpfcctl reload)"

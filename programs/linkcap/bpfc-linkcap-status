@@ -1,0 +1,320 @@
+#!/bin/bash
+# bpfc-linkcap-status - loss, delivered rate, queueing delay and capacity per
+# neighbor, from the linkcap programs (bpfc-linkcap-gen). Reads the pinned
+# maps with "bpfc -r"; a shaper can poll the -1 or -j output.
+#
+# Must run as root (reads pinned eBPF maps).
+
+BPFC=${BPFC:-bpfc}
+CONF=${BPFC_CONF:-/etc/bpfc/bpfc.conf}
+CONFIG_DIR=""; MAP_DIR=""; FMT=table; FILTER_IF=""; NETNS=; PREFIX_ARG=
+ORIG_ARGS=("$@")
+_args=()
+while [ $# -gt 0 ]; do
+    case $1 in
+    --netns) NETNS=${2:-}; shift 2 || shift ;;
+    --netns=*) NETNS=${1#*=}; shift ;;
+    *) _args+=("$1"); shift ;;
+    esac
+done
+set -- ${_args[@]+"${_args[@]}"}
+
+usage() {
+cat <<EOF
+Usage: $(basename "$0") [options] [command]
+
+Commands:
+  status [IF]            one row per neighbor (the default)
+  detail [IF]            every value per neighbor
+  counters [IF]          report/reply counters per interface
+  settings [IF]          the runtime settings in force
+  set IF SETTING VALUE   change a setting at run time
+  unset IF SETTING       return it to the generated value
+
+Options:
+  -i IF     only this interface
+  -P NAME   map suffix (with -i, when the programs were generated with --prefix)
+  -m DIR    pinned map directory (default: map_dir in $CONF, else /sys/fs/bpf)
+  -c DIR    program directory (default: config_dir in $CONF, else /etc/bpfc/interfaces.d)
+  -n NAME   network namespace NAME (also --netns NAME)
+  -j        JSON
+  -1        one line of key=value per neighbor (for scripts and shapers)
+  -h        help
+
+Settings: interval, delay-threshold, baseline-window, capacity-window
+(durations: us, ms, s, m; a bare number is ms), overhead (bytes per packet).
+
+State per neighbor:
+  under      the queueing delay is at its baseline: the path has room. The
+             lower bound is the highest rate delivered while it was.
+  at         the queueing delay is above delay-threshold: the path is full,
+             and capacity is the median rate delivered while it was.
+  idle       nothing sent to it in the capacity window
+  no-reply   reports go out but nothing comes back (no linkcap there?)
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+conf_value() { [ -r "$CONF" ] && sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" | tail -1; }
+
+CMD=; ARGS=()
+while [ $# -gt 0 ]; do
+    OPTIND=1
+    while getopts "i:P:m:c:n:j1h" o; do
+        case $o in
+        i) FILTER_IF=$OPTARG ;;
+        P) PREFIX_ARG=$OPTARG ;;
+        m) MAP_DIR=$OPTARG ;;
+        c) CONFIG_DIR=$OPTARG ;;
+        n) NETNS=$OPTARG ;;
+        j) FMT=json ;;
+        1) FMT=line ;;
+        h) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    [ $# -gt 0 ] || break
+    if [ -z "$CMD" ]; then CMD=$1; else ARGS+=("$1"); fi
+    shift
+done
+CMD=${CMD:-status}
+
+netns_reexec() {
+    local ns=$1; shift
+    [ -n "$ns" ] || return 0
+    [ "${BPFC_IN_NETNS:-}" = "$ns" ] && return 0
+    local ctl=${BPFCCTL:-}
+    if [ -z "$ctl" ]; then
+        ctl=$(command -v bpfcctl 2>/dev/null) || ctl=$(cd "$(dirname "$0")" && pwd)/../../bpfcd/bpfcctl
+    fi
+    [ -x "$ctl" ] || { echo "Error: -n needs bpfcctl (not found; set BPFCCTL=)" >&2; exit 1; }
+    exec "$ctl" -n "$ns" exec -- "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$@"
+}
+netns_reexec "$NETNS" "${ORIG_ARGS[@]}"
+[ -n "$MAP_DIR" ] || MAP_DIR=${BPFC_MAP_DIR:-}
+[ -n "$CONFIG_DIR" ] || CONFIG_DIR=${BPFC_CONFIG_DIR:-}
+[ -n "$MAP_DIR" ] || MAP_DIR=$(conf_value map_dir)
+[ -n "$MAP_DIR" ] || MAP_DIR=/sys/fs/bpf
+[ -n "$CONFIG_DIR" ] || CONFIG_DIR=$(conf_value config_dir)
+[ -n "$CONFIG_DIR" ] || CONFIG_DIR=/etc/bpfc/interfaces.d
+AWK=$(command -v gawk 2>/dev/null || echo awk)
+
+parse_dur_ns() {
+    local v=${1,,}
+    [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)(us|ms|s|m)?$ ]] || return 1
+    awk -v n="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[3]:-ms}" \
+        'BEGIN{m=(u=="us")?1e3:(u=="ms")?1e6:(u=="s")?1e9:6e10; printf "%.0f\n", n*m}'
+}
+map_id() {
+    local h n a=abcdefghijklmnopqrstuvwxyz234567 out="" i
+    h=$(printf '%s' "$1" | sha256sum); n=$((16#${h:0:10}))
+    for i in 1 2 3 4 5 6 7 8; do out=${a:$((n & 31)):1}$out; n=$((n >> 5)); done
+    echo "lc$out"
+}
+
+# The generated programs carry their settings in a "# linkcap:" line.
+# IFS / HDRS: the interfaces found and their header lines.
+IFLIST=(); declare -A HDRS
+for f in "$CONFIG_DIR"/*/egress/*.bpfc; do
+    [ -r "$f" ] || continue
+    h=$(sed -n '1s/^# linkcap: //p' "$f")
+    [ -n "$h" ] || continue
+    i=$(sed -n 's/.* iface=\([^ ]*\).*/\1/p' <<< "$h")
+    [ -n "$i" ] || continue
+    [ -n "${HDRS[$i]+x}" ] && continue
+    IFLIST+=("$i"); HDRS[$i]=$h
+done
+# an interface given with -i whose programs are not in the program directory
+if [ -n "$FILTER_IF" ] && [ -z "${HDRS[$FILTER_IF]+x}" ]; then
+    p=${PREFIX_ARG:-$(map_id "$FILTER_IF")}
+    [ -e "$MAP_DIR/CF_$p" ] || die "no linkcap programs for $FILTER_IF (in $CONFIG_DIR) and no maps CF_$p in $MAP_DIR"
+    IFLIST+=("$FILTER_IF"); HDRS[$FILTER_IF]="iface=$FILTER_IF prefix=$p link=eth"
+fi
+hdr() { sed -n "s/.* $2=\([^ ]*\).*/\1/p" <<< " ${HDRS[$1]}"; }
+
+declare -A CFGIDX=([interval]=0 [delay-threshold]=1 [baseline-window]=2 [capacity-window]=3 [overhead]=4)
+declare -A HDRKEY=([interval]=interval [delay-threshold]=delay_threshold [baseline-window]=baseline_window [capacity-window]=capacity_window [overhead]=overhead)
+
+now_ns() {   # CLOCK_MONOTONIC, as the programs' bpf_ktime_get_ns
+    local n
+    n=$(head -3 /proc/timer_list 2>/dev/null | sed -n 's/^now at \([0-9]*\) nsecs.*/\1/p')
+    [ -n "$n" ] && { echo "$n"; return; }
+    awk '{printf "%.0f\n", $1 * 1e9}' /proc/uptime
+}
+
+dump() { "$BPFC" -m "$MAP_DIR" -r "$1" 2>/dev/null; }
+
+do_set() {   # set|unset IF KEY [VALUE]
+    local op=$1 IF=$2 k=$3 v=$4 P idx val
+    [ -n "$IF" ] && [ -n "${HDRS[$IF]+x}" ] || die "no linkcap interface ${IF:-?} (see $(basename "$0") status)"
+    [ -n "${CFGIDX[$k]+x}" ] || die "unknown setting ${k:-?}: interval, delay-threshold, baseline-window, capacity-window, overhead"
+    P=$(hdr "$IF" prefix); idx=${CFGIDX[$k]}
+    if [ "$op" = unset ]; then val=0
+    elif [ "$k" = overhead ]; then
+        [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -le 255 ] || die "overhead: 0-255 bytes"
+        val=$((v + 1))
+    else
+        val=$(parse_dur_ns "$v") || die "$k: not a duration: $v"
+        [ "$val" -gt 0 ] || die "$k must be more than 0"
+        [ "$k" != interval ] || { [ "$val" -ge 10000000 ] && [ "$val" -le 60000000000 ]; } || die "interval: 10ms - 60s"
+    fi
+    "$BPFC" -m "$MAP_DIR" -w "CF_$P" "$idx" "$val" >/dev/null || die "could not write CF_$P in $MAP_DIR"
+    echo "$IF: $k $( [ "$op" = unset ] && echo "back to the generated value ($(hdr "$IF" "${HDRKEY[$k]}"))" || echo "= $v")"
+}
+
+case $CMD in
+set)   do_set set "${ARGS[0]}" "${ARGS[1]}" "${ARGS[2]}"; exit ;;
+unset) do_set unset "${ARGS[0]}" "${ARGS[1]}"; exit ;;
+status|detail|counters|settings) [ -z "${ARGS[0]}" ] || FILTER_IF=${ARGS[0]} ;;
+*) usage >&2; exit 2 ;;
+esac
+
+[ ${#IFLIST[@]} -gt 0 ] || die "no linkcap programs in $CONFIG_DIR (bpfc-linkcap-gen -i IF)"
+NOW=$(now_ns)
+FIRST=1
+case $CMD in counters|settings) JKEY=interfaces ;; *) JKEY=neighbors ;; esac
+[ "$FMT" = json ] && printf '{"%s":[' "$JKEY"
+for IF in "${IFLIST[@]}"; do
+    [ -z "$FILTER_IF" ] || [ "$FILTER_IF" = "$IF" ] || continue
+    P=$(hdr "$IF" prefix); LINK=$(hdr "$IF" link)
+    if [ ! -e "$MAP_DIR/CF_$P" ]; then
+        [ "$FMT" = table ] && echo "$IF: no maps (CF_$P) in $MAP_DIR: programs not loaded?"
+        continue
+    fi
+    DEFS="interval=$(parse_dur_ns "$(hdr "$IF" interval)") delay_threshold=$(parse_dur_ns "$(hdr "$IF" delay_threshold)") baseline_window=$(parse_dur_ns "$(hdr "$IF" baseline_window)") capacity_window=$(parse_dur_ns "$(hdr "$IF" capacity_window)") overhead=$(hdr "$IF" overhead) ring=$(hdr "$IF" ring) neighbors=$(hdr "$IF" neighbors)"
+    {
+        for m in CF NK TX RX ST RG; do
+            echo "@$m"
+            dump "${m}_$P"
+        done
+    } | "$AWK" -v ifname="$IF" -v link="$LINK" -v now="$NOW" -v defs="$DEFS" -v fmt="$FMT" \
+               -v cmd="$CMD" -v first="$FIRST" '
+function hex(s) { return strtonum(s) }
+function mac(k,   i, b, o) {           # the key keeps the MAC in frame order, first byte lowest
+    o = ""
+    for (i = 0; i < 6; i++) { b = int(k / 2^(8*i)) % 256; o = o (i ? ":" : "") sprintf("%02x", b) }
+    return o
+}
+function ip4(k) { return sprintf("%d.%d.%d.%d", int(k/16777216)%256, int(k/65536)%256, int(k/256)%256, k%256) }
+function rate(kbps) {
+    if (kbps == "") return "-"
+    if (kbps >= 1e6) return sprintf("%.2fG", kbps/1e6)
+    if (kbps >= 1e3) return sprintf("%.1fM", kbps/1e3)
+    return sprintf("%.0fk", kbps)
+}
+function ms(us) { return (us == "") ? "-" : sprintf("%.1f", us/1000) }
+function jstr(s) { gsub(/["\\]/, "\\\\&", s); return "\"" s "\"" }
+function jnum(v) { return (v == "") ? "null" : v }
+BEGIN {
+    n = split(defs, d, " ")
+    for (i = 1; i <= n; i++) { split(d[i], kv, "="); def[kv[1]] = kv[2] }
+    ring = def["ring"] ? def["ring"] : 64
+}
+/^@/ { m = substr($0, 2); next }
+/Key:/ { v[m, hex($3)] = hex($6); next }
+END {
+    cfg["interval"] = v["CF", 0] ? v["CF", 0] : def["interval"]
+    cfg["delay_threshold"] = v["CF", 1] ? v["CF", 1] : def["delay_threshold"]
+    cfg["baseline_window"] = v["CF", 2] ? v["CF", 2] : def["baseline_window"]
+    cfg["capacity_window"] = v["CF", 3] ? v["CF", 3] : def["capacity_window"]
+    cfg["overhead"] = v["CF", 4] ? v["CF", 4] - 1 : def["overhead"]
+    thr_us = cfg["delay_threshold"] / 1000
+    win_ms = cfg["capacity_window"] / 1e6
+    now_ms = now / 1e6
+    # slots handed out (CF 8 also counts the attempts once the table is full)
+    maxn = def["neighbors"] ? def["neighbors"] : 4096
+    nslots = v["CF", 8]; if (nslots > maxn) nslots = maxn
+    cnames = "neighbors refused (table full)|reports skipped (GSO packet)|reports sent|replies sent|replies received|reports received|stale replies|counter resets"
+    split(cnames, cn, "|")
+    if (cmd == "settings") {
+        if (fmt == "json") {
+            printf "%s{\"interface\":%s,\"interval_ms\":%.3f,\"delay_threshold_ms\":%.3f,\"baseline_window_ms\":%.0f,\"capacity_window_ms\":%.0f,\"overhead\":%d}", first ? "" : ",", jstr(ifname), cfg["interval"]/1e6, cfg["delay_threshold"]/1e6, cfg["baseline_window"]/1e6, cfg["capacity_window"]/1e6, cfg["overhead"]
+        } else if (fmt == "line") {
+            printf "interface=%s interval_ms=%.3f delay_threshold_ms=%.3f baseline_window_ms=%.0f capacity_window_ms=%.0f overhead=%d\n", ifname, cfg["interval"]/1e6, cfg["delay_threshold"]/1e6, cfg["baseline_window"]/1e6, cfg["capacity_window"]/1e6, cfg["overhead"]
+        } else {
+            printf "%s (%s)\n  interval          %.3f ms%s\n  delay-threshold   %.3f ms%s\n  baseline-window   %.0f ms%s\n  capacity-window   %.0f ms%s\n  overhead          %d bytes%s\n", ifname, link, cfg["interval"]/1e6, v["CF",0]?" (set)":"", cfg["delay_threshold"]/1e6, v["CF",1]?" (set)":"", cfg["baseline_window"]/1e6, v["CF",2]?" (set)":"", cfg["capacity_window"]/1e6, v["CF",3]?" (set)":"", cfg["overhead"], v["CF",4]?" (set)":""
+        }
+        exit
+    }
+    if (cmd == "counters") {
+        if (fmt == "json") {
+            printf "%s{\"interface\":%s,\"neighbors\":%d", first ? "" : ",", jstr(ifname), nslots
+            for (i = 1; i <= 8; i++) { k = cn[i]; gsub(/ \(.*\)/, "", k); gsub(/ /, "_", k); printf ",%s:%d", jstr(k), v["CF", 9 + i] }
+            printf "}"
+        } else if (fmt == "line") {
+            printf "interface=%s neighbors=%d", ifname, nslots
+            for (i = 1; i <= 8; i++) { k = cn[i]; gsub(/ \(.*\)/, "", k); gsub(/ /, "_", k); printf " %s=%d", k, v["CF", 9 + i] }
+            printf "\n"
+        } else {
+            printf "%s (%s): %d neighbors\n", ifname, link, nslots
+            for (i = 1; i <= 8; i++) printf "  %-32s %d\n", cn[i], v["CF", 9 + i]
+        }
+        exit
+    }
+    if (fmt == "table" && cmd == "status") {
+        printf "%-10s %-19s %-9s %9s %9s %9s %7s %8s %8s %8s\n", "Interface", "Neighbor", "State", "Capacity", "LowerBnd", "Rate", "Loss%", "QDelay", "RTT", "LastRpl"
+    }
+    out = 0
+    for (s = 0; s < nslots; s++) {
+        key = v["NK", s]
+        nb = (link == "eth") ? mac(key) : (link == "mgre") ? ip4(key) : "peer"
+        txp = v["TX", 2*s]; txb = v["TX", 2*s+1]; rxp = v["RX", 2*s]; rxb = v["RX", 2*s+1]
+        b = 16*s
+        reports = v["ST", b+1]; last_reply = v["ST", b+12]; last_report = v["ST", b+0]
+        ns_ = v["ST", b+13]
+        # samples in the window, newest first
+        cnt = 0; lb = ""; ncong = 0; sp = 0; sl = 0; sb = 0; sbl = 0; newest = -1; nt = 0
+        delete cr
+        for (i = 0; i < ring && i < ns_; i++) {
+            idx = (ns_ - 1 - i) % ring
+            o = s*ring*8 + idx*8
+            t = v["RG", o]; iv = v["RG", o+1]
+            if (iv <= 0 || now_ms - t > win_ms) continue
+            kb = v["RG", o+5] * 8000 / iv
+            dp = v["RG", o+2]; dr = v["RG", o+3]; qd = v["RG", o+6]
+            if (newest < 0) { newest = idx; cur_rate = kb; cur_qd = qd; cur_rtt = v["RG", o+7]; cur_t = t; cur_pk = dr; cur_iv = iv }
+            cnt++
+            sp += dp; sl += dp - dr; sb += v["RG", o+4]; sbl += v["RG", o+4] - v["RG", o+5]
+            if (qd > thr_us) { cr[++ncong] = kb }
+            else if (lb == "" || kb > lb) lb = kb
+        }
+        cap = ""
+        if (ncong >= 3) {
+            asort(cr)
+            cap = (ncong % 2) ? cr[(ncong+1)/2] : (cr[ncong/2] + cr[ncong/2+1]) / 2
+        }
+        loss = (sp > 0) ? 100 * sl / sp : ""
+        if (loss != "" && loss < 0) loss = 0
+        if (cnt == 0) {
+            state = (reports > 0 && (last_reply == 0 || now - last_reply > 3*cfg["interval"] + 1e9) && now - last_report < cfg["capacity_window"]) ? "no-reply" : "idle"
+            cur_rate = ""; cur_qd = ""; cur_rtt = ""; cur_wire = ""
+        } else {
+            state = (cur_qd > thr_us) ? "at" : "under"
+            cur_wire = cur_rate + cfg["overhead"] * cur_pk * 8000 / cur_iv
+        }
+        age = last_reply ? (now - last_reply) / 1e6 : ""
+        if (fmt == "table" && cmd == "status") {
+            printf "%-10s %-19s %-9s %9s %9s %9s %7s %8s %8s %8s\n", ifname, nb, state, rate(cap), rate(lb), rate(cur_rate), (loss == "") ? "-" : sprintf("%.2f", loss), ms(cur_qd), ms(cur_rtt), (age == "") ? "-" : sprintf("%.0fms", age)
+        } else if (fmt == "table") {
+            printf "%s neighbor %s (slot %d)\n", ifname, nb, s
+            printf "  state %s; capacity %s, lower bound %s (bit/s of IP packets)\n", state, rate(cap), rate(lb)
+            printf "  now: rate %s (wire %s), queueing delay %s ms, RTT %s ms\n", rate(cur_rate), rate(cur_wire), ms(cur_qd), ms(cur_rtt)
+            printf "  window %.0f s: %d samples, %d at capacity, loss %s %% of packets, %s %% of bytes\n", win_ms/1000, cnt, ncong, (loss == "") ? "-" : sprintf("%.3f", loss), (sb > 0) ? sprintf("%.3f", (sbl > 0 ? 100*sbl/sb : 0)) : "-"
+            printf "  sent %d packets / %d bytes, received %d / %d; %d reports, last reply %s ms ago\n", txp, txb, rxp, rxb, reports, (age == "") ? "-" : sprintf("%.0f", age)
+        } else if (fmt == "line") {
+            printf "interface=%s neighbor=%s state=%s capacity_kbps=%s lower_bound_kbps=%s rate_kbps=%s wire_rate_kbps=%s loss_pct=%s qdelay_us=%s rtt_us=%s samples=%d congested=%d last_reply_ms=%s tx_packets=%d tx_bytes=%d rx_packets=%d rx_bytes=%d\n", ifname, nb, state, (cap == "") ? "-" : sprintf("%.0f", cap), (lb == "") ? "-" : sprintf("%.0f", lb), (cur_rate == "") ? "-" : sprintf("%.0f", cur_rate), (cur_wire == "") ? "-" : sprintf("%.0f", cur_wire), (loss == "") ? "-" : sprintf("%.3f", loss), (cur_qd == "") ? "-" : cur_qd, (cur_rtt == "") ? "-" : cur_rtt, cnt, ncong, (age == "") ? "-" : sprintf("%.0f", age), txp, txb, rxp, rxb
+        } else {
+            printf "%s{\"interface\":%s,\"neighbor\":%s,\"state\":%s,\"capacity_kbps\":%s,\"lower_bound_kbps\":%s,\"rate_kbps\":%s,\"wire_rate_kbps\":%s,\"loss_pct\":%s,\"qdelay_us\":%s,\"rtt_us\":%s,\"samples\":%d,\"congested\":%d,\"last_reply_ms\":%s,\"tx_packets\":%d,\"tx_bytes\":%d,\"rx_packets\":%d,\"rx_bytes\":%d}", (first && out == 0) ? "" : ",", jstr(ifname), jstr(nb), jstr(state), jnum(cap == "" ? "" : sprintf("%.0f", cap)), jnum(lb == "" ? "" : sprintf("%.0f", lb)), jnum(cur_rate == "" ? "" : sprintf("%.0f", cur_rate)), jnum(cur_wire == "" ? "" : sprintf("%.0f", cur_wire)), jnum(loss == "" ? "" : sprintf("%.3f", loss)), jnum(cur_qd), jnum(cur_rtt), cnt, ncong, jnum(age == "" ? "" : sprintf("%.0f", age)), txp, txb, rxp, rxb
+        }
+        out++
+    }
+    if (out == 0 && fmt == "table") printf "%-10s (no neighbors yet)\n", ifname
+    exit (out > 0) ? 0 : 3
+}'
+    rc=$?
+    # status 3: the interface printed nothing (JSON stays well formed)
+    [ $rc -eq 0 ] && FIRST=0
+done
+[ "$FMT" = json ] && printf ']}\n'
+exit 0

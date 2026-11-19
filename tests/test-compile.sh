@@ -54,7 +54,7 @@ for f in ip-src ip-dst tcp-src tcp-dst udp-src udp-dst tcp-seq tcp-ack tcp-flags
          l4-off payload-off payload-len flow-key tstamp ip-tos ip-len ip-frag ip-proto ip-ident gre-key \
          gre-proto eth-proto dst-mac src-mac mpls-label mpls-bos vlan-id arp-htype arp-ptype arp-hlen \
          arp-plen arp-oper arp-sha arp-spa arp-tha arp-tpa ip6-src ip6-dst ip6-proto ip6-tclass ip6-flow \
-         time random cpu len protocol queue skb-mark skb-hash skb-ingress skb-ifindex; do
+         time random cpu len protocol queue skb-mark skb-hash skb-priority gso-segs skb-ingress skb-ifindex; do
 	ok "CC-get-$f" "get $f V"
 done
 ok CC-get-bytes          "get bytes 14 2 V"
@@ -70,7 +70,7 @@ declare -A VARSIZE=( [dst-mac]=8 [src-mac]=8 [arp-sha]=8 [arp-tha]=8 [ip6-src]=1
 for f in tstamp dst-mac src-mac eth-proto ip-src ip-dst ip-tos ip-proto ip-len ip-frag tcp-src tcp-dst \
          udp-src udp-dst vlan-id mpls-label mpls-bos queue arp-htype arp-ptype arp-hlen arp-plen arp-oper \
          arp-sha arp-tha arp-spa arp-tpa ip6-src ip6-dst ip6-proto ip6-tclass ip6-flow icmp-type len \
-         skb-mark skb-hash protocol; do
+         skb-mark skb-hash skb-priority protocol; do
 	ok "CC-set-$f"     "set $f ${SETVAL[$f]:-5}"
 	ok "CC-set-$f-var" "decl V ${VARSIZE[$f]:-4}; set $f %V"
 done
@@ -84,7 +84,7 @@ ok CC-set-val-var    "decl V 4; decl W 4; set val V %W"
 for f in src-mac dst-mac eth-proto vlan-id mpls-label mpls-bos ip-proto ip-tos ip-frag ip-frag-off ip-len \
          ip-src ip-dst tcp-src udp-src tcp-dst udp-dst gre-key gre-proto arp-htype arp-ptype arp-hlen \
          arp-plen arp-oper arp-sha arp-tha arp-spa arp-tpa ip6-src ip6-dst ip6-proto ip6-tclass ip6-flow \
-         icmp-type skb-mark skb-hash skb-ifindex skb-ingress len protocol; do
+         icmp-type skb-mark skb-hash skb-priority gso-segs skb-ifindex skb-ingress len protocol; do
 	ok "CC-match-$f"     "match $f ${SETVAL[$f]:-5}"
 	ok "CC-match-$f-var" "decl V ${VARSIZE[$f]:-4}; match $f %V"
 done

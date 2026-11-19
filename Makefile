@@ -47,7 +47,7 @@ RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
 TARBALL    = bpfc-$(VERSION).tar.gz
 
-.PHONY: fuzz check-compile check-dataplane check-ecmp check-all all clean install install-programs dist rpm srpm check
+.PHONY: fuzz check-compile check-dataplane check-ecmp check-linkcap check-all all clean install install-programs dist rpm srpm check
 
 all: $(TARGET) $(DAEMON) $(CTL)
 
@@ -177,6 +177,9 @@ check-compile: $(TARGET)
 
 check-ecmp: $(TARGET)
 	bash tests/run-tests.sh $(TESTFLAGS) ecmp
+
+check-linkcap: $(TARGET)
+	bash tests/run-tests.sh $(TESTFLAGS) linkcap
 
 check-dataplane: $(TARGET)
 	bash tests/run-tests.sh $(TESTFLAGS) verifier-budget dataplane dataplane-udp

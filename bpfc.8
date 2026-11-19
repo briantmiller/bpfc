@@ -268,6 +268,12 @@ A variable offset reads with \fBbpf_skb_load_bytes\fR (0 outside the packet) and
 .BI "get|set tstamp " "VAR|value"
 \fBskb->tstamp\fR in ns; a future time on egress paces the packet under the fq qdisc.
 .TP
+.BI "get|set|match skb\-priority " "VAR|value"
+\fBskb->priority\fR: the prio/pfifo_fast band, or an HTB class (major:minor as 0xMMMMmmmm) the packet is queued in.
+.TP
+.BI "get|match gso\-segs " "VAR|value"
+The number of segments in a GSO/GRO packet (\fBskb->gso_segs\fR); 0 or 1 for an ordinary packet.
+.TP
 \fBif\fR \fIA\fR \fBseq-lt\fR|\fBseq-le\fR|\fBseq-gt\fR|\fBseq-ge\fR \fIB\fR
 Serial-number comparison of 32-bit wrapping counters (TCP sequence numbers).
 .TP
@@ -357,7 +363,7 @@ The packet length, from \fBbpf_xdp_get_buff_len\fR. \fBget skb\-ingress\fR and \
 \fBadd\-head\-bytes\fR, \fBadd\-bytes\fR, \fBdel\-bytes\fR, \fBadd\-l2\-bytes\fR, \fBdel\-l2\-bytes\fR, \fBpush\-\fR/\fBpop\-eth\fR, \fBpush\-\fR/\fBpop\-vlan\fR, \fBpush\-qinq\fR, \fBencap\-\fR/\fBdecap\-mpls\fR, \fBencap\-\fR/\fBdecap\-gre\fR, \fBinsert\-l2\fR, \fBremove\-l2\fR, \fBstrip\-l2\fR and \fBset len\fR work, so the MPLS pseudowire examples do too. They grow or shrink the packet at the front with \fBbpf_xdp_adjust_head\fR (at most 255 bytes at a time; generic mode has 256 bytes of headroom) and at the end with \fBbpf_xdp_adjust_tail\fR. Inserted bytes are zero, as on TC. With an offset up to 64, \fBadd\-bytes\fR and \fBdel\-bytes\fR move only the bytes in front of it; growing at the end needs tailroom, which generic mode may not have. VLAN tags are pushed into and popped from the packet (4 bytes at offset 12, the MAC addresses moved in front).
 .TP
 .B Refused
-Commands that need an skb are a compile error naming the command: \fBip\-frag\fR, \fBip\-defrag\fR, \fBclone\fR, \fBredirect\-neigh\fR, \fBreclassify\fR, and the skb fields (\fBskb\-mark\fR, \fBskb\-hash\fR, \fBskb\-cb\fR, \fBprotocol\fR, \fBtstamp\fR, \fBset queue\fR). Maps, buffer maps, \fBxor\-packet\fR, \fBcalc\-csum\fR, \fBfib\-lookup\fR and the rest work.
+Commands that need an skb are a compile error naming the command: \fBip\-frag\fR, \fBip\-defrag\fR, \fBclone\fR, \fBredirect\-neigh\fR, \fBreclassify\fR, and the skb fields (\fBskb\-mark\fR, \fBskb\-hash\fR, \fBskb\-priority\fR, \fBgso\-segs\fR, \fBskb\-cb\fR, \fBprotocol\fR, \fBtstamp\fR, \fBset queue\fR). Maps, buffer maps, \fBxor\-packet\fR, \fBcalc\-csum\fR, \fBfib\-lookup\fR and the rest work.
 .PP
 The constants \fB$XDP\fR (1 in an XDP program, else 0) and \fB$HOOK\fR (\fBingress\fR, \fBegress\fR or \fBxdp\fR) let one file serve several hooks: \fBwhen $XDP == 0\fR ... \fBend\-when\fR.
 .SH EXAMPLES

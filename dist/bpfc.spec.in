@@ -73,7 +73,11 @@ runtime settings. Includes the built-in profiles, the design notes and
 example programs. bpfc-ecmp-gen generates a bandwidth-aware, policy-based
 ECMP layer over the kernel's multipath routes, and bpfc-ecmp-status shows
 per-interface load, per-flow bandwidth and decisions and sets each
-interface's bandwidth.
+interface's bandwidth. bpfc-linkcap-gen generates per-neighbor packet
+accounting with report/reply frames (Ethernet, point-to-point links such
+as GRE, PPP and WireGuard, and multipoint GRE), and bpfc-linkcap-status
+turns it into loss, delivered rate, queueing delay and a capacity
+estimate per neighbor, for a shaper to poll.
 
 %prep
 %autosetup

@@ -108,7 +108,7 @@ See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)`. Build an RPM (RHEL 9/10) with `
 * Checksum-aware rewrites (`set ip-src`, ports, `ip-tos`, ...) update the IP and TCP/UDP checksums incrementally, as on TC. XDP sees complete checksums; a packet a local socket sent through a veth pair may carry a partial one (CHECKSUM_PARTIAL), which an L4 rewrite corrupts once the packet is forwarded: turn tx checksum offload off on such senders (`ethtool -K <dev> tx off`).
 * VLAN tags are in the packet: `match vlan`/`qinq`, `get`/`match vlan-id` read them there, `set vlan-id` rewrites the id in the tag (keeping priority and DEI; pushes an 802.1Q tag when there is none), and `push-`/`pop-vlan` insert or remove the 4-byte tag after the MAC addresses. A NIC that strips tags (`rxvlan` offload) may hand generic XDP packets without them.
 * Resizing works: `add-head-bytes`, `add-bytes`/`del-bytes`, `add-l2-bytes`/`del-l2-bytes`, `push-`/`pop-eth`, `push-`/`pop-vlan`, `push-qinq`, `encap-`/`decap-mpls`, `encap-`/`decap-gre`, `insert-l2`/`remove-l2`/`strip-l2` and `set len`, so the [MPLS pseudowire](#3-mpls-pseudowires) examples run as XDP programs too. The packet grows or shrinks at the front with `bpf_xdp_adjust_head` (up to 255 bytes at a time; generic mode has 256 bytes of headroom) and at the end with `bpf_xdp_adjust_tail`; inserted bytes are zero, as on TC. Growing at the end needs tailroom, which generic mode may not have.
-* Commands that need an skb are a compile error naming the command: `ip-frag`, `ip-defrag`, `clone`, `redirect-neigh`, `reclassify`, and the skb fields (`skb-mark`, `skb-hash`, `skb-cb`, `protocol`, `tstamp`, `set queue`). `get len`, `skb-ingress`/`skb-ifindex` (the ingress interface) and `queue` (the receive queue) work.
+* Commands that need an skb are a compile error naming the command: `ip-frag`, `ip-defrag`, `clone`, `redirect-neigh`, `reclassify`, and the skb fields (`skb-mark`, `skb-hash`, `skb-priority`, `gso-segs`, `skb-cb`, `protocol`, `tstamp`, `set queue`). `get len`, `skb-ingress`/`skb-ifindex` (the ingress interface) and `queue` (the receive queue) work.
 * `$XDP` (1 in an XDP program) and `$HOOK` (`ingress`, `egress`, `xdp`) let one file serve several hooks: `when $XDP == 0; set skb-mark 5; end-when`.
 
 ---
@@ -171,6 +171,21 @@ bpfc-ecmp-status set shed 60           # thresholds and timers at run time
 
 Every packet re-checks that its flow's interface is still a member of the route, so a withdrawn next hop is noticed on the next packet. See [programs/ecmp/DESIGN.md](programs/ecmp/DESIGN.md); `make check-ecmp` (root) runs the end-to-end tests.
 
+### Per-neighbor loss and capacity (`bpfc-linkcap-gen`)
+
+Every unicast IP packet leaving an interface is counted per neighbor (the next hop's MAC on Ethernet; the far end of a point-to-point link such as GRE, PPP or WireGuard; the outer address on multipoint GRE). At each report interval a clone of a packet becomes a small report with the cumulative counts and a timestamp, the neighbor answers with what it received by then, and the sender gets loss, delivered rate, queueing delay (no clock synchronisation) and RTT per interval. The status tool turns these into a capacity estimate: the median rate delivered while the queueing delay is above a threshold, or a lower bound while it is not; loss without a delay rise is link loss, not congestion. Both ends must run it; nothing is sent on idle links.
+
+```bash
+bpfc-linkcap-gen -i eth0 -i gre1            # /etc/bpfc/interfaces.d/<if>/{ingress/5,egress/60000}.bpfc
+bpfc-linkcap-gen -i wan0 --profile leo      # also: default, geo
+systemctl reload bpfcd
+bpfc-linkcap-status                         # one row per neighbor: state, capacity, lower bound, rate, loss, delay
+bpfc-linkcap-status -1                      # key=value per neighbor, for a shaper (-j: JSON)
+bpfc-linkcap-status set eth0 delay-threshold 20ms
+```
+
+See [programs/linkcap/DESIGN.md](programs/linkcap/DESIGN.md) for the frames, the samples and the limits; `make check-linkcap` (root) runs the end-to-end tests.
+
 ---
 
 ## Language Syntax
@@ -222,6 +237,8 @@ Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val |
 * `skb-ingress` - Ingress interface number associated with sk_buff.
 * `skb-mark` - Netfilter/iptables firewall mark (`u32`).
 * `skb-hash` - RPS flow hash (`u32`).
+* `skb-priority` - `skb->priority`: the prio/pfifo_fast band, or an HTB class (major:minor as `0xMMMMmmmm`) the packet is queued in (`u32`).
+* `gso-segs` - (`get`/`match` only) the number of segments a GSO/GRO packet is made of (`skb->gso_segs`); 0 or 1 for an ordinary packet.
 * `tstamp` - `skb->tstamp`, 64-bit ns. On egress, a time in the future (CLOCK_MONOTONIC, as `get time`) holds the packet until then under the fq qdisc (earliest-departure-time pacing).
 * `skb-cb <0-4>` - 20-byte control buffer array (5x `u32` slots) for passing state across tail-calls and to the next TC priority.
 * `cpu` - (`get` only) number of the CPU running the program.

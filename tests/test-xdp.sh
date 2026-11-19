@@ -84,6 +84,8 @@ echo "compile"
 bad_msg() { local out; out=$("$BPFC" "${@:3}" 2>&1); local rc=$?
 	if [ $rc -ne 0 ] && [ $rc -lt 128 ] && [[ "$out" == *"$2"* ]]; then test_pass "$1"; else test_fail "$1"; echo "$out" | head -2 | sed 's/^/    /'; fi; }
 bad_msg XDP-err-skb-mark   "'set skb-mark' is not available in XDP programs" -d xdp "set skb-mark 5"
+bad_msg XDP-err-skb-prio   "'set skb-priority' is not available in XDP programs" -d xdp "set skb-priority 5"
+bad_msg XDP-err-gso-segs   "XDP has no GSO state" -d xdp "decl V 4; get gso-segs V"
 bad_msg XDP-err-reclassify "'reclassify' is not available in XDP programs"   -d xdp "reclassify"
 bad_msg XDP-err-clone      "XDP cannot clone packets"                        -d xdp "clone lo"
 bad_msg XDP-err-redir-in   "can only redirect out of an interface"          -d xdp "redirect lo ingress"
