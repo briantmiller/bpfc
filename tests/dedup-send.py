@@ -2,7 +2,8 @@
 """Test helper for tests/test-dedup.sh: sends crafted IPv4 frames on lo.
 
   dedup-send.py --lo-up
-      bring lo up and allow 127/8 sources arriving on it (route_localnet),
+      bring lo up and accept 127/8 sources arriving on it (route_localnet,
+      accept_local, rp_filter 0),
       in a fresh network namespace
   dedup-send.py [--recv PORT] PKT [PKT ...]
       PKT is a comma-separated list of key=value (all optional):
@@ -23,10 +24,14 @@ def lo_up():
     flags = struct.unpack('16sH14x', fcntl.ioctl(s, SIOCGIFFLAGS, struct.pack('16sH14x', b'lo', 0)))[1]
     fcntl.ioctl(s, SIOCSIFFLAGS, struct.pack('16sH14x', b'lo', flags | IFF_UP))
     # Frames sent with AF_PACKET arrive without a route: a 127/8 source is
-    # martian unless route_localnet is on.
+    # martian unless route_localnet is on, and it is a local address, which
+    # reverse-path filtering refuses unless accept_local is on. A new
+    # namespace inherits rp_filter from the host (RHEL: 1), and the effective
+    # value is the larger of "all" and the interface's, so both are set.
     for c in ('all', 'lo'):
-        with open('/proc/sys/net/ipv4/conf/%s/route_localnet' % c, 'w') as f:
-            f.write('1')
+        for k, v in (('route_localnet', '1'), ('accept_local', '1'), ('rp_filter', '0')):
+            with open('/proc/sys/net/ipv4/conf/%s/%s' % (c, k), 'w') as f:
+                f.write(v)
 
 def csum(b):
     if len(b) % 2:
