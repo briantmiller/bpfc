@@ -69,6 +69,13 @@ static struct daemon_info dinfo;
 static struct slot *slots;
 static int nslots, cap_slots;
 static int state_dirty;
+/*
+ * Set once the previous run's state file has been read for adoption. From then
+ * on the state file is rewritten as each program is installed, not only at the
+ * end of a pass, so bpfcctl never shows the previous run's state (as "not
+ * running", with program ids that are gone) while the first compiles run.
+ */
+static int state_live;
 static int sigfd = -1, nlfd = -1, tfd = -1, pidfd = -1;
 static int verify_pending;
 
@@ -167,9 +174,15 @@ static void fill_dinfo(void) {
 static void write_state(void) {
     char path[PATH_MAX + 32];
     snprintf(path, sizeof(path), "%s/%s", cfg.state_dir, STATE_FILE_NAME);
-    qsort(slots, nslots, sizeof(*slots), slot_cmp);
+    /* Sorted for the file, on a copy: callers may be iterating over slots. */
+    struct slot *sorted = nslots ? malloc((size_t)nslots * sizeof(*slots)) : NULL;
+    if (sorted) {
+        memcpy(sorted, slots, (size_t)nslots * sizeof(*slots));
+        qsort(sorted, nslots, sizeof(*sorted), slot_cmp);
+    }
     fill_dinfo();
-    int rc = state_write(path, &dinfo, slots, nslots);
+    int rc = state_write(path, &dinfo, sorted ? sorted : slots, nslots);
+    free(sorted);
     if (rc < 0) logmsg(LOG_LVL_ERR, "cannot write %s: %s", path, strerror(-rc));
     state_dirty = 0;
 }
@@ -688,7 +701,20 @@ static void apply(int is_reload) {
         }
         i++;
     }
+    /* What this pass will compile shows as "installing" until it is done (the state
+     * file is rewritten as it goes). Only where the interface is there: install_slot()
+     * makes the others pending. */
+    for (int i = 0; ns_active() && i < nslots; i++) {
+        struct slot *s = &slots[i];
+        if (s->dirty && !s->excluded && s->status != ST_INSTALLING && if_nametoindex(s->iface)) {
+            s->status = ST_INSTALLING;
+            state_dirty = 1;
+        }
+    }
     for (int i = 0; i < nslots; i++) {
+        /* What the previous slot changed, for bpfcctl, before the next compile.
+         * write_state() sorts a copy, so slots keeps its order under this loop. */
+        if (state_live && state_dirty) write_state();
         struct slot *s = &slots[i];
         int was_new = s->is_new;
         s->is_new = 0;
@@ -1102,6 +1128,8 @@ static int ns_enter(struct netns_loc *loc, int at_start) {
     load_links();
     scan_dir();
     if (at_start) adopt_previous_state();
+    state_live = 1;
+    write_state();      /* this run's pid, and the adopted programs, before any compile */
     retry_reason = "namespace found";
     apply(1);           /* every slot not adopted is pending: install them all */
     retry_reason = "reload retry";
@@ -2176,11 +2204,14 @@ int main(int argc, char **argv) {
         scan_dir();          /* the programs show as pending until the namespace is found */
         apply(0);
         ns_check(1);
+        state_live = 1;     /* entered and adopted by now, or not there: nothing left to read */
         ns_start_timer();
     } else {
         load_links();
         scan_dir();
         adopt_previous_state();
+        state_live = 1;
+        write_state();      /* this run's pid, and the adopted programs, before any compile */
         apply(0);
         verify_all();
     }

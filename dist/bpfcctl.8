@@ -69,6 +69,13 @@ load still shows its name, as long as bpfc got past preprocessing. Statuses are:
 .B installed
 Attached and current.
 .TP
+.B installing
+New or changed, and waiting for its turn to compile in the pass bpfcd is
+running (at startup or a reload). A program it replaces keeps running until
+then (KERNEL shows
+.BR previous ).
+Shown only while the pass lasts.
+.TP
 .B pending-iface
 The interface does not exist; installed when it appears.
 .TP

@@ -199,6 +199,8 @@ static const char *kernel_check(const struct slot *s, const char **color) {
         *color = C_GREEN;
         return "ok";
     }
+    /* About to be replaced: the program attached is the one this slot installed before. */
+    if (s->status == ST_INSTALLING && k && s->prog_id && k->prog_id == s->prog_id) return "previous";
     if (k) { *color = C_YELLOW; return "occupied"; }
     return "-";
 }
@@ -206,7 +208,7 @@ static const char *kernel_check(const struct slot *s, const char **color) {
 static const char *status_color(int st) {
     switch (st) {
     case ST_INSTALLED: return C_GREEN;
-    case ST_PENDING: case ST_EXCLUDED: return C_DIM;
+    case ST_PENDING: case ST_EXCLUDED: case ST_INSTALLING: return C_DIM;
     case ST_FAILED: case ST_DISABLED: return C_RED;
     default: return C_YELLOW;
     }

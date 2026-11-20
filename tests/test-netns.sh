@@ -149,7 +149,9 @@ check "restart in a different namespace installs afresh" eventually eval 'logged
 
 # ------------------------------------------------------------------ bpfcctl
 echo "bpfcctl"
-check "status -n exits 0 and names the namespace"      eval '"$BPFCCTL" -n bnt-a --color=never > $T/st; [ $? -eq 0 ] && grep -q "^netns: bnt-a" $T/st'
+# Exit status 0 only once every program of the restarted instance is installed and checked
+# against the kernel: wait for that, since compiling can take longer than the kernel check above.
+check "status -n exits 0 and names the namespace"      eventually eval '"$BPFCCTL" -n bnt-a --color=never > $T/st; [ $? -eq 0 ] && grep -q "^netns: bnt-a" $T/st'
 check "kernel cross-checked inside the namespace"      eval 'grep -E "^eth0 +ingress +10 " $T/st | grep -q " ok "'
 ip -n bnt-a link add bnt-only type veth peer name bnt-only2
 check "exec runs inside, /sys remounted for it"        eval '"$BPFCCTL" -n bnt-a exec ls /sys/class/net | grep -qx bnt-only && ! ls /sys/class/net | grep -qx bnt-only'

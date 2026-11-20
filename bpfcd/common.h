@@ -181,6 +181,7 @@ enum slot_status {
     ST_REPLACED_EXT,      /* replaced by something other than bpfcd (log policy) */
     ST_DISABLED,          /* reinstall limit hit; waits for the next reload */
     ST_EXCLUDED,          /* an empty file opts this interface out of a %all% / %<kind>% program */
+    ST_INSTALLING,        /* new or changed, to be compiled in the pass under way (any older program still runs) */
     ST__COUNT
 };
 

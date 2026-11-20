@@ -47,6 +47,7 @@ static const char *const status_names[ST__COUNT] = {
     [ST_REPLACED_EXT] = "replaced-externally",
     [ST_DISABLED] = "reinstall-limit",
     [ST_EXCLUDED] = "excluded",
+    [ST_INSTALLING] = "installing",
 };
 
 const char *status_name(int st) {
