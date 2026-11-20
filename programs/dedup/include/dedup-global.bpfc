@@ -1,0 +1,31 @@
+# dedup-global.bpfc: IPv4 duplicate removal shared by several interfaces.
+#
+#   include dedup-global.bpfc;
+#   match udp; match udp-dst 5000-5010; dedup; end-match; end-match;
+#
+# Attach at the ingress (TC, or XDP) of every interface that can receive a
+# copy: all of them use one table (scope G, maps DDS_G and so on), so the
+# copy arriving second, on whichever interface, is dropped. This is the
+# shape for 1+1 redundant paths. Egress is refused: a forwarded packet seen
+# at ingress and again at egress would be its own duplicate.
+#
+# -s DD_GROUP=<name> gives an independent table (scope <name>, 1-27 letters,
+# digits or _), for separate sets of interfaces. Give every program of a set
+# the same DD_GROUP and the same settings: they share the maps, and a map
+# declared with another size is replaced (its contents lost).
+#
+# Settings: see dedup-lib.bpfc. Status: bpfc-dedup.
+include dedup-lib.bpfc;
+
+when $HOOK == egress;
+  dedup-global-attaches-at-ingress-only-use-dedup-iface-for-egress;
+end-when;
+
+const DD_GROUP G;
+const DD_SCOPE $DD_GROUP;
+
+dedup-maps $DD_SCOPE;
+
+define dedup;
+  dedup-core $DD_SCOPE;
+end-define;

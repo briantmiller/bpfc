@@ -1,0 +1,14 @@
+# Global de-duplication for 1+1 redundant paths: the same stream arrives on
+# wan1 and wan2, and whichever copy comes second is dropped. Both interfaces
+# run this same file (wan2/ingress/40.bpfc includes it), so they share one
+# table (scope G: maps DDS_G, ...). Allow for the larger delay difference
+# between the paths: the window (DD_MS) must be longer, and the ID must not
+# wrap within it.
+# Status: bpfc-dedup G
+name dedup 1+1 on $IFNAME;
+include dedup-global.bpfc;
+
+match ip-dst 198.51.100.0/24;
+  match udp; dedup; end-match;
+  match tcp; dedup; end-match;
+end-match;

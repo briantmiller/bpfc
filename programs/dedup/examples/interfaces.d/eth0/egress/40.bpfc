@@ -1,0 +1,18 @@
+# Per-interface de-duplication at eth0 egress: duplicates created on this
+# host (a mirror, a redundant tunnel ending here) are not sent twice. The
+# egress table (E_eth0) is separate from the ingress one (I_eth0), so a
+# forwarded packet seen at both hooks is not its own duplicate.
+#
+# With many classes, set a flag in the matches and call dedup once: each
+# call is a full copy of the check.
+# Status: bpfc-dedup E_eth0
+name dedup on $IFNAME $HOOK;
+include dedup-iface.bpfc;
+
+decl DD 1;
+match udp; match udp-dst 5000-5010; set val DD 1; end-match; end-match;
+match tcp; match tcp-dst 179; set val DD 1; end-match; end-match;     # BGP
+match ospf; set val DD 1; end-match;
+if DD ne 0;
+  dedup;
+end-if;

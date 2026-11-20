@@ -1,0 +1,35 @@
+# dedup-iface.bpfc: IPv4 duplicate removal for one interface and one hook.
+#
+#   include dedup-iface.bpfc;
+#   match udp; match udp-dst 5000-5010; dedup; end-match; end-match;
+#
+# Attach at ingress or egress (TC) of any interface; bpfcd's %all% and
+# %<kind>% templates work too. Each interface and hook has its own table
+# (scope I_<if> or E_<if>, maps DDS_I_eth0 and so on), so a packet that
+# passes ingress and then egress, or two interfaces, is never a duplicate of
+# itself. Only packets handed to `dedup` are checked: call it inside the
+# matches for the traffic that can be duplicated, as often as needed. Each
+# call is a copy of the check (about 1,000 instructions, 1,200 verified;
+# bpfc allows 32,768): with many classes, set a flag in the matches and call
+# dedup once.
+#
+# Needs -i (or -s IFNAME=...). Settings: see dedup-lib.bpfc (DD_MS, DD_IDS,
+# DD_PKTS, DD_ENTRIES, DD_FLOWS, DD_HIST, DD_MODE). Status: bpfc-dedup.
+include dedup-lib.bpfc;
+
+const DD_U _;
+when $HOOK == egress;
+  const DD_SCOPE E$DD_U$IFNAME;
+otherwise;
+  when $HOOK == xdp;
+    const DD_SCOPE X$DD_U$IFNAME;
+  otherwise;
+    const DD_SCOPE I$DD_U$IFNAME;
+  end-when;
+end-when;
+
+dedup-maps $DD_SCOPE;
+
+define dedup;
+  dedup-core $DD_SCOPE;
+end-define;

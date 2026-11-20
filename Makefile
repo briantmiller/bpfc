@@ -100,6 +100,8 @@ install: all install-programs
 #                                           is created for local profiles
 #   programs/<name>/*.md                 -> PROGRAMS_DOCDIR/<name>/
 #   programs/<name>/examples/            -> PROGRAMS_DOCDIR/<name>/examples/
+#   programs/<name>/include/*.bpfc       -> SYSCONFDIR/bpfc/include/ (bpfc's
+#                                           include path; config files)
 # A tool that names /usr/share/bpfc/<name>/ is told where DATADIR put it.
 # PROGRAMS_FILELIST, when set, receives the RPM %files entries for what was
 # installed outside DATADIR/bpfc and PROGRAMS_DOCDIR (the spec uses it).
@@ -132,6 +134,11 @@ install-programs:
 			install -m 0644 "$$dir"/profiles/*.profile "$(DESTDIR)$(DATADIR)/bpfc/$$name/profiles/"; \
 			[ -z "$$list" ] || printf '%%dir %s\n' "$(SYSCONFDIR)/bpfc/$$name" "$(SYSCONFDIR)/bpfc/$$name/profiles.d" >> "$$list"; \
 		fi; \
+		for f in "$$dir"/include/*.bpfc; do \
+			[ -f "$$f" ] || continue; \
+			install -D -m 0644 "$$f" "$(DESTDIR)$(SYSCONFDIR)/bpfc/include/$${f##*/}"; \
+			[ -z "$$list" ] || echo "%config(noreplace) $(SYSCONFDIR)/bpfc/include/$${f##*/}" >> "$$list"; \
+		done; \
 		if [ -d "$$dir/examples" ]; then \
 			(cd "$$dir" && find examples -type f) | while IFS= read -r f; do \
 				install -D -m 0644 "$$dir/$$f" "$(DESTDIR)$(PROGRAMS_DOCDIR)/$$name/$$f"; \
@@ -168,7 +175,7 @@ srpm: $(TARBALL)
 TESTFLAGS ?=
 
 check: all
-	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd netns rest xdp xdp-examples tc-examples ecmp container install
+	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd netns rest xdp xdp-examples tc-examples dedup ecmp container install
 
 # Compile-only checks of every field and command and of the error messages;
 # needs no root (the few commands that create maps are skipped without it).

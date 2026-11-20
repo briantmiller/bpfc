@@ -77,7 +77,10 @@ interface's bandwidth. bpfc-linkcap-gen generates per-neighbor packet
 accounting with report/reply frames (Ethernet, point-to-point links such
 as GRE, PPP and WireGuard, and multipoint GRE), and bpfc-linkcap-status
 turns it into loss, delivered rate, queueing delay and a capacity
-estimate per neighbor, for a shaper to poll.
+estimate per neighbor, for a shaper to poll. dedup-iface.bpfc and 
+dedup-global.bpfc (in /etc/bpfc/include) drop duplicate IPv4 packets per 
+interface or across interfaces, and bpfc-dedup shows their counters and 
+recent duplicates.
 
 %prep
 %autosetup
@@ -146,12 +149,25 @@ fi
 %{_docdir}/%{name}-container/
 
 # programs.files, written by `make install-programs`: each program's tools
-# in sbin and its /etc/bpfc/<name>/profiles.d, whatever programs/ holds.
+# in sbin, its /etc/bpfc/<name>/profiles.d and its include files in
+# /etc/bpfc/include, whatever programs/ holds.
 %files programs -f programs.files
 %{_datadir}/bpfc/
 %{_docdir}/%{name}-programs/
 
 %changelog
+* Wed Nov 18 2026 bpfc maintainers <brun064@gmail.com> - @VERSION@-@RELEASE@
+- dedup: IPv4 duplicate-packet removal. dedup-iface.bpfc (a table per
+  interface and hook, ingress or egress) and dedup-global.bpfc (one table
+  shared by the ingress of several interfaces) define a dedup macro to call
+  inside matches. Key: source, destination, protocol and IP ID, plus the
+  total length and TCP/UDP checksum; fragments, and non-TCP/UDP DF packets
+  with ID 0, pass untouched. Entries expire by time (DD_MS), ID rollover
+  (DD_IDS) or packet count (DD_PKTS). bpfc-dedup shows counters, the last
+  duplicate and a history; -j JSON, -z reset. Tests: suite dedup (make check)
+- install-programs: programs/<name>/include/*.bpfc go to /etc/bpfc/include
+  (%config(noreplace))
+
 * Mon Nov 16 2026 bpfc maintainers <brun064@gmail.com> - @VERSION@-@RELEASE@
 - bpfc-scripts is renamed bpfc-programs (it obsoletes and provides
   bpfc-scripts, so an update replaces it); its docs move to

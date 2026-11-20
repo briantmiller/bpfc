@@ -1,0 +1,2 @@
+# Same program and table as wan1 (see there).
+include ../../wan1/ingress/40.bpfc;

@@ -1,0 +1,342 @@
+# dedup-lib.bpfc: IPv4 duplicate-packet removal, the shared core of
+# dedup-iface.bpfc (one table per interface and hook) and dedup-global.bpfc
+# (one table shared by the ingress of several interfaces). Programs include
+# one of those two and call `dedup;` inside their own matches; this file is
+# not meant to be included directly. Status: bpfc-dedup(8).
+#
+# A packet is a duplicate of an earlier one when source, destination, IP
+# protocol and IP identification are the same, and so is a signature of the
+# rest: the IP total length and one 16-bit word of the L4 header (the TCP or
+# UDP checksum, for other protocols the word at L4 offset 2, the ICMP
+# checksum). Two different TCP/UDP packets with the same ID therefore almost
+# never match, even from stacks that send a constant ID (RFC 6864).
+#
+# Not deduplicated, passed untouched (and counted):
+#   - fragments (MF set or a fragment offset): every fragment shares the ID
+#   - protocols other than TCP/UDP with DF set and ID 0: atomic datagrams
+#     whose ID carries no information (Linux sends ID 0 on unconnected DF
+#     sockets)
+#   - anything that is not IPv4
+#
+# An earlier packet stops counting (its entry is stale) when any of these
+# holds, so a recycled ID is never mistaken for a duplicate:
+#   - time:     it is older than DD_MS milliseconds
+#   - rollover: the sender's IP ID has advanced DD_IDS or more since, over
+#               (source, destination, protocol): the 16-bit ID may have
+#               wrapped back to the same value (default 32768, half the space)
+#   - packets:  DD_PKTS or more packets of that (source, destination,
+#               protocol) have passed since
+# DD_IDS or DD_PKTS 0 turns that test off.
+#
+# Maps, per scope <S> (dedup-iface: I_<if> / E_<if>, dedup-global: G or the
+# DD_GROUP name):
+#   DDS_<S>  LRU hash, DD_ENTRIES. key = src<<32 | id<<16 | proto<<8 |
+#            fold8(dst); value = signature<<32 | 1<<31 | tick, where
+#            signature = dst ^ (totlen<<16 | L4 word), tick = ktime>>20
+#            (1.048576 ms) in 31 bits, compared modulo 2^31
+#   DDQ_<S>  LRU hash, DD_ENTRIES. Same key; value = the flow's ID advance
+#            <<32 | packet count when the packet was recorded
+#   DDF_<S>  LRU hash, DD_FLOWS. key = src<<32 | (dst ^ proto*0x45d9f3b) mod
+#            2^32; value = ID advance<<32 | packets (both mod 2^32)
+#   DDL_<S>  LRU hash, DD_FLOWS. Same key; value = 1<<16 | last ID seen
+#   DDC_<S>  array, 16 counters and settings (see DD_C_* below)
+#   DDH_<S>  array, the last DD_HIST duplicates, 3 words each:
+#            src<<32 | dst; ktime ns; proto<<48 | id<<32 | ifindex
+#
+# The duplicate check is atomic (calc-map xchg), so two copies handled by two
+# CPUs at once cannot both pass. The flow counters (DDF/DDL) are updated with
+# get/set and are not atomic across CPUs; a lost update only shifts the
+# rollover and packet tests by a packet.
+#
+# Constants (-s NAME=value):
+const DD_MS 1000;          # time window, milliseconds
+const DD_IDS 32768;        # ID advance that ends the window (0: off)
+const DD_PKTS 32768;       # packets that end the window (0: off)
+const DD_ENTRIES 65536;    # packets remembered (DDS, DDQ)
+const DD_FLOWS 4096;       # (source, destination, protocol) tracked (DDF, DDL)
+const DD_HIST 16;          # duplicates kept in the history ring
+const DD_MODE drop;        # drop, or count (count duplicates, pass them)
+
+# DDC_<S> indices, read by bpfc-dedup.
+const DD_C_CHECKED 0;      # packets checked
+const DD_C_DUP 1;          # duplicates (dropped, or passed in count mode)
+const DD_C_NEW 2;          # packets recorded as new
+const DD_C_EXP_TIME 3;     # matching earlier packet older than DD_MS
+const DD_C_EXP_IDS 4;      # matching earlier packet, ID advanced DD_IDS since
+const DD_C_EXP_PKTS 5;     # matching earlier packet, DD_PKTS packets since
+const DD_C_FRAG 6;         # fragments passed untouched
+const DD_C_ATOMIC 7;       # non-TCP/UDP, DF and ID 0: passed untouched
+const DD_C_REPLACED 8;     # same key, different signature (another packet)
+const DD_C_HIST 9;         # duplicates written to the history (total)
+const DD_C_LAST 10;        # ktime ns of the last duplicate
+const DD_C_CFG_MS 11;      # settings, written with each duplicate
+const DD_C_CFG_IDS 12;
+const DD_C_CFG_PKTS 13;
+const DD_C_CFG_HIST 14;
+const DD_C_CFG_MODE 15;    # 0 drop, 1 count
+
+# The window in clock ticks (ktime >> 20), at least 1.
+const DD_TICKS $((DD_MS * 1000000 / 1048576) > 0 ? (DD_MS * 1000000 / 1048576) : 1);
+
+# Declare the maps of scope S (once per program, before the first dedup-core).
+define dedup-maps S;
+  hash-map DDS_$S $DD_ENTRIES;
+  hash-map DDQ_$S $DD_ENTRIES;
+  hash-map DDF_$S $DD_FLOWS;
+  hash-map DDL_$S $DD_FLOWS;
+  array-map DDC_$S 16;
+  array-map DDH_$S $(DD_HIST * 3);
+end-define;
+
+# The check itself, on the current packet, with the maps of scope S. Drops a
+# duplicate (DD_MODE drop); otherwise falls through to the next command.
+define dedup-core S;
+  match ip;
+    decl GO_$UNIQUE 1;
+    decl T_$UNIQUE 8;
+    decl FRAG_$UNIQUE 2;
+    decl ID_$UNIQUE 2;
+    decl P_$UNIQUE 1;
+    decl W_$UNIQUE 2;
+    decl L4_$UNIQUE 2;
+    set val GO_$UNIQUE 1;
+
+    get ip-frag FRAG_$UNIQUE;
+    set val T_$UNIQUE %FRAG_$UNIQUE;
+    calc and T_$UNIQUE 0x3fff;
+    if T_$UNIQUE ne 0;
+      calc-map add DDC_$S $DD_C_FRAG 1;
+      set val GO_$UNIQUE 0;
+    end-if;
+
+    get ip-ident ID_$UNIQUE;
+    get ip-proto P_$UNIQUE;
+    get l4-off L4_$UNIQUE;
+    if GO_$UNIQUE ne 0;
+      if P_$UNIQUE eq 6;
+        calc add L4_$UNIQUE 16;
+      else;
+        if P_$UNIQUE eq 17;
+          calc add L4_$UNIQUE 6;
+        else;
+          calc add L4_$UNIQUE 2;
+          set val T_$UNIQUE %FRAG_$UNIQUE;
+          calc and T_$UNIQUE 0x4000;
+          if T_$UNIQUE ne 0;
+            if ID_$UNIQUE eq 0;
+              calc-map add DDC_$S $DD_C_ATOMIC 1;
+              set val GO_$UNIQUE 0;
+            end-if;
+          end-if;
+        end-if;
+      end-if;
+      get bytes %L4_$UNIQUE 2 W_$UNIQUE;
+    end-if;
+    free L4_$UNIQUE;
+    free FRAG_$UNIQUE;
+
+    if GO_$UNIQUE ne 0;
+      calc-map add DDC_$S $DD_C_CHECKED 1;
+      decl SRC_$UNIQUE 4;
+      decl DST_$UNIQUE 4;
+      decl LEN_$UNIQUE 2;
+      decl NOW_$UNIQUE 8;
+      decl TICK_$UNIQUE 4;
+      decl KEY_$UNIQUE 8;
+      decl VAL_$UNIQUE 8;
+      decl FK_$UNIQUE 8;
+      get ip-src SRC_$UNIQUE;
+      get ip-dst DST_$UNIQUE;
+      get ip-len LEN_$UNIQUE;
+      get time NOW_$UNIQUE;
+      set val T_$UNIQUE %NOW_$UNIQUE;
+      calc rsh T_$UNIQUE 20;
+      calc and T_$UNIQUE 0x7fffffff;
+      set val TICK_$UNIQUE %T_$UNIQUE;
+
+      # KEY = src<<32 | id<<16 | proto<<8 | fold8(dst)
+      set val KEY_$UNIQUE %DST_$UNIQUE;
+      set val T_$UNIQUE %DST_$UNIQUE;
+      calc rsh T_$UNIQUE 16;
+      calc xor KEY_$UNIQUE %T_$UNIQUE;
+      set val T_$UNIQUE %KEY_$UNIQUE;
+      calc rsh T_$UNIQUE 8;
+      calc xor KEY_$UNIQUE %T_$UNIQUE;
+      calc and KEY_$UNIQUE 0xff;
+      set val T_$UNIQUE %P_$UNIQUE;
+      calc lsh T_$UNIQUE 8;
+      calc or KEY_$UNIQUE %T_$UNIQUE;
+      set val T_$UNIQUE %ID_$UNIQUE;
+      calc lsh T_$UNIQUE 16;
+      calc or KEY_$UNIQUE %T_$UNIQUE;
+      set val T_$UNIQUE %SRC_$UNIQUE;
+      calc lsh T_$UNIQUE 32;
+      calc or KEY_$UNIQUE %T_$UNIQUE;
+
+      # VAL = (dst ^ (totlen<<16 | L4 word))<<32 | 1<<31 | tick
+      set val VAL_$UNIQUE %LEN_$UNIQUE;
+      calc lsh VAL_$UNIQUE 16;
+      calc or VAL_$UNIQUE %W_$UNIQUE;
+      calc xor VAL_$UNIQUE %DST_$UNIQUE;
+      calc lsh VAL_$UNIQUE 32;
+      calc or VAL_$UNIQUE 0x80000000;
+      calc or VAL_$UNIQUE %TICK_$UNIQUE;
+      free LEN_$UNIQUE;
+      free W_$UNIQUE;
+
+      # FK = src<<32 | (dst ^ proto*0x45d9f3b) mod 2^32
+      set val FK_$UNIQUE %P_$UNIQUE;
+      calc mul FK_$UNIQUE 0x45d9f3b;
+      calc xor FK_$UNIQUE %DST_$UNIQUE;
+      calc and FK_$UNIQUE 0xffffffff;
+      set val T_$UNIQUE %SRC_$UNIQUE;
+      calc lsh T_$UNIQUE 32;
+      calc or FK_$UNIQUE %T_$UNIQUE;
+
+      # The flow's ID advance and packet count, including this packet.
+      decl ADV_$UNIQUE 4;
+      decl PK_$UNIQUE 4;
+      decl LI_$UNIQUE 4;
+      decl D16_$UNIQUE 2;
+      decl NEWLAST_$UNIQUE 1;
+      get map DDF_$S %FK_$UNIQUE T_$UNIQUE;
+      set val PK_$UNIQUE %T_$UNIQUE;
+      calc rsh T_$UNIQUE 32;
+      set val ADV_$UNIQUE %T_$UNIQUE;
+      calc add PK_$UNIQUE 1;
+      get map DDL_$S %FK_$UNIQUE LI_$UNIQUE;
+      if LI_$UNIQUE eq 0;
+        set val NEWLAST_$UNIQUE 1;
+      else;
+        set val D16_$UNIQUE %ID_$UNIQUE;
+        calc sub D16_$UNIQUE %LI_$UNIQUE;
+        if D16_$UNIQUE lt 32768;
+          calc add ADV_$UNIQUE %D16_$UNIQUE;
+          set val NEWLAST_$UNIQUE 1;
+        end-if;
+      end-if;
+      free D16_$UNIQUE;
+      free LI_$UNIQUE;
+
+      # Claim the key atomically; OLD is what was there.
+      decl OLD_$UNIQUE 8;
+      decl DUP_$UNIQUE 1;
+      decl X_$UNIQUE 4;
+      decl Q_$UNIQUE 8;
+      calc-map xchg DDS_$S %KEY_$UNIQUE %VAL_$UNIQUE OLD_$UNIQUE;
+      if OLD_$UNIQUE ne 0;
+        set val T_$UNIQUE %OLD_$UNIQUE;
+        calc xor T_$UNIQUE %VAL_$UNIQUE;
+        calc rsh T_$UNIQUE 32;
+        if T_$UNIQUE eq 0;
+          # Same packet. Age in ticks, modulo 2^31.
+          set val T_$UNIQUE %TICK_$UNIQUE;
+          calc sub T_$UNIQUE %OLD_$UNIQUE;
+          calc and T_$UNIQUE 0x7fffffff;
+          if T_$UNIQUE gt $DD_TICKS;
+            calc-map add DDC_$S $DD_C_EXP_TIME 1;
+          else;
+            set val DUP_$UNIQUE 1;
+            # Q = the flow's ID advance<<32 | packets when it was recorded.
+            # X is 4 bytes, so the differences are taken modulo 2^32.
+            get map DDQ_$S %KEY_$UNIQUE Q_$UNIQUE;
+            when $DD_IDS > 0;
+              set val X_$UNIQUE %ADV_$UNIQUE;
+              set val T_$UNIQUE %Q_$UNIQUE;
+              calc rsh T_$UNIQUE 32;
+              calc sub X_$UNIQUE %T_$UNIQUE;
+              if X_$UNIQUE ge $DD_IDS;
+                set val DUP_$UNIQUE 0;
+                calc-map add DDC_$S $DD_C_EXP_IDS 1;
+              end-if;
+            end-when;
+            when $DD_PKTS > 0;
+              if DUP_$UNIQUE ne 0;
+                set val X_$UNIQUE %PK_$UNIQUE;
+                calc sub X_$UNIQUE %Q_$UNIQUE;
+                if X_$UNIQUE ge $DD_PKTS;
+                  set val DUP_$UNIQUE 0;
+                  calc-map add DDC_$S $DD_C_EXP_PKTS 1;
+                end-if;
+              end-if;
+            end-when;
+          end-if;
+        else;
+          calc-map add DDC_$S $DD_C_REPLACED 1;
+        end-if;
+      end-if;
+      free X_$UNIQUE;
+      free Q_$UNIQUE;
+
+      if DUP_$UNIQUE ne 0;
+        # Keep the first copy's time, so the window runs from it.
+        set map DDS_$S %KEY_$UNIQUE %OLD_$UNIQUE;
+        calc-map add DDC_$S $DD_C_DUP 1;
+        set map DDC_$S $DD_C_LAST %NOW_$UNIQUE;
+        set map DDC_$S $DD_C_CFG_MS $DD_MS;
+        set map DDC_$S $DD_C_CFG_IDS $DD_IDS;
+        set map DDC_$S $DD_C_CFG_PKTS $DD_PKTS;
+        set map DDC_$S $DD_C_CFG_HIST $DD_HIST;
+        when $DD_MODE == count;
+          set map DDC_$S $DD_C_CFG_MODE 1;
+        otherwise;
+          set map DDC_$S $DD_C_CFG_MODE 0;
+        end-when;
+
+        # History: slot = n mod DD_HIST, 3 words.
+        decl H_$UNIQUE 8;
+        decl IF_$UNIQUE 4;
+        calc-map add DDC_$S $DD_C_HIST 1 H_$UNIQUE;
+        calc mod H_$UNIQUE $DD_HIST;
+        calc mul H_$UNIQUE 3;
+        set val T_$UNIQUE %SRC_$UNIQUE;
+        calc lsh T_$UNIQUE 32;
+        calc or T_$UNIQUE %DST_$UNIQUE;
+        set map DDH_$S %H_$UNIQUE %T_$UNIQUE;
+        calc add H_$UNIQUE 1;
+        set map DDH_$S %H_$UNIQUE %NOW_$UNIQUE;
+        calc add H_$UNIQUE 1;
+        get skb-ifindex IF_$UNIQUE;
+        set val T_$UNIQUE %P_$UNIQUE;
+        calc lsh T_$UNIQUE 16;
+        calc or T_$UNIQUE %ID_$UNIQUE;
+        calc lsh T_$UNIQUE 32;
+        calc or T_$UNIQUE %IF_$UNIQUE;
+        set map DDH_$S %H_$UNIQUE %T_$UNIQUE;
+        free H_$UNIQUE;
+        free IF_$UNIQUE;
+        when $DD_MODE != count;
+          drop;
+        end-when;
+      else;
+        calc-map add DDC_$S $DD_C_NEW 1;
+        set val T_$UNIQUE %ADV_$UNIQUE;
+        calc lsh T_$UNIQUE 32;
+        calc or T_$UNIQUE %PK_$UNIQUE;
+        set map DDQ_$S %KEY_$UNIQUE %T_$UNIQUE;
+        set map DDF_$S %FK_$UNIQUE %T_$UNIQUE;
+        if NEWLAST_$UNIQUE ne 0;
+          set val T_$UNIQUE %ID_$UNIQUE;
+          calc or T_$UNIQUE 0x10000;
+          set map DDL_$S %FK_$UNIQUE %T_$UNIQUE;
+        end-if;
+      end-if;
+      free SRC_$UNIQUE;
+      free DST_$UNIQUE;
+      free NOW_$UNIQUE;
+      free TICK_$UNIQUE;
+      free KEY_$UNIQUE;
+      free VAL_$UNIQUE;
+      free FK_$UNIQUE;
+      free ADV_$UNIQUE;
+      free PK_$UNIQUE;
+      free NEWLAST_$UNIQUE;
+      free OLD_$UNIQUE;
+      free DUP_$UNIQUE;
+    end-if;
+    free GO_$UNIQUE;
+    free T_$UNIQUE;
+    free ID_$UNIQUE;
+    free P_$UNIQUE;
+  end-match;
+end-define;

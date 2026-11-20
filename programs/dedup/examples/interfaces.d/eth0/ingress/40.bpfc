@@ -1,0 +1,13 @@
+# Per-interface de-duplication at eth0 ingress (bpfcd: priority 40).
+# Only the traffic that can arrive twice is checked: here RTP media
+# (UDP 10000-20000) and a telemetry feed (UDP 5000) from 192.0.2.0/24.
+# Status: bpfc-dedup I_eth0
+name dedup on $IFNAME $HOOK;
+include dedup-iface.bpfc;
+
+match ip-src 192.0.2.0/24;
+  match udp;
+    match udp-dst 10000-20000; dedup; end-match;
+    match udp-dst 5000; dedup; end-match;
+  end-match;
+end-match;

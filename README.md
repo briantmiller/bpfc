@@ -186,6 +186,21 @@ bpfc-linkcap-status set eth0 delay-threshold 20ms
 
 See [programs/linkcap/DESIGN.md](programs/linkcap/DESIGN.md) for the frames, the samples and the limits; `make check-linkcap` (root) runs the end-to-end tests.
 
+### Duplicate-packet removal (`dedup`)
+
+Drops the second copy of an IPv4 packet (same source, destination, protocol and IP ID, and the same length and TCP/UDP checksum). Include `dedup-iface.bpfc` (one table per interface and hook, ingress or egress) or `dedup-global.bpfc` (one table shared by the ingress of several interfaces, for 1+1 redundant paths), then call `dedup` inside the matches for the traffic that can be duplicated. Fragments pass untouched. An earlier packet stops counting after `DD_MS` milliseconds, once the sender's ID has advanced `DD_IDS` (rollover), or after `DD_PKTS` packets of its flow. The include files are installed in `/etc/bpfc/include`.
+
+```
+include dedup-iface.bpfc;
+match udp; match udp-dst 5000-5010; dedup; end-match; end-match;
+```
+
+```bash
+bpfc-dedup                 # counters, last duplicate and recent duplicates per table; -j for JSON, -z to reset
+```
+
+See [programs/dedup/README.md](programs/dedup/README.md).
+
 ---
 
 ## Language Syntax

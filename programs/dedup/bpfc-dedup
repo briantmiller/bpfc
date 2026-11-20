@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# bpfc-dedup - show the counters and recent duplicates of the bpfc IPv4
+# de-duplication programs (dedup-iface.bpfc, dedup-global.bpfc).  Pure bash
+# (4.4 or later); besides bash it runs only bpfc (-r, -w).
+set -euo pipefail
+shopt -s nullglob
+
+BPFC_BIN=${BPFC_BIN:-bpfc}
+MAP_DIR=${BPFC_MAP_DIR:-}; NETNS=
+ORIG_ARGS=("$@")
+FORMAT=table; HIST=-1; RESET=0
+SCOPES=()
+usage() { cat <<'USAGE'
+Usage: bpfc-dedup [options] [SCOPE...]
+  SCOPE                   I_<if> (ingress), E_<if> (egress), X_<if> (XDP),
+                          G or a DD_GROUP name (global); default: all found
+  -H, --history N         show the last N duplicates per scope (default: all
+                          kept, DD_HIST; 0: none)
+  -j, --json              JSON output
+  -z, --reset             zero the counters and the history of the scopes
+  --bpfc PATH             path to bpfc binary (default: BPFC_BIN or bpfc)
+  -m, --map-dir DIR       pinned map directory (default: map_dir in
+                          /etc/bpfc/bpfc.conf, else /sys/fs/bpf)
+  -n, --netns NAME        network namespace NAME: run inside it, with its map
+                          directory
+  -h, --help              show this help
+
+Counters:
+  checked     packets handed to dedup and checked
+  duplicates  dropped (or only counted, DD_MODE count)
+  new         recorded as a new packet
+  expired     a matching earlier packet no longer counted: older than DD_MS
+              (time), the sender's IP ID advanced DD_IDS since (rollover), or
+              DD_PKTS packets of the flow passed since (packets)
+  replaced    same source, ID, protocol and destination hash, but a different
+              packet (signature): the earlier entry was replaced
+  fragments   fragments, passed untouched
+  atomic-id0  not TCP/UDP, DF set and ID 0: passed untouched
+USAGE
+}
+while (($#)); do
+  case "$1" in
+    -H|--history) HIST=${2:?missing count}; shift 2;;
+    -j|--json) FORMAT=json; shift;;
+    -z|--reset) RESET=1; shift;;
+    --bpfc) BPFC_BIN=${2:?missing path}; shift 2;;
+    -m|--map-dir) MAP_DIR=${2:?missing directory}; shift 2;;
+    -n|--netns) NETNS=${2:?missing namespace}; shift 2;;
+    -h|--help) usage; exit 0;;
+    -*) echo "bpfc-dedup: unknown option: $1" >&2; usage >&2; exit 2;;
+    *) SCOPES+=("$1"); shift;;
+  esac
+done
+die() { echo "bpfc-dedup: $*" >&2; exit 2; }
+[[ $HIST =~ ^-?[0-9]+$ ]] || die 'history must be a number'
+
+# -n NETNS: run again inside the namespace through "bpfcctl exec", which sets
+# BPFC_MAP_DIR and friends to that namespace's paths (bpfcd(8)).
+if [ -n "$NETNS" ] && [ "${BPFC_IN_NETNS:-}" != "$NETNS" ]; then
+  ctl=${BPFCCTL:-}; here=.
+  [[ $0 == */* ]] && here=${0%/*}
+  here=$(cd "$here" && pwd)
+  [ -n "$ctl" ] || ctl=$(command -v bpfcctl 2>/dev/null) || ctl=$here/../../bpfcd/bpfcctl
+  [ -x "$ctl" ] || die '-n needs bpfcctl (not found; set BPFCCTL=)'
+  exec "$ctl" -n "$NETNS" exec -- "$here/${0##*/}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+fi
+
+if [ -z "$MAP_DIR" ] && [ -r /etc/bpfc/bpfc.conf ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ $line =~ ^[[:space:]]*map_dir[[:space:]]*=[[:space:]]*([^#]*) ]]; then
+      MAP_DIR=${BASH_REMATCH[1]%"${BASH_REMATCH[1]##*[![:space:]]}"}
+    fi
+  done < /etc/bpfc/bpfc.conf
+fi
+MAP_DIR=${MAP_DIR:-/sys/fs/bpf}
+
+if ((${#SCOPES[@]} == 0)); then
+  for f in "$MAP_DIR"/DDC_*; do SCOPES+=("${f##*/DDC_}"); done
+fi
+if ((${#SCOPES[@]} == 0)); then
+  [ "$FORMAT" = json ] && echo '[]' || echo "No dedup maps in $MAP_DIR"
+  exit 0
+fi
+for s in "${SCOPES[@]}"; do
+  [ -e "$MAP_DIR/DDC_$s" ] || die "no scope $s (no $MAP_DIR/DDC_$s)"
+done
+
+# read_array MAP: V[key] = value (decimal) from "bpfc -r"
+declare -a V
+read_array() {
+  local line k v
+  V=()
+  while IFS= read -r line; do
+    [[ $line =~ Key:\ 0x([0-9a-fA-F]+)\ -\>\ Value:\ 0x([0-9a-fA-F]+) ]] || continue
+    k=$((16#${BASH_REMATCH[1]})); v=$((16#${BASH_REMATCH[2]}))
+    V[k]=$v
+  done < <("$BPFC_BIN" -m "$MAP_DIR" -r "$1" 2>/dev/null || :)
+}
+
+if ((RESET)); then
+  for s in "${SCOPES[@]}"; do
+    for k in 0 1 2 3 4 5 6 7 8 9 10; do "$BPFC_BIN" -m "$MAP_DIR" -w "DDC_$s" "$k" 0 >/dev/null; done
+    read_array "DDH_$s"
+    for k in "${!V[@]}"; do "$BPFC_BIN" -m "$MAP_DIR" -w "DDH_$s" "$k" 0 >/dev/null; done
+    echo "bpfc-dedup: $s reset"
+  done
+  exit 0
+fi
+
+# The programs' times are CLOCK_MONOTONIC (bpf_ktime_get_ns).
+mono_ns() {
+  local line up
+  if [[ -r /proc/timer_list ]]; then
+    while read -r line; do
+      if [[ $line =~ ^now\ at\ ([0-9]+)\ nsecs ]]; then NOW_NS=${BASH_REMATCH[1]}; return 0; fi
+    done < /proc/timer_list
+  fi
+  read -r up _ < /proc/uptime
+  NOW_NS=$(( 10#${up%.*} * 1000000000 + 10#${up#*.} * 10000000 ))
+}
+declare -A IFNAME=()
+for d in /sys/class/net/*; do
+  [ -r "$d/ifindex" ] && read -r idx < "$d/ifindex" && IFNAME[$idx]=${d##*/}
+done
+ip4() { echo "$(( $1 >> 24 & 255 )).$(( $1 >> 16 & 255 )).$(( $1 >> 8 & 255 )).$(( $1 & 255 ))"; }
+proto_name() {
+  case $1 in 1) echo icmp;; 6) echo tcp;; 17) echo udp;; 47) echo gre;; 50) echo esp;;
+             89) echo ospf;; 132) echo sctp;; *) echo "$1";; esac
+}
+ago() {   # ns -> "1.234s"
+  local d=$(( NOW_NS - $1 )); (( d < 0 )) && d=0
+  printf '%d.%03ds' $(( d / 1000000000 )) $(( d / 1000000 % 1000 ))
+}
+where() {
+  case $1 in
+    I_*) echo "${1#I_} ingress";; E_*) echo "${1#E_} egress";;
+    X_*) echo "${1#X_} xdp";; *) echo "global ($1)";;
+  esac
+}
+
+mono_ns
+first=1
+[ "$FORMAT" = json ] && echo '['
+for s in "${SCOPES[@]}"; do
+  read_array "DDC_$s"
+  c=(); for ((k = 0; k < 16; k++)); do c[k]=${V[k]:-0}; done
+  nhist=${c[14]}; total=${c[9]}
+  (( nhist > 0 )) || nhist=0
+  # history, newest first
+  H=()
+  if (( nhist > 0 && total > 0 && HIST != 0 )); then
+    read_array "DDH_$s"
+    n=$(( total < nhist ? total : nhist ))
+    (( HIST > 0 && HIST < n )) && n=$HIST
+    for ((i = 0; i < n; i++)); do
+      slot=$(( (total - 1 - i) % nhist * 3 ))
+      a=${V[slot]:-0}; t=${V[slot+1]:-0}; m=${V[slot+2]:-0}
+      (( t > 0 )) || continue
+      H+=("$(( a >> 32 & 0xffffffff )) $(( a & 0xffffffff )) $t $(( m >> 48 & 255 )) $(( m >> 32 & 0xffff )) $(( m & 0xffffffff ))")
+    done
+  fi
+  mode=drop; (( c[15] == 1 )) && mode=count
+  if [ "$FORMAT" = json ]; then
+    ((first)) || echo ','
+    first=0
+    last=null; (( c[10] > 0 )) && last=$(( (NOW_NS - c[10]) / 1000000 ))
+    printf '  {"scope": "%s", "where": "%s", "checked": %d, "duplicates": %d, "new": %d,\n' \
+      "$s" "$(where "$s")" "${c[0]}" "${c[1]}" "${c[2]}"
+    printf '   "expired_time": %d, "expired_rollover": %d, "expired_packets": %d,\n' "${c[3]}" "${c[4]}" "${c[5]}"
+    printf '   "fragments": %d, "atomic_id0": %d, "replaced": %d, "history_total": %d,\n' \
+      "${c[6]}" "${c[7]}" "${c[8]}" "${c[9]}"
+    printf '   "last_duplicate_ms_ago": %s,\n' "$last"
+    if (( c[10] > 0 )); then
+      printf '   "settings": {"window_ms": %d, "ids": %d, "packets": %d, "history": %d, "mode": "%s"},\n' \
+        "${c[11]}" "${c[12]}" "${c[13]}" "${c[14]}" "$mode"
+    else
+      printf '   "settings": null,\n'
+    fi
+    printf '   "history": ['
+    sep=
+    for h in ${H[@]+"${H[@]}"}; do
+      read -r src dst t p id ifx <<< "$h"
+      printf '%s\n    {"ms_ago": %d, "src": "%s", "dst": "%s", "protocol": "%s", "id": %d, "ifindex": %d, "interface": "%s"}' \
+        "$sep" $(( (NOW_NS - t) / 1000000 )) "$(ip4 "$src")" "$(ip4 "$dst")" "$(proto_name "$p")" "$id" "$ifx" "${IFNAME[$ifx]:-$ifx}"
+      sep=,
+    done
+    printf ']}'
+  else
+    ((first)) || echo
+    first=0
+    echo "== $s: $(where "$s")"
+    printf '  checked %d  duplicates %d  new %d\n' "${c[0]}" "${c[1]}" "${c[2]}"
+    printf '  expired: time %d  rollover %d  packets %d   replaced %d\n' "${c[3]}" "${c[4]}" "${c[5]}" "${c[8]}"
+    printf '  passed untouched: fragments %d  atomic-id0 %d\n' "${c[6]}" "${c[7]}"
+    if (( c[10] > 0 )); then
+      printf '  last duplicate %s ago   (window %d ms, ids %d, packets %d, mode %s)\n' \
+        "$(ago "${c[10]}")" "${c[11]}" "${c[12]}" "${c[13]}" "$mode"
+    else
+      echo '  last duplicate: none'
+    fi
+    if ((${#H[@]})); then
+      printf '  %-10s %-15s    %-15s %-5s %5s  %s\n' AGO SOURCE DESTINATION PROTO ID INTERFACE
+      for h in "${H[@]}"; do
+        read -r src dst t p id ifx <<< "$h"
+        printf '  %-10s %-15s -> %-15s %-5s %5d  %s\n' "$(ago "$t")" "$(ip4 "$src")" "$(ip4 "$dst")" \
+          "$(proto_name "$p")" "$id" "${IFNAME[$ifx]:-$ifx}"
+      done
+    fi
+  fi
+done
+[ "$FORMAT" = json ] && printf '\n]\n'
+exit 0
