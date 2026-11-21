@@ -38,9 +38,13 @@ sudo ./bpfc -i <interface> -d xdp -D
 | `-D` | Delete only the program at `-p <prio>` on `-d <dir>` (`-d xdp`: the XDP program, no `-p`). |
 | `-n <name>` | Name the TC filter and the kernel program (shown by `tc filter show` and `bpftool prog`). |
 | `-I` | Print a `BPFC_INFO id=... tag=...` line after attaching, and first a `BPFC_NAME <text>` line for a program with a `name`. |
-| `-r <map>` | Dump the contents of a pinned map. |
+| `-r <map>` | Dump the contents of a pinned map. With `-K`/`-V`, or for a prefix map, a table: a `#` header line, then one line per entry. |
+| `-K '<fields>'` | With `-r` / `-R`: decode the keys as a `pack` of these fields (`-K 'vlan-id ip-src'` prints `101 100.64.1.20 ...`). Values are then printed in decimal. |
+| `-V '<fields>'` | With `-r`: decode the values the same way. |
 | `-R <map>[,<map>...]` | Print pinned maps joined on their keys: `# key <map>...`, then per key the key and each map's value (`-` where it has none). For scripts. |
-| `-w <map> <key> <value>` | Write a 64-bit value into a pinned map (e.g. runtime settings). |
+| `-w <map> <key> <value>` | Write a 64-bit value into a pinned map (e.g. runtime settings). The key or value may be a `pack ...`/`hash ...` text as for `-H`; for a prefix map the key is a prefix (`10.0.0.0/8`). |
+| `-x <map> <key>` | Delete an entry (key as for `-w`). |
+| `-H '<hash ...\|pack ...>'` | Print the key a program's `hash` or `pack` gives for these values: `bpfc -H 'hash 64 ip-src=10.0.0.1 ip-dst=10.0.0.2 ip-proto=6 src-port=1000 dst-port=80'`. See [doc/flow-tracking.md](doc/flow-tracking.md). |
 | `-v` | Verbose mode. Prints a trace of jump offset calculations and block resolutions. |
 | `-E` | Print the program after `include`, `const`, `define`, `repeat` and `when` are expanded, then exit. |
 | `-s <NAME>=<value>` | Set `const NAME`, overriding the program's own value. Repeatable. |
@@ -229,6 +233,11 @@ Note - Terminal commands must be last command in program or be followed by 'end-
 Quick boolean filters for specific L2/L3 types. Use as standalone matches (e.g., `match tcp;`).
 * Supported: `ip`, `ip6`, `arp`, `icmp`, `gre`, `tcp`, `udp`, `igmp`, `ospf`, `pim`, `esp`, `rsvp`, `l2tp`, `vlan`, `qinq`.
 
+### tcpdump-style Matches
+* `match host <addr | %VAR>` / `match net <prefix>` - IPv4 source or destination.
+* `match port <n | lo-hi | %VAR>` - TCP, UDP or SCTP source or destination port (IPv4, not later fragments); `match src-port ...`, `match dst-port ...` one side.
+* `match dscp <name | 0-63>`, `match ecn <not-ect | ect1 | ect0 | ce | 0-3>` - IPv4. DSCP names: `default`/`be`/`cs0`, `le`, `cs1`-`cs7`, `af11`-`af43`, `va`, `ef`; `set dscp` / `set ecn` take them too.
+
 ### Packet Data Fields (`get`, `set`, `match`)
 Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val | %VAR>`), and evaluation (`match <field> <val | %VAR>`). Subnets (`10.0.0.0/24`) and port ranges (`80-100`) are fully supported. Numbers may be decimal or `0x` hex anywhere. Values are checked when compiling: a number must fit the field (port 0-65535, `ip-tos` 0-255, `vlan-id` 0-4095, ...), addresses must be complete (`10.0.0.300`, `10.0.0` or a 5-byte MAC are errors), and a range must be low-high; `redirect`/`clone` to an interface that does not exist is an error too. Variables hold host-order values, so `match <field> %VAR` compares with what `get <field>` stored (for `mpls-label`, the label itself). `match vlan` / `match qinq` look at the offloaded tag, or at the frame when no tag is offloaded.
 
@@ -241,7 +250,8 @@ Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val |
 * **GRE:** `gre-key`, `gre-proto` (any IHL; the key is found after the checksum when the C bit is set)
 * **TCP (IPv4, any IHL; `get` only):** `tcp-seq`, `tcp-ack`, `tcp-flags` (the flags byte: FIN 0x01, SYN 0x02, RST 0x04, PSH 0x08, ACK 0x10), `tcp-win` (unscaled), `tcp-hlen` (header length incl. options, bytes). 0 when the packet is not IPv4 TCP.
 * **Offsets and lengths (IPv4, any IHL; `get` only):** `l4-off` (offset of the TCP/UDP/... header in the frame), `payload-off` (TCP: after the options, UDP: after 8 bytes), `payload-len` (from the IP total length, so Ethernet padding is not counted). Use them with variable offsets: `get bytes %OFF 4 V`.
-* **Flow key (`get` only):** `flow-key [reverse | symmetric]` - 64-bit hash of the IPv4 addresses, protocol and TCP/UDP ports (never 0; 0 for non-IPv4). `reverse` is the key of the opposite direction, so a returning ACK finds its data flow's map entry; `symmetric` is the same key for both directions.
+* **Flow key (`get` only):** `flow-key [reverse | symmetric]` - the same as `hash VAR 64 [reverse | symmetric] ip-src ip-dst ip-proto src-port dst-port` (below): a 64-bit hash of the IPv4 addresses, protocol and TCP/UDP/SCTP ports (never 0; 0 for non-IPv4; ports 0 for fragments). `reverse` is the key of the opposite direction, so a returning ACK finds its data flow's map entry; `symmetric` is the same key for both directions. (Its values changed when `hash` was added: maps keyed by it start new entries after an upgrade.)
+* **Any-protocol fields (`get`, `set` ports):** `src-port`, `dst-port` (TCP, UDP or SCTP; 0 for other protocols and fragments; `set` rewrites TCP or UDP with the checksum), `dscp`, `ecn` (`set` keeps the other bits of the TOS byte; names below), `ip-ttl`, `icmp-type`, `icmp-code`, `icmp-id` (`get` only; `icmp-id` for echo requests and replies).
 * **Generic:** `bytes <offset | %VAR> <length>` - with a variable offset the bytes are read with `bpf_skb_load_bytes` (0 if outside the packet) and written with `bpf_skb_store_bytes` (nothing written if outside).
 
 ### Context Metadata (`__sk_buff`)
@@ -286,6 +296,17 @@ Allows persistent data storage across packets and network interfaces.
 * `calc-map <add|or|and|xor|xchg> <MAP_NAME> <key | %VAR> <val | %VAR> [OLD_VAR]` - Atomic update of a 64-bit map value (created as 0); `OLD_VAR` receives the previous value. Safe when several CPUs update the same key, unlike `get map` + `set map`.
 * `xor-packet <MAP_NAME> <len> [src [dst]]` / `xor-packet-keyed <MAP_NAME> <key> <len> [src [dst]]` - XOR packet bytes into a buffer (atomically; dst is a multiple of 8). Building block for XOR parity / FEC.
 * `zero-buffer <MAP_NAME> <len> [dst]` / `zero-buffer-keyed <MAP_NAME> <key> <len> [dst]` - Zero part of a buffer.
+
+### Flow Keys (`hash`, `pack`) and Commands Built on Them
+A key picks a map entry: per host, per flow, per conversation. [doc/flow-tracking.md](doc/flow-tracking.md) explains them for network engineers, with examples (NAT, load sharing, CoPP, policers, accounting, sampling, duplicate removal).
+* `pack <VAR> [symmetric|reverse] <field>[:bits] ...` - The fields side by side, the first in the highest bits: `pack K ip-src ip-dst` is `src << 32 | dst`. Exact and readable (`bpfc -r -K`), at most 64 bits. Fields have their natural width (address 32, port 16, VLAN 12, MAC 48, DSCP 6, ...); `ip-src/24` keeps the network bits (24), `:bits` the low bits, `%VAR[:bits]` a variable, `<n>:<bits>` a constant, `bytes <offset|%VAR> <1-8>` packet bytes, any other `get` field its value.
+* `hash <VAR> <bits | buckets N> [symmetric|reverse] [seed <n|%VAR>] <field> ...` - Any fields, IPv6 addresses (`ip6-src`, `ip6-dst`, `ip6-src/64`) included, mixed into 1-64 bits (MurmurHash3's finaliser over 64-bit words), or `buckets N` = 0..N-1 spread evenly. The same in user space: `bpfc -H`. 64 bits: never 0 for a packet that has the fields.
+* Keys of IPv4 (or IPv6) fields are 0 for other packets; ports are 0 for protocols without them and for every fragment. `reverse` swaps each source/destination pair (the reply's key); `symmetric` orders the pairs, the lower first, with one decision for all (both directions one key). Neither depends on the hook.
+* `unpack <%SRC> <VAR>:<bits> ...` - A packed value taken apart, the first variable from the highest bits.
+* `count <MAP> [<BYTES_MAP>] <key...>` - Atomically add 1 (and the frame length to the second map) to the key's entry. A key is a list of fields (packed when they fit in 64 bits, hashed otherwise), or one `%VAR`.
+* `match seen <MAP> <key...> within <time> [refresh]` - True when the key was seen less than `<time>` (`50ms`, `2s`) ago; every packet records itself, atomically (of two copies at once exactly one is seen). The window runs from the first sighting, or with `refresh` from the last.
+* `match over-rate <MAP> <key...> <rate> [burst <size>]` - True for packets above the rate per key: `100/s` (burst in packets) or `10mbit` (bit/s, burst in bytes, `64k` = 64 KiB); the burst defaults to 100 ms of the rate. A lock-free GCRA policer.
+* `prefix-map <MAP> [entries]` / `match <ip-src|ip-dst|%VAR> in <MAP> [VALUE_VAR]` - A longest-prefix-match table of IPv4 prefixes, filled with `bpfc -w MAP 10.0.0.0/8 1` (`-x` to remove).
 
 ### Routing & Forwarding
 * `fib-lookup [options] [<address> | %VAR]` / `fib-lookup6 ...` - Queries the kernel's routing tables (`bpf_fib_lookup`), for the packet's destination unless an address is given. Populates `%FIB_RESULT`, `%FIB_SMAC`, `%FIB_DMAC`, `%FIB_IP_DST`, `%FIB_IP6_DST`, `%FIB_IFINDEX`. The address can be a 4-byte variable in host order, as `get ip-dst` gives it (`get ip-dst D; fib-lookup %D`); `%FIB_IP_DST` comes back in the same order. Options:
@@ -449,6 +470,8 @@ Incoming:
 * Change the packet destination IP address to the original source IP address referenced by `FLOW_KEY`
 
 This implementation uses the normal Linux routing FIB, so there is no need to do FIB lookups or redirection in eBPF.
+
+The same NAT written with `pack` (one file for both hooks, exact keys), and a version with port translation, so inside hosts that use the same source port no longer collide, are `dist/examples/flow/nat-pack.bpfc` and `nat-pat.bpfc`, explained in [doc/flow-tracking.md](doc/flow-tracking.md#81-nat-three-ways).
 
 NAT ICMP traffic on eth0
 ```bash
@@ -956,3 +979,7 @@ bpfc -i wan0 -d egress -p 10 -m /sys/fs/bpf -s NET=198.51.100.0/24 -s RATE=50000
 ```
 
 The departure times are CLOCK_MONOTONIC, as `get time` gives them. The next-departure time in map `PACE` is shared by all CPUs without locking, so the rate is approximate under heavy parallel load; one key per destination (a map keyed by `ip-dst`) paces each destination separately.
+
+### 19. Flow tracking: NAT with port translation, load sharing, CoPP, accounting, sampling
+
+`dist/examples/flow` (installed to the doc directory, `examples/flow`) has programs built on `hash`, `pack`, `count`, `seen`, `over-rate` and prefix maps: NAT with exact keys and with port translation (`nat-pack.bpfc`, `nat-pat.bpfc`), symmetric firewall load sharing (`fw-loadshare.bpfc`), control-plane policing (`copp.bpfc`), a SYN guard per /24, a policer and a two-colour marker in one line each (`syn-guard-subnet.bpfc`, `policer-rate.bpfc`, `tenant-marker.bpfc`), per-customer and per-conversation accounting with readable tables (`customer-accounting.bpfc`, `conversations.bpfc`), whole-flow sampling (`flow-sample.bpfc`), duplicate removal (`dedup-simple.bpfc`) and storm control (`storm-control.bpfc`). [doc/flow-tracking.md](doc/flow-tracking.md) explains each of them, and how to choose a key, for network engineers.

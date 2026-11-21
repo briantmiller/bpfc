@@ -228,7 +228,7 @@ bad CC-err-fill-bytes       "fill-bytes length must be 1-64"      "fill-bytes 14
 bad CC-err-get-bytes-len    "get bytes length must be 1, 2, 4, or 8" "get bytes 14 3 V"
 bad CC-err-skb-cb-index     "skb-cb index must be between 0 and 4" "set skb-cb 7 5"
 bad CC-err-too-many-vars    "no stack left for variable"          "repeat 49 as I; decl V\$I 8; end-repeat"
-bad CC-err-too-many-words   "more than 16 words"                  "debug-log a b c d e f g h i j k l m n o p q"
+bad CC-err-too-many-words   "more than 32 words"                  "debug-log a b c d e f g h i j k l m n o p q r s t u v w x y z A B C D E F"
 
 # ---------------- device type and kind ----------------
 # known while compiling: from -i, or -s IFTYPE=/IFKIND= without an interface

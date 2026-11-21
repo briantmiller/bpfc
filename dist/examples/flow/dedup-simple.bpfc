@@ -1,0 +1,9 @@
+# dedup-simple.bpfc: 1+1 redundant paths (the same packets arrive over two
+# links): pass the first copy and drop the second. A packet is known by its
+# addresses, protocol and IP identification; copies are 50 ms apart at most.
+# programs/dedup does the complete job (ID rollover, statistics, ...).
+match ip;
+  match seen DUPS ip-src ip-dst ip-proto ip-ident within 50ms;
+    drop;
+  end-match;
+end-match;

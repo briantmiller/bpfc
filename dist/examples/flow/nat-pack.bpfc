@@ -1,0 +1,39 @@
+# nat-pack.bpfc: the README's NAT (example 4) written with pack. It works the
+# same way: going out, the inside address is remembered and replaced by
+# $WAN_IP; coming back, the reply's destination is set back to it. The keys
+# are exact now: remote address, remote port and our port side by side.
+# Attach the same file to the WAN interface's egress and ingress:
+#   bpfc -i wan -d egress  -p 100 -f nat-pack.bpfc
+#   bpfc -i wan -d ingress -p 100 -f nat-pack.bpfc
+# Limit: no port translation. Two inside hosts that use the same source port
+# to the same server share a key, and the replies of both go to the one that
+# sent last. nat-pat.bpfc translates ports.
+const WAN_IP 10.0.0.30;
+
+when $HOOK == egress;
+  # Key = what the reply will carry: "reverse" reads the reply's view of this
+  # packet (its source is our destination, and the other way round).
+  match icmp; match icmp-type 8;
+    pack K reverse ip-src icmp-id;               # = ip-dst icmp-id of this packet
+    get ip-src IN; set map ICMP_NAT %K %IN; set ip-src $WAN_IP;
+  end-match; end-match;
+  match tcp;
+    pack K reverse ip-src src-port dst-port;     # remote address, remote port, our port
+    get ip-src IN; set map TCP_NAT %K %IN; set ip-src $WAN_IP;
+  end-match;
+  match udp;
+    pack K reverse ip-src src-port dst-port;
+    get ip-src IN; set map UDP_NAT %K %IN; set ip-src $WAN_IP;
+  end-match;
+otherwise;
+  # Coming in: the same key, read straight from the reply.
+  match icmp; match icmp-type 0;
+    pack K ip-src icmp-id; get map ICMP_NAT %K IN; if IN ne 0; set ip-dst %IN; end-if;
+  end-match; end-match;
+  match tcp;
+    pack K ip-src src-port dst-port; get map TCP_NAT %K IN; if IN ne 0; set ip-dst %IN; end-if;
+  end-match;
+  match udp;
+    pack K ip-src src-port dst-port; get map UDP_NAT %K IN; if IN ne 0; set ip-dst %IN; end-if;
+  end-match;
+end-when;

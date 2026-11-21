@@ -136,6 +136,120 @@ sleep 0.5s
 echo "UDP Echo" | timeout 4 ip netns exec HOST1 ncat -u 10.0.0.1 7 &>/dev/null
 
 
+#The README's NAT (Advanced Examples 4), as printed there: its bpfc commands
+#are taken from README.md and run with eth0 replaced by wan.
+ip netns exec RTR ./bpfc -i wan -c &>/dev/null
+readme_nat() {
+	python3 - "$1" <<'PY'
+import re, sys
+t = open("README.md").read()
+sec = t[t.index("### 4. Network Address Translation (NAT)"):t.index("### 5.")]
+for blk in re.findall(r"```bash\n(.*?)```", sec, re.S):
+    blk = blk.replace("\\\n", " ")
+    for line in blk.splitlines():
+        line = line.strip()
+        if line.startswith("bpfc "):
+            print(line[5:])
+PY
+}
+if command -v python3 >/dev/null; then
+	n=0
+	while IFS= read -r cmd; do
+		eval "set -- $cmd"
+		args=()
+		for a; do [ "$a" = eth0 ] && a=wan; args+=("$a"); done
+		ip netns exec RTR ./bpfc -m /var/run/bpf/RTR "${args[@]}" >/dev/null || { test_fail "NAT-README-LOAD ($cmd)"; }
+		n=$((n + 1))
+	done < <(readme_nat)
+	[ $n -eq 7 ] && test_pass "NAT-README-LOAD ($n programs)" || test_fail "NAT-README-LOAD ($n programs, expected 7)"
+	ip netns exec HOST1 ping -c 3 10.0.0.1 &>/dev/null && test_pass NAT-README-ICMP || test_fail NAT-README-ICMP
+	echo "TCP Echo" | timeout 4 ip netns exec HOST1 nc -w 1 10.0.0.1 7 &>/dev/null && test_pass NAT-README-TCP || test_fail NAT-README-TCP
+	timeout 5 ip netns exec HOST1 tcpdump -c 1 -lvnpi rtr udp and ip src 10.0.0.1 &>/dev/null && test_pass NAT-README-UDP || test_fail NAT-README-UDP &
+	sleep 0.5s
+	echo "UDP Echo" | timeout 4 ip netns exec HOST1 ncat -u 10.0.0.1 7 &>/dev/null
+	wait $!
+fi
+
+#NAT written with pack (dist/examples/flow/nat-pack.bpfc), then with port
+#translation (nat-pat.bpfc): the same checks, then two inside hosts using the
+#same source port to the same server at the same time.
+EXF=dist/examples/flow
+ip netns exec RTR ./bpfc -i wan -c &>/dev/null
+nat_load() {
+	ip netns exec RTR ./bpfc $COPTS -i wan -d egress -p 100 -m /var/run/bpf/RTR -f $EXF/$1.bpfc >/dev/null &&
+	ip netns exec RTR ./bpfc $COPTS -i wan -d ingress -p 100 -m /var/run/bpf/RTR -f $EXF/$1.bpfc >/dev/null
+}
+# Two clients, one per inside host, both from source port $2, talk to the
+# WAN server at once; prints what each got back ("H1 H2" when both got their own).
+same_port() {
+	local proto=$1 port=$2 out1 out2
+	out1=$(mktemp); out2=$(mktemp)
+	for h in 1 2; do
+		ip netns exec HOST$h timeout 5 python3 -c '
+import socket, sys
+proto, port, me = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM if proto == "udp" else socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("", port)); s.settimeout(3)
+dst = ("10.0.0.1", 9 if proto == "udp" else 10)
+if proto == "udp": s.sendto(me.encode(), dst)
+else: s.connect(dst); s.send(me.encode())
+try: print(s.recv(100).decode())
+except Exception: print("-")' $proto $port H$h > $( [ $h = 1 ] && echo $out1 || echo $out2 ) 2>/dev/null &
+		sleep 0.1
+	done
+	wait
+	echo "$(cat $out1) $(cat $out2)"
+	rm -f $out1 $out2
+}
+if command -v python3 >/dev/null; then
+	# echo servers on WAN that answer after 1 s, so both clients have sent before any reply comes back
+	ip netns exec WAN python3 -c '
+import socket, threading, time
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("10.0.0.1", 9))
+t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind(("10.0.0.1", 10)); t.listen(16)
+def udp():
+    while True:
+        d, a = u.recvfrom(100)
+        threading.Timer(1, u.sendto, (d, a)).start()
+def tcp(c):
+    d = c.recv(100); time.sleep(1); c.send(d); c.close()
+threading.Thread(target=udp, daemon=True).start()
+while True:
+    c, a = t.accept(); threading.Thread(target=tcp, args=(c,), daemon=True).start()' &>/dev/null &
+	SLOW_PID=$!
+	sleep 0.5
+fi
+
+nat_load nat-pack && test_pass NAT-PACK-LOAD || test_fail NAT-PACK-LOAD
+ip netns exec HOST1 ping -c 3 10.0.0.1 &>/dev/null && test_pass NAT-PACK-ICMP || test_fail NAT-PACK-ICMP
+echo "TCP Echo" | timeout 4 ip netns exec HOST1 nc -w 1 10.0.0.1 7 &>/dev/null && test_pass NAT-PACK-TCP || test_fail NAT-PACK-TCP
+timeout 5 ip netns exec HOST1 tcpdump -c 1 -lvnpi rtr udp and ip src 10.0.0.1 &>/dev/null && test_pass NAT-PACK-UDP || test_fail NAT-PACK-UDP &
+sleep 0.5s
+echo "UDP Echo" | timeout 4 ip netns exec HOST1 ncat -u 10.0.0.1 7 &>/dev/null
+wait $!
+if [ -n "$SLOW_PID" ]; then
+	# the limitation nat-pat.bpfc removes: without port translation both replies
+	# go to HOST2, which sent last, and HOST1 gets nothing
+	R=$(same_port udp 5555)
+	[ "${R%% *}" = "-" ] && test_pass "NAT-PACK-SAME-PORT-COLLIDES ($R)" || test_fail "NAT-PACK-SAME-PORT-COLLIDES ($R)"
+fi
+
+ip netns exec RTR ./bpfc -i wan -c &>/dev/null
+nat_load nat-pat && test_pass NAT-PAT-LOAD || test_fail NAT-PAT-LOAD
+ip netns exec HOST1 ping -c 3 10.0.0.1 &>/dev/null && test_pass NAT-PAT-ICMP || test_fail NAT-PAT-ICMP
+echo "TCP Echo" | timeout 4 ip netns exec HOST1 nc -w 1 10.0.0.1 7 &>/dev/null && test_pass NAT-PAT-TCP || test_fail NAT-PAT-TCP
+if [ -n "$SLOW_PID" ]; then
+	R=$(same_port udp 5556)
+	[ "$R" = "H1 H2" ] && test_pass "NAT-PAT-SAME-PORT-UDP ($R)" || test_fail "NAT-PAT-SAME-PORT-UDP ($R)"
+	R=$(same_port tcp 5557)
+	[ "$R" = "H1 H2" ] && test_pass "NAT-PAT-SAME-PORT-TCP ($R)" || test_fail "NAT-PAT-SAME-PORT-TCP ($R)"
+	N=$(ip netns exec RTR ./bpfc -m /var/run/bpf/RTR -r PAT_IN | grep -c 'Key:')
+	[ "$N" -ge 4 ] && test_pass "NAT-PAT-ENTRIES ($N flows)" || test_fail "NAT-PAT-ENTRIES ($N flows)"
+	kill $SLOW_PID &>/dev/null
+fi
+ip netns exec RTR ./bpfc -i wan -c &>/dev/null
+
 #Test bed cleanup
 kill -9 $TCP_PID &>/dev/null 
 kill -9 $UDP_PID &>/dev/null 

@@ -40,7 +40,7 @@ LOCALSTATEDIR ?= /var/lib
 DAEMON_CFLAGS = $(WARN) -Wno-format-truncation -DBPFC_VERSION='"$(VERSION)"'
 
 # Everything that goes into the source tarball used by `make rpm`.
-DIST_FILES = Makefile LICENSE README.md bpfc.8 bpfc.c test.sh tests \
+DIST_FILES = Makefile LICENSE README.md bpfc.8 bpfc.c test.sh tests doc \
              bpfcd/*.c bpfcd/*.h dist programs
 
 RPMTOP     = $(CURDIR)/rpmbuild
@@ -86,7 +86,10 @@ install: all install-programs
 	install -m 0644 dist/examples/xdp/*.bpfc $(DESTDIR)$(DOCDIR)/examples/xdp/
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/tc
 	install -m 0644 dist/examples/tc/*.bpfc $(DESTDIR)$(DOCDIR)/examples/tc/
+	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/flow
+	install -m 0644 dist/examples/flow/*.bpfc $(DESTDIR)$(DOCDIR)/examples/flow/
 	install -m 0644 README.md $(DESTDIR)$(DOCDIR)/README.md
+	install -m 0644 doc/flow-tracking.md $(DESTDIR)$(DOCDIR)/flow-tracking.md
 	install -D -m 0755 dist/container/bpfcd-entrypoint $(DESTDIR)$(SBINDIR)/bpfcd-entrypoint
 	install -D -m 0644 dist/container/README.md $(DESTDIR)$(CONTAINER_DOCDIR)/README.md
 	install -D -m 0644 dist/container/Containerfile $(DESTDIR)$(CONTAINER_DOCDIR)/Containerfile
@@ -175,7 +178,7 @@ srpm: $(TARBALL)
 TESTFLAGS ?=
 
 check: all
-	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack bpfcd netns rest xdp xdp-examples tc-examples dedup ecmp container install
+	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack keys bpfcd netns rest xdp xdp-examples tc-examples flow-examples dedup ecmp container install
 
 # Compile-only checks of every field and command and of the error messages;
 # needs no root (the few commands that create maps are skipped without it).

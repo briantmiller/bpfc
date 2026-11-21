@@ -1,0 +1,9 @@
+# customer-accounting.bpfc: packets and bytes per customer on a VLAN
+# aggregation port (TC ingress of the trunk): one entry per VLAN and address,
+# packed into the key, so the table reads back as it was counted:
+#   bpfc -r CUST_B -K 'vlan-id ip-src'        (bytes; CUST_P: packets)
+hash-map CUST_P 100000;
+hash-map CUST_B 100000;
+match ip;
+  count CUST_P CUST_B vlan-id ip-src;
+end-match;

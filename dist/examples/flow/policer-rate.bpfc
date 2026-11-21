@@ -1,0 +1,11 @@
+# policer-rate.bpfc: policer.bpfc written with over-rate: traffic from $NET
+# gets $RATE with bursts of $BURST, and the excess is dropped. Key 0 is one
+# bucket for all of $NET; with "ip-src" instead, every host gets the rate.
+const NET 10.1.0.0/24;
+const RATE 8mbit;
+const BURST 30000;
+match ip; match ip-src $NET;
+  match over-rate POLICE 0 $RATE burst $BURST;
+    drop;
+  end-match;
+end-match; end-match;

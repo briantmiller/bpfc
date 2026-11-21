@@ -1,0 +1,17 @@
+# flow-sample.bpfc: NetFlow-style sampling, one flow in $N. Every packet of a
+# sampled flow, in both directions, is counted in one entry and copied to
+# $COLLECTOR. The flow's hash decides, so a sampled flow is complete, unlike
+# picking packets at random (sampled-mirror.bpfc). A flow's entry:
+#   bpfc -r SAMPLE_B, with the key from
+#   bpfc -H 'hash 64 symmetric ip-src=... ip-dst=... ip-proto=6 src-port=... dst-port=...'
+const N 100;
+const COLLECTOR mon0;
+hash-map SAMPLE_P 65536;
+hash-map SAMPLE_B 65536;
+match ip;
+  hash S buckets $N symmetric ip-src ip-dst ip-proto src-port dst-port;
+  if S eq 0;
+    count SAMPLE_P SAMPLE_B symmetric ip-src ip-dst ip-proto src-port dst-port;
+    clone $COLLECTOR egress;
+  end-if;
+end-match;

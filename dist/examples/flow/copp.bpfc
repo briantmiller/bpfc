@@ -1,0 +1,20 @@
+# copp.bpfc: control-plane policing for a Linux router (TC ingress on every
+# interface, e.g. bpfcd's interfaces.d/%all%/ingress): for traffic to the
+# router's own addresses, BGP only from configured peers, SSH and SNMP
+# limited per source address; everything else, and transit, is untouched.
+#   bpfc -w LOCAL 192.0.2.254/32 1      (the router's addresses)
+#   bpfc -w BGP_PEERS 192.0.2.1/32 1    (a peer; bpfc -x BGP_PEERS 192.0.2.1/32 removes it)
+prefix-map LOCAL 256;
+prefix-map BGP_PEERS 1024;
+match ip-dst in LOCAL;
+  match tcp; match port 179;
+    if ip-src in BGP_PEERS; continue; end-if;
+    drop;
+  end-match; end-match;
+  match tcp; match dst-port 22;
+    match over-rate COPP_SSH ip-src 10/s burst 20; drop; end-match;
+  end-match; end-match;
+  match udp; match dst-port 161;
+    match over-rate COPP_SNMP ip-src 50/s; drop; end-match;
+  end-match; end-match;
+end-match;

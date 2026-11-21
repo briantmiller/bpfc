@@ -1,0 +1,12 @@
+# tenant-marker.bpfc: a two-colour marker (TC egress to the WAN): a tenant's
+# traffic within its contract is marked AF11, the excess AF13 (high drop
+# precedence), so the WAN drops the excess first instead of this router.
+const TENANT 10.20.0.0/16;
+const CIR 50mbit;
+match ip; match ip-src $TENANT;
+  match over-rate TENANT_RL ip-src/16 $CIR burst 256k;
+    set dscp af13;
+  else;
+    set dscp af11;
+  end-match;
+end-match; end-match;

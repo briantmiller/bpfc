@@ -1,0 +1,15 @@
+# fw-loadshare.bpfc: spread flows over $LINKS transparent (bridged) firewalls
+# so that both directions of a conversation reach the same one: a stateful
+# firewall drops a reply whose request it never saw. "symmetric" gives A->B
+# and B->A one key; "buckets" turns the key into 0..LINKS-1, evenly.
+# Attach to the ingress of the inside and the outside interface (TC or XDP)
+# and fill the map with the firewall links' interface numbers:
+#   bpfc -w FW_LINKS 0 $(cat /sys/class/net/fw0/ifindex)      (1, 2: fw1, fw2)
+# For routed firewalls, choose a next hop per bucket and fib-lookup it.
+const LINKS 3;
+array-map FW_LINKS $LINKS;
+match ip;
+  hash B buckets $LINKS symmetric ip-src ip-dst ip-proto src-port dst-port;
+  get map FW_LINKS %B IF;
+  if IF ne 0; redirect %IF egress; end-if;
+end-match;

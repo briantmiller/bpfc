@@ -1,0 +1,9 @@
+# syn-guard-subnet.bpfc: at most $LIMIT new TCP connections (SYNs) from each
+# /24, so a flood spread over many addresses of one network is still caught.
+# dist/examples/xdp/syn-guard.bpfc does the same per address by hand.
+const LIMIT 1000/s;
+match tcp; match tcp-flags SYN;
+  match over-rate SYN_RL ip-src/24 $LIMIT burst 2000;
+    drop;
+  end-match;
+end-match; end-match;

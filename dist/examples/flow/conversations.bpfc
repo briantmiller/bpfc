@@ -1,0 +1,8 @@
+# conversations.bpfc: bytes per conversation, both directions in one entry
+# ("symmetric" puts the lower address first). Top talkers:
+#   bpfc -r CONV_B -K 'ip-src ip-dst' | sort -k3 -n | tail
+hash-map CONV_P 65536;
+hash-map CONV_B 65536;
+match ip;
+  count CONV_P CONV_B symmetric ip-src ip-dst;
+end-match;

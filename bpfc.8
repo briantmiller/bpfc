@@ -24,6 +24,21 @@ bpfc \- Pure C eBPF bytecode compiler and direct network fabric loader
 .RI { "<instructions>" " | " \-f " file" }
 .PP
 .B bpfc
+.RB [ \-m
+.IR map_dir ]
+.RB { \-r
+.IR map " [" \-K
+.IR fields "] [" \-V
+.IR fields "] | " \-R
+.IR map , map ... " [" \-K
+.IR fields "] | " \-w
+.I map key value
+.RB "| " \-x
+.I map key
+.RB "| " \-H
+.IR key-text }
+.PP
+.B bpfc
 .RB \-i
 .IR interface
 .RB \-c
@@ -91,7 +106,19 @@ Read instructions from \fIfile\fR (\fB\-\fR for standard input). Line breaks act
 Directory for pinned maps (default \fI/sys/fs/bpf\fR). A map is pinned there under its name, which must be 1\-31 characters without \fB/\fR; the kernel's own name for it is the last 15 characters, with characters other than letters, digits, \fB_\fR and \fB.\fR replaced by \fB_\fR.
 .TP
 .BI \-r " map"
-Print the contents of a pinned map and exit.
+Print the contents of a pinned map and exit. With \fB\-K\fR or \fB\-V\fR, or for a prefix map, the output is a table: a line \fB#\fR naming the columns, then one line per entry (a prefix map's key is printed as \fIaddress\fB/\fIlength\fR, values in decimal unless \fB\-V\fR decodes them).
+.TP
+.BI \-K " fields"
+With \fB\-r\fR or \fB\-R\fR: decode each key as a \fBpack\fR of \fIfields\fR (for example \fB\-K 'vlan-id ip-src'\fR prints \fB101 100.64.1.20\fR); \fB\-R\fR joins the decoded fields with commas.
+.TP
+.BI \-V " fields"
+With \fB\-r\fR: decode each value as a \fBpack\fR of \fIfields\fR.
+.TP
+.BI \-H " key-text"
+Print the key a program's \fBhash\fR or \fBpack\fR computes, from the command written without its variable and with \fB=\fR\fIvalue\fR after each field, and exit: \fBbpfc \-H 'hash 64 symmetric ip-src=10.0.0.1 ip-dst=192.0.2.10 ip-proto=6 src-port=51515 dst-port=443'\fR. Addresses, MACs, DSCP and ECN names are written as such; a variable as \fB%\fR\fIVAR\fB:\fIbits\fB=\fIvalue\fR; another \fBget\fR field as \fIname\fB:\fIbits\fB=\fIvalue\fR. With \fBreverse\fR, give both fields of each pair as they are in the packet.
+.TP
+.BI \-x " map key"
+Delete the entry of \fIkey\fR from a pinned map and exit (\fIkey\fR as for \fB\-w\fR).
 .TP
 .BI \-R " map\fR[\fB,\fImap\fR...]"
 Print several pinned maps of 64-bit keys and values joined on their keys, and exit: a line
@@ -99,7 +126,7 @@ Print several pinned maps of 64-bit keys and values joined on their keys, and ex
 followed by the map names, then one line per key found in any of the maps (each key once, in the order first seen): the key as \fB0x\fR and 16 hex digits, then each map's value in hex, or \fB\-\fR where that map has no entry. A map that is not pinned is a column of \fB\-\fR, with a warning; the exit status is 1 when none can be opened. Meant for scripts that read one table spread over several maps (\fBbpfc-flows\fR).
 .TP
 .BI \-w " map key value"
-Write a 64-bit \fIvalue\fR under \fIkey\fR in a pinned 8-byte map (for example a program's runtime settings) and exit. Numbers may be decimal or 0x hexadecimal.
+Write a 64-bit \fIvalue\fR under \fIkey\fR in a pinned 8-byte map (for example a program's runtime settings) and exit. Numbers may be decimal or 0x hexadecimal; the key or the value may also be a \fBpack\fR or \fBhash\fR text as for \fB\-H\fR. For a prefix map the key is an IPv4 prefix (\fB10.0.0.0/8\fR).
 .TP
 .B \-E
 Print the program after preprocessing (\fBinclude\fR, \fBconst\fR, \fBdefine\fR, \fBrepeat\fR, \fBwhen\fR and \fB$\fR substitution) as plain instructions, one per line, and exit without compiling.
@@ -260,7 +287,7 @@ Overwrite 1\-64 packet bytes with one byte value. Checksums are not updated (see
 TCP header fields, the L4 header offset and the payload offset and length, following the real IPv4 and TCP header lengths; 0 when they do not apply.
 .TP
 .BI "get flow-key " "VAR [reverse|symmetric]"
-64-bit hash of the IPv4 addresses, protocol and TCP/UDP ports; \fBreverse\fR gives the key of the opposite direction, \fBsymmetric\fR one key for both.
+The same as \fBhash\fR \fIVAR\fR \fB64\fR [\fBreverse\fR|\fBsymmetric\fR] \fBip-src ip-dst ip-proto src-port dst-port\fR: a 64-bit hash of the IPv4 addresses, protocol and TCP/UDP/SCTP ports; \fBreverse\fR gives the key of the opposite direction, \fBsymmetric\fR one key for both.
 .TP
 .BI "get|set bytes " "%OFF len ..."
 A variable offset reads with \fBbpf_skb_load_bytes\fR (0 outside the packet) and writes with \fBbpf_skb_store_bytes\fR.
@@ -282,6 +309,45 @@ Declare \fImap\fR as an array of \fIentries\fR 64-bit values with keys 0..\fIent
 .TP
 .BI "hash-map " "map entries"
 Declare \fImap\fR as the default LRU hash map (64-bit keys and values), with \fIentries\fR (1\-16777216) instead of 10000. Like \fBarray-map\fR it comes before the map's first use; a pinned map of another size or kind is replaced (losing its contents). A program that uses the map without declaring it uses the pinned map as it is, whatever its size.
+.SS Flow Keys
+A key picks a map entry: per host, per flow, per conversation.
+.I /usr/share/doc/bpfc/flow-tracking.md
+explains them with examples. A key is a list of fields: \fBip-src\fR, \fBip-dst\fR (32 bits; \fBip-src/24\fR: the 24 network bits), \fBip-proto\fR, \fBip-tos\fR, \fBdscp\fR (6), \fBecn\fR (2), \fBip-ttl\fR, \fBip-ident\fR, \fBip-len\fR, \fBsrc-port\fR, \fBdst-port\fR (TCP, UDP or SCTP), \fBtcp-src\fR, \fBtcp-dst\fR, \fBudp-src\fR, \fBudp-dst\fR, \fBicmp-type\fR, \fBicmp-code\fR, \fBicmp-id\fR, \fBip6-src\fR, \fBip6-dst\fR (128 bits, \fBhash\fR only), \fBip6-proto\fR, \fBip6-flow\fR, \fBip6-tclass\fR, \fBsrc-mac\fR, \fBdst-mac\fR (48), \fBeth-proto\fR, \fBvlan-id\fR (12), \fB%\fR\fIVAR\fR, \fIn\fB:\fIbits\fR (a constant), \fBbytes\fR \fIoffset len\fR, or any other \fBget\fR field. \fB:\fR\fIbits\fR keeps a field's low bits. A key of IPv4 (or IPv6) fields is absent for other packets: \fBhash\fR and \fBpack\fR give 0, the commands below do nothing. Ports and ICMP fields are 0 for protocols without them and for every fragment. \fBreverse\fR swaps each source/destination pair (the reply's key); \fBsymmetric\fR orders each pair, the lower first, deciding once from the first pair that differs, so both directions get one key. Neither depends on the hook.
+.TP
+.BI "pack " "VAR [symmetric|reverse] field[:bits] ..."
+The fields side by side in one 64-bit value, the first in the highest bits (\fBpack K ip-src ip-dst\fR is src << 32 | dst). At most 64 bits; exact, and readable with \fB\-r \-K\fR.
+.TP
+.BI "hash " "VAR bits|buckets N [symmetric|reverse] [seed n|%VAR] field ..."
+The fields mixed into \fIbits\fR (1\-64), or into 0..\fIN\fR\-1 spread evenly. Any fields, IPv6 addresses included. The fields are packed into 64-bit words (a field never spans two; an IPv6 address is two words), each mixed in with MurmurHash3's 64-bit finaliser; a 64-bit hash of a packet that has the fields is never 0. \fBbpfc \-H\fR computes the same.
+.TP
+.BI "unpack " "%SRC VAR:bits ..."
+A packed value taken apart: the first variable gets the highest of the bits listed.
+.TP
+.BI "count " "MAP [BYTES_MAP] key ..."
+Atomically add 1 to the key's entry in \fIMAP\fR and, with a second map, the frame length there. The key is a field list (packed when it fits in 64 bits, hashed otherwise) or one \fB%\fR\fIVAR\fR.
+.TP
+.BI "match seen " "MAP key ... within time [refresh]"
+True when the key was seen less than \fItime\fR (\fBns\fR, \fBus\fR, \fBms\fR, \fBs\fR, \fBm\fR) ago. Every packet records itself atomically; the window runs from the first sighting, or with \fBrefresh\fR from the latest.
+.TP
+.BI "match over-rate " "MAP key ... rate [burst size]"
+True for packets above \fIrate\fR per key: \fIn\fB/s\fR or \fIn\fBpps\fR (burst in packets), or \fIn\fBbit\fR, \fBkbit\fR, \fBmbit\fR, \fBgbit\fR (burst in bytes, \fBk\fR = 1024). The burst defaults to 100 ms of the rate. A lock-free GCRA policer.
+.TP
+.BI "prefix-map " "MAP [entries]"
+Declare a longest-prefix-match table of IPv4 prefixes (64-bit values), filled with \fBbpfc \-w\fR \fIMAP prefix value\fR.
+.TP
+.BI "match " "ip-src|ip-dst|%VAR " "in " "MAP [VAR]"
+True when the address is in one of the map's prefixes; \fIVAR\fR gets the longest match's value.
+.TP
+.BI "match " "host addr|net prefix|port n[-m]|src-port n[-m]|dst-port n[-m]"
+IPv4 source or destination address, prefix or TCP/UDP/SCTP port (not later fragments), like tcpdump.
+.TP
+.BI "match|set " "dscp|ecn name|n"
+DSCP (\fBdefault\fR, \fBle\fR, \fBcs0\fR\-\fBcs7\fR, \fBaf11\fR\-\fBaf43\fR, \fBva\fR, \fBef\fR or 0\-63) or ECN (\fBnot-ect\fR, \fBect1\fR, \fBect0\fR, \fBce\fR); \fBset\fR keeps the other bits and updates the checksum.
+.TP
+.BI "get " "src-port|dst-port|dscp|ecn|ip-ttl|icmp-id|icmp-type|icmp-code VAR"
+.TP
+.BI "set " "src-port|dst-port n|%VAR"
+TCP or UDP, with the checksum.
 .SS Buffer Maps
 .TP
 .BI "buffer-map " "map [value_size]"

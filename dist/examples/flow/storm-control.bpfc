@@ -1,0 +1,10 @@
+# storm-control.bpfc: per-host limits for broadcast protocols, like a
+# switch's storm control (TC ingress on access ports, or a bridge's ports):
+# ARP and DHCP DISCOVER floods from one bad NIC or a loop are cut, keyed by
+# source MAC.
+match arp;
+  match over-rate ARP_RL src-mac 20/s burst 40; drop; end-match;
+end-match;
+match udp; match dst-port 67;
+  match over-rate DHCP_RL src-mac 5/s burst 10; drop; end-match;
+end-match; end-match;

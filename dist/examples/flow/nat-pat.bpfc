@@ -1,0 +1,68 @@
+# nat-pat.bpfc: NAT with port translation (PAT, "overload"). Every inside
+# flow gets a public port of its own, so inside hosts that pick the same
+# source port no longer collide. A public port only has to be unique per
+# remote address and port, so the 40000 ports are reused for every server.
+# TCP and UDP; ICMP echo as in nat-pack.bpfc. Attach to the WAN interface:
+#   bpfc -i wan -d egress  -p 100 -f nat-pat.bpfc
+#   bpfc -i wan -d ingress -p 100 -f nat-pat.bpfc
+#   bpfc -r PAT_IN       (one line per translated flow)
+# Entries age out when the maps are full (LRU). Two new flows choosing the
+# same port on two CPUs at the same instant could both take it (very rare).
+const WAN_IP 10.0.0.30;
+const INSIDE 192.168.0.0/24;
+const PORT_LO 20000;           # public ports PORT_LO .. PORT_LO + PORTS - 1
+const PORTS 40000;
+const TRIES 4;                 # ports tried for a new flow before giving up
+hash-map PAT_OUT 65536;        # inside flow -> its public port
+hash-map PAT_IN 65536;         # (protocol, remote, remote port, public port) -> inside address and port
+
+define pat-out PROTO NUM;
+  match $PROTO; match ip-src $INSIDE;
+    hash FLOW 64 $NUM:8 ip-src ip-dst src-port dst-port;     # this flow, from inside
+    pack ME ip-src src-port;                                 # the inside end: address and port
+    get map PAT_OUT %FLOW PUB;
+    if PUB eq 0;
+      # A new flow: its public port comes from its hash. If another flow to
+      # the same remote end has that port, try the next hash (seed 1, 2, ...).
+      repeat $TRIES as I;
+        hash PUB buckets $PORTS seed $I $NUM:8 ip-src ip-dst src-port dst-port;
+        calc add PUB $PORT_LO;
+        hash BACK 64 reverse $NUM:8 ip-src src-port %PUB:16;  # the key the replies will have
+        get map PAT_IN %BACK OWNER;
+        if OWNER eq 0; break-repeat; end-if;                 # free
+        if OWNER eq %ME; break-repeat; end-if;               # ours already
+        set val PUB 0;
+      end-repeat;
+      if PUB eq 0; drop; end-if;                             # all tried ports are taken
+      set map PAT_OUT %FLOW %PUB;
+    end-if;
+    hash BACK 64 reverse $NUM:8 ip-src src-port %PUB:16;
+    set map PAT_IN %BACK %ME;                                # (again) for the replies
+    set ip-src $WAN_IP; set src-port %PUB;
+  end-match; end-match;
+end-define;
+
+define pat-in PROTO NUM;
+  match $PROTO; match ip-dst $WAN_IP;
+    hash BACK 64 $NUM:8 ip-src src-port dst-port;            # the same fields as BACK above
+    get map PAT_IN %BACK ME;
+    if ME ne 0;
+      unpack %ME IN:32 INPORT:16;
+      set ip-dst %IN; set dst-port %INPORT;
+    end-if;
+  end-match; end-match;
+end-define;
+
+when $HOOK == egress;
+  pat-out tcp 6;
+  pat-out udp 17;
+  match icmp; match icmp-type 8; match ip-src $INSIDE;
+    pack K reverse ip-src icmp-id; get ip-src IN; set map ICMP_NAT %K %IN; set ip-src $WAN_IP;
+  end-match; end-match; end-match;
+otherwise;
+  pat-in tcp 6;
+  pat-in udp 17;
+  match icmp; match icmp-type 0;
+    pack K ip-src icmp-id; get map ICMP_NAT %K IN; if IN ne 0; set ip-dst %IN; end-if;
+  end-match; end-match;
+end-when;

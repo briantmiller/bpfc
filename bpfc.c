@@ -206,7 +206,7 @@ static void emit_load_operand(int reg, const char *arg);
 /* --- Map Tracking (Symbol Table) --- */
 #define MAX_MAPS 16
 char verifier_log_buf[BPF_LOG_BUF_SIZE];
-struct { char name[32]; int fd; int is_buf; int is_array; int percpu; uint32_t entries; uint32_t vsize; } maps[MAX_MAPS];
+struct { char name[32]; int fd; int is_buf; int is_array; int percpu; int is_lpm; uint32_t entries; uint32_t vsize; } maps[MAX_MAPS];
 int num_maps = 0;
 
 char bpf_map_dir[255] = BPF_FS_DIR;
@@ -4831,6 +4831,13 @@ int map_is_array(int fd) {
     return 0;
 }
 
+/* True if fd is a prefix map (LPM trie) of this program. */
+int map_is_lpm(int fd) {
+    for (int i = 0; i < num_maps; i++)
+        if (maps[i].fd == fd) return maps[i].is_lpm;
+    return 0;
+}
+
 /*
  * array-map <NAME> <entries>
  * An array of <entries> 64-bit values with keys 0..entries-1, used with the
@@ -4935,7 +4942,7 @@ int get_or_create_map(const char *name) {
     // 3. Try to retrieve it from the global BPF filesystem
     int fd = get_pinned_map_fd(pin_path);
     
-    int is_array = 0;
+    int is_array = 0, is_lpm = 0;
     uint32_t entries = DEFAULT_MAP_ENTRIES;
     if (fd >= 0) {
         if (verbose_mode) printf("[!] Found existing pinned map '%s' at %s (FD: %d)\n", name, pin_path, fd);
@@ -4945,6 +4952,7 @@ int get_or_create_map(const char *name) {
         if (map_info(fd, &info) == 0) {
             entries = info.max_entries;
             if (info.type == BPF_MAP_TYPE_ARRAY && info.value_size == 8) is_array = 1;
+            if (info.type == BPF_MAP_TYPE_LPM_TRIE) is_lpm = 1;
         }
     } else {
         // 4. If it doesn't exist globally, create it in the kernel...
@@ -4962,6 +4970,7 @@ int get_or_create_map(const char *name) {
     
     // 5. Register it in our local symbol table for fast subsequent lookups
     register_map(name, fd, 0, is_array, 0, entries, 8);
+    maps[num_maps - 1].is_lpm = is_lpm;
     return fd;
 }
 
@@ -5925,66 +5934,11 @@ static void emit_fmix64(int x) {
     emit(BPF_ALU64_REG(BPF_XOR, x, BPF_REG_0));
 }
 
-/* swap registers a and b through R0 */
-static void emit_swap(int a, int b) {
-    emit(BPF_MOV64_REG(BPF_REG_0, a));
-    emit(BPF_MOV64_REG(a, b));
-    emit(BPF_MOV64_REG(b, BPF_REG_0));
-}
-
-/*
- * get flow-key VAR [reverse | symmetric]
- * 64-bit hash of the IPv4 addresses, protocol and (TCP/UDP) ports, any IHL;
- * never 0 for IPv4, 0 otherwise. "reverse" gives the key of the opposite
- * direction (so a returning ACK finds the data flow's entry), "symmetric"
- * the same key for both directions.
- */
+static void kf_flow_key(const char *var, int mode);
 void compile_get_flow_key(const char *var, int mode) {
     if (mode < 0) { fprintf(stderr, "Error: get flow-key VAR [reverse|symmetric]\n"); exit(1); }
-    int v_off = allocate_var(var, 8);
-    jlist_t fail = {.n = 0}, noports = {.n = 0};
-    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, v_off, 0));
-    emit_l4_offset(&fail);
-    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_BYTES, 0));
-    emit_ld_pkt(0, pkt_off(26), 8, PS_BYTES, &fail);
-    emit_ip_proto(&fail);
-    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_CUR, 0));
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JEQ|BPF_K, .dst_reg=BPF_REG_1, .imm=6, .off=1}));
-    jl_add(&noports);
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=17}));
-    emit_ld_pkt(PS_L4, 0, 4, PS_CUR, &noports);
-    jl_patch(&noports, prog_idx);
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, PS_BYTES));      /* saddr */
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, PS_BYTES + 4));  /* daddr */
-    emit(BPF_LDX_MEM(BPF_H, BPF_REG_3, BPF_REG_10, PS_CUR));        /* sport */
-    emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_10, PS_CUR + 2));    /* dport */
-    emit(BPF_LDX_MEM(BPF_B, BPF_REG_5, BPF_REG_10, PS_AUX));        /* proto */
-    if (mode == 1) {
-        emit_swap(BPF_REG_1, BPF_REG_2);
-        emit_swap(BPF_REG_3, BPF_REG_4);
-    } else if (mode == 2) {
-        /* order (addr, port) pairs: swap if saddr > daddr, or equal and sport > dport */
-        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2, .off=3}));
-        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_X, .dst_reg=BPF_REG_1, .src_reg=BPF_REG_2, .off=8}));
-        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JLE|BPF_X, .dst_reg=BPF_REG_3, .src_reg=BPF_REG_4, .off=7}));
-        emit(((struct bpf_insn){.code=BPF_JMP|BPF_JA, .off=0}));
-        emit_swap(BPF_REG_1, BPF_REG_2);
-        emit_swap(BPF_REG_3, BPF_REG_4);
-    }
-    /* a = saddr << 32 | daddr (R1), b = sport << 24 | dport << 8 | proto (R3) */
-    emit(BPF_ALU64_IMM(BPF_LSH, BPF_REG_1, 32));
-    emit(BPF_ALU64_REG(BPF_OR, BPF_REG_1, BPF_REG_2));
-    emit(BPF_ALU64_IMM(BPF_LSH, BPF_REG_3, 24));
-    emit(BPF_ALU64_IMM(BPF_LSH, BPF_REG_4, 8));
-    emit(BPF_ALU64_REG(BPF_OR, BPF_REG_3, BPF_REG_4));
-    emit(BPF_ALU64_REG(BPF_OR, BPF_REG_3, BPF_REG_5));
-    emit_fmix64(BPF_REG_3);
-    emit(BPF_ALU64_REG(BPF_XOR, BPF_REG_1, BPF_REG_3));
-    emit_fmix64(BPF_REG_1);
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_1, .imm=0, .off=1}));
-    emit(BPF_MOV64_IMM(BPF_REG_1, 1));
-    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, v_off));
-    jl_patch(&fail, prog_idx);
+    /* the same key as hash VAR 64 [reverse|symmetric] ip-src ip-dst ip-proto src-port dst-port */
+    kf_flow_key(var, mode);
 }
 
 /* get bytes %OFF <len> VAR: variable offset; 0 if outside the packet */
@@ -6634,40 +6588,6 @@ void compile_l4_csum(int is_udp, const char *var, int l3off, int maxlen) {
 void compile_recalculate_l4_csum(int is_udp) { compile_l4_csum(is_udp, NULL, 14, 9000); }
 
 /* -w <map> <key> <value>: write a 64-bit value into a pinned 8-byte map. */
-int write_map_value(const char *map_name, const char *map_dir, const char *key_s, const char *val_s) {
-    char pin_path[256];
-    snprintf(pin_path, sizeof(pin_path), "%s/%s", map_dir, map_name);
-    int fd = get_pinned_map_fd(pin_path);
-    if (fd < 0) {
-        fprintf(stderr, "Error: Could not open map '%s' (Path: %s): %s\n", map_name, pin_path, strerror(errno));
-        return 1;
-    }
-    char *end;
-    errno = 0;
-    uint64_t key = strtoull(key_s, &end, 0);
-    if (errno || *end) { fprintf(stderr, "Error: invalid key '%s'\n", key_s); close(fd); return 1; }
-    uint64_t val = strtoull(val_s, &end, 0);
-    if (errno || *end) { fprintf(stderr, "Error: invalid value '%s'\n", val_s); close(fd); return 1; }
-    struct bpf_map_info info;
-    uint32_t key32 = (uint32_t)key;
-    int is32 = map_info(fd, &info) == 0 && info.key_size == 4;
-    if (map_info(fd, &info) == 0 && info.value_size != 8) {
-        fprintf(stderr, "Error: map '%s' does not hold 64-bit values\n", map_name);
-        close(fd);
-        return 1;
-    }
-    union bpf_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.map_fd = fd;
-    attr.key = is32 ? (unsigned long)&key32 : (unsigned long)&key;
-    attr.value = (unsigned long)&val;
-    attr.flags = BPF_ANY;
-    int r = bpf_syscall(BPF_MAP_UPDATE_ELEM, &attr, sizeof(attr));
-    if (r < 0) fprintf(stderr, "Error: could not update map '%s': %s\n", map_name, strerror(errno));
-    close(fd);
-    return r < 0 ? 1 : 0;
-}
-
 /*
  * Retrieves an active Map FD from the filesystem, iterates through all
  * populated entries, and prints them in Hex format.
@@ -6784,6 +6704,7 @@ static void keyset_add(struct keyset *ks, uint64_t k) {
     ks->keys[ks->n++] = k;
 }
 
+static void kf_print_join_key(FILE *o, uint64_t k);
 int dump_maps_joined(const char *list, const char *map_dir) {
     char buf[4096];
     snprintf(buf, sizeof(buf), "%s", list);
@@ -6830,7 +6751,7 @@ int dump_maps_joined(const char *list, const char *map_dir) {
     putchar('\n');
     for (size_t i = 0; i < ks.n; i++) {
         uint64_t v;
-        printf("0x%016llx", (unsigned long long)ks.keys[i]);
+        kf_print_join_key(stdout, ks.keys[i]);
         for (int m = 0; m < n; m++) {
             if (fds[m] >= 0 && bpf_map_lookup_elem_user(fds[m], &ks.keys[i], &v) == 0)
                 printf(" 0x%llx", (unsigned long long)v);
@@ -7324,7 +7245,11 @@ void help(const char *arg0) {
         "-m <dir>"		,"specify directory for BPF maps",
         "-r <map>"		,"dump contents of specified map",
         "-R <map>[,<map>...]"	,"print maps of 64-bit keys joined on their keys: key, then each map's value or -",
-        "-w <map> <key> <value>"	,"write a 64-bit value under key in a pinned 8-byte map (e.g. runtime settings)",
+        "-w <map> <key> <value>"	,"write a 64-bit value under key in a pinned 8-byte map (key/value: a number, 'pack ...'/'hash ...' as for -H, or a prefix for a prefix map)",
+        "-x <map> <key>"	,"delete the entry of key (as for -w)",
+        "-K '<fields>'"	,"with -r/-R: decode keys as a pack of these fields (-K 'vlan-id ip-src'); values in decimal",
+        "-V '<fields>'"	,"with -r: decode values as a pack of these fields",
+        "-H '<hash|pack ...>'"	,"print the key 'hash'/'pack' gives for field=value pairs: -H 'hash 64 ip-src=10.0.0.1 ip-dst=10.0.0.2'",
         "-f <file>"		,"read command instructions from file, - for STDIN",
         "-E"			,"print the program after include, const, define, repeat and when are expanded, then exit",
         "-s <NAME>=<value>"	,"set const NAME (overrides 'const NAME' in the program); repeatable",
@@ -7341,6 +7266,16 @@ void help(const char *arg0) {
 	"else"					,"begin false branch of the current if block",
 	"end-if"				,"close the current if or if/else block",
 	"match <field> <INT|0x00|%VAR>"		,"conditional, check if field equals value or variable, if so continue execution",
+	"pack <VAR> [symmetric|reverse] <field>[:bits]...","fields side by side in one 64-bit key, the first highest (see doc/flow-tracking.md)",
+	"hash <VAR> <bits|buckets N> [symmetric|reverse] [seed n] <field>...","fields (IPv6 too) hashed into 1-64 bits, or 0..N-1",
+	"unpack <%SRC> <VAR>:<bits>..."		,"take a packed value apart, first VAR from the highest bits",
+	"count <MAP> [<BYTES_MAP>] <key...>"	,"atomically count packets (and bytes) per key",
+	"match seen <MAP> <key...> within <time> [refresh]","true when the key was seen less than <time> (50ms, 2s) ago",
+	"match over-rate <MAP> <key...> <rate> [burst <n>]","true above <rate> (100/s, 10mbit) per key: a policer",
+	"prefix-map <MAP> [entries]"		,"declare a longest-prefix-match table of IPv4 prefixes",
+	"match <ip-src|ip-dst|%VAR> in <MAP> [VAR]","true when the address is in a prefix of the prefix map",
+	"match host|net|port|src-port|dst-port <v>","tcpdump-style: IPv4 source or destination address, prefix or port",
+	"match dscp|ecn <name|n>"		,"DSCP (ef, af41, cs6, ...) or ECN (ce, ect0, ...); set dscp/ecn too",
 	"match <shorthand>"			,"match Ethernet and optionally IP protocol",
 	"  vlan"				,"match packets encapsulated in 802.1q VLAN",
 	"  qinq"				,"match packets encapsulated in 801.1ad aka Q-in-Q",
@@ -7467,6 +7402,9 @@ void help(const char *arg0) {
 	"udp-src"		,"UDP source port",
 	"udp-dst"		,"UDP destination port",
 	"tcp-flags"		,"TCP flags - match only: FIN, SYN, RST, PSH, ACK, URG",
+	"src-port, dst-port"	,"TCP, UDP or SCTP port (0 for other protocols and fragments); set: TCP or UDP",
+	"icmp-id, icmp-code"	,"ICMP echo identifier, ICMP code - get only",
+	"dscp, ecn, ip-ttl"	,"DSCP and ECN bits of the TOS byte (get/set/match), TTL (get)",
     };
     char *raw_fields[] = {
 	"bytes <off> <len> [VAL]"	,"get/set len bytes at offset in the packet",
@@ -7688,6 +7626,1778 @@ static int check_field_value(const char *op, const char *f, const char *val) {
     return 0;
 }
 
+int process_cmd(char *cmd, const char *dir);
+/* ======================================================================
+ * Flow keys: hash, pack, unpack, and the commands built on them (seen,
+ * over-rate, count), plus the shared field names (src-port, dscp, ...).
+ * doc/flow-tracking.md explains them for network engineers.
+ *
+ * A key is a list of fields. Each field is read from the packet (or a
+ * variable or constant) as a host-order number of <width> bits:
+ *
+ *   pack  puts the fields side by side, the first in the highest bits:
+ *         pack K ip-src ip-dst  ->  src << 32 | dst. Exact and readable,
+ *         at most 64 bits in all.
+ *   hash  packs the fields the same way into 64-bit words (a field never
+ *         straddles two words; an IPv6 address is two words of its own),
+ *         then mixes the words: h = INIT ^ seed; for each word w:
+ *         h = fmix64(h ^ w) + GOLDEN. 64 bits: 0 becomes 1, so 0 means
+ *         "fields not in this packet". Fewer bits: the high half is folded
+ *         into the low half (32 bits or fewer), then the low bits are kept.
+ *         buckets N: ((h ^ h >> 32) & 0xffffffff) * N >> 32, which spreads
+ *         evenly over 0..N-1.
+ *
+ * reverse swaps src/dst pairs (the reply's key); symmetric orders each
+ * pair, the lower first, with one decision for all pairs taken from the
+ * first pair (then the next while equal), so both directions get one key.
+ *
+ * A key whose fields belong to IPv4 (or IPv6) is "absent" for other
+ * packets: hash and pack store 0, the commands built on keys do nothing.
+ * Ports, ICMP type/code/id are 0 for protocols that have none and for every
+ * fragment (all fragments of a datagram get the same key). IPv6 ports are
+ * read only directly after the fixed header (no extension headers).
+ *
+ * bpfc -H computes the same key in user space (kspec_eval), so scripts can
+ * look up or write map entries.
+ * ====================================================================== */
+
+#define KH_INIT 0x6a09e667f3bcc909ULL
+#define KH_GOLD 0x9e3779b97f4a7c15ULL
+
+static uint64_t kf_fmix(uint64_t k) {
+    k ^= k >> 33; k *= 0xff51afd7ed558ccdULL; k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL; k ^= k >> 33;
+    return k;
+}
+
+enum {
+    KF_IP_SRC, KF_IP_DST, KF_IP_PROTO, KF_IP_TOS, KF_DSCP, KF_ECN, KF_IP_TTL, KF_IP_IDENT, KF_IP_LEN,
+    KF_SRC_PORT, KF_DST_PORT, KF_TCP_SRC, KF_TCP_DST, KF_UDP_SRC, KF_UDP_DST,
+    KF_ICMP_TYPE, KF_ICMP_CODE, KF_ICMP_ID,
+    KF_IP6_SRC, KF_IP6_DST, KF_IP6_PROTO, KF_IP6_FLOW, KF_IP6_TCLASS,
+    KF_SRC_MAC, KF_DST_MAC, KF_ETH_PROTO, KF_VLAN_ID,
+    KF_VAR, KF_CONST, KF_BYTES, KF_GET
+};
+
+/* fam: 4 IPv4, 6 IPv6, 'L' transport (IPv6 when the key has IPv6 fields,
+ * else IPv4), 0 any packet. pair: fields swapped by reverse/symmetric. */
+static const struct kf_def { const char *name; int kind, width, fam, pair, src, partner; } kf_defs[] = {
+    {"ip-src",     KF_IP_SRC,     32, 4,   1, 1, KF_IP_DST},
+    {"ip-dst",     KF_IP_DST,     32, 4,   1, 0, KF_IP_SRC},
+    {"ip-proto",   KF_IP_PROTO,    8, 4,   0, 0, 0},
+    {"ip-tos",     KF_IP_TOS,      8, 4,   0, 0, 0},
+    {"dscp",       KF_DSCP,        6, 4,   0, 0, 0},
+    {"ecn",        KF_ECN,         2, 4,   0, 0, 0},
+    {"ip-ttl",     KF_IP_TTL,      8, 4,   0, 0, 0},
+    {"ip-ident",   KF_IP_IDENT,   16, 4,   0, 0, 0},
+    {"ip-len",     KF_IP_LEN,     16, 4,   0, 0, 0},
+    {"src-port",   KF_SRC_PORT,   16, 'L', 2, 1, KF_DST_PORT},
+    {"dst-port",   KF_DST_PORT,   16, 'L', 2, 0, KF_SRC_PORT},
+    {"tcp-src",    KF_TCP_SRC,    16, 'L', 3, 1, KF_TCP_DST},
+    {"tcp-dst",    KF_TCP_DST,    16, 'L', 3, 0, KF_TCP_SRC},
+    {"udp-src",    KF_UDP_SRC,    16, 'L', 4, 1, KF_UDP_DST},
+    {"udp-dst",    KF_UDP_DST,    16, 'L', 4, 0, KF_UDP_SRC},
+    {"icmp-type",  KF_ICMP_TYPE,   8, 'L', 0, 0, 0},
+    {"icmp-code",  KF_ICMP_CODE,   8, 'L', 0, 0, 0},
+    {"icmp-id",    KF_ICMP_ID,    16, 'L', 0, 0, 0},
+    {"ip6-src",    KF_IP6_SRC,   128, 6,   5, 1, KF_IP6_DST},
+    {"ip6-dst",    KF_IP6_DST,   128, 6,   5, 0, KF_IP6_SRC},
+    {"ip6-proto",  KF_IP6_PROTO,   8, 6,   0, 0, 0},
+    {"ip6-flow",   KF_IP6_FLOW,   20, 6,   0, 0, 0},
+    {"ip6-tclass", KF_IP6_TCLASS,  8, 6,   0, 0, 0},
+    {"src-mac",    KF_SRC_MAC,    48, 0,   6, 1, KF_DST_MAC},
+    {"dst-mac",    KF_DST_MAC,    48, 0,   6, 0, KF_SRC_MAC},
+    {"eth-proto",  KF_ETH_PROTO,  16, 0,   0, 0, 0},
+    {"vlan-id",    KF_VLAN_ID,    12, 0,   0, 0, 0},
+};
+#define KF_NDEFS (int)(sizeof(kf_defs) / sizeof(kf_defs[0]))
+
+static const struct kf_def *kf_def_by_name(const char *n) {
+    for (int i = 0; i < KF_NDEFS; i++) if (!strcmp(kf_defs[i].name, n)) return &kf_defs[i];
+    return NULL;
+}
+static const struct kf_def *kf_def_by_kind(int k) {
+    for (int i = 0; i < KF_NDEFS; i++) if (kf_defs[i].kind == k) return &kf_defs[i];
+    return NULL;
+}
+
+/* DSCP and ECN names (RFC 2474, 2597, 3246, 5865, 8622, 3168) */
+static const struct { const char *name; int v; } dscp_names[] = {
+    {"default", 0}, {"be", 0}, {"cs0", 0}, {"le", 1}, {"cs1", 8}, {"af11", 10}, {"af12", 12}, {"af13", 14},
+    {"cs2", 16}, {"af21", 18}, {"af22", 20}, {"af23", 22}, {"cs3", 24}, {"af31", 26}, {"af32", 28},
+    {"af33", 30}, {"cs4", 32}, {"af41", 34}, {"af42", 36}, {"af43", 38}, {"cs5", 40}, {"va", 44},
+    {"ef", 46}, {"cs6", 48}, {"cs7", 56},
+};
+static const char *ecn_names[] = {"not-ect", "ect1", "ect0", "ce"};
+
+/* DSCP name or number 0-63; -1 if neither */
+static int parse_dscp(const char *s) {
+    for (size_t i = 0; i < sizeof(dscp_names) / sizeof(dscp_names[0]); i++)
+        if (!strcasecmp(s, dscp_names[i].name)) return dscp_names[i].v;
+    uint64_t v;
+    if (!parse_num(s, 63, &v)) return (int)v;
+    return -1;
+}
+static const char *dscp_name(int v) {
+    for (size_t i = 0; i < sizeof(dscp_names) / sizeof(dscp_names[0]); i++)
+        if (dscp_names[i].v == v && strcmp(dscp_names[i].name, "be") && strcmp(dscp_names[i].name, "cs0"))
+            return dscp_names[i].name;
+    return NULL;
+}
+static int parse_ecn(const char *s) {
+    for (int i = 0; i < 4; i++) if (!strcasecmp(s, ecn_names[i])) return i;
+    uint64_t v;
+    if (!parse_num(s, 3, &v)) return (int)v;
+    return -1;
+}
+
+#define KF_MAX 24
+struct kfield {
+    int kind, width, nat, prefix, fam, pair, src, partner, is128;
+    int bits_given;
+    char name[48];      /* as written, for messages and table headers */
+    char var[32];       /* KF_VAR, KF_GET: the variable */
+    char get[32];       /* KF_GET: the get field */
+    uint64_t cval;      /* KF_CONST */
+    int boff, blen;     /* KF_BYTES */
+    char boffvar[32];   /* KF_BYTES with a variable offset */
+    int slot;           /* stack offset while a key is built */
+    uint64_t v[2];      /* bpfc -H: the value (v[0] the high word of 128) */
+};
+struct kspec {
+    int hash, bits, dir, seed_var;   /* dir: 0, 1 reverse, 2 symmetric */
+    uint64_t buckets, seed;
+    char seedname[32];
+    int n, fam, l4;
+    struct kfield f[KF_MAX];
+};
+
+static int kf_err(const char *what, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "Error: %s: ", what);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+    return -1;
+}
+
+static uint64_t kf_mask(int bits) { return bits >= 64 ? ~0ULL : (1ULL << bits) - 1; }
+
+/* The value of field f written as text (bpfc -H, -w), with prefix and
+ * width applied as the program applies them. */
+static int kf_user_value(struct kfield *f, const char *s, const char *what) {
+    uint64_t v = 0;
+    f->v[0] = f->v[1] = 0;
+    switch (f->kind) {
+    case KF_IP_SRC: case KF_IP_DST: {
+        struct in_addr a;
+        if (inet_pton(AF_INET, s, &a) != 1) return kf_err(what, "%s=%s is not an IPv4 address", f->name, s);
+        v = ntohl(a.s_addr);
+        break;
+    }
+    case KF_IP6_SRC: case KF_IP6_DST: {
+        unsigned char b[16];
+        if (inet_pton(AF_INET6, s, b) != 1) return kf_err(what, "%s=%s is not an IPv6 address", f->name, s);
+        for (int i = 0; i < 8; i++) { f->v[0] = f->v[0] << 8 | b[i]; f->v[1] = f->v[1] << 8 | b[i + 8]; }
+        if (f->prefix >= 0) {
+            int p = f->prefix;
+            uint64_t mh = p >= 64 ? ~0ULL : p == 0 ? 0 : ~0ULL << (64 - p);
+            uint64_t ml = p <= 64 ? 0 : p >= 128 ? ~0ULL : ~0ULL << (128 - p);
+            f->v[0] &= mh; f->v[1] &= ml;
+        }
+        return 0;
+    }
+    case KF_SRC_MAC: case KF_DST_MAC:
+        if (!valid_mac(s)) return kf_err(what, "%s=%s is not a MAC address", f->name, s);
+        v = parse_mac(s);
+        { uint64_t r = 0; for (int i = 0; i < 6; i++) r = r << 8 | ((v >> (8 * i)) & 0xff); v = r; }
+        break;
+    case KF_DSCP: {
+        int d = parse_dscp(s);
+        if (d < 0) return kf_err(what, "%s=%s is not a DSCP name or 0-63", f->name, s);
+        v = d;
+        break;
+    }
+    case KF_ECN: {
+        int e = parse_ecn(s);
+        if (e < 0) return kf_err(what, "%s=%s is not an ECN name or 0-3", f->name, s);
+        v = e;
+        break;
+    }
+    default:
+        if (parse_num(s, UINT64_MAX, &v)) return kf_err(what, "%s=%s is not a number", f->name, s);
+    }
+    if (f->kind == KF_IP_SRC || f->kind == KF_IP_DST) {
+        if (f->prefix >= 0) v = f->prefix == 0 ? 0 : v >> (32 - f->prefix);
+    }
+    f->v[1] = v & kf_mask(f->width);
+    return 0;
+}
+
+/*
+ * Parses the field list tok[0..n-1] into ks (after any options). user: the
+ * tokens are NAME=VALUE (bpfc -H); otherwise names a program reads.
+ */
+static int kspec_parse_fields(struct kspec *ks, char **tok, int n, int user, const char *what) {
+    ks->n = 0;
+    for (int i = 0; i < n; i++) {
+        if (ks->n >= KF_MAX) return kf_err(what, "at most %d fields", KF_MAX);
+        struct kfield *f = &ks->f[ks->n];
+        memset(f, 0, sizeof(*f));
+        f->prefix = -1;
+        char spec[96];
+        const char *val = NULL;
+        snprintf(spec, sizeof(spec), "%s", tok[i]);
+        if (!strcmp(spec, "bytes")) {
+            if (i + 2 >= n) return kf_err(what, "bytes needs an offset and a length: bytes <offset|%%VAR> <1-8>");
+            f->kind = KF_BYTES;
+            const char *off = tok[++i];
+            char lenbuf[64];
+            snprintf(lenbuf, sizeof(lenbuf), "%s", tok[++i]);
+            char *eq = user ? strchr(lenbuf, '=') : NULL;
+            if (user && !eq) return kf_err(what, "give the value as bytes <offset> <length>=<value>");
+            if (eq) { *eq = 0; val = tok[i] + (eq - lenbuf) + 1; }
+            uint64_t l;
+            if (parse_num(lenbuf, 8, &l) || l == 0) return kf_err(what, "bytes length must be 1-8");
+            f->blen = (int)l;
+            if (off[0] == '%') {
+                if (user) return kf_err(what, "bytes with a variable offset: give its offset as a number");
+                snprintf(f->boffvar, sizeof(f->boffvar), "%s", off);
+            } else {
+                uint64_t o;
+                if (parse_num(off, 65535, &o)) return kf_err(what, "bad bytes offset '%s'", off);
+                f->boff = (int)o;
+            }
+            f->nat = f->width = 8 * f->blen;
+            snprintf(f->name, sizeof(f->name), "bytes:%s:%d", off, f->blen);
+            goto have_value;
+        }
+        if (user) {
+            char *eq = strchr(spec, '=');
+            int is_const = isdigit((unsigned char)spec[0]);
+            if (!eq && !is_const) return kf_err(what, "field '%s' needs a value: %s=<value>", spec, spec);
+            if (eq) { *eq = 0; val = tok[i] + (eq - spec) + 1; }
+        }
+        char *colon = strrchr(spec, ':');
+        int bits = 0;
+        if (colon) {
+            uint64_t b;
+            if (parse_num(colon + 1, 64, &b) || b == 0) return kf_err(what, "'%s': the width after ':' must be 1-64 bits", tok[i]);
+            bits = (int)b;
+            *colon = 0;
+            f->bits_given = 1;
+        }
+        char *slash = strchr(spec, '/');
+        if (slash) {
+            uint64_t p;
+            *slash = 0;
+            const struct kf_def *d = kf_def_by_name(spec);
+            if (!d || (d->kind != KF_IP_SRC && d->kind != KF_IP_DST && d->kind != KF_IP6_SRC && d->kind != KF_IP6_DST))
+                return kf_err(what, "'%s': only ip-src, ip-dst, ip6-src and ip6-dst take a /prefix", tok[i]);
+            if (parse_num(slash + 1, d->width, &p)) return kf_err(what, "'%s': prefix must be 0-%d", tok[i], d->width);
+            f->prefix = (int)p;
+        }
+        snprintf(f->name, sizeof(f->name), "%s", tok[i]);
+        if (user && f->name[0] && strchr(f->name, '=')) *strchr(f->name, '=') = 0;
+        const struct kf_def *d = kf_def_by_name(spec);
+        if (d) {
+            f->kind = d->kind; f->nat = d->width; f->fam = d->fam;
+            f->pair = d->pair; f->src = d->src; f->partner = d->partner;
+            f->is128 = d->width == 128;
+            f->width = f->nat;
+            if (f->prefix >= 0 && !f->is128) f->width = f->prefix;
+            if (bits) {
+                if (f->is128) return kf_err(what, "'%s': an IPv6 address has no width option", tok[i]);
+                if (bits > f->width) return kf_err(what, "'%s': %s has only %d bits", tok[i], spec, f->width);
+                f->width = bits;
+            }
+        } else if (spec[0] == '%') {
+            f->kind = KF_VAR;
+            snprintf(f->var, sizeof(f->var), "%.31s", spec);
+            int sz = 0;
+            if (!user) {
+                get_var_offset(spec);          /* exits if it is not declared */
+                sz = get_var_size(spec);
+            }
+            f->nat = sz ? sz * 8 : 64;
+            if (f->nat > 64) {
+                f->is128 = 1; f->nat = 128;
+                if (bits) return kf_err(what, "'%s': a 16-byte variable has no width option", tok[i]);
+            }
+            if (user && !bits)
+                return kf_err(what, "give the variable's width, its size in bits: %s:<bits>=<value> (decl V 2: %s:16)", spec, spec);
+            f->width = bits ? bits : f->nat;
+        } else if (isdigit((unsigned char)spec[0])) {
+            f->kind = KF_CONST;
+            if (parse_num(spec, UINT64_MAX, &f->cval)) return kf_err(what, "bad number '%s'", spec);
+            f->nat = 64;
+            f->width = bits ? bits : (f->cval >> 32 ? 64 : 32);
+            if (!bits && !ks->hash) return kf_err(what, "constant '%s' needs a width in a pack: %s:<bits>", spec, spec);
+            f->v[1] = f->cval & kf_mask(f->width);
+            ks->n++;
+            continue;
+        } else if (user) {
+            /* any other get field (gre-key, skb-mark, ...): its value as a number */
+            if (!bits) return kf_err(what, "'%s': give the field's width, e.g. %s:32=<value>", tok[i], spec);
+            f->kind = KF_CONST;
+            f->nat = 64;
+            f->width = bits;
+        } else {
+            f->kind = KF_GET;
+            snprintf(f->get, sizeof(f->get), "%.31s", spec);
+            f->width = bits;          /* 0: the get variable's size, known when compiling */
+            f->nat = 64;
+        }
+have_value:
+        if (user) {
+            if (f->kind == KF_VAR && !val) return kf_err(what, "%s needs a value", f->name);
+            if (kf_user_value(f, val, what)) return -1;
+        }
+        ks->n++;
+    }
+    if (ks->n == 0) return kf_err(what, "no fields");
+    return 0;
+}
+
+/* Swaps, families, transport fields; checks that hold for any key. */
+static int kspec_finish(struct kspec *ks, int user, const char *what) {
+    int has4 = 0, has6 = 0, total = 0;
+    for (int i = 0; i < ks->n; i++) {
+        struct kfield *f = &ks->f[i];
+        if (ks->dir == 1 && f->pair) {
+            /* reverse: read each pair field from the other side */
+            const struct kf_def *d = kf_def_by_kind(f->partner);
+            f->kind = d->kind; f->src = d->src; f->partner = d->partner;
+        }
+        if (f->fam == 4) has4 = 1;
+        if (f->fam == 6) has6 = 1;
+        if (f->fam == 'L') ks->l4 = 1;
+        if (!user && l3off != 14 && (f->kind == KF_SRC_MAC || f->kind == KF_DST_MAC ||
+                                     f->kind == KF_ETH_PROTO || f->kind == KF_VLAN_ID)) {
+            char w[80];
+            snprintf(w, sizeof(w), "%s %s", what, f->name);
+            require_eth(w);
+        }
+        total += f->is128 ? 128 : f->width;
+    }
+    if (has4 && has6) return kf_err(what, "a key has IPv4 or IPv6 fields, not both");
+    ks->fam = has6 ? 6 : (has4 || ks->l4) ? 4 : 0;
+    if (!ks->hash) {
+        for (int i = 0; i < ks->n; i++)
+            if (ks->f[i].is128) return kf_err(what, "%s is 128 bits: a pack holds 64; use hash", ks->f[i].name);
+        if (total > 64 && !user)
+            return kf_err(what, "the fields take %d bits; a pack holds 64 (use hash, or give fields fewer bits with :<bits>)", total);
+        if (total > 64) return kf_err(what, "the fields take %d bits; a pack holds 64", total);
+    }
+    if (ks->dir == 2) {
+        /* symmetric: every pair field needs its partner, of the same width and prefix */
+        for (int i = 0; i < ks->n; i++) {
+            struct kfield *f = &ks->f[i];
+            if (!f->pair) continue;
+            int found = 0;
+            for (int j = 0; j < ks->n; j++)
+                if (ks->f[j].kind == f->partner && ks->f[j].width == f->width && ks->f[j].prefix == f->prefix) found++;
+            if (found != 1) {
+                const struct kf_def *p = kf_def_by_kind(f->partner);
+                return kf_err(what, "symmetric: %s needs %s once, of the same width and prefix, to swap with", f->name, p->name);
+            }
+        }
+    }
+    return 0;
+}
+
+/* Options before the fields. hash: <bits> | buckets <N>; both: symmetric,
+ * reverse; hash: seed <n|%VAR>. Returns the index of the first field. */
+static int kspec_parse_opts(struct kspec *ks, char **tok, int n, int user, const char *what) {
+    int i = 0;
+    if (ks->hash) {
+        uint64_t b;
+        if (i < n && !strcmp(tok[i], "buckets")) {
+            if (i + 1 >= n || parse_num(tok[i + 1], 0xFFFFFFFFULL, &b) || b < 1)
+                return kf_err(what, "buckets needs a count, 1-4294967295");
+            ks->buckets = b; ks->bits = 64; i += 2;
+        } else if (i < n && !parse_num(tok[i], 64, &b) && b >= 1) {
+            ks->bits = (int)b; i++;
+        } else return kf_err(what, "usage: hash <VAR> <bits 1-64 | buckets N> [symmetric|reverse] [seed <n|%%VAR>] <field>...");
+    }
+    for (; i < n; i++) {
+        if (!strcmp(tok[i], "symmetric") || !strcmp(tok[i], "reverse")) {
+            if (ks->dir) return kf_err(what, "symmetric and reverse are exclusive");
+            ks->dir = tok[i][0] == 's' ? 2 : 1;
+        } else if (ks->hash && !strcmp(tok[i], "seed")) {
+            if (i + 1 >= n) return kf_err(what, "seed needs a number or %%VAR");
+            const char *s = tok[++i];
+            if (user) {
+                const char *eq = strchr(s, '=');
+                if (s[0] == '%' && eq) s = eq + 1;
+                else if (s[0] == '%') return kf_err(what, "seed %%VAR=<value>");
+            }
+            if (s[0] == '%') { ks->seed_var = 1; snprintf(ks->seedname, sizeof(ks->seedname), "%s", s); }
+            else if (parse_num(s, UINT64_MAX, &ks->seed)) return kf_err(what, "bad seed '%s'", s);
+        } else break;
+    }
+    return i;
+}
+
+/* The key's value from the fields' user values (bpfc -H). */
+static uint64_t kspec_eval(struct kspec *ks) {
+    uint64_t v[KF_MAX][2];
+    for (int i = 0; i < ks->n; i++) { v[i][0] = ks->f[i].v[0]; v[i][1] = ks->f[i].v[1]; }
+    if (ks->dir == 2) {
+        int done[8] = {0}, decided = 0, swap = 0;
+        for (int i = 0; i < ks->n && !decided; i++) {
+            struct kfield *f = &ks->f[i];
+            if (!f->pair || done[f->pair]) continue;
+            done[f->pair] = 1;
+            int s = -1, d = -1;
+            for (int j = 0; j < ks->n; j++) {
+                if (ks->f[j].pair != f->pair) continue;
+                if (ks->f[j].src) s = j; else d = j;
+            }
+            for (int w = 0; w < 2 && !decided; w++) {
+                if (v[s][w] > v[d][w]) { swap = 1; decided = 1; }
+                else if (v[s][w] < v[d][w]) decided = 1;
+            }
+        }
+        if (swap)
+            for (int i = 0; i < ks->n; i++) {
+                struct kfield *f = &ks->f[i];
+                if (!f->pair || !f->src) continue;
+                for (int j = 0; j < ks->n; j++)
+                    if (ks->f[j].kind == f->partner) {
+                        uint64_t a = v[i][0], b = v[i][1];
+                        v[i][0] = v[j][0]; v[i][1] = v[j][1]; v[j][0] = a; v[j][1] = b;
+                    }
+            }
+    }
+    if (!ks->hash) {
+        uint64_t acc = 0;
+        for (int i = 0; i < ks->n; i++) {
+            int w = ks->f[i].width;
+            acc = w >= 64 ? v[i][1] : (acc << w) | v[i][1];
+        }
+        return acc;
+    }
+    uint64_t h = KH_INIT ^ ks->seed, word = 0;
+    int used = 0;
+    for (int i = 0; i < ks->n; i++) {
+        struct kfield *f = &ks->f[i];
+        if (f->is128) {
+            if (used) { h = kf_fmix(h ^ word) + KH_GOLD; word = 0; used = 0; }
+            h = kf_fmix(h ^ v[i][0]) + KH_GOLD;
+            h = kf_fmix(h ^ v[i][1]) + KH_GOLD;
+            continue;
+        }
+        if (used + f->width > 64) { h = kf_fmix(h ^ word) + KH_GOLD; word = 0; used = 0; }
+        word = (f->width >= 64 || !used) ? v[i][1] : (word << f->width) | v[i][1];
+        used += f->width;
+    }
+    if (used) h = kf_fmix(h ^ word) + KH_GOLD;
+    if (ks->buckets) return (((h ^ (h >> 32)) & 0xffffffffULL) * ks->buckets) >> 32;
+    if (ks->bits >= 64) return h ? h : 1;
+    if (ks->bits <= 32) h ^= h >> 32;
+    return h & kf_mask(ks->bits);
+}
+
+/* ---- BPF side ---- */
+
+static const char *kf_dir = "ingress";   /* the hook, for commands that expand into others */
+static int kf_uniq = 0;
+
+static int ej_k(int op, int dst, int32_t imm) {
+    int i = prog_idx;
+    emit(((struct bpf_insn){.code = BPF_JMP | op | BPF_K, .dst_reg = dst, .imm = imm}));
+    return i;
+}
+static int ej_x(int op, int dst, int src) {
+    int i = prog_idx;
+    emit(((struct bpf_insn){.code = BPF_JMP | op | BPF_X, .dst_reg = dst, .src_reg = src}));
+    return i;
+}
+static void ej_here(int i) { prog[i].off = prog_idx - i - 1; }
+
+/* reg &= mask, through R2 when it does not fit an immediate */
+static void emit_and_mask(int reg, uint64_t mask) {
+    if (mask == ~0ULL) return;
+    if (mask <= 0x7fffffffULL) { emit(BPF_ALU64_IMM(BPF_AND, reg, (int32_t)mask)); return; }
+    char b[24];
+    snprintf(b, sizeof(b), "%llu", (unsigned long long)mask);
+    emit_load_operand(BPF_REG_2, b);
+    emit(BPF_ALU64_REG(BPF_AND, reg, BPF_REG_2));
+}
+
+/* Runs a command built here (expansions), as if it were written. */
+static int kf_run(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    int rc = process_cmd(buf, kf_dir);
+    if (rc) { fprintf(stderr, "Error: in '%s'\n", buf); exit(1); }
+    return rc;
+}
+
+/* The family check: absent unless the packet is IPv4 (4) or IPv6 (6). */
+static void kf_emit_family(int fam, jlist_t *absent) {
+    if (!fam) return;
+    if (l3off == 14) {
+        emit_ld_pkt(0, 12, 2, PS_BYTES, absent);
+        emit_ld_host(PS_BYTES, 2);
+        jl_add(absent);
+        ej_k(BPF_JNE, BPF_REG_1, fam == 4 ? 0x0800 : 0x86DD);
+    }
+    emit_ld_pkt(0, pkt_off(14), 1, PS_BYTES, absent);
+    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+    emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 4));
+    jl_add(absent);
+    ej_k(BPF_JNE, BPF_REG_1, fam);
+}
+
+/* PS_L4 = transport header offset; [lslot] = its protocol, 0 for fragments */
+static void kf_emit_l4(int fam, int lslot, jlist_t *absent) {
+    if (fam == 6) {
+        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_L4, l3off + 40));
+        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_BYTES, 0));
+        emit_ld_pkt(0, pkt_off(20), 1, PS_BYTES, absent);
+        emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+        emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, lslot));
+        return;
+    }
+    emit_l4_offset(absent);
+    emit_ld_pkt(0, pkt_off(20), 2, PS_BYTES, absent);
+    emit_ld_host(PS_BYTES, 2);
+    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0x3FFF));
+    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, lslot, 0));
+    int jfrag = ej_k(BPF_JNE, BPF_REG_1, 0);
+    emit_ld_pkt(0, pkt_off(23), 1, PS_BYTES, absent);
+    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, lslot));
+    ej_here(jfrag);
+}
+
+/* R1 = an IPv4/IPv6 header field of size bytes at Ethernet-frame offset off */
+static void kf_ld(int off, int size, jlist_t *absent) {
+    emit_ld_pkt(0, pkt_off(off), size, PS_BYTES, absent);
+    emit_ld_host(PS_BYTES, size);
+}
+
+/* R1 = a transport field (size 1 or 2 at L4 + rel) when [lslot] is one of
+ * protos (0-terminated), and (types) the ICMP type is one of them; else 0. */
+static void kf_ld_l4(int lslot, const int *protos, const int *types, int rel, int size) {
+    jlist_t zero = {0}, ok = {0};
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, lslot));
+    for (int k = 0; protos[k]; k++) { jl_add(&ok); ej_k(BPF_JEQ, BPF_REG_1, protos[k]); }
+    jl_add(&zero);
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    jl_patch(&ok, prog_idx);
+    if (types) {
+        jlist_t tok = {0};
+        emit_ld_pkt(PS_L4, 0, 1, PS_BYTES, &zero);
+        emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+        for (int k = 0; types[k] >= 0; k++) { jl_add(&tok); ej_k(BPF_JEQ, BPF_REG_1, types[k]); }
+        jl_add(&zero);
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+        jl_patch(&tok, prog_idx);
+    }
+    emit_ld_pkt(PS_L4, rel, size, PS_BYTES, &zero);
+    emit_ld_host(PS_BYTES, size);
+    int jend = prog_idx;
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    jl_patch(&zero, prog_idx);
+    emit(BPF_MOV64_IMM(BPF_REG_1, 0));
+    ej_here(jend);
+}
+
+/* Reads field f into its slot (host order; prefix and width applied). */
+static void kf_emit_field(struct kfield *f, int fam, int lslot, jlist_t *absent) {
+    static const int p_port[] = {6, 17, 132, 0}, p_tcp[] = {6, 0}, p_udp[] = {17, 0};
+    static const int p_icmp4[] = {1, 0}, p_icmp6[] = {58, 0};
+    static const int t_echo4[] = {0, 8, -1}, t_echo6[] = {128, 129, -1};
+    switch (f->kind) {
+    case KF_IP_SRC:   kf_ld(26, 4, absent); break;
+    case KF_IP_DST:   kf_ld(30, 4, absent); break;
+    case KF_IP_PROTO: kf_ld(23, 1, absent); break;
+    case KF_IP_TOS:   kf_ld(15, 1, absent); break;
+    case KF_DSCP:     kf_ld(15, 1, absent); emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 2)); break;
+    case KF_ECN:      kf_ld(15, 1, absent); emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 3)); break;
+    case KF_IP_TTL:   kf_ld(22, 1, absent); break;
+    case KF_IP_IDENT: kf_ld(18, 2, absent); break;
+    case KF_IP_LEN:   kf_ld(16, 2, absent); break;
+    case KF_SRC_PORT: kf_ld_l4(lslot, p_port, NULL, 0, 2); break;
+    case KF_DST_PORT: kf_ld_l4(lslot, p_port, NULL, 2, 2); break;
+    case KF_TCP_SRC:  kf_ld_l4(lslot, p_tcp, NULL, 0, 2); break;
+    case KF_TCP_DST:  kf_ld_l4(lslot, p_tcp, NULL, 2, 2); break;
+    case KF_UDP_SRC:  kf_ld_l4(lslot, p_udp, NULL, 0, 2); break;
+    case KF_UDP_DST:  kf_ld_l4(lslot, p_udp, NULL, 2, 2); break;
+    case KF_ICMP_TYPE: kf_ld_l4(lslot, fam == 6 ? p_icmp6 : p_icmp4, NULL, 0, 1); break;
+    case KF_ICMP_CODE: kf_ld_l4(lslot, fam == 6 ? p_icmp6 : p_icmp4, NULL, 1, 1); break;
+    case KF_ICMP_ID:  kf_ld_l4(lslot, fam == 6 ? p_icmp6 : p_icmp4, fam == 6 ? t_echo6 : t_echo4, 4, 2); break;
+    case KF_IP6_PROTO: kf_ld(20, 1, absent); break;
+    case KF_IP6_FLOW:  kf_ld(14, 4, absent); emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0xFFFFF)); break;
+    case KF_IP6_TCLASS: kf_ld(14, 4, absent); emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 20));
+                       emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0xFF)); break;
+    case KF_ETH_PROTO: emit_ld_pkt(0, 12, 2, PS_BYTES, absent); emit_ld_host(PS_BYTES, 2); break;
+    case KF_SRC_MAC: case KF_DST_MAC:
+        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_BYTES, 0));
+        emit_ld_pkt(0, f->kind == KF_SRC_MAC ? 6 : 0, 6, PS_BYTES, absent);
+        emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_BYTES));
+#if defined(HOST_LITTLE_ENDIAN)
+        emit(((struct bpf_insn){.code = BPF_END | BPF_ALU | BPF_TO_BE, .dst_reg = BPF_REG_1, .imm = 64}));
+#endif
+        emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 16));
+        break;
+    case KF_VLAN_ID:
+        if (is_xdp) {
+            /* XDP: the tag is still in the frame */
+            jlist_t none = {0};
+            emit_ld_pkt(0, 12, 2, PS_BYTES, &none);
+            emit_ld_host(PS_BYTES, 2);
+            jl_add(&none);
+            ej_k(BPF_JNE, BPF_REG_1, 0x8100);
+            emit_ld_pkt(0, 14, 2, PS_BYTES, &none);
+            emit_ld_host(PS_BYTES, 2);
+            emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0xFFF));
+            int j = prog_idx;
+            emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+            jl_patch(&none, prog_idx);
+            emit(BPF_MOV64_IMM(BPF_REG_1, 0));
+            ej_here(j);
+        } else {
+            emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, vlan_tci));
+            emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0xFFF));
+        }
+        break;
+    case KF_VAR: case KF_GET:
+        if (f->is128) {
+            int vo = get_var_offset(f->var);
+            for (int w = 0; w < 2; w++) {
+                emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, vo + 8 * w));
+#if defined(HOST_LITTLE_ENDIAN)
+                emit(((struct bpf_insn){.code = BPF_END | BPF_ALU | BPF_TO_BE, .dst_reg = BPF_REG_1, .imm = 64}));
+#endif
+                emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, f->slot + 8 * w));
+            }
+            goto mask128;
+        }
+        emit_load_operand(BPF_REG_1, f->var);
+        break;
+    case KF_CONST: {
+        char b[24];
+        snprintf(b, sizeof(b), "%llu", (unsigned long long)(f->cval & kf_mask(f->width)));
+        emit_load_operand(BPF_REG_1, b);
+        break;
+    }
+    case KF_BYTES: {
+        jlist_t zero = {0};
+        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_BYTES, 0));
+        if (f->boffvar[0]) {
+            emit_load_operand(BPF_REG_1, f->boffvar);
+            emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, PS_CUR));
+            emit_ld_pkt(PS_CUR, 0, f->blen, PS_BYTES, &zero);
+        } else emit_ld_pkt(0, f->boff, f->blen, PS_BYTES, &zero);
+        jl_patch(&zero, prog_idx);   /* outside the packet: 0 */
+        emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_BYTES));
+#if defined(HOST_LITTLE_ENDIAN)
+        emit(((struct bpf_insn){.code = BPF_END | BPF_ALU | BPF_TO_BE, .dst_reg = BPF_REG_1, .imm = 64}));
+#endif
+        if (f->blen < 8) emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 64 - 8 * f->blen));
+        break;
+    }
+    case KF_IP6_SRC: case KF_IP6_DST:
+        emit_ld_pkt(0, pkt_off(f->kind == KF_IP6_SRC ? 22 : 38), 16, f->slot, absent);
+        for (int w = 0; w < 2; w++) {
+            emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, f->slot + 8 * w));
+#if defined(HOST_LITTLE_ENDIAN)
+            emit(((struct bpf_insn){.code = BPF_END | BPF_ALU | BPF_TO_BE, .dst_reg = BPF_REG_1, .imm = 64}));
+#endif
+            emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, f->slot + 8 * w));
+        }
+mask128:
+        if (f->prefix >= 0 && f->prefix < 128) {
+            int p = f->prefix;
+            uint64_t m[2] = {p >= 64 ? ~0ULL : p == 0 ? 0 : ~0ULL << (64 - p),
+                             p <= 64 ? 0 : ~0ULL << (128 - p)};
+            for (int w = 0; w < 2; w++) {
+                emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, f->slot + 8 * w));
+                if (m[w] == 0) emit(BPF_MOV64_IMM(BPF_REG_1, 0));
+                else emit_and_mask(BPF_REG_1, m[w]);
+                emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, f->slot + 8 * w));
+            }
+        }
+        return;
+    }
+    /* IPv4 prefix: keep the network bits */
+    if ((f->kind == KF_IP_SRC || f->kind == KF_IP_DST) && f->prefix >= 0) {
+        if (f->prefix == 0) emit(BPF_MOV64_IMM(BPF_REG_1, 0));
+        else if (f->prefix < 32) emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 32 - f->prefix));
+    }
+    if (f->width < 64 && (f->bits_given || f->kind == KF_VAR || f->kind == KF_GET || f->kind == KF_BYTES))
+        emit_and_mask(BPF_REG_1, kf_mask(f->width));
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, f->slot));
+}
+
+static void kf_emit_mix(int x) {
+    emit(BPF_ALU64_REG(BPF_XOR, BPF_REG_3, x));
+    emit_fmix64(BPF_REG_3);
+    emit_load_operand(BPF_REG_2, "0x9e3779b97f4a7c15");
+    emit(BPF_ALU64_REG(BPF_ADD, BPF_REG_3, BPF_REG_2));
+}
+
+/*
+ * Compiles key ks into variable dst (allocated with dsize bytes if new).
+ * Packets without the key's fields: dst = 0, or, with absent_out, a jump
+ * added to that list (dst unchanged).
+ */
+static void compile_key(struct kspec *ks, const char *dst, int dsize, jlist_t *absent_out) {
+    /* 1. other get fields, into variables of their own */
+    for (int i = 0; i < ks->n; i++) {
+        struct kfield *f = &ks->f[i];
+        if (f->kind != KF_GET) continue;
+        snprintf(f->var, sizeof(f->var), "%%__kg%d", kf_uniq++);
+        kf_run("get %s %s", f->get, f->var + 1);
+        int sz = get_var_size(f->var) * 8;
+        if (sz > 64) { f->is128 = 1; f->nat = 128; }
+        if (!f->width) f->width = sz > 64 ? 64 : sz;
+        if (!ks->hash && f->is128) { fprintf(stderr, "Error: pack: %s is 128 bits; use hash\n", f->get); exit(1); }
+    }
+    if (!ks->hash) {
+        int total = 0;
+        for (int i = 0; i < ks->n; i++) total += ks->f[i].width;
+        if (total > 64) { fprintf(stderr, "Error: pack: the fields take %d bits; a pack holds 64\n", total); exit(1); }
+    }
+    int d_off = allocate_var(dst, dsize);
+    if (ks->seed_var) get_var_offset(ks->seedname);
+
+    /* 2. scratch: one slot per field (two for 128 bits) and the L4 protocol */
+    int nslots = 1;
+    for (int i = 0; i < ks->n; i++) nslots += ks->f[i].is128 ? 2 : 1;
+    int base = stack_scratch(nslots * 8, "a key");
+    int lslot = base, s = base + 8;
+    for (int i = 0; i < ks->n; i++) { ks->f[i].slot = s; s += ks->f[i].is128 ? 16 : 8; }
+
+    jlist_t absent = {0};
+    kf_emit_family(ks->fam, &absent);
+    if (ks->l4) kf_emit_l4(ks->fam, lslot, &absent);
+    for (int i = 0; i < ks->n; i++) kf_emit_field(&ks->f[i], ks->fam, lslot, &absent);
+
+    /* 3. symmetric: one decision from the first pair that differs */
+    if (ks->dir == 2) {
+        jlist_t swap = {0}, keep = {0};
+        int done[8] = {0};
+        int ps[8], pd[8], np = 0;
+        for (int i = 0; i < ks->n; i++) {
+            struct kfield *f = &ks->f[i];
+            if (!f->pair || done[f->pair]) continue;
+            done[f->pair] = 1;
+            int a = -1, b = -1;
+            for (int j = 0; j < ks->n; j++) {
+                if (ks->f[j].pair != f->pair) continue;
+                if (ks->f[j].src) a = j; else b = j;
+            }
+            ps[np] = a; pd[np++] = b;
+        }
+        for (int p = 0; p < np; p++) {
+            int words = ks->f[ps[p]].is128 ? 2 : 1;
+            for (int w = 0; w < words; w++) {
+                emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, ks->f[ps[p]].slot + 8 * w));
+                emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, ks->f[pd[p]].slot + 8 * w));
+                jl_add(&swap); ej_x(BPF_JGT, BPF_REG_1, BPF_REG_2);
+                jl_add(&keep); ej_x(BPF_JNE, BPF_REG_1, BPF_REG_2);
+            }
+        }
+        jl_add(&keep);
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+        jl_patch(&swap, prog_idx);
+        for (int p = 0; p < np; p++) {
+            int words = ks->f[ps[p]].is128 ? 2 : 1;
+            for (int w = 0; w < words; w++) {
+                int a = ks->f[ps[p]].slot + 8 * w, b = ks->f[pd[p]].slot + 8 * w;
+                emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, a));
+                emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, b));
+                emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_2, a));
+                emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, b));
+            }
+        }
+        jl_patch(&keep, prog_idx);
+    }
+
+    /* 4. combine into R3 */
+    if (!ks->hash) {
+        emit(BPF_MOV64_IMM(BPF_REG_3, 0));
+        for (int i = 0; i < ks->n; i++) {
+            struct kfield *f = &ks->f[i];
+            emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, f->slot));
+            if (f->width < 64) emit(BPF_ALU64_IMM(BPF_LSH, BPF_REG_3, f->width));
+            else emit(BPF_MOV64_IMM(BPF_REG_3, 0));
+            emit(BPF_ALU64_REG(BPF_OR, BPF_REG_3, BPF_REG_1));
+        }
+    } else {
+        char init[24];
+        snprintf(init, sizeof(init), "%llu", (unsigned long long)(KH_INIT ^ (ks->seed_var ? 0 : ks->seed)));
+        emit_load_operand(BPF_REG_3, init);
+        if (ks->seed_var) {
+            emit_load_operand(BPF_REG_1, ks->seedname);
+            emit(BPF_ALU64_REG(BPF_XOR, BPF_REG_3, BPF_REG_1));
+        }
+        int used = 0;
+        emit(BPF_MOV64_IMM(BPF_REG_4, 0));
+        for (int i = 0; i < ks->n; i++) {
+            struct kfield *f = &ks->f[i];
+            if (f->is128) {
+                if (used) { kf_emit_mix(BPF_REG_4); emit(BPF_MOV64_IMM(BPF_REG_4, 0)); used = 0; }
+                for (int w = 0; w < 2; w++) {
+                    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, f->slot + 8 * w));
+                    kf_emit_mix(BPF_REG_1);
+                }
+                continue;
+            }
+            if (used + f->width > 64) { kf_emit_mix(BPF_REG_4); emit(BPF_MOV64_IMM(BPF_REG_4, 0)); used = 0; }
+            emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, f->slot));
+            if (used && f->width < 64) emit(BPF_ALU64_IMM(BPF_LSH, BPF_REG_4, f->width));
+            emit(BPF_ALU64_REG(BPF_OR, BPF_REG_4, BPF_REG_1));
+            used += f->width;
+        }
+        if (used) kf_emit_mix(BPF_REG_4);
+        if (ks->buckets) {
+            emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_3));
+            emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 32));
+            emit(BPF_ALU64_REG(BPF_XOR, BPF_REG_3, BPF_REG_1));
+            emit(((struct bpf_insn){.code = BPF_ALU | BPF_MOV | BPF_X, .dst_reg = BPF_REG_3, .src_reg = BPF_REG_3}));
+            char nb[24];
+            snprintf(nb, sizeof(nb), "%llu", (unsigned long long)ks->buckets);
+            emit_load_operand(BPF_REG_1, nb);
+            emit(BPF_ALU64_REG(BPF_MUL, BPF_REG_3, BPF_REG_1));
+            emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_3, 32));
+        } else if (ks->bits >= 64) {
+            int j = ej_k(BPF_JNE, BPF_REG_3, 0);
+            emit(BPF_MOV64_IMM(BPF_REG_3, 1));
+            ej_here(j);
+        } else {
+            if (ks->bits <= 32) {
+                emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_3));
+                emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 32));
+                emit(BPF_ALU64_REG(BPF_XOR, BPF_REG_3, BPF_REG_1));
+            }
+            emit_and_mask(BPF_REG_3, kf_mask(ks->bits));
+        }
+    }
+    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_3));
+    emit_store_r1(d_off, get_var_size(dst));
+    if (absent_out) {
+        for (int i = 0; i < absent.n; i++) {
+            if (absent_out->n >= 512) { fprintf(stderr, "Error: internal jump list full\n"); exit(1); }
+            absent_out->idx[absent_out->n++] = absent.idx[i];
+        }
+    } else if (absent.n) {
+        int j = prog_idx;
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+        jl_patch(&absent, prog_idx);
+        emit(BPF_MOV64_IMM(BPF_REG_1, 0));
+        emit_store_r1(d_off, get_var_size(dst));
+        ej_here(j);
+    }
+    for (int i = 0; i < ks->n; i++)
+        if (ks->f[i].kind == KF_GET) compile_free_var(ks->f[i].var + 1);
+}
+
+/* hash <VAR> ... / pack <VAR> ... */
+static int compile_hash_pack(int hash, char **tok, int t) {
+    const char *what = hash ? "hash" : "pack";
+    if (t < 3) {
+        return kf_err(what, hash ? "usage: hash <VAR> <bits 1-64 | buckets N> [symmetric|reverse] [seed <n|%%VAR>] <field>..."
+                                 : "usage: pack <VAR> [symmetric|reverse] <field>[:bits]...");
+    }
+    static struct kspec ks;
+    memset(&ks, 0, sizeof(ks));
+    ks.hash = hash;
+    int i = kspec_parse_opts(&ks, tok + 2, t - 2, 0, what);
+    if (i < 0) return 1;
+    if (kspec_parse_fields(&ks, tok + 2 + i, t - 2 - i, 0, what) || kspec_finish(&ks, 0, what)) return 1;
+    compile_key(&ks, tok[1], 8, NULL);
+    return 0;
+}
+
+/* A single field read the key way (get src-port V, get dscp V, ...). */
+static void compile_get_keyfield(const char *field, const char *var) {
+    static struct kspec ks;
+    memset(&ks, 0, sizeof(ks));
+    char fb[48];
+    snprintf(fb, sizeof(fb), "%s", field);
+    char *tk[1] = {fb};
+    if (kspec_parse_fields(&ks, tk, 1, 0, "get") || kspec_finish(&ks, 0, "get")) exit(1);
+    int w = ks.f[0].width;
+    compile_key(&ks, var, w <= 8 ? 1 : w <= 16 ? 2 : w <= 32 ? 4 : 8, NULL);
+}
+
+/*
+ * The key of a seen/over-rate/count command: one %VAR or number as it is,
+ * or the fields packed when they fit in 64 bits, hashed otherwise.
+ */
+static void compile_cmd_key(char **tok, int n, const char *what, const char *kvar, jlist_t *absent) {
+    if (n == 1 && tok[0][0] == '%' && !strchr(tok[0], ':')) {
+        allocate_var(kvar, 8);
+        compile_set_var(kvar, tok[0]);
+        return;
+    }
+    static struct kspec ks;
+    memset(&ks, 0, sizeof(ks));
+    ks.hash = 1; ks.bits = 64;
+    int k = 0;
+    for (; k < n; k++) {
+        if (!strcmp(tok[k], "symmetric")) ks.dir = 2;
+        else if (!strcmp(tok[k], "reverse")) ks.dir = 1;
+        else break;
+    }
+    if (kspec_parse_fields(&ks, tok + k, n - k, 0, what)) exit(1);
+    int total = 0, wide = 0;
+    for (int j = 0; j < ks.n; j++) {
+        if (ks.f[j].is128 || ks.f[j].kind == KF_GET) wide = 1;
+        total += ks.f[j].width;
+    }
+    if (!wide && total <= 64) ks.hash = 0;
+    if (kspec_finish(&ks, 0, what)) exit(1);
+    compile_key(&ks, kvar, 8, absent);
+}
+
+/* unpack <%SRC> <VAR>:<bits> ...: the counterpart of pack, first VAR from the highest bits */
+static int compile_unpack(char **tok, int t) {
+    if (t < 3 || tok[1][0] != '%') return kf_err("unpack", "usage: unpack <%%SRC> <VAR>:<bits> [<VAR>:<bits> ...]");
+    char names[KF_MAX][32];
+    int widths[KF_MAX], n = 0, total = 0;
+    for (int i = 2; i < t; i++) {
+        if (n >= KF_MAX) return kf_err("unpack", "at most %d variables", KF_MAX);
+        const char *c = strrchr(tok[i], ':');
+        uint64_t b;
+        if (!c || parse_num(c + 1, 64, &b) || !b) return kf_err("unpack", "'%s': write <VAR>:<bits>", tok[i]);
+        snprintf(names[n], sizeof(names[n]), "%.*s", (int)(c - tok[i]), tok[i]);
+        if (names[n][0] == '%') memmove(names[n], names[n] + 1, strlen(names[n]));
+        widths[n] = (int)b;
+        total += widths[n++];
+    }
+    if (total > 64) return kf_err("unpack", "the variables take %d bits; at most 64", total);
+    int offs[KF_MAX], sizes[KF_MAX];
+    for (int i = 0; i < n; i++) {
+        int w = widths[i];
+        offs[i] = allocate_var(names[i], w <= 8 ? 1 : w <= 16 ? 2 : w <= 32 ? 4 : 8);
+        sizes[i] = get_var_size(names[i]);
+    }
+    emit_load_operand(BPF_REG_3, tok[1]);
+    for (int i = n - 1; i >= 0; i--) {
+        emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_3));
+        emit_and_mask(BPF_REG_1, kf_mask(widths[i]));
+        emit_store_r1(offs[i], sizes[i]);
+        if (i && widths[i] < 64) emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_3, widths[i]));
+    }
+    return 0;
+}
+
+/* ---- units: times, rates and sizes, as tc writes them ---- */
+
+/* ns from 50ms, 2s, 100us, 500ns, 1m; -1 if not a time */
+static int64_t parse_time_ns(const char *s) {
+    char *end;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (errno || end == s || v < 0) return -1;
+    double m;
+    if (!strcmp(end, "ns")) m = 1;
+    else if (!strcmp(end, "us")) m = 1e3;
+    else if (!strcmp(end, "ms")) m = 1e6;
+    else if (!strcmp(end, "s") || !strcmp(end, "sec")) m = 1e9;
+    else if (!strcmp(end, "m") || !strcmp(end, "min")) m = 60e9;
+    else return -1;
+    return (int64_t)(v * m + 0.5);
+}
+
+/* A rate: packets per second (100/s, 100pps) -> *pps, or bits per second
+ * (10mbit, 1gbit, 500kbit, 64000bit) -> *bps. 0 on success. */
+static int parse_rate(const char *s, double *pps, double *bps) {
+    char *end;
+    errno = 0;
+    double v = strtod(s, &end);
+    *pps = *bps = 0;
+    if (errno || end == s || v <= 0) return -1;
+    if (!strcmp(end, "/s") || !strcasecmp(end, "pps")) { *pps = v; return 0; }
+    double m = 0;
+    if (!strcasecmp(end, "bit")) m = 1;
+    else if (!strcasecmp(end, "kbit")) m = 1e3;
+    else if (!strcasecmp(end, "mbit")) m = 1e6;
+    else if (!strcasecmp(end, "gbit")) m = 1e9;
+    else if (!strcasecmp(end, "tbit")) m = 1e12;
+    if (!m) return -1;
+    *bps = v * m;
+    return 0;
+}
+
+/* bytes from 1514, 64k, 64kb, 2m (k = 1024, as tc) */
+static int64_t parse_size(const char *s) {
+    char *end;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (errno || end == s || v < 0) return -1;
+    double m;
+    if (!*end || !strcasecmp(end, "b")) m = 1;
+    else if (!strcasecmp(end, "k") || !strcasecmp(end, "kb")) m = 1024;
+    else if (!strcasecmp(end, "m") || !strcasecmp(end, "mb")) m = 1024.0 * 1024;
+    else return -1;
+    return (int64_t)(v * m + 0.5);
+}
+
+/* Map pointer for the key in var kvar, created as 0 if missing, into R0;
+ * jumps to fail if the map is full. */
+static void emit_map_ptr(int map_fd, const char *kvar, jlist_t *fail) {
+    emit_load_operand(BPF_REG_1, kvar);
+    emit(BPF_STX_MEM(map_is_array(map_fd) ? BPF_W : BPF_DW, BPF_REG_10, BPF_REG_1, -8));
+    emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .imm = map_fd}));
+    emit(((struct bpf_insn){.code = 0x00}));
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8));
+    emit(BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    int have = ej_k(BPF_JNE, BPF_REG_0, 0);
+    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, -16, 0));
+    emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .imm = map_fd}));
+    emit(((struct bpf_insn){.code = 0x00}));
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8));
+    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, -16));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 1));                 /* BPF_NOEXIST */
+    emit(BPF_CALL_FUNC(BPF_FUNC_map_update_elem));
+    emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .imm = map_fd}));
+    emit(((struct bpf_insn){.code = 0x00}));
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8));
+    emit(BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    jl_add(fail);
+    ej_k(BPF_JEQ, BPF_REG_0, 0);
+    ej_here(have);
+}
+
+/* The match block's "no match" exit for the jumps in l (one instruction,
+ * jumped over by the code before it). */
+static void kf_nomatch(jlist_t *l) {
+    int j = prog_idx;
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    jl_patch(l, prog_idx);
+    add_block_jump();
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    ej_here(j);
+}
+
+/*
+ * match|if seen <MAP> <key...> within <time> [refresh]
+ * True when the key was recorded less than <time> ago. Every packet records
+ * itself: an unseen key (or one older than <time>) starts a new window; a
+ * hit leaves the first sighting's time (the window runs from it) unless
+ * refresh, which moves it to now (idle timeout). The record is atomic, so
+ * of two copies arriving on two CPUs at once exactly one is "seen".
+ */
+static int compile_match_seen(char **tok, int t) {
+    int w = -1;
+    for (int i = 3; i < t; i++) if (!strcmp(tok[i], "within")) { w = i; break; }
+    if (t < 6 || w < 0 || w + 1 >= t || w == 3)
+        return kf_err("match seen", "usage: match seen <MAP> <key field...|%%VAR> within <time, e.g. 50ms> [refresh]");
+    int64_t ns = parse_time_ns(tok[w + 1]);
+    if (ns <= 0) return kf_err("match seen", "'%s' is not a time: write a unit, e.g. 50ms, 2s, 100us", tok[w + 1]);
+    int refresh = 0;
+    for (int i = w + 2; i < t; i++) {
+        if (!strcmp(tok[i], "refresh")) refresh = 1;
+        else return kf_err("match seen", "unexpected '%s' after the time", tok[i]);
+    }
+    int fd = get_or_create_map(tok[2]);
+    char kv[32], now[32];
+    snprintf(kv, sizeof(kv), "__sk%d", kf_uniq);
+    snprintf(now, sizeof(now), "__sn%d", kf_uniq++);
+    start_match_block();
+    jlist_t no = {0};
+    allocate_var(now, 8);
+    compile_cmd_key(tok + 3, w - 3, "match seen", kv, &no);
+    compile_get_time(now);
+    char nowv[34], kvv[34];
+    snprintf(nowv, sizeof(nowv), "%%%s", now);
+    snprintf(kvv, sizeof(kvv), "%%%s", kv);
+    emit_map_ptr(fd, kvv, &no);
+    emit_load_operand(BPF_REG_1, nowv);
+    emit(((struct bpf_insn){.code = BPF_STX | BPF_ATOMIC | BPF_DW, .dst_reg = BPF_REG_0, .src_reg = BPF_REG_1,
+                            .imm = BPF_XCHG}));
+    jl_add(&no);
+    ej_k(BPF_JEQ, BPF_REG_1, 0);                        /* never seen */
+    emit_load_operand(BPF_REG_2, nowv);
+    emit(BPF_ALU64_REG(BPF_SUB, BPF_REG_2, BPF_REG_1));
+    char nb[24];
+    snprintf(nb, sizeof(nb), "%lld", (long long)ns);
+    emit_load_operand(BPF_REG_3, nb);
+    jl_add(&no);
+    ej_x(BPF_JGE, BPF_REG_2, BPF_REG_3);               /* older than the window: a new one starts now */
+    if (!refresh) emit(BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_1, 0));   /* keep the first sighting */
+    kf_nomatch(&no);
+    compile_free_var(kv);
+    compile_free_var(now);
+    return 0;
+}
+
+/*
+ * match|if over-rate <MAP> <key...> <rate> [burst <size>]
+ * True for packets above <rate> (100/s, 10mbit, ...) per key, with a burst
+ * allowance (default 100 ms of the rate; at least one packet, or 1514
+ * bytes): a policer's exceed action. GCRA: the map holds each key's
+ * theoretical arrival time (ns); a packet conforms when that is no later
+ * than now + burst, and then moves it on by the packet's cost (1/rate, or
+ * its length at the rate). Lock-free: a conforming packet adds its cost
+ * atomically and an exceeding one takes it back, so CPUs sharing a key
+ * cannot both pass on the same allowance.
+ */
+static int compile_match_over_rate(char **tok, int t) {
+    const char *what = "match over-rate";
+    int r = -1;
+    double pps = 0, bps = 0;
+    for (int i = 3; i < t; i++) if (!parse_rate(tok[i], &pps, &bps)) { r = i; break; }
+    if (t < 5 || r <= 3)
+        return kf_err(what, "usage: match over-rate <MAP> <key field...|%%VAR> <rate: 100/s, 10mbit, ...> [burst <packets|bytes>]");
+    int64_t burst = -1;
+    for (int i = r + 1; i < t; i++) {
+        if (!strcmp(tok[i], "burst") && i + 1 < t) {
+            burst = parse_size(tok[++i]);
+            if (burst <= 0) return kf_err(what, "burst '%s': a count of packets (100/s) or a size in bytes (10mbit): 20, 64k", tok[i]);
+        } else return kf_err(what, "unexpected '%s' after the rate", tok[i]);
+    }
+    /* cost per packet, scaled by 1024 for bytes */
+    uint64_t k1024 = 0, inc = 0, tau;
+    if (pps > 0) {
+        inc = (uint64_t)(1e9 / pps + 0.5);
+        if (!inc) inc = 1;
+        if (burst < 0) { burst = (int64_t)(pps / 10); if (burst < 1) burst = 1; }
+        tau = (uint64_t)((double)burst * 1e9 / pps);
+    } else {
+        k1024 = (uint64_t)(8e9 * 1024 / bps + 0.5);
+        if (!k1024) k1024 = 1;
+        if (burst < 0) { burst = (int64_t)(bps / 8 / 10); if (burst < 1514) burst = 1514; }
+        tau = (uint64_t)((double)burst * 8e9 / bps);
+    }
+    int fd = get_or_create_map(tok[2]);
+    char kv[32], now[32], cost[32], kvv[34], nowv[34], costv[34];
+    snprintf(kv, sizeof(kv), "__rk%d", kf_uniq);
+    snprintf(now, sizeof(now), "__rn%d", kf_uniq);
+    snprintf(cost, sizeof(cost), "__rc%d", kf_uniq++);
+    snprintf(kvv, sizeof(kvv), "%%%s", kv);
+    snprintf(nowv, sizeof(nowv), "%%%s", now);
+    snprintf(costv, sizeof(costv), "%%%s", cost);
+    start_match_block();
+    jlist_t no = {0};
+    allocate_var(now, 8);
+    int c_off = allocate_var(cost, 8);
+    compile_cmd_key(tok + 3, r - 3, what, kv, &no);
+    if (pps > 0) {
+        char b[24];
+        snprintf(b, sizeof(b), "%llu", (unsigned long long)inc);
+        emit_load_operand(BPF_REG_1, b);
+    } else {
+        emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, len));
+        char b[24];
+        snprintf(b, sizeof(b), "%llu", (unsigned long long)k1024);
+        emit_load_operand(BPF_REG_2, b);
+        emit(BPF_ALU64_REG(BPF_MUL, BPF_REG_1, BPF_REG_2));
+        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 512));
+        emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 10));
+    }
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, c_off));
+    compile_get_time(now);
+    emit_map_ptr(fd, kvv, &no);
+    /* idle (TAT in the past): TAT = now + cost, conforming */
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_0, 0));
+    emit_load_operand(BPF_REG_2, nowv);
+    int busy = ej_x(BPF_JGE, BPF_REG_1, BPF_REG_2);
+    emit_load_operand(BPF_REG_1, costv);
+    emit(BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_2));
+    emit(((struct bpf_insn){.code = BPF_STX | BPF_ATOMIC | BPF_DW, .dst_reg = BPF_REG_0, .src_reg = BPF_REG_1,
+                            .imm = BPF_XCHG}));
+    jl_add(&no);
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    ej_here(busy);
+    /* old = fetch_add(TAT, cost); exceeding when old > now + burst: take it back */
+    emit_load_operand(BPF_REG_1, costv);
+    emit(((struct bpf_insn){.code = BPF_STX | BPF_ATOMIC | BPF_DW, .dst_reg = BPF_REG_0, .src_reg = BPF_REG_1,
+                            .imm = BPF_ADD | BPF_FETCH}));
+    char tb[24];
+    snprintf(tb, sizeof(tb), "%llu", (unsigned long long)tau);
+    emit_load_operand(BPF_REG_3, tb);
+    emit_load_operand(BPF_REG_2, nowv);
+    emit(BPF_ALU64_REG(BPF_ADD, BPF_REG_2, BPF_REG_3));
+    jl_add(&no);
+    ej_x(BPF_JLE, BPF_REG_1, BPF_REG_2);
+    emit_load_operand(BPF_REG_1, costv);
+    emit(BPF_ALU64_IMM(BPF_MUL, BPF_REG_1, -1));
+    emit(((struct bpf_insn){.code = BPF_STX | BPF_ATOMIC | BPF_DW, .dst_reg = BPF_REG_0, .src_reg = BPF_REG_1,
+                            .imm = BPF_ADD}));
+    kf_nomatch(&no);
+    compile_free_var(kv);
+    compile_free_var(now);
+    compile_free_var(cost);
+    return 0;
+}
+
+/* Is tok a key field (as opposed to a map name) in count's arguments? */
+static int kf_is_field_tok(const char *tok) {
+    char s[64];
+    snprintf(s, sizeof(s), "%s", tok);
+    char *c = strpbrk(s, ":/");
+    if (c) *c = 0;
+    return tok[0] == '%' || isdigit((unsigned char)tok[0]) || !strcmp(s, "bytes") || !strcmp(s, "symmetric") ||
+           !strcmp(s, "reverse") || kf_def_by_name(s) != NULL;
+}
+
+/*
+ * count <MAP> [<BYTES_MAP>] <key...>
+ * Adds 1 to the key's entry in MAP and, with a second map, the packet's
+ * length (as len: the whole frame) to its entry there. Atomic.
+ */
+static int compile_count(char **tok, int t) {
+    if (t < 3) return kf_err("count", "usage: count <MAP> [<BYTES_MAP>] <key field...|%%VAR>");
+    int k = 2;
+    const char *bmap = NULL;
+    if (t > 3 && !kf_is_field_tok(tok[2])) { bmap = tok[2]; k = 3; }
+    int fd = get_or_create_map(tok[1]);
+    int bfd = bmap ? get_or_create_map(bmap) : -1;
+    char kv[32], lv[32], kvv[34], lvv[34];
+    snprintf(kv, sizeof(kv), "__ck%d", kf_uniq);
+    snprintf(lv, sizeof(lv), "__cl%d", kf_uniq++);
+    snprintf(kvv, sizeof(kvv), "%%%s", kv);
+    snprintf(lvv, sizeof(lvv), "%%%s", lv);
+    if (bmap) allocate_var(lv, 8);
+    jlist_t skip = {0};
+    compile_cmd_key(tok + k, t - k, "count", kv, &skip);
+    compile_calc_map("add", fd, kvv, "1", NULL);
+    if (bmap) {
+        int lo = get_var_offset(lvv);
+        emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, len));
+        emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, lo));
+        compile_calc_map("add", bfd, kvv, lvv, NULL);
+    }
+    jl_patch(&skip, prog_idx);
+    compile_free_var(kv);
+    if (bmap) compile_free_var(lv);
+    return 0;
+}
+
+/* ---- prefix maps (longest-prefix match on IPv4 addresses) ---- */
+
+int map_is_lpm(int fd);
+
+/* prefix-map <NAME> [entries]: an LPM trie of IPv4 prefixes -> 64-bit values */
+int get_or_create_prefix_map(const char *name, uint32_t entries) {
+    check_map_name(name);
+    if (entries == 0 || entries > (1U << 24)) {
+        fprintf(stderr, "Error: prefix-map '%s' needs 1-16777216 entries\n", name);
+        exit(1);
+    }
+    for (int i = 0; i < num_maps; i++) {
+        if (strcmp(maps[i].name, name)) continue;
+        if (!maps[i].is_lpm) {
+            fprintf(stderr, "Error: prefix-map '%s' must come before the map is first used\n", name);
+            exit(1);
+        }
+        return maps[i].fd;
+    }
+    char pin_path[256];
+    snprintf(pin_path, sizeof(pin_path), "%s/%s", bpf_map_dir, name);
+    int fd = get_pinned_map_fd(pin_path);
+    if (fd >= 0) {
+        struct bpf_map_info info;
+        if (map_info(fd, &info) == 0 &&
+            (info.type != BPF_MAP_TYPE_LPM_TRIE || info.key_size != 8 || info.value_size != 8 ||
+             info.max_entries != entries)) {
+            char why[96];
+            snprintf(why, sizeof(why), info.type != BPF_MAP_TYPE_LPM_TRIE ? "is pinned as another kind of map"
+                                                                         : "is pinned with another size");
+            fd = replace_pinned(pin_path, fd, name, why);
+        }
+    }
+    if (fd < 0) {
+        union bpf_attr attr = {
+            .map_type = BPF_MAP_TYPE_LPM_TRIE, .key_size = 8, .value_size = 8, .max_entries = entries,
+            .map_flags = 1 /* BPF_F_NO_PREALLOC, required */,
+        };
+        kernel_obj_name(attr.map_name, name);
+        fd = bpf_syscall(BPF_MAP_CREATE, &attr, sizeof(attr));
+        if (fd < 0) { perror("Failed to create prefix map"); exit(1); }
+        if (pin_map_fd(fd, pin_path) < 0) perror("Error pinning bpf map");
+    }
+    register_map(name, fd, 0, 0, 0, entries, 8);
+    maps[num_maps - 1].is_lpm = 1;
+    return fd;
+}
+
+/* match|if <ip-src|ip-dst|%VAR> in <MAP> [VALUE_VAR] */
+static int compile_match_in(char **tok, int t) {
+    const char *what = "match ... in";
+    if (t < 4 || t > 5) return kf_err(what, "usage: match <ip-src|ip-dst|%%VAR> in <PREFIX_MAP> [VALUE_VAR]");
+    int fd = get_or_create_map(tok[3]);
+    if (!map_is_lpm(fd)) return kf_err(what, "%s is not a prefix map: declare it first with prefix-map %s", tok[3], tok[3]);
+    int v_off = 0, v_sz = 0;
+    if (t == 5) { v_off = allocate_var(tok[4], 8); v_sz = get_var_size(tok[4]); }
+    start_match_block();
+    jlist_t no = {0};
+    if (!strcmp(tok[1], "ip-src") || !strcmp(tok[1], "ip-dst")) {
+        kf_emit_family(4, &no);
+        emit_ld_pkt(0, pkt_off(!strcmp(tok[1], "ip-src") ? 26 : 30), 4, -4, &no);
+    } else if (tok[1][0] == '%') {
+        emit_load_operand(BPF_REG_1, tok[1]);
+        emit(((struct bpf_insn){.code = BPF_END | BPF_ALU | BPF_TO_BE, .dst_reg = BPF_REG_1, .imm = 32}));
+        emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -4));
+    } else return kf_err(what, "'%s': ip-src, ip-dst or a %%VAR holding an address (host order)", tok[1]);
+    emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -8, 32));
+    emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .imm = fd}));
+    emit(((struct bpf_insn){.code = 0x00}));
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8));
+    emit(BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    jl_add(&no);
+    ej_k(BPF_JEQ, BPF_REG_0, 0);
+    if (t == 5) {
+        emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_0, 0));
+        emit_store_r1(v_off, v_sz);
+    }
+    kf_nomatch(&no);
+    return 0;
+}
+
+/* ---- tcpdump-style matches: host, net, port, src-port, dst-port ---- */
+
+/* match host <addr|%VAR> / match net <prefix>: the IPv4 source or destination */
+static int compile_match_host(const char *val, int is_net) {
+    uint32_t ip = 0, mask = 0xFFFFFFFF;
+    if (val[0] != '%') {
+        char b[64];
+        snprintf(b, sizeof(b), "%s", val);
+        if (!valid_ip(b, 0, 1)) return kf_err(is_net ? "match net" : "match host", "'%s' is not an IPv4 %s", val,
+                                             is_net ? "prefix" : "address");
+        if (!is_net && strchr(b, '/')) return kf_err("match host", "a host is one address; use match net for a prefix");
+        parse_ip_cidr(b, &ip, &mask);
+        ip = ntohl(ip); mask = ntohl(mask);
+    }
+    start_match_block();
+    jlist_t no = {0}, yes = {0};
+    kf_emit_family(4, &no);
+    for (int side = 0; side < 2; side++) {
+        emit_ld_pkt(0, pkt_off(side ? 30 : 26), 4, PS_BYTES, &no);
+        emit_ld_host(PS_BYTES, 4);
+        if (val[0] == '%') {
+            emit_load_operand(BPF_REG_2, val);
+        } else {
+            emit_and_mask(BPF_REG_1, mask);
+            char b[24];
+            snprintf(b, sizeof(b), "%u", ip & mask);
+            emit_load_operand(BPF_REG_2, b);
+        }
+        if (!side) { jl_add(&yes); ej_x(BPF_JEQ, BPF_REG_1, BPF_REG_2); }
+        else { jl_add(&no); ej_x(BPF_JNE, BPF_REG_1, BPF_REG_2); }
+    }
+    jl_patch(&yes, prog_idx);
+    kf_nomatch(&no);
+    return 0;
+}
+
+/* match port|src-port|dst-port <n[-m]|%VAR>: TCP, UDP or SCTP over IPv4,
+ * not a fragment after the first. port: either side. */
+static int compile_match_port(const char *which, const char *val) {
+    uint16_t lo = 0, hi = 0;
+    int is_var = val[0] == '%';
+    if (!is_var) {
+        char b[32];
+        snprintf(b, sizeof(b), "%s", val);
+        uint64_t a, c;
+        char *d = strchr(b, '-');
+        if (d) *d = 0;
+        if (parse_num(b, 65535, &a) || (d && (parse_num(d + 1, 65535, &c) || c < a)))
+            return kf_err("match port", "'%s': a port 0-65535 or a range low-high", val);
+        lo = (uint16_t)a; hi = d ? (uint16_t)c : lo;
+    }
+    int sides = !strcmp(which, "port") ? 3 : !strcmp(which, "src-port") ? 1 : 2;
+    start_match_block();
+    jlist_t no = {0}, yes = {0}, l4ok = {0};
+    kf_emit_family(4, &no);
+    emit_l4_offset(&no);
+    emit_ld_pkt(0, pkt_off(20), 2, PS_BYTES, &no);
+    emit_ld_host(PS_BYTES, 2);
+    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0x1FFF));
+    jl_add(&no);
+    ej_k(BPF_JNE, BPF_REG_1, 0);                       /* later fragment: no ports */
+    emit_ld_pkt(0, pkt_off(23), 1, PS_BYTES, &no);
+    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+    jl_add(&l4ok); ej_k(BPF_JEQ, BPF_REG_1, 6);
+    jl_add(&l4ok); ej_k(BPF_JEQ, BPF_REG_1, 17);
+    jl_add(&l4ok); ej_k(BPF_JEQ, BPF_REG_1, 132);
+    jl_add(&no);
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    jl_patch(&l4ok, prog_idx);
+    int last = sides == 3 ? 1 : sides - 1;
+    for (int side = (sides == 2 ? 1 : 0); side <= last; side++) {
+        jlist_t miss = {0};
+        int final = side == last;
+        emit_ld_pkt(PS_L4, side ? 2 : 0, 2, PS_BYTES, &no);
+        emit_ld_host(PS_BYTES, 2);
+        if (is_var) {
+            emit_load_operand(BPF_REG_2, val);
+            if (final) { jl_add(&no); ej_x(BPF_JNE, BPF_REG_1, BPF_REG_2); }
+            else { jl_add(&yes); ej_x(BPF_JEQ, BPF_REG_1, BPF_REG_2); }
+            continue;
+        }
+        jl_add(final ? &no : &miss); ej_k(BPF_JLT, BPF_REG_1, lo);
+        if (final) { jl_add(&no); ej_k(BPF_JGT, BPF_REG_1, hi); }
+        else { jl_add(&yes); ej_k(BPF_JLE, BPF_REG_1, hi); }
+        jl_patch(&miss, prog_idx);
+    }
+    jl_patch(&yes, prog_idx);
+    kf_nomatch(&no);
+    return 0;
+}
+
+/* match dscp <name|0-63>, match ecn <name|0-3> (IPv4) */
+static int compile_match_dscp_ecn(int is_ecn, const char *val) {
+    int v = is_ecn ? parse_ecn(val) : parse_dscp(val);
+    if (v < 0) return kf_err(is_ecn ? "match ecn" : "match dscp", "'%s': %s", val,
+                             is_ecn ? "not-ect, ect1, ect0, ce or 0-3" : "a DSCP name (ef, af41, cs6, ...) or 0-63");
+    start_match_block();
+    match_l3_proto(0x0800, is_ecn ? "ecn" : "dscp");
+    compile_match_core(15, 1, is_ecn ? (uint32_t)v : (uint32_t)v << 2, is_ecn ? 0x03 : 0xFC, NULL);
+    return 0;
+}
+
+/* set dscp|ecn <name|number|%VAR>: the other bits of the TOS byte stay; IPv4 only */
+static int compile_set_dscp_ecn(int is_ecn, const char *val) {
+    char v[32];
+    if (val[0] == '%') snprintf(v, sizeof(v), "%s", val);
+    else {
+        int n = is_ecn ? parse_ecn(val) : parse_dscp(val);
+        if (n < 0) return kf_err(is_ecn ? "set ecn" : "set dscp", "'%s': %s", val,
+                                 is_ecn ? "not-ect, ect1, ect0, ce or 0-3" : "a DSCP name (ef, af41, cs6, ...) or 0-63");
+        snprintf(v, sizeof(v), "%d", n);
+    }
+    int u = kf_uniq++;
+    kf_run("match ip");
+    kf_run("get ip-tos __dt%d", u);
+    kf_run("calc and __dt%d %d", u, is_ecn ? 0xFC : 0x03);
+    if (val[0] == '%') {
+        kf_run("set val __dv%d %s", u, v);
+        kf_run("calc and __dv%d %d", u, is_ecn ? 3 : 63);
+        if (!is_ecn) kf_run("calc lsh __dv%d 2", u);
+        kf_run("calc or __dt%d %%__dv%d", u, u);
+        kf_run("free __dv%d", u);
+    } else kf_run("calc or __dt%d %d", u, is_ecn ? atoi(v) : atoi(v) << 2);
+    kf_run("set ip-tos %%__dt%d", u);
+    kf_run("free __dt%d", u);
+    kf_run("end-match");
+    return 0;
+}
+
+/* set src-port|dst-port <n|%VAR>: TCP or UDP, with its checksum */
+static int compile_set_any_port(int is_dst, const char *val) {
+    if (val[0] != '%') {
+        uint64_t p;
+        if (parse_num(val, 65535, &p)) return kf_err(is_dst ? "set dst-port" : "set src-port", "'%s' is not a port 0-65535", val);
+    }
+    kf_run("match tcp");
+    kf_run("set tcp-%s %s", is_dst ? "dst" : "src", val);
+    kf_run("end-match");
+    kf_run("match udp");
+    kf_run("set udp-%s %s", is_dst ? "dst" : "src", val);
+    kf_run("end-match");
+    return 0;
+}
+
+/* ---- bpfc -H and readable map dumps (-K) ---- */
+
+/* "<hash [bits|buckets N] [symmetric|reverse] [seed n]|pack [...]> field=value ..." -> key */
+static int key_from_text(const char *text, uint64_t *out, const char *what) {
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s", text);
+    char *tok[64];
+    int n = 0;
+    for (char *s, *w = strtok_r(buf, " \t", &s); w && n < 64; w = strtok_r(NULL, " \t", &s)) tok[n++] = w;
+    if (n < 2 || (strcmp(tok[0], "hash") && strcmp(tok[0], "pack")))
+        return kf_err(what, "write 'hash <bits> [options] field=value ...' or 'pack [options] field=value ...'");
+    static struct kspec ks;
+    memset(&ks, 0, sizeof(ks));
+    ks.hash = !strcmp(tok[0], "hash");
+    int i = kspec_parse_opts(&ks, tok + 1, n - 1, 1, what);
+    if (i < 0) return -1;
+    if (kspec_parse_fields(&ks, tok + 1 + i, n - 1 - i, 1, what) || kspec_finish(&ks, 1, what)) return -1;
+    if (ks.dir == 1) {
+        /* the values are the packet's; reverse reads each pair field from the other side */
+        for (int a = 0; a < ks.n; a++) {
+            if (!ks.f[a].pair) continue;
+            int partner = 0;
+            for (int b = 0; b < ks.n; b++) if (b != a && ks.f[b].pair == ks.f[a].pair) partner = 1;
+            if (!partner)
+                return kf_err(what, "reverse: give both %s and its partner (the packet's values), "
+                                    "or write the key without reverse as the program reads it", ks.f[a].name);
+            for (int b = a + 1; b < ks.n; b++)
+                if (ks.f[b].pair == ks.f[a].pair) {
+                    uint64_t x0 = ks.f[a].v[0], x1 = ks.f[a].v[1];
+                    ks.f[a].v[0] = ks.f[b].v[0]; ks.f[a].v[1] = ks.f[b].v[1];
+                    ks.f[b].v[0] = x0; ks.f[b].v[1] = x1;
+                }
+        }
+    }
+    *out = kspec_eval(&ks);
+    return 0;
+}
+
+/* A key or value for -w: a number, or "hash ..." / "pack ..." */
+static int parse_key_arg(const char *s, uint64_t *out, const char *what) {
+    if (!strncmp(s, "hash ", 5) || !strncmp(s, "pack ", 5)) return key_from_text(s, out, what);
+    char *end;
+    errno = 0;
+    *out = strtoull(s, &end, 0);
+    if (errno || *end || !*s) return kf_err(what, "'%s' is not a number (or hash ... / pack ...)", s);
+    return 0;
+}
+
+/* A -K / -V layout: the field names of a pack, e.g. "vlan-id ip-src" */
+struct klayout { int n; struct kfield f[KF_MAX]; };
+
+static int parse_layout(const char *text, struct klayout *lo, const char *what) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", text);
+    char *tok[KF_MAX + 4];
+    int n = 0;
+    for (char *s, *w = strtok_r(buf, " \t,", &s); w && n < KF_MAX + 4; w = strtok_r(NULL, " \t,", &s)) tok[n++] = w;
+    static struct kspec ks;
+    memset(&ks, 0, sizeof(ks));
+    /* parse as a pack with dummy values */
+    char vals[KF_MAX + 4][96];
+    char *vt[KF_MAX + 4];
+    for (int i = 0; i < n; i++) {
+        const struct kf_def *d;
+        char nm[64];
+        snprintf(nm, sizeof(nm), "%s", tok[i]);
+        char *c = strpbrk(nm, ":/");
+        if (c) *c = 0;
+        d = kf_def_by_name(nm);
+        const char *dummy = "0";
+        if (d && (d->kind == KF_IP_SRC || d->kind == KF_IP_DST)) dummy = "0.0.0.0";
+        else if (d && (d->kind == KF_SRC_MAC || d->kind == KF_DST_MAC)) dummy = "0:0:0:0:0:0";
+        if (isdigit((unsigned char)tok[i][0])) snprintf(vals[i], sizeof(vals[i]), "%s", tok[i]);
+        else if (!d && !strchr(tok[i], ':')) snprintf(vals[i], sizeof(vals[i]), "%s:64=0", tok[i]);
+        else snprintf(vals[i], sizeof(vals[i]), "%s=%s", tok[i], dummy);
+        vt[i] = vals[i];
+    }
+    if (kspec_parse_fields(&ks, vt, n, 1, what) || kspec_finish(&ks, 1, what)) return -1;
+    lo->n = ks.n;
+    memcpy(lo->f, ks.f, sizeof(ks.f[0]) * ks.n);
+    return 0;
+}
+
+/* Prints a packed value field by field, separated by sep. */
+static void print_layout(FILE *o, const struct klayout *lo, uint64_t v, const char *sep) {
+    uint64_t parts[KF_MAX];
+    for (int i = lo->n - 1; i >= 0; i--) {
+        int w = lo->f[i].width;
+        parts[i] = v & kf_mask(w);
+        v = w >= 64 ? 0 : v >> w;
+    }
+    for (int i = 0; i < lo->n; i++) {
+        const struct kfield *f = &lo->f[i];
+        uint64_t x = parts[i];
+        if (i) fputs(sep, o);
+        switch (f->kind) {
+        case KF_IP_SRC: case KF_IP_DST:
+            if (f->prefix >= 0 && !f->bits_given) {
+                uint32_t a = f->prefix == 0 ? 0 : (uint32_t)(x << (32 - f->prefix));
+                fprintf(o, "%u.%u.%u.%u/%d", a >> 24, (a >> 16) & 255, (a >> 8) & 255, a & 255, f->prefix);
+            } else if (f->width == 32)
+                fprintf(o, "%u.%u.%u.%u", (unsigned)(x >> 24), (unsigned)(x >> 16) & 255, (unsigned)(x >> 8) & 255, (unsigned)x & 255);
+            else fprintf(o, "%llu", (unsigned long long)x);
+            break;
+        case KF_SRC_MAC: case KF_DST_MAC:
+            if (f->width == 48) {
+                for (int b = 5; b >= 0; b--) fprintf(o, "%02llx%s", (unsigned long long)(x >> (8 * b)) & 255, b ? ":" : "");
+            } else fprintf(o, "%llu", (unsigned long long)x);
+            break;
+        case KF_DSCP: {
+            const char *nm = f->width == 6 ? dscp_name((int)x) : NULL;
+            if (nm) fputs(nm, o); else fprintf(o, "%llu", (unsigned long long)x);
+            break;
+        }
+        case KF_ECN:
+            if (f->width == 2) fputs(ecn_names[x & 3], o); else fprintf(o, "%llu", (unsigned long long)x);
+            break;
+        case KF_ETH_PROTO:
+            fprintf(o, "0x%04llx", (unsigned long long)x);
+            break;
+        default:
+            fprintf(o, "%llu", (unsigned long long)x);
+        }
+    }
+}
+
+static void print_layout_header(FILE *o, const struct klayout *lo) {
+    for (int i = 0; i < lo->n; i++) fprintf(o, "%s%s", i ? " " : "", lo->f[i].name);
+}
+
+/* ---- map access from the command line: -w, -x, -r with -K/-V, -H ---- */
+
+static int open_map_cli(const char *map_name, const char *map_dir, struct bpf_map_info *info) {
+    char pin_path[512];
+    snprintf(pin_path, sizeof(pin_path), "%s/%s", map_dir ? map_dir : BPF_FS_DIR, map_name);
+    int fd = get_pinned_map_fd(pin_path);
+    if (fd < 0) {
+        fprintf(stderr, "Error: Could not open map '%s' (Path: %s): %s\n", map_name, pin_path, strerror(errno));
+        return -1;
+    }
+    if (map_info(fd, info)) memset(info, 0, sizeof(*info));
+    return fd;
+}
+
+/* An LPM key (prefix length, IPv4 address in network order) from a.b.c.d[/len] */
+static int lpm_key(const char *s, uint32_t k[2]) {
+    char b[64];
+    snprintf(b, sizeof(b), "%s", s);
+    uint64_t len = 32;
+    char *sl = strchr(b, '/');
+    if (sl) { *sl = 0; if (parse_num(sl + 1, 32, &len)) return -1; }
+    struct in_addr a;
+    if (inet_pton(AF_INET, b, &a) != 1) return -1;
+    uint32_t h = ntohl(a.s_addr);
+    if (len < 32) h &= len ? ~0U << (32 - len) : 0;
+    k[0] = (uint32_t)len;
+    k[1] = htonl(h);
+    return 0;
+}
+
+/* The key buffer for a map: 8 bytes, 4 for arrays, the LPM key for prefix maps. */
+static int cli_key(const struct bpf_map_info *info, const char *s, void *kbuf, const char *what) {
+    if (info->type == BPF_MAP_TYPE_LPM_TRIE) {
+        if (lpm_key(s, kbuf)) return kf_err(what, "'%s' is not an IPv4 prefix (a.b.c.d/len)", s);
+        return 0;
+    }
+    uint64_t k;
+    if (parse_key_arg(s, &k, what)) return -1;
+    if (info->key_size == 4) { uint32_t k32 = (uint32_t)k; memcpy(kbuf, &k32, 4); }
+    else memcpy(kbuf, &k, 8);
+    return 0;
+}
+
+int map_write_cli(const char *map_name, const char *map_dir, const char *key_s, const char *val_s) {
+    struct bpf_map_info info;
+    int fd = open_map_cli(map_name, map_dir, &info);
+    if (fd < 0) return 1;
+    if (info.value_size != 8) {
+        fprintf(stderr, "Error: map '%s' does not hold 64-bit values\n", map_name);
+        close(fd);
+        return 1;
+    }
+    uint64_t kbuf[2] = {0, 0}, val;
+    if (cli_key(&info, key_s, kbuf, "-w") || parse_key_arg(val_s, &val, "-w")) { close(fd); return 1; }
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = fd;
+    attr.key = (unsigned long)kbuf;
+    attr.value = (unsigned long)&val;
+    attr.flags = BPF_ANY;
+    int r = bpf_syscall(BPF_MAP_UPDATE_ELEM, &attr, sizeof(attr));
+    if (r < 0) fprintf(stderr, "Error: could not update map '%s': %s\n", map_name, strerror(errno));
+    close(fd);
+    return r < 0 ? 1 : 0;
+}
+
+int map_delete_cli(const char *map_name, const char *map_dir, const char *key_s) {
+    struct bpf_map_info info;
+    int fd = open_map_cli(map_name, map_dir, &info);
+    if (fd < 0) return 1;
+    uint64_t kbuf[2] = {0, 0};
+    if (cli_key(&info, key_s, kbuf, "-x")) { close(fd); return 1; }
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = fd;
+    attr.key = (unsigned long)kbuf;
+    int r = bpf_syscall(BPF_MAP_DELETE_ELEM, &attr, sizeof(attr));
+    if (r < 0) fprintf(stderr, "Error: could not delete from map '%s': %s\n", map_name, strerror(errno));
+    close(fd);
+    return r < 0 ? 1 : 0;
+}
+
+/*
+ * -r with -K/-V, or of a prefix map: a table. The first line names the
+ * columns (# <key fields> <value fields>); then one line per entry, the
+ * key's fields decoded (-K), or 0x... without -K; the value's fields (-V),
+ * or the value in decimal without -V. A prefix map's key is the prefix.
+ */
+int map_dump_cli(const char *map_name, const char *map_dir, const char *klay, const char *vlay) {
+    struct bpf_map_info info;
+    int fd = open_map_cli(map_name, map_dir, &info);
+    if (fd < 0) return 1;
+    int lpm = info.type == BPF_MAP_TYPE_LPM_TRIE;
+    if (!klay && !vlay && !lpm) {
+        close(fd);
+        dump_map_contents(map_name, map_dir);
+        return 0;
+    }
+    if (info.value_size != 8 || (!lpm && info.key_size != 8 && info.key_size != 4) ||
+        info.type == BPF_MAP_TYPE_PERCPU_ARRAY || info.type == BPF_MAP_TYPE_PERCPU_HASH ||
+        info.type == BPF_MAP_TYPE_LRU_PERCPU_HASH) {
+        fprintf(stderr, "Error: map '%s' does not hold 64-bit values\n", map_name);
+        close(fd);
+        return 1;
+    }
+    static struct klayout kl, vl;
+    if (klay && lpm) { fprintf(stderr, "Error: -K: %s is a prefix map; its keys are prefixes\n", map_name); close(fd); return 1; }
+    if (klay && parse_layout(klay, &kl, "-K")) { close(fd); return 1; }
+    if (vlay && parse_layout(vlay, &vl, "-V")) { close(fd); return 1; }
+    printf("# ");
+    if (lpm) printf("prefix");
+    else if (klay) print_layout_header(stdout, &kl);
+    else printf("key");
+    printf(" ");
+    if (vlay) print_layout_header(stdout, &vl); else printf("value");
+    putchar('\n');
+    uint64_t key[2] = {0, 0}, next[2] = {0, 0}, v;
+    int res = bpf_map_get_next_key_user(fd, NULL, next);
+    while (res == 0) {
+        if (bpf_map_lookup_elem_user(fd, next, &v) == 0) {
+            if (lpm) {
+                uint32_t k[2];
+                memcpy(k, next, 8);
+                uint32_t a = ntohl(k[1]);
+                printf("%u.%u.%u.%u/%u", a >> 24, (a >> 16) & 255, (a >> 8) & 255, a & 255, k[0]);
+            } else {
+                uint32_t k32;
+                memcpy(&k32, next, 4);
+                uint64_t kv = info.key_size == 4 ? k32 : next[0];
+                if (klay) print_layout(stdout, &kl, kv, " ");
+                else printf("0x%016llx", (unsigned long long)kv);
+            }
+            putchar(' ');
+            if (vlay) print_layout(stdout, &vl, v, " ");
+            else printf("%llu", (unsigned long long)v);
+            putchar('\n');
+        }
+        memcpy(key, next, sizeof(key));
+        res = bpf_map_get_next_key_user(fd, key, next);
+    }
+    close(fd);
+    return 0;
+}
+
+/* -R with -K: the key column decoded */
+static struct klayout join_layout;
+static int join_layout_set = 0;
+static void kf_print_join_key(FILE *o, uint64_t k) {
+    if (join_layout_set) print_layout(o, &join_layout, k, ",");
+    else fprintf(o, "0x%016llx", (unsigned long long)k);
+}
+
+static void kf_flow_key(const char *var, int mode) {
+    static struct kspec ks;
+    memset(&ks, 0, sizeof(ks));
+    char f0[] = "ip-src", f1[] = "ip-dst", f2[] = "ip-proto", f3[] = "src-port", f4[] = "dst-port";
+    char *tk[] = {f0, f1, f2, f3, f4};
+    ks.hash = 1; ks.bits = 64; ks.dir = mode == 1 ? 1 : mode == 2 ? 2 : 0;
+    if (kspec_parse_fields(&ks, tk, 5, 0, "flow-key") || kspec_finish(&ks, 0, "flow-key")) exit(1);
+    compile_key(&ks, var, 8, NULL);
+}
+
 static int cmd_depth = 0; /* > 1 while a command compiles the commands it expands into */
 static int process_cmd_1(char *cmd, const char *dir);
 int process_cmd(char *cmd, const char *dir) {
@@ -7701,27 +9411,28 @@ static int process_cmd_1(char *cmd, const char *dir) {
 
 	char *save_w ;
 
-        char *tok[16];
+        char *tok[32];
 	int t = 0;
+	kf_dir = dir;
 	while (*cmd == '\n' || *cmd == '\r' || *cmd == ' ' || *cmd == '\t') {
 		++cmd;
 	}
 	if (cmd[0] == '#' || strlen(cmd)==0)
 		return 0;
         char *w = strtok_r(cmd, " ", &save_w);
-        while (w && t < 16) { 
+        while (w && t < 32) { 
 		tok[t++] = w; 
 		w = strtok_r(NULL, " ", &save_w); 
 	}
         if (t == 0)
 	    return 0;
 	if (w) {
-		fprintf(stderr, "Error: '%s' has more than 16 words\n", tok[0]);
+		fprintf(stderr, "Error: '%s' has more than 32 words\n", tok[0]);
 		return 1;
 	}
 	/* Hex literals (0x...) become decimal, so the many fields read with
 	 * atoi() get their value: "set ip-tos 0x10" used to write 0. */
-	static char hexbuf[16][24];
+	static char hexbuf[32][24];
 	for (int k = 1; k < t; k++) {
 		char *dash = strchr(tok[k], '-');
 		if (dash && dash != tok[k] && strstr(tok[k], "0x")) {
@@ -7745,7 +9456,7 @@ static int process_cmd_1(char *cmd, const char *dir) {
 		tok[k] = hexbuf[k];
 	}
 	if ((!strcmp(tok[0], "set") || !strcmp(tok[0], "match") || !strcmp(tok[0], "if")) && t > 2 &&
-	    check_field_value(tok[0], tok[1], tok[2]))
+	    strcmp(tok[2], "in") && check_field_value(tok[0], tok[1], tok[2]))
 		return 1;
         
         char *op = tok[0]; 
@@ -7879,6 +9590,35 @@ static int process_cmd_1(char *cmd, const char *dir) {
 	if (strcmp(op, "fill-bytes")==0) {
 		if (t < 4) { fprintf(stderr, "Error: fill-bytes <offset|%%VAR> <len|%%VAR> <byte|%%VAR>\n"); return 1; }
 		compile_fill_bytes(tok[1], tok[2], tok[3]); return 0;
+	}
+	if (strcmp(op, "get") == 0 && t > 2 &&
+	    (!strcmp(a1, "src-port") || !strcmp(a1, "dst-port") || !strcmp(a1, "dscp") || !strcmp(a1, "ecn") ||
+	     !strcmp(a1, "ip-ttl") || !strcmp(a1, "icmp-id") || !strcmp(a1, "icmp-code") || !strcmp(a1, "icmp-type"))) {
+		if (t != 3) { fprintf(stderr, "Error: get %s <VAR>\n", a1); return 1; }
+		compile_get_keyfield(a1, a2);
+		return 0;
+	}
+	if (strcmp(op, "set") == 0 && t == 3 && (!strcmp(a1, "dscp") || !strcmp(a1, "ecn")))
+		return compile_set_dscp_ecn(!strcmp(a1, "ecn"), a2) ? 1 : 0;
+	if (strcmp(op, "set") == 0 && t == 3 && (!strcmp(a1, "src-port") || !strcmp(a1, "dst-port")))
+		return compile_set_any_port(!strcmp(a1, "dst-port"), a2) ? 1 : 0;
+	if (!strcmp(op, "hash") || !strcmp(op, "pack"))
+		return compile_hash_pack(!strcmp(op, "hash"), tok, t) ? 1 : 0;
+	if (!strcmp(op, "unpack")) return compile_unpack(tok, t) ? 1 : 0;
+	if (!strcmp(op, "count")) return compile_count(tok, t) ? 1 : 0;
+	if (!strcmp(op, "prefix-map")) {
+		if (t < 2 || t > 3) { fprintf(stderr, "Error: usage: prefix-map <MAP> [entries]\n"); return 1; }
+		get_or_create_prefix_map(a1, t > 2 ? (uint32_t)strtoul(a2, NULL, 0) : DEFAULT_MAP_ENTRIES);
+		return 0;
+	}
+	if ((!strcmp(op, "match") || !strcmp(op, "if")) && t > 2) {
+		if (!strcmp(a1, "seen")) return compile_match_seen(tok, t) ? 1 : 0;
+		if (!strcmp(a1, "over-rate")) return compile_match_over_rate(tok, t) ? 1 : 0;
+		if (!strcmp(a2, "in")) return compile_match_in(tok, t) ? 1 : 0;
+		if (t == 3 && (!strcmp(a1, "host") || !strcmp(a1, "net"))) return compile_match_host(a2, !strcmp(a1, "net")) ? 1 : 0;
+		if (t == 3 && (!strcmp(a1, "port") || !strcmp(a1, "src-port") || !strcmp(a1, "dst-port")))
+			return compile_match_port(a1, a2) ? 1 : 0;
+		if (t == 3 && (!strcmp(a1, "dscp") || !strcmp(a1, "ecn"))) return compile_match_dscp_ecn(!strcmp(a1, "ecn"), a2) ? 1 : 0;
 	}
 	if (strcmp(op, "get") == 0 && t > 2) {
             char *f = a1; char *var = a2;
@@ -9447,12 +11187,14 @@ int main(int argc, char **argv) {
     char *filename = NULL;
     char *read_map = NULL, *join_maps = NULL;
     char *write_map = NULL, *write_key = NULL, *write_val = NULL;
+    char *del_map = NULL, *del_key = NULL, *key_text = NULL, *klay = NULL, *vlay = NULL;
     int delete_prio = 0, show_info = 0, expand_only = 0, list_files = 0;
     for (int i = 1; i < argc; i++) {
         /* Options that take a value must not run past the end of argv. */
         int needs_arg = !strcmp(argv[i],"-i") || !strcmp(argv[i],"-d") || !strcmp(argv[i],"-p") ||
                         !strcmp(argv[i],"-m") || !strcmp(argv[i],"-r") || !strcmp(argv[i],"-R") || !strcmp(argv[i],"-f") ||
-                        !strcmp(argv[i],"-n") || !strcmp(argv[i],"-s") || !strcmp(argv[i],"-L");
+                        !strcmp(argv[i],"-n") || !strcmp(argv[i],"-s") || !strcmp(argv[i],"-L") ||
+                        !strcmp(argv[i],"-H") || !strcmp(argv[i],"-K") || !strcmp(argv[i],"-V");
         if (needs_arg && i + 1 >= argc) {
             fprintf(stderr, "Error: option %s requires an argument\n", argv[i]);
             return 1;
@@ -9473,6 +11215,13 @@ int main(int argc, char **argv) {
             if (i + 3 >= argc) { fprintf(stderr, "Error: -w requires <map> <key> <value>\n"); return 1; }
             write_map = argv[++i]; write_key = argv[++i]; write_val = argv[++i];
         }
+        else if (strcmp(argv[i],"-x")==0) {
+            if (i + 2 >= argc) { fprintf(stderr, "Error: -x requires <map> <key>\n"); return 1; }
+            del_map = argv[++i]; del_key = argv[++i];
+        }
+        else if (strcmp(argv[i],"-H")==0) key_text = argv[++i];
+        else if (strcmp(argv[i],"-K")==0) klay = argv[++i];
+        else if (strcmp(argv[i],"-V")==0) vlay = argv[++i];
         else if (strcmp(argv[i],"-f")==0) filename = argv[++i];
         else if (strcmp(argv[i],"-E")==0) expand_only = 1;
         else if (strcmp(argv[i],"-M")==0) list_files = 1;
@@ -9481,14 +11230,26 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i],"-h")==0 || strcmp(argv[i],"--help")==0) { help(argv[0]); return 0; }
         else instr = argv[i];
     }
-    if (write_map)
-        return write_map_value(write_map, bpf_map_dir, write_key, write_val);
-    if (read_map) {
-        dump_map_contents(read_map, bpf_map_dir);
+    if (key_text) {
+        uint64_t k;
+        if (key_from_text(key_text, &k, "-H")) return 1;
+        printf("0x%016llx\n", (unsigned long long)k);
         return 0;
     }
-    if (join_maps)
+    if (write_map)
+        return map_write_cli(write_map, bpf_map_dir, write_key, write_val);
+    if (del_map)
+        return map_delete_cli(del_map, bpf_map_dir, del_key);
+    if (read_map)
+        return map_dump_cli(read_map, bpf_map_dir, klay, vlay);
+    if (join_maps) {
+        if (vlay) { fprintf(stderr, "Error: -V does not apply to -R\n"); return 1; }
+        if (klay) {
+            if (parse_layout(klay, &join_layout, "-K")) return 1;
+            join_layout_set = 1;
+        }
         return dump_maps_joined(join_maps, bpf_map_dir);
+    }
     if(strcmp(dir, "ingress") && strcmp(dir, "egress") && strcmp(dir, "xdp")) {
         fprintf(stderr, "Error: direction must be 'ingress', 'egress' or 'xdp', not '%s'\n", dir);
         return 1;
