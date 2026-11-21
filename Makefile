@@ -25,13 +25,16 @@ CONTAINER_DOCDIR ?= $(PREFIX)/share/doc/bpfc-container
 PROGRAMS_DOCDIR ?= $(PREFIX)/share/doc/bpfc-programs
 SYSCONFDIR ?= /etc
 UNITDIR   ?= $(PREFIX)/lib/systemd/system
+LIBEXECDIR ?= $(PREFIX)/libexec
 DESTDIR   ?=
 
 TARGET     = bpfc
 DAEMON     = bpfcd/bpfcd
 CTL        = bpfcd/bpfcctl
-COMMON_SRC = bpfcd/common.c bpfcd/netns.c bpfcd/json.c
-COMMON_HDR = bpfcd/common.h bpfcd/netns.h bpfcd/json.h
+# Frontends: programs that turn other file types (20.acl) into bpfc
+FRONTENDS  = frontends/acl
+COMMON_SRC = bpfcd/common.c bpfcd/netns.c bpfcd/json.c bpfcd/acl.c
+COMMON_HDR = bpfcd/common.h bpfcd/netns.h bpfcd/json.h bpfcd/acl.h
 # The REST API's HTTP server: bpfcd only.
 HTTP_SRC   = bpfcd/http.c
 HTTP_HDR   = bpfcd/http.h
@@ -41,7 +44,7 @@ DAEMON_CFLAGS = $(WARN) -Wno-format-truncation -DBPFC_VERSION='"$(VERSION)"'
 
 # Everything that goes into the source tarball used by `make rpm`.
 DIST_FILES = Makefile LICENSE README.md bpfc.8 bpfc.c test.sh tests doc \
-             bpfcd/*.c bpfcd/*.h dist programs
+             bpfcd/*.c bpfcd/*.h dist programs frontends/*.c
 
 RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
@@ -49,7 +52,10 @@ TARBALL    = bpfc-$(VERSION).tar.gz
 
 .PHONY: fuzz check-compile check-dataplane check-ecmp check-linkcap check-all all clean install install-programs dist rpm srpm check
 
-all: $(TARGET) $(DAEMON) $(CTL)
+all: $(TARGET) $(DAEMON) $(CTL) $(FRONTENDS)
+
+frontends/acl: frontends/acl.c
+	$(CC) $(CFLAGS) $(WARN) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ frontends/acl.c
 
 $(TARGET): bpfc.c
 	$(CC) $(CFLAGS) $(WARN) $(FEATURES) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfc.c
@@ -64,6 +70,9 @@ install: all install-programs
 	install -D -m 0755 $(TARGET) $(DESTDIR)$(SBINDIR)/bpfc
 	install -D -m 0755 $(DAEMON) $(DESTDIR)$(SBINDIR)/bpfcd
 	install -D -m 0755 $(CTL) $(DESTDIR)$(SBINDIR)/bpfcctl
+	install -D -m 0755 frontends/acl $(DESTDIR)$(LIBEXECDIR)/bpfc/frontends/acl
+	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/frontends
+	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/bpfc/acl.d
 	install -D -m 0644 bpfc.8 $(DESTDIR)$(MANDIR)/man8/bpfc.8
 	install -D -m 0644 dist/bpfcd.8 $(DESTDIR)$(MANDIR)/man8/bpfcd.8
 	install -D -m 0644 dist/bpfcctl.8 $(DESTDIR)$(MANDIR)/man8/bpfcctl.8
@@ -90,6 +99,10 @@ install: all install-programs
 	install -m 0644 dist/examples/flow/*.bpfc $(DESTDIR)$(DOCDIR)/examples/flow/
 	install -m 0644 README.md $(DESTDIR)$(DOCDIR)/README.md
 	install -m 0644 doc/flow-tracking.md $(DESTDIR)$(DOCDIR)/flow-tracking.md
+	install -m 0644 doc/firewall.md $(DESTDIR)$(DOCDIR)/firewall.md
+	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/acl/acl.d
+	install -m 0644 dist/examples/acl/*.acl $(DESTDIR)$(DOCDIR)/examples/acl/
+	install -m 0644 dist/examples/acl/acl.d/*.acl $(DESTDIR)$(DOCDIR)/examples/acl/acl.d/
 	install -D -m 0755 dist/container/bpfcd-entrypoint $(DESTDIR)$(SBINDIR)/bpfcd-entrypoint
 	install -D -m 0644 dist/container/README.md $(DESTDIR)$(CONTAINER_DOCDIR)/README.md
 	install -D -m 0644 dist/container/Containerfile $(DESTDIR)$(CONTAINER_DOCDIR)/Containerfile
@@ -178,7 +191,7 @@ srpm: $(TARBALL)
 TESTFLAGS ?=
 
 check: all
-	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack keys bpfcd netns rest xdp xdp-examples tc-examples flow-examples dedup ecmp container install
+	bash tests/run-tests.sh $(TESTFLAGS) compile preprocessor stack keys bpfcd netns rest xdp xdp-examples tc-examples flow-examples acl frontends dedup ecmp container install
 
 # Compile-only checks of every field and command and of the error messages;
 # needs no root (the few commands that create maps are skipped without it).
@@ -206,5 +219,5 @@ fuzz:
 	./tests/fuzz-rest $(FUZZ_ITERS)
 
 clean:
-	rm -f $(TARGET) $(DAEMON) $(CTL) output.bpf $(TARBALL) tests/fuzz-rest
+	rm -f $(TARGET) $(DAEMON) $(CTL) $(FRONTENDS) output.bpf $(TARBALL) tests/fuzz-rest
 	rm -rf $(RPMTOP) .dist

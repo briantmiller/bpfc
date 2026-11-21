@@ -6,6 +6,10 @@
  *   bpfcctl show <iface> <dir> <prio>     metadata, source file and failure log
  *   bpfcctl show ... --bytecode           plus the kernel's translated bytecode
  *   bpfcctl reload [--no-wait]            SIGHUP bpfcd and report the outcome
+ *   bpfcctl show access-lists [NAME] [interface IF]   IOS-style, with matches
+ *   bpfcctl clear access-list counters [NAME]
+ *   bpfcctl top [N] [SECONDS]             the busiest access-list entries
+ *   bpfcctl log [-f]                      access-list log lines (bpfcd writes them)
  *
  * Copyright (C) 2026
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -14,6 +18,7 @@
 #include "common.h"
 #include "netns.h"
 #include "json.h"
+#include "acl.h"
 
 #include <ctype.h>
 
@@ -133,10 +138,12 @@ static int load_state(struct daemon_info *di, struct slot **slots) {
 static int file_is_empty(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
+    const char *base = strrchr(path, '/');
+    int fe = program_type(base ? base + 1 : path, NULL, 0) == 1;
     int c, in_comment = 0, empty = 1;
     while ((c = fgetc(f)) != EOF) {
         if (in_comment) { if (c == '\n') in_comment = 0; continue; }
-        if (c == '#') { in_comment = 1; continue; }
+        if (c == '#' || (fe && c == '!')) { in_comment = 1; continue; }
         if (!isspace(c) && c != ';') { empty = 0; break; }
     }
     fclose(f);
@@ -151,7 +158,8 @@ static int file_state(const struct slot *s) {
     if (!strcmp(s->sha256, "empty")) return file_is_empty(s->path) ? 0 : 1;
     char hex[65];
     int has_includes;
-    if (sha256_program(daemon_bpfc[0] ? daemon_bpfc : cfg.bpfc_path, s->path, cfg.compile_timeout,
+    if (!strncmp(s->sha256, "conflict-", 9)) return 0;
+    if (sha256_program(daemon_bpfc[0] ? daemon_bpfc : cfg.bpfc_path, s->path, dir_name(s->dir), cfg.compile_timeout,
                        hex, &has_includes) < 0) return -1;
     return strcmp(hex, s->sha256) ? 1 : 0;
 }
@@ -192,7 +200,7 @@ static const char *kernel_check(const struct slot *s, const char **color) {
     const struct tc_filter *k = kernel_at(s->iface, s->dir, s->prio);
     *color = C_DIM;
     if (!kernel_ok) return "?";
-    if (s->status == ST_INSTALLED) {
+    if (slot_live(s->status)) {
         if (!if_nametoindex(s->iface)) { *color = C_RED; return "no-iface"; }
         if (!k) { *color = C_RED; return "MISSING"; }
         if (k->prog_id != s->prog_id) { *color = C_RED; return "DIFFERS"; }
@@ -209,7 +217,7 @@ static const char *status_color(int st) {
     switch (st) {
     case ST_INSTALLED: return C_GREEN;
     case ST_PENDING: case ST_EXCLUDED: case ST_INSTALLING: return C_DIM;
-    case ST_FAILED: case ST_DISABLED: return C_RED;
+    case ST_FAILED: case ST_DISABLED: case ST_KEPT: return C_RED;
     default: return C_YELLOW;
     }
 }
@@ -254,7 +262,8 @@ static int cmd_status(int show_all, int long_fmt) {
     if (n == 0) {
         const char *cd = di.config_dir[0] ? di.config_dir : DEFAULT_CONFIG_DIR;
         printf("No programs configured. Add files as %s/<interface|%%all%%|%%<kind>%%>/<ingress|egress>/<priority>.bpfc\n"
-               "or %s/<interface|%%all%%|%%<kind>%%>/xdp.bpfc and run: %s\n", cd, cd, reload_cmd());
+               "(or .<type> for a frontend, e.g. 20.acl) or %s/<interface|%%all%%|%%<kind>%%>/xdp.bpfc and run: %s\n",
+               cd, cd, reload_cmd());
     } else {
         int wif = 5, wname = 0;
         for (int i = 0; i < n; i++) {
@@ -287,14 +296,14 @@ static int cmd_status(int show_all, int long_fmt) {
                    short_path(s->path, &di), C_YELLOW, mark, C_OFF);
             if (s->error[0])
                 printf("%*s%s-> %s%s\n", wif + 2, "", C_DIM, s->error, C_OFF);
-            if (long_fmt && s->status == ST_INSTALLED) {
+            if (long_fmt && slot_live(s->status)) {
                 char t[32];
                 fmt_time(s->installed_at, t, sizeof(t));
                 printf("%*s%sinstalled %s, %u insns, sha256 %.16s, ifindex %d%s\n", wif + 2, "", C_DIM,
                        t, s->insns, s->sha256, s->ifindex, C_OFF);
             }
-            if (s->status == ST_FAILED || s->status == ST_DISABLED || s->status == ST_REMOVED_EXT ||
-                s->status == ST_REPLACED_EXT || (s->status == ST_INSTALLED && kernel_ok && strcmp(kw, "ok")))
+            if (s->status == ST_FAILED || s->status == ST_DISABLED || s->status == ST_REMOVED_EXT || s->status == ST_KEPT ||
+                s->status == ST_REPLACED_EXT || (slot_live(s->status) && kernel_ok && strcmp(kw, "ok")))
                 problems++;
         }
     }
@@ -314,7 +323,7 @@ static int cmd_status(int show_all, int long_fmt) {
                     const struct tc_filter *f = &v->f[j];
                     int managed = 0;
                     for (int i = 0; i < n; i++)
-                        if (slots[i].status == ST_INSTALLED && !strcmp(slots[i].iface, p->if_name) &&
+                        if (slot_live(slots[i].status) && !strcmp(slots[i].iface, p->if_name) &&
                             slots[i].dir == dir && slots[i].prio == f->prio && slots[i].prog_id == f->prog_id)
                             managed = 1;
                     if (managed) continue;
@@ -407,7 +416,7 @@ static int status_json(struct jbuf *b, int show_all) {
                     const struct tc_filter *f = &v->f[j];
                     int managed = 0;
                     for (int i = 0; i < n; i++)
-                        if (slots[i].status == ST_INSTALLED && !strcmp(slots[i].iface, p->if_name) &&
+                        if (slot_live(slots[i].status) && !strcmp(slots[i].iface, p->if_name) &&
                             slots[i].dir == dir && slots[i].prio == f->prio && slots[i].prog_id == f->prog_id)
                             managed = 1;
                     if (managed) continue;
@@ -581,10 +590,10 @@ static int print_file(const char *path, const char *heading) {
     return 0;
 }
 
-static int cmd_show(int argc, char **argv, int bytecode) {
+static int cmd_show(int argc, char **argv, int bytecode, int source) {
     /* Accepts "iface dir prio" or "iface/dir/prio"; "iface xdp" or "iface/xdp". */
-    static const char usage[] = "Usage: bpfcctl show <iface> <ingress|egress> <prio> [--bytecode]\n"
-                                "       bpfcctl show <iface> xdp [--bytecode]\n";
+    static const char usage[] = "Usage: bpfcctl show <iface> <ingress|egress> <prio> [--bytecode] [--source]\n"
+                                "       bpfcctl show <iface> xdp [--bytecode] [--source]\n";
     char ifbuf[IFNAMSIZ + 64], *iface, *dirs, *prios;
     if (argc == 1 && strchr(argv[0], '/')) {
         snprintf(ifbuf, sizeof(ifbuf), "%s", argv[0]);
@@ -634,6 +643,8 @@ static int cmd_show(int argc, char **argv, int bytecode) {
     printf("  file:       %s%s\n", s->path,
            fs == 1 ? " (modified since last reload)" : fs < 0 ? " (deleted since last reload)" : "");
     printf("  sha256:     %s\n", s->sha256[0] ? s->sha256 : "-");
+    printf("  on failure: %s\n", s->on_failure == ON_FAILURE_REMOVE ? "remove (option in the program)" :
+                                 s->on_failure == ON_FAILURE_KEEP ? "keep (option in the program)" : "as bpfc.conf's on_failure");
     printf("  program:    id %u  tag %s  %u insns\n", s->prog_id, s->tag[0] ? s->tag : "-", s->insns);
     printf("  kernel:     %s%s%s\n", kc, kw, C_OFF);
     printf("  installed:  %s   last change: %s\n", t1, t2);
@@ -644,8 +655,17 @@ static int cmd_show(int argc, char **argv, int bytecode) {
 
     if (print_file(s->path, "Source") < 0)
         printf("\n(source file %s cannot be read: %s)\n", s->path, strerror(errno));
+    const char *base = strrchr(s->path, '/');
+    if (program_type(base ? base + 1 : s->path, NULL, 0) == 1) {
+        char gp[PATH_MAX + 64];
+        generated_path(gp, sizeof(gp), state_dir(), s->iface, s->dir, s->prio);
+        if (source && print_file(gp, "Generated bpfc (the frontend's output, last attempt)") < 0)
+            printf("\n(no generated source at %s)\n", gp);
+        else if (!source)
+            printf("\n%s(bpfcctl show --source: the bpfc the frontend generated)%s\n", C_DIM, C_OFF);
+    }
 
-    if (s->status == ST_FAILED) {
+    if (s->status == ST_FAILED || s->status == ST_KEPT) {
         char ep[PATH_MAX + 64];
         error_log_path(ep, sizeof(ep), state_dir(), s->iface, s->dir, s->prio);
         if (print_file(ep, "bpfc output from the failed attempt") < 0)
@@ -729,13 +749,13 @@ static int cmd_reload(int wait) {
     int counts[ST__COUNT] = {0};
     for (int i = 0; i < n; i++) if (slots[i].status >= 0 && slots[i].status < ST__COUNT) counts[slots[i].status]++;
     printf("Reloaded: %d installed, %d waiting for interface, %d failed\n", counts[ST_INSTALLED],
-           counts[ST_PENDING], counts[ST_FAILED] + counts[ST_DISABLED]);
+           counts[ST_PENDING], counts[ST_FAILED] + counts[ST_DISABLED] + counts[ST_KEPT]);
     int failed = 0;
     for (int i = 0; i < n; i++) {
-        if (slots[i].status != ST_FAILED && slots[i].status != ST_DISABLED) continue;
+        if (slots[i].status != ST_FAILED && slots[i].status != ST_DISABLED && slots[i].status != ST_KEPT) continue;
         failed++;
-        printf("  %sFAILED%s %s %s %d: %s\n", C_RED, C_OFF, slots[i].iface, dir_name(slots[i].dir),
-               slots[i].prio, slots[i].error);
+        printf("  %s%s%s %s %s %d: %s\n", C_RED, slots[i].status == ST_KEPT ? "FAILED (previous kept)" : "FAILED", C_OFF,
+               slots[i].iface, dir_name(slots[i].dir), slots[i].prio, slots[i].error);
     }
     free(slots);
     return failed ? 2 : 0;
@@ -916,6 +936,70 @@ static int cmd_exec(int argc, char **argv) {
 
 /* ======================= main ======================= */
 
+static const char *map_dir(void) { return cfg.map_dir[0] ? cfg.map_dir : DEFAULT_MAP_ROOT; }
+
+static int cmd_access_lists(int argc, char **argv, int bytes) {
+    const char *name = NULL, *iface = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "interface") && i + 1 < argc) iface = argv[++i];
+        else if (!name) name = argv[i];
+        else { fprintf(stderr, "usage: bpfcctl show access-lists [NAME] [interface IF]\n"); return 2; }
+    }
+    return acl_show(stdout, state_dir(), map_dir(), name, iface, bytes);
+}
+
+static int cmd_clear(int argc, char **argv) {
+    if (argc < 2 || strcmp(argv[0], "access-list") || strcmp(argv[1], "counters") || argc > 3) {
+        fprintf(stderr, "usage: bpfcctl clear access-list counters [NAME]\n");
+        return 2;
+    }
+    int n = acl_clear(state_dir(), map_dir(), argc == 3 ? argv[2] : NULL);
+    if (n < 0) {
+        fprintf(stderr, "bpfcctl: %s/BPFC_ACL_P: %s\n", map_dir(), errno == EPERM || errno == EACCES ? "run as root" : strerror(errno));
+        return 1;
+    }
+    if (!n && argc == 3) { fprintf(stderr, "bpfcctl: no access list %s is installed\n", argv[2]); return 1; }
+    return 0;
+}
+
+static int cmd_top(int argc, char **argv) {
+    int n = 20;
+    double secs = 1;
+    if (argc > 0) n = atoi(argv[0]);
+    if (argc > 1) secs = atof(argv[1]);
+    if (argc > 2 || n <= 0 || secs <= 0 || secs > 3600) { fprintf(stderr, "usage: bpfcctl top [N] [SECONDS]\n"); return 2; }
+    return acl_top(stdout, state_dir(), map_dir(), secs, n);
+}
+
+static int cmd_log(int follow) {
+    char p[PATH_MAX + 16];
+    snprintf(p, sizeof(p), "%s/acl.log", state_dir());
+    FILE *f = fopen(p, "r");
+    if (!f && !follow) {
+        if (errno == ENOENT) { printf("no access-list log lines yet (%s)\n", p); return 0; }
+        fprintf(stderr, "bpfcctl: %s: %s\n", p, strerror(errno));
+        return 1;
+    }
+    char line[2048];
+    for (;;) {
+        if (f) {
+            while (fgets(line, sizeof(line), f)) fputs(line, stdout);
+            fflush(stdout);
+            clearerr(f);
+        }
+        if (!follow) break;
+        sleep(1);
+        /* bpfcd starts a new file when the old one gets large */
+        struct stat a, b;
+        if (stat(p, &a) == 0 && (!f || (fstat(fileno(f), &b) == 0 && (a.st_ino != b.st_ino || a.st_size < ftell(f))))) {
+            if (f) fclose(f);
+            f = fopen(p, "r");
+        }
+    }
+    if (f) fclose(f);
+    return 0;
+}
+
 static void usage(void) {
     printf("Usage: bpfcctl [options] [command]\n\n"
            "Commands:\n"
@@ -926,7 +1010,13 @@ static void usage(void) {
            "  show <iface> <dir> <prio>      details, source and failure output for one program\n"
            "  show <iface> xdp               the same for the interface's XDP program\n"
            "      -b, --bytecode             also print the kernel's translated bytecode\n"
+           "      --source                   also print the bpfc a frontend generated (20.acl, ...)\n"
            "  reload [--no-wait]             make bpfcd rescan and report the result\n"
+           "  show access-lists [NAME] [interface IF] [-l]\n"
+           "                                 access lists as IOS shows them, with matches (-l: and bytes)\n"
+           "  clear access-list counters [NAME]  zero the matches (of one list, or all)\n"
+           "  top [N] [SECONDS]              the N (20) busiest access-list entries over SECONDS (1)\n"
+           "  log [-f]                       access-list log lines (entries with log); -f follows\n"
            "  env                            the paths in use, as shell assignments (for scripts)\n"
            "  exec [--] <command> [args]     run a command inside the -n namespace\n\n"
            "Options:\n"
@@ -941,14 +1031,15 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
-    int show_all = 0, long_fmt = 0, bytecode = 0, nowait = 0, all_netns = 0, json = 0;
+    int show_all = 0, long_fmt = 0, bytecode = 0, nowait = 0, all_netns = 0, json = 0, follow = 0;
     const char *color = "auto";
-    enum { OPT_NOWAIT = 256, OPT_ALL_NETNS };
+    enum { OPT_NOWAIT = 256, OPT_ALL_NETNS, OPT_SOURCE };
+    int source = 0;
     static const struct option longopts[] = {
         {"config", required_argument, 0, 'c'}, {"state-dir", required_argument, 0, 's'},
         {"netns", required_argument, 0, 'n'}, {"all-netns", no_argument, 0, OPT_ALL_NETNS},
         {"all", no_argument, 0, 'a'}, {"long", no_argument, 0, 'l'}, {"bytecode", no_argument, 0, 'b'},
-        {"json", no_argument, 0, 'j'},
+        {"json", no_argument, 0, 'j'}, {"source", no_argument, 0, OPT_SOURCE},
         {"no-wait", no_argument, 0, OPT_NOWAIT}, {"color", required_argument, 0, 'C'},
         {"version", no_argument, 0, 'V'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
 
@@ -971,7 +1062,7 @@ int main(int argc, char **argv) {
     }
     int o;
     /* "+" would stop at the command; we want options anywhere, so permute (GNU default). */
-    while ((o = getopt_long(opt_argc, argv, "c:s:n:albjVh", longopts, NULL)) != -1) {
+    while ((o = getopt_long(opt_argc, argv, "c:s:n:albjfVh", longopts, NULL)) != -1) {
         switch (o) {
         case 'c': conf_override = optarg; break;
         case 'n': netns_arg = optarg; break;
@@ -981,7 +1072,9 @@ int main(int argc, char **argv) {
         case 'l': long_fmt = 1; break;
         case 'b': bytecode = 1; break;
         case 'j': json = 1; break;
+        case 'f': follow = 1; break;
         case OPT_NOWAIT: nowait = 1; break;
+        case OPT_SOURCE: source = 1; break;
         case 'C': color = optarg; break;
         case 'V': printf("bpfcctl %s\n", BPFC_VERSION); return 0;
         case 'h': usage(); return 0;
@@ -1010,10 +1103,20 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(cmd, "env")) return cmd_env();
     if (!strcmp(cmd, "exec")) return cmd_exec(rest, args);
-    if (!strcmp(cmd, "status") || !strcmp(cmd, "show")) enter_cfg_netns();
+    if (!strcmp(cmd, "status") || !strcmp(cmd, "show") || !strcmp(cmd, "clear") || !strcmp(cmd, "top"))
+        enter_cfg_netns();
     if (json && strcmp(cmd, "status")) { fprintf(stderr, "bpfcctl: --json applies to status\n"); return 2; }
     if (!strcmp(cmd, "status")) return json ? cmd_status_json(show_all) : cmd_status(show_all, long_fmt);
-    if (!strcmp(cmd, "show")) return cmd_show(rest, args, bytecode);
+    if (!strcmp(cmd, "show") && rest > 0 && (!strcmp(args[0], "access-lists") || !strcmp(args[0], "access-list") ||
+                                              !strcmp(args[0], "ip") || !strcmp(args[0], "ipv6") || !strcmp(args[0], "mac"))) {
+        int k = strcmp(args[0], "access-lists") && strcmp(args[0], "access-list") ? 2 : 1;   /* show ip access-lists */
+        if (k == 2 && (rest < 2 || strncmp(args[1], "access-list", 11))) { usage(); return 2; }
+        return cmd_access_lists(rest - k, args + k, long_fmt);
+    }
+    if (!strcmp(cmd, "show")) return cmd_show(rest, args, bytecode, source);
+    if (!strcmp(cmd, "clear")) return cmd_clear(rest, args);
+    if (!strcmp(cmd, "top")) return cmd_top(rest, args);
+    if (!strcmp(cmd, "log")) return cmd_log(follow);
     if (!strcmp(cmd, "reload")) return cmd_reload(!nowait);
     if (!strcmp(cmd, "help")) { usage(); return 0; }
     fprintf(stderr, "Unknown command '%s'\n", cmd);

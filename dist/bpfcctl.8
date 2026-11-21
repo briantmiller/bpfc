@@ -28,6 +28,29 @@ bpfcctl \- show and inspect programs managed by bpfcd
 .RB [ \-\-no\-wait ]
 .br
 .B bpfcctl
+.RI [ options ]
+.B show access-lists
+.RI [ name ]
+.RB [ interface
+.IR iface ]
+.RB [ \-l ]
+.br
+.B bpfcctl
+.RI [ options ]
+.B clear access-list counters
+.RI [ name ]
+.br
+.B bpfcctl
+.RI [ options ]
+.B top
+.RI [ n " [" seconds ]]
+.br
+.B bpfcctl
+.RI [ options ]
+.B log
+.RB [ \-f ]
+.br
+.B bpfcctl
 .B \-\-all\-netns
 .RB [ status ]
 .br
@@ -82,6 +105,10 @@ The interface does not exist; installed when it appears.
 .B failed
 bpfc or the verifier rejected the file, or attaching failed. The priority is
 empty.
+.TP
+.B failed-kept
+The new version failed as above, and the previous program is still attached
+(\fIon_failure = keep\fR, the default). Counts as a problem.
 .TP
 .B removed-externally
 Removed by something else while
@@ -179,6 +206,26 @@ rewrites), with helper calls named when
 .I /proc/kallsyms
 is readable. Requires root.
 .RE
+.TP
+.BR "show access-lists " [\fIname\fR] " " [ "interface \fIiface\fR" ]
+The access lists installed from \fB.acl\fR files, as IOS shows them: a
+heading (\fBExtended IP access list WEB\fR) and each entry with its sequence
+number and \fB(\fIn\fB matches)\fR, summed over the interfaces it is applied on
+(or only \fIiface\fR). The implicit deny is shown when it has matches. \fB\-l\fR
+adds bytes. \fBshow ip access-lists\fR and \fBshow access-list\fR are the same.
+Reading counters requires root.
+.TP
+.BR "clear access-list counters " [\fIname\fR]
+Zero the matches of one list, or of all.
+.TP
+.BR "top " [\fIn\fR " [" \fIseconds\fR ]]
+The \fIn\fR (20) access-list entries with the most packets per second over
+\fIseconds\fR (1): rate in packets and bits, total matches, interface,
+direction, list, sequence number and entry.
+.TP
+.BR "log " [ \-f ]
+Access-list log lines (entries with \fBlog\fR or \fBlog-input\fR), from
+\fI<state_dir>/acl.log\fR; \fB\-f\fR keeps printing new ones.
 .TP
 .B reload
 Send SIGHUP to bpfcd, wait for the rescan to finish and summarize the

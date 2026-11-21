@@ -387,7 +387,7 @@ void json_file_scope(const char *path, int dir, char *out, size_t outlen) {
 }
 
 int json_status_is_problem(int st) {
-    return st == ST_FAILED || st == ST_DISABLED || st == ST_REMOVED_EXT || st == ST_REPLACED_EXT;
+    return st == ST_FAILED || st == ST_DISABLED || st == ST_REMOVED_EXT || st == ST_REPLACED_EXT || st == ST_KEPT;
 }
 
 void json_slot(struct jbuf *b, const struct slot *s, const struct json_status_ctx *c) {
@@ -411,7 +411,7 @@ void json_slot(struct jbuf *b, const struct slot *s, const struct json_status_ct
     if (s->ifindex) jb_kint(b, "ifindex", s->ifindex);
     else jb_knull(b, "ifindex");
     jb_kstr(b, "sha256", strcmp(s->sha256, "empty") ? s->sha256 : NULL);
-    jb_ktime(b, "installed_at", s->status == ST_INSTALLED ? s->installed_at : 0);
+    jb_ktime(b, "installed_at", slot_live(s->status) ? s->installed_at : 0);
     jb_ktime(b, "changed_at", s->changed_at);
     jb_kstr(b, "error", s->error[0] ? s->error : NULL);
     if (c->extra) c->extra(b, s, c->arg);

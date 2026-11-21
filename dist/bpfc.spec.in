@@ -95,7 +95,7 @@ recent duplicates.
     DOCDIR=%{_docdir}/%{name} CONTAINER_DOCDIR=%{_docdir}/%{name}-container \
     PROGRAMS_DOCDIR=%{_docdir}/%{name}-programs \
     PROGRAMS_FILELIST=$PWD/programs.files \
-    UNITDIR=%{_unitdir} SYSCONFDIR=%{_sysconfdir} \
+    UNITDIR=%{_unitdir} SYSCONFDIR=%{_sysconfdir} LIBEXECDIR=%{_libexecdir} \
     SYSUSERSDIR=%{_sysusersdir} LOCALSTATEDIR=%{_localstatedir}/lib
 
 %pre
@@ -128,6 +128,9 @@ fi
 %{_sbindir}/bpfc
 %{_sbindir}/bpfcd
 %{_sbindir}/bpfcctl
+%dir %{_libexecdir}/bpfc
+%dir %{_libexecdir}/bpfc/frontends
+%{_libexecdir}/bpfc/frontends/acl
 %{_mandir}/man8/bpfc.8*
 %{_mandir}/man8/bpfcd.8*
 %{_mandir}/man8/bpfcctl.8*
@@ -139,6 +142,8 @@ fi
 %dir %{_sysconfdir}/bpfc/interfaces.d
 %dir %{_sysconfdir}/bpfc/netns
 %dir %{_sysconfdir}/bpfc/include
+%dir %{_sysconfdir}/bpfc/frontends
+%dir %{_sysconfdir}/bpfc/acl.d
 %{_sysusersdir}/bpfc.conf
 %dir %{_localstatedir}/lib/bpfc
 %dir %{_localstatedir}/lib/bpfc/interfaces.d
@@ -156,6 +161,22 @@ fi
 %{_docdir}/%{name}-programs/
 
 %changelog
+* Sat Nov 21 2026 bpfc maintainers <brun064@gmail.com> - @VERSION@-@RELEASE@
+- Frontends: <priority>.<type> program files are translated into bpfc by
+  /etc/bpfc/frontends/<type> or /usr/libexec/bpfc/frontends/<type> (any
+  executable, run unprivileged with a clean environment); bpfc -F, -G;
+  preprocessor depends, meta, option. bpfcd manages them like .bpfc files
+  (change detection through depends, conflicts, bpfcctl show --source)
+- on_failure = keep|remove (bpfc.conf) and option on-failure: by default a
+  program whose new version fails stays attached (status failed-kept)
+- acl frontend: Cisco IOS access lists (standard, extended, IPv6, MAC,
+  numbered and named, object groups, reflexive lists, log/log-input), with
+  shared definitions in /etc/bpfc/acl.d. bpfcctl show access-lists, clear
+  access-list counters, top, log; bpfcd writes %SEC-6-IPACCESSLOGP lines.
+  Guide: doc/firewall.md; examples in examples/acl. Tests: acl, frontends
+- IPv6 for ports, host/net, dscp/ecn, icmp6, prefix maps, get/set fields;
+  new: transport, ringbuf-map, log, prefix (static prefix maps), get
+  l4-proto, frag-off, tcp-flags
 * Wed Nov 18 2026 bpfc maintainers <brun064@gmail.com> - @VERSION@-@RELEASE@
 - dedup: IPv4 duplicate-packet removal. dedup-iface.bpfc (a table per
   interface and hook, ingress or egress) and dedup-global.bpfc (one table

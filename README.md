@@ -104,6 +104,30 @@ See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)`. Build an RPM (RHEL 9/10) with `
 
 ---
 
+## Firewalls with Cisco IOS access lists
+
+A program file need not be bpfc: `<priority>.<type>` files are translated by a *frontend* (`/etc/bpfc/frontends/<type>`, then `/usr/libexec/bpfc/frontends/<type>`; a script or a binary, see FRONTENDS in `bpfc(8)`). bpfc ships one, `acl`, for IOS access lists:
+
+```
+# /etc/bpfc/interfaces.d/eth0/ingress/10.acl
+ip access-list extended EDGE-IN
+ 10 deny ip 10.0.0.0 0.255.255.255 any log
+ 20 permit tcp any 203.0.113.0 0.0.0.255 established
+ 30 permit tcp any host 203.0.113.25 eq smtp
+ 40 deny ip any any log
+```
+
+```
+bpfcctl show access-lists              # Extended IP access list EDGE-IN / 20 permit ... (88213 matches)
+bpfcctl top                            # the busiest entries right now
+bpfcctl log -f                         # %SEC-6-IPACCESSLOGP: list EDGE-IN denied tcp ...
+bpfcctl clear access-list counters EDGE-IN
+```
+
+Standard, extended, IPv6 and MAC lists, numbered and named, object groups (shared ones in `/etc/bpfc/acl.d`), reflexive lists (`reflect`/`evaluate`), `established`, TCP flags, fragments, DSCP/precedence/TTL, `log` and `log-input`. Anything bpfc cannot apply exactly is an error, and a list that fails to load leaves the previous one running. [doc/firewall.md](doc/firewall.md) is the guide; examples are in `dist/examples/acl`.
+
+---
+
 ## XDP
 
 `-d xdp` compiles the same language into an XDP program and attaches it as the interface's XDP program, in generic (skb) mode for now (native/driver mode later). It runs before GRO, TC and the stack. One program per interface; attaching replaces it atomically.

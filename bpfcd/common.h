@@ -64,6 +64,7 @@ int log_level_parse(const char *s);
 /* ---------------- configuration ---------------- */
 
 enum ext_policy { EXT_REINSTALL = 0, EXT_LOG = 1 };
+enum { ON_FAILURE_KEEP = 1, ON_FAILURE_REMOVE = 2 };
 
 struct config {
     char bpfc_path[PATH_MAX];
@@ -74,6 +75,7 @@ struct config {
     int remove_on_stop;          /* bool */
     int reinstall_limit;         /* max automatic reinstalls per slot per minute */
     int compile_timeout;         /* seconds before a bpfc run is killed */
+    int on_failure;              /* ON_FAILURE_KEEP or ON_FAILURE_REMOVE: when a new version fails */
     int log_level;               /* enum log_level */
     /* Network namespace (bpfcd/bpfcctl -n NAME); empty for the namespace bpfcd starts in. */
     char netns[NETNS_NAME_MAX + 1];
@@ -164,8 +166,16 @@ int sha256_file(const char *path, char out_hex[65]);
  * because the program file's own mtime no longer shows every change. Any
  * other program hashes exactly as sha256_file(). Returns 0 or -errno.
  */
-int sha256_program(const char *bpfc_path, const char *path, int timeout_s,
+int sha256_program(const char *bpfc_path, const char *path, const char *dir, int timeout_s,
                    char out_hex[65], int *has_includes);
+/*
+ * Program files: <priority>.<type> (xdp.<type> for XDP). Type "bpfc" is bpfc
+ * itself; any other ([a-z0-9], at most 15) is translated by the frontend of
+ * that name (bpfc -f runs it). Returns 1 for a frontend type, 0 for bpfc,
+ * -1 for a name that is not a program file.
+ */
+int program_type(const char *fname, char *type, size_t len);
+
 
 /* ---------------- running bpfc ---------------- */
 
@@ -191,8 +201,11 @@ enum slot_status {
     ST_DISABLED,          /* reinstall limit hit; waits for the next reload */
     ST_EXCLUDED,          /* an empty file opts this interface out of a %all% / %<kind>% program */
     ST_INSTALLING,        /* new or changed, to be compiled in the pass under way (any older program still runs) */
+    ST_KEPT,              /* the new version failed; the previous program is still attached (on-failure keep) */
     ST__COUNT
 };
+/* A program that is attached: installed, or kept after a newer version failed. */
+static inline int slot_live(int status) { return status == ST_INSTALLED || status == ST_KEPT; }
 
 const char *status_name(int st);
 int status_parse(const char *s);
@@ -213,6 +226,7 @@ struct slot {
     time_t installed_at;      /* when the current program was attached */
     time_t changed_at;        /* last status change */
     char error[512];          /* short reason for failed / external states */
+    int on_failure;           /* the program's "option on-failure": 0 not given, ON_FAILURE_KEEP, ON_FAILURE_REMOVE */
     /* daemon-only bookkeeping (not persisted) */
     int seen;                 /* present in the latest scan of the config dir */
     int dirty;                /* needs (re)install */
@@ -220,6 +234,7 @@ struct slot {
     int has_includes;         /* hash covers included files; mtime alone does not show changes */
     int from_template;        /* comes from %all% or %<kind>% for this interface */
     int excluded;             /* the chosen file is empty: nothing at this priority */
+    char conflict[640];       /* two files for this priority (20.acl and 20.bpfc): why it cannot be installed */
     time_t reinstall_window;  /* start of the current one-minute reinstall window */
     int reinstall_count;
 };
@@ -254,6 +269,10 @@ void parse_name_line(const char *out, char *name, size_t namelen);
 /* Path of the saved bpfc output for a failed slot. */
 void error_log_path(char *out, size_t outlen, const char *state_dir,
                     const char *iface, int dir, int prio);
+/* <state_dir>/meta/<iface>.<dir>.<prio>: the program's meta lines (bpfc -I BPFC_META);
+ * <state_dir>/generated/<iface>.<dir>.<prio>.bpfc: a frontend's output. */
+void meta_path(char *out, size_t outlen, const char *state_dir, const char *iface, int dir, int prio);
+void generated_path(char *out, size_t outlen, const char *state_dir, const char *iface, int dir, int prio);
 
 /* ---------------- TC filter dump ---------------- */
 

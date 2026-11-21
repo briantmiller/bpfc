@@ -55,7 +55,10 @@ ok  KC-hash-5tuple   "hash K 64 ip-src ip-dst ip-proto src-port dst-port"
 ok  KC-hash-sym      "hash K 64 symmetric ip-src ip-dst ip-proto src-port dst-port"
 ok  KC-hash-buckets  "hash B buckets 3 symmetric ip-src ip-dst ip-proto src-port dst-port"
 ok  KC-hash-ip6      "hash K 64 symmetric ip6-src ip6-dst ip6-proto src-port dst-port"
-ok  KC-hash-ip6-pfx  "hash K 32 ip6-src/64 ip6-dst/48"
+ok  KC-hash-ip6-pfx  "hash K 32 ip6-src/64 ip6-dst/48 ip6-src/96"
+ok  KC-pack-ip6-pfx  "pack K ip6-src/48 ip6-dst/16"
+ok  KC-v6-matches    "match host fd00::1; drop; end-match; match net fd00::/8; drop; end-match; match port 53; drop; end-match; match icmp6; drop; end-match"
+ok  KC-v6-prefix-map "prefix-map P6 ipv6; match ip6-src in P6 V; drop; end-match"
 ok  KC-hash-seed     "decl S 8; set val S 5; hash K 20 seed %S ip-src icmp-id"
 ok  KC-hash-get      "hash K 64 gre-key skb-mark bytes 14 4"
 ok  KC-pack          "pack K vlan-id dscp ecn ip-ttl ip-proto icmp-id"
@@ -87,6 +90,8 @@ bad KC-raw-mac       -s L3OFF=0 "pack K src-mac"
 bad KC-pack-const    "pack K 6 ip-src"
 bad KC-seen-unit     "match seen D ip-src within 50; drop; end-match"
 bad KC-in-not-prefix "match ip-src in NOTPFX; drop; end-match"
+bad KC-in-family     "prefix-map P4X; match ip6-src in P4X; drop; end-match"
+bad KC-pack-ip6-wide "pack K ip6-src/64 dst-port"
 
 echo "== bpfc -H"
 eqk "-H pack: src << 32 | dst" "$(H pack ip-src=10.88.0.1 ip-dst=10.88.0.2)" 0x0a5800010a580002
@@ -171,10 +176,51 @@ eqk "MACs and EtherType" "$(v KM 1)" "$(H hash 40 src-mac=$AMAC dst-mac=$BMAC et
 T6="ip6-src=fd88::1 ip6-dst=fd88::2 ip6-proto=17 src-port=3333 dst-port=4444"
 eqk "IPv6 hash" "$(v KH6 21)" "$(H hash 64 $T6)"
 eqk "IPv6 symmetric, both directions" "$(v KS6 22)" "$(v KS6 21)"
-eqk "IPv6 extension header: no ports" "$(v KH6 23)" "$(H hash 64 ip6-src=fd88::1 ip6-dst=fd88::2 ip6-proto=0 src-port=0 dst-port=0)"
+eqk "IPv6 behind a hop-by-hop header: the ports are found" "$(v KH6 23)" "$(H hash 64 ip6-src=fd88::1 ip6-dst=fd88::2 ip6-proto=0 src-port=3333 dst-port=4444)"
 eqk "IPv6 pack" "$(v KP6 21)" "$(H pack ip6-proto=17 ip6-flow=21 src-port=3333)"
 eqk "ARP: an IPv4 key is absent (0)" "$(v KA 1)" 0x0000000000000000
 eqk "ARP: a key of any-packet fields is not" "$(v KA 2)" "$(H pack vlan-id=0 src-mac:8=$AMAC)"
+B $BPFC -i kb0 -c
+
+echo "== IPv6: prefixes, fragments, host/net/port, dscp, prefix maps"
+B $BPFC -m $MAPS -i kb0 -d ingress -p 10 'array-map V6K 64; prefix-map P6 64 ipv6;
+match ip6;
+  get ip6-flow I;
+  hash K 64 ip6-src ip6-dst src-port dst-port; set map V6K %I %K;
+  pack K ip6-src/48 ip6-dst/16; calc add I 32; set map V6K %I %K;
+end-match;
+match udp; match dst-port 9200; calc-map add V6C 0 1; end-match; end-match;
+match port 9201; calc-map add V6C 1 1; end-match;
+match host fd88::7; calc-map add V6C 2 1; end-match;
+match net fd99::/16; calc-map add V6C 3 1; end-match;
+match dscp ef; calc-map add V6C 4 1; end-match;
+match icmp6; calc-map add V6C 5 1; end-match;
+if ip6-src in P6 V; calc-map add V6C %V 1; end-if;
+match ip6; match dst-port 9202; get src-port SP; set map V6C 6 %SP; get dscp D; set map V6C 7 %D; set dscp af41; end-match; end-match;
+continue' >/dev/null || test_fail "IPv6 program attaches"
+B $BPFC -m $MAPS -i kb0 -d ingress -p 20 'match ip6; match dst-port 9202; get dscp D; set map V6C 8 %D; end-match; end-match' >/dev/null
+$BPFC -m $MAPS -w P6 fd88::/64 10 >/dev/null; $BPFC -m $MAPS -w P6 fd88::8:0/112 11 >/dev/null
+send l3=6,proto=udp,src=fd88::1,dst=fd88::2,sport=5,dport=6,frag6=first,ident=1 \
+     l3=6,proto=udp,src=fd88::1,dst=fd88::2,sport=5,dport=6,frag6=later,ident=2 \
+     l3=6,proto=udp,src=fd88:0:0:0:abcd::1,dst=fd88::2,sport=5,dport=6,ident=3 \
+     l3=6,proto=udp,src=fd99::1,dst=fd88::2,dport=9201,hbh=1,ident=4 \
+     l3=6,proto=tcp,src=fd88::1,dst=fd88::7,dport=80,ident=5 \
+     l3=6,proto=udp,src=fd88::8:5,dst=fd88::2,sport=4321,dport=9202,tos=184,ident=6 \
+     l3=6,proto=icmp,src=fd88::1,dst=fd88::2,ident=7
+eqk "IPv6 first fragment: ports 0" "$(v V6K 1)" "$(H hash 64 ip6-src=fd88::1 ip6-dst=fd88::2 src-port=0 dst-port=0)"
+eqk "IPv6 later fragment: the same key" "$(v V6K 2)" "$(v V6K 1)"
+eqk "pack ip6-src/48 ip6-dst/16" "$(v V6K 35)" "$(H pack ip6-src/48=fd88:0:0:0:abcd::1 ip6-dst/16=fd88::2)"
+check "match port: IPv6 behind a hop-by-hop header ($(( $(v V6C 1) )))" [ $(( $(v V6C 1) )) -eq 1 ]
+check "match host: an IPv6 destination ($(( $(v V6C 2) )))" [ $(( $(v V6C 2) )) -eq 1 ]
+check "match net: an IPv6 source prefix ($(( $(v V6C 3) )))" [ $(( $(v V6C 3) )) -eq 1 ]
+check "match dscp ef: the traffic class ($(( $(v V6C 4) )))" [ $(( $(v V6C 4) )) -eq 1 ]
+check "match icmp6 ($(( $(v V6C 5) )))" [ $(( $(v V6C 5) )) -eq 1 ]
+check "IPv6 prefix map: longest match (/64: $(( $(v V6C 10) )), /112: $(( $(v V6C 11) )))" [ $(( $(v V6C 10) )) -eq 5 -a $(( $(v V6C 11) )) -eq 1 ]
+check "-r lists IPv6 prefixes" sh -c "$BPFC -m $MAPS -r P6 | grep -qx 'fd88::8:0/112 11'"
+eqk "get src-port, IPv6" "$(v V6C 6)" "$(printf 0x%016x 4321)"
+eqk "get dscp, IPv6 (ef)" "$(v V6C 7)" "$(printf 0x%016x 46)"
+eqk "set dscp af41 on IPv6, seen by the next program" "$(v V6C 8)" "$(printf 0x%016x 34)"
+check "-K decodes an IPv6 prefix" sh -c "$BPFC -m $MAPS -w V6C 'pack ip6-src/48=fd88:1:2::9' 7 >/dev/null && $BPFC -m $MAPS -r V6C -K 'ip6-src/48' | grep -qx 'fd88:1:2::/48 7'"
 B $BPFC -i kb0 -c
 
 echo "== unpack, get, set"

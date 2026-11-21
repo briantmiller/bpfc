@@ -21,6 +21,10 @@ bpfc \- Pure C eBPF bytecode compiler and direct network fabric loader
 .RB [ \-L
 .IR dir ]
 .RB [ \-E | \-M ]
+.RB [ \-F
+.IR type ]
+.RB [ \-G
+.IR file ]
 .RI { "<instructions>" " | " \-f " file" }
 .PP
 .B bpfc
@@ -137,6 +141,12 @@ Set the constant \fINAME\fR, overriding a \fBconst\fR \fINAME\fR in the program.
 .BI \-L " dir"
 Search \fIdir\fR for include files, before the default \fI/etc/bpfc/include\fR. May be given more than once.
 .TP
+.BI \-F " type"
+The type of the \fB\-f\fR file, whatever its name: \fBbpfc\fR (compile it as it is) or the name of a frontend (\fB\-F acl\fR). Without \fB\-F\fR, a file named \fIx\fB.\fItype\fR other than \fB.bpfc\fR goes through the frontend for \fItype\fR; see FRONTENDS.
+.TP
+.BI \-G " file"
+Write the bpfc a frontend produced to \fIfile\fR (\fBbpfcd\fR keeps it for \fBbpfcctl show \-\-source\fR).
+.TP
 .B \-M
 Print the program file and every file it includes, one per line, and exit. \fBbpfcd\fR(8) uses this to notice changes to included files.
 .TP
@@ -181,6 +191,15 @@ Define \fB$\fINAME\fR. A number or constant expression is stored as a number, an
 .TP
 \fBdefine\fR \fINAME\fR [\fIPARAM\fR ...] ; ... ; \fBend-define\fR
 Define a macro, used as an instruction: \fINAME arg ...\fR. In the body, \fB$\fIPARAM\fR is the argument and \fB$UNIQUE\fR a number unique to each use (for labels). The body sees only its parameters and consts. A macro may not be named after a bpfc instruction.
+.TP
+.BI "depends " file
+The program also depends on \fIfile\fR: \fB\-M\fR lists it, so \fBbpfcd\fR reinstalls the program when it changes. For frontends, whose input is more than the file they were given.
+.TP
+.BI "meta " text
+A line for \fBbpfcd\fR and \fBbpfcctl\fR, printed by \fB\-I\fR as \fBBPFC_META\fR \fItext\fR; generates no code. bpfcd keeps them in \fI<state_dir>/meta\fR (the \fBacl\fR frontend describes each entry and its counter this way).
+.TP
+.BR "option on-failure " keep|remove
+For \fBbpfcd\fR: when a new version of this program fails to compile or load, keep the running one (\fBkeep\fR, the default of \fIon_failure\fR in \fBbpfc.conf\fR(5)) or remove it. \fB\-I\fR prints \fBBPFC_OPTION on-failure\fR \fIvalue\fR.
 .TP
 .BI "name " text
 The program's name, for people: \fBbpfcd\fR records it and \fBbpfcctl status\fR and the REST API show it. It generates no code and is printed only by \fB\-I\fR (as \fBBPFC_NAME\fR); it does not change the filter or kernel program name (\fB\-n\fR). \fItext\fR is the rest of the instruction, up to 64 bytes, with runs of spaces collapsed; one pair of surrounding double quotes is optional; \fB$\fR substitution applies, so \fBname guard on $IFNAME\fR works in a template. It cannot contain \fB;\fR. Giving the same name again is allowed. A name in the file being compiled wins over one in a file it includes, so a library may have its own name; two different names in the same file, or in two included files when the program has none of its own, are an error. A \fBname\fR in a branch \fBwhen\fR drops is ignored.
@@ -332,8 +351,11 @@ True when the key was seen less than \fItime\fR (\fBns\fR, \fBus\fR, \fBms\fR, \
 .BI "match over-rate " "MAP key ... rate [burst size]"
 True for packets above \fIrate\fR per key: \fIn\fB/s\fR or \fIn\fBpps\fR (burst in packets), or \fIn\fBbit\fR, \fBkbit\fR, \fBmbit\fR, \fBgbit\fR (burst in bytes, \fBk\fR = 1024). The burst defaults to 100 ms of the rate. A lock-free GCRA policer.
 .TP
-.BI "prefix-map " "MAP [entries]"
-Declare a longest-prefix-match table of IPv4 prefixes (64-bit values), filled with \fBbpfc \-w\fR \fIMAP prefix value\fR.
+.BI "prefix-map " "MAP [entries] [ipv6] [static]"
+Declare a longest-prefix-match table of IPv4 (with \fBipv6\fR: IPv6) prefixes (64-bit values), filled with \fBbpfc \-w\fR \fIMAP prefix value\fR. A \fBstatic\fR map holds exactly the program's \fBprefix\fR lines: they are written when the program is attached, and entries the program no longer lists are deleted.
+.TP
+.BI "prefix " "MAP prefix [value]"
+An entry (value default 1) of a static prefix map.
 .TP
 .BI "match " "ip-src|ip-dst|%VAR " "in " "MAP [VAR]"
 True when the address is in one of the map's prefixes; \fIVAR\fR gets the longest match's value.
@@ -344,7 +366,16 @@ IPv4 source or destination address, prefix or TCP/UDP/SCTP port (not later fragm
 .BI "match|set " "dscp|ecn name|n"
 DSCP (\fBdefault\fR, \fBle\fR, \fBcs0\fR\-\fBcs7\fR, \fBaf11\fR\-\fBaf43\fR, \fBva\fR, \fBef\fR or 0\-63) or ECN (\fBnot-ect\fR, \fBect1\fR, \fBect0\fR, \fBce\fR); \fBset\fR keeps the other bits and updates the checksum.
 .TP
-.BI "get " "src-port|dst-port|dscp|ecn|ip-ttl|icmp-id|icmp-type|icmp-code VAR"
+.BI "transport " "PROTO SPORT DPORT TCPFLAGS ICMPTYPE ICMPCODE FRAGOFF"
+Read the transport header once into seven variables (\fB\-\fR skips one): the protocol (IPv6: after up to four extension headers, fragment headers included), the ports (TCP, UDP, SCTP), the TCP flags, the ICMP or ICMPv6 type and code, and the fragment offset. Ports, flags and ICMP fields are 0 in a later fragment (\fIFRAGOFF\fR not 0), which has no transport header. Rules that then compare variables cost a few instructions each; the \fBacl\fR frontend is built on this.
+.TP
+.BI "ringbuf-map " "MAP [bytes]"
+Declare a ring buffer (default 262144 bytes, a power of two) for \fBlog\fR.
+.TP
+.BI "log " "MAP id|%VAR [bytes]"
+Put one record in a ring buffer: the time (ns, CLOCK_MONOTONIC, 8 bytes), \fIid\fR (8), the interface index (4), the packet length (4), then the first \fIbytes\fR (default 96, a multiple of 8 up to 256) of the frame, zero padded. A full buffer drops the record. Rate-limit it (\fBmatch seen\fR) for anything but rare events.
+.TP
+.BI "get " "src-port|dst-port|dscp|ecn|ip-ttl|icmp-id|icmp-type|icmp-code|tcp-flags|l4-proto|frag-off VAR"
 .TP
 .BI "set " "src-port|dst-port n|%VAR"
 TCP or UDP, with the checksum.
@@ -432,6 +463,29 @@ The packet length, from \fBbpf_xdp_get_buff_len\fR. \fBget skb\-ingress\fR and \
 Commands that need an skb are a compile error naming the command: \fBip\-frag\fR, \fBip\-defrag\fR, \fBclone\fR, \fBredirect\-neigh\fR, \fBreclassify\fR, and the skb fields (\fBskb\-mark\fR, \fBskb\-hash\fR, \fBskb\-priority\fR, \fBgso\-segs\fR, \fBskb\-cb\fR, \fBprotocol\fR, \fBtstamp\fR, \fBset queue\fR). Maps, buffer maps, \fBxor\-packet\fR, \fBcalc\-csum\fR, \fBfib\-lookup\fR and the rest work.
 .PP
 The constants \fB$XDP\fR (1 in an XDP program, else 0) and \fB$HOOK\fR (\fBingress\fR, \fBegress\fR or \fBxdp\fR) let one file serve several hooks: \fBwhen $XDP == 0\fR ... \fBend\-when\fR.
+.SH FRONTENDS
+A frontend turns another kind of file into bpfc. For \fB\-f 20.acl\fR bpfc runs the frontend \fBacl\fR with the file's path as its only argument and compiles what it prints. Frontends are looked up in \fI/etc/bpfc/frontends\fR, then \fI/usr/libexec/bpfc/frontends\fR (\fBBPFC_FRONTEND_DIRS\fR, a colon-separated list, replaces both); the first wins, so a file in /etc overrides the packaged one. A frontend is any executable: a shell or Python script or a binary. It and its directory must be owned by root (or the user running bpfc) and not writable by group or others.
+.PP
+bpfc runs it in the file's directory, as user \fBbpfc\fR (or \fBnobody\fR; \fBBPFC_FRONTEND_USER\fR names another) when run as root, with no new privileges, no standard input, a 10-second limit (\fBBPFC_FRONTEND_TIMEOUT\fR) and at most 16 MiB of output, in a clean environment:
+.TP
+.B BPFC_FRONTEND_API
+1, the version of this contract.
+.TP
+.B BPFC_FILE
+the file being translated (also the argument).
+.TP
+.BR BPFC_IFNAME ", " BPFC_IFINDEX ", " BPFC_IFKIND ", " BPFC_IFTYPE ", " BPFC_L3OFF
+the \fB\-i\fR interface: name, index, kind (veth, nic, ...), ARPHRD type, offset of the IP header (14 on Ethernet, 0 on a tunnel).
+.TP
+.BR BPFC_HOOK ", " BPFC_PRIO
+ingress, egress or xdp, and the \fB\-p\fR priority.
+.TP
+.BR BPFC_CONF_DIR ", " BPFC_MAP_DIR ", " BPFC_BPFC
+\fI/etc/bpfc\fR (\fBBPFC_CONF_ROOT\fR), the map directory, and the path of bpfc.
+.PP
+Its output is bpfc with each instruction ending in \fB;\fR (newlines alone do not separate them). It should print \fBdepends\fR for every other file it read, \fBname\fR, and \fBoption\fR and \fBmeta\fR as it needs; error messages go to standard error as \fIfile\fB:\fIline\fB: \fImessage\fR, with a non-zero exit status. \fB\-M\fR lists the frontend itself among the program's files.
+.PP
+The \fBacl\fR frontend (Cisco IOS access lists) comes with bpfc; see \fI/usr/share/doc/bpfc/firewall.md\fR.
 .SH EXAMPLES
 .PP
 Intercept traffic matching a specific destination IP, force a VLAN tag on it, and redirect it to a monitoring interface:
@@ -457,6 +511,19 @@ Drop UDP to port 9 at the XDP hook of eth0, then remove the program:
 .RE
 .SH NOTES
 The 512-byte eBPF stack holds 128 bytes of fixed instruction scratch, then one 8-byte slot per variable (two for a 16-byte IPv6 address), up to 48 slots. Instructions that need more scratch (\fBfib-lookup\fR 72 bytes, \fBpush-eth\fR 32, byte insertion and deletion) use the space below the variables while they run. \fBxor-packet\fR and the TCP/UDP checksums work in chunks of up to 256 bytes, smaller when more than 16 variables leave less room (more verifier instructions, same result). \fBfib-lookup\fR adds five variables. When something does not fit, bpfc names the instruction and the bytes it needs; \fBfree\fR variables that are no longer used. Arbitrary byte injection (\fBadd-bytes\fR) is constrained to 256 bytes per instruction to satisfy kernel verifier bounds.
+.SH ENVIRONMENT
+.TP
+.B BPFC_FRONTEND_DIRS
+where frontends are looked up (default \fI/etc/bpfc/frontends:/usr/libexec/bpfc/frontends\fR).
+.TP
+.B BPFC_FRONTEND_TIMEOUT
+seconds a frontend may take (default 10).
+.TP
+.B BPFC_FRONTEND_USER
+the user frontends run as when bpfc runs as root (default \fBbpfc\fR, else \fBnobody\fR).
+.TP
+.B BPFC_CONF_ROOT
+passed to frontends as \fBBPFC_CONF_DIR\fR (default \fI/etc/bpfc\fR).
 .SH SEE ALSO
 .BR bpfcd (8),
 .BR bpfcctl (8),

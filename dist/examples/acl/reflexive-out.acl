@@ -1,0 +1,10 @@
+! interfaces.d/eth0/egress/10.acl: everything going out makes an entry in
+! the reflexive list MIRROR, which lets the replies back in (see
+! reflexive-in.acl). Sessions end after 300 s idle (ip reflexive-list
+! timeout), 5 s after a FIN or RST.
+ip reflexive-list timeout 300
+ip access-list extended OUTBOUND
+ 10 permit tcp any any reflect MIRROR
+ 20 permit udp any any reflect MIRROR timeout 30
+ 30 permit icmp any any reflect MIRROR timeout 10
+ 40 permit ip any any

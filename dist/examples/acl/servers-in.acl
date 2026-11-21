@@ -1,0 +1,3 @@
+! interfaces.d/eth1/ingress/20.acl: apply SERVERS-IN (from acl.d) to eth1
+interface eth1
+ ip access-group SERVERS-IN in

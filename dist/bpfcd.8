@@ -26,6 +26,7 @@ hook, of the matching interfaces. It is normally started by systemd as
 /etc/bpfc/interfaces.d/%all%/{ingress,egress}/<priority>.bpfc
 /etc/bpfc/interfaces.d/%<kind>%/{ingress,egress}/<priority>.bpfc
 /etc/bpfc/interfaces.d/{<interface>,%all%,%<kind>%}/xdp.bpfc
+/etc/bpfc/interfaces.d/.../<priority>.<type>    (a frontend's file: 20.acl)
 .EE
 .PP
 The priority is 1\-65535 without leading zeros; lower priorities run first.
@@ -33,6 +34,32 @@ Each file holds bpfc instructions separated by \(oq;\(cq. A \(oq#\(cq at the sta
 an instruction begins a comment that ends at the end of the line. Files that
 do not follow this naming are ignored with a warning; world-writable files are
 refused, since a program can drop or redirect any traffic.
+.SS Other file types
+A file named
+.IB priority . type
+(or
+.BI xdp. type\fR)
+other than \fB.bpfc\fR is translated by the frontend for \fItype\fR (see
+FRONTENDS in \fBbpfc\fR(8)) every time it is compiled; everything else about
+it is as for a \fB.bpfc\fR file. In these files \(oq!\(cq also starts a comment, as
+in IOS. A change to the file, to a file the frontend \fBdepends\fR on, or to the
+frontend itself reinstalls the program. Two files for one priority
+(\fB20.bpfc\fR and \fB20.acl\fR) are an error: neither is installed and
+\fBbpfcctl status\fR names both. The translation is kept in
+\fI/run/bpfc/generated\fR for \fBbpfcctl show \-\-source\fR, and the program's
+\fBmeta\fR lines in \fI/run/bpfc/meta\fR.
+.PP
+The \fBacl\fR frontend applies Cisco IOS access lists; their counters are
+shown by \fBbpfcctl show access-lists\fR, and for entries with \fBlog\fR or
+\fBlog-input\fR bpfcd reads the log ring buffer (\fBBPFC_ACL_LOG\fR in the map
+directory) and writes one line per flow, as IOS does
+(\fB%SEC-6-IPACCESSLOGP: list WEB permitted tcp 10.9.0.1(4321) -> 10.0.0.9(80), 1 packet\fR),
+to its log and to \fI/run/bpfc/acl.log\fR (\fBbpfcctl log\fR). See
+\fI/usr/share/doc/bpfc/firewall.md\fR.
+.SS When a new version fails
+By default the program that is running stays attached and its status is
+\fBfailed-kept\fR. \fIon_failure\fR in \fBbpfc.conf\fR(5), or the program's own
+\fBoption on-failure keep|remove\fR, can have it removed instead.
 .SS XDP
 .I xdp.bpfc
 in an interface's directory is that interface's XDP program, compiled with
@@ -508,6 +535,18 @@ Current state, read by
 .TP
 .I /run/bpfc/errors/
 bpfc output of failed programs.
+.TP
+.I /run/bpfc/meta/ ", " /run/bpfc/generated/
+programs' meta lines, and frontends' translations.
+.TP
+.I /run/bpfc/acl.log
+access-list log lines (\fBacl.log.1\fR: the previous 16 MiB).
+.TP
+.I /etc/bpfc/frontends/ ", " /usr/libexec/bpfc/frontends/
+frontends, the first overriding the second.
+.TP
+.I /etc/bpfc/acl.d/
+access lists and object groups shared by all \fB.acl\fR files.
 .TP
 .I /run/bpfc/bpfcd.pid
 PID file, locked while bpfcd runs.

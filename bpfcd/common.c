@@ -48,6 +48,7 @@ static const char *const status_names[ST__COUNT] = {
     [ST_DISABLED] = "reinstall-limit",
     [ST_EXCLUDED] = "excluded",
     [ST_INSTALLING] = "installing",
+    [ST_KEPT] = "failed-kept",
 };
 
 const char *status_name(int st) {
@@ -226,6 +227,7 @@ void config_defaults(struct config *c) {
     c->remove_on_stop = 0;
     c->reinstall_limit = 5;
     c->compile_timeout = 30;
+    c->on_failure = ON_FAILURE_KEEP;
     c->log_level = LOG_LVL_INFO;
     snprintf(c->rest_owner, sizeof(c->rest_owner), "%s", DEFAULT_REST_OWNER);
     c->rest_mode = DEFAULT_REST_MODE;
@@ -275,7 +277,7 @@ static int parse_int(const char *v, int lo, int hi, int *out) {
 /* Settings that can be given in bpfc.conf and, upper-cased with a BPFCD_ prefix, in the environment. */
 static const char *const config_keys[] = {
     "bpfc_path", "config_dir", "state_dir", "map_dir", "on_external_change",
-    "remove_on_stop", "reinstall_limit", "compile_timeout", "log_level",
+    "remove_on_stop", "reinstall_limit", "compile_timeout", "on_failure", "log_level",
     "netns_path", "netns_veth", "rest_socket", "rest_socket_owner", "rest_socket_mode", "rest_dir", NULL};
 
 /* Applies one setting. Returns 0, -1 for an unknown key, -2 for an invalid value. */
@@ -321,6 +323,10 @@ static int config_set(struct config *c, const char *k, const char *v) {
     else if (!strcmp(k, "on_external_change")) {
         if (!strcmp(v, "reinstall")) c->on_external_change = EXT_REINSTALL;
         else if (!strcmp(v, "log")) c->on_external_change = EXT_LOG;
+        else return -2;
+    } else if (!strcmp(k, "on_failure")) {
+        if (!strcmp(v, "keep")) c->on_failure = ON_FAILURE_KEEP;
+        else if (!strcmp(v, "remove")) c->on_failure = ON_FAILURE_REMOVE;
         else return -2;
     } else if (!strcmp(k, "remove_on_stop")) { if (parse_bool(v, &c->remove_on_stop) < 0) return -2; }
     else if (!strcmp(k, "reinstall_limit")) { if (parse_int(v, 0, 1000, &c->reinstall_limit) < 0) return -2; }
@@ -669,10 +675,22 @@ static int mentions_include(const char *path) {
     return found;
 }
 
-int sha256_program(const char *bpfc_path, const char *path, int timeout_s,
+int program_type(const char *fname, char *type, size_t len) {
+    const char *dot = strrchr(fname, '.');
+    if (!dot || dot == fname || !dot[1] || strlen(dot + 1) > 15) return -1;
+    for (const char *p = dot + 1; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9'))) return -1;
+    if (type) snprintf(type, len, "%s", dot + 1);
+    return strcmp(dot + 1, "bpfc") ? 1 : 0;
+}
+
+int sha256_program(const char *bpfc_path, const char *path, const char *dir, int timeout_s,
                    char out_hex[65], int *has_includes) {
     *has_includes = 0;
-    int m = mentions_include(path);
+    const char *base = strrchr(path, '/');
+    /* a frontend's input: always through bpfc -M, which runs the frontend and
+     * lists the frontend itself and every file it depends on */
+    int m = program_type(base ? base + 1 : path, NULL, 0) == 1 ? 1 : mentions_include(path);
     if (m < 0) return m;
     if (!m) return sha256_file(path, out_hex);
     *has_includes = 1;
@@ -681,7 +699,7 @@ int sha256_program(const char *bpfc_path, const char *path, int timeout_s,
     int rc = sha256_file(path, main_hex);
     if (rc < 0) return rc;
 
-    char *argv[] = {(char *)bpfc_path, "-M", "-f", (char *)path, NULL};
+    char *argv[] = {(char *)bpfc_path, "-M", "-d", (char *)(dir ? dir : "ingress"), "-f", (char *)path, NULL};
     struct run_result r;
     rc = run_capture(argv, &r, timeout_s, NULL);
     if (rc < 0) return rc;
@@ -869,6 +887,7 @@ int state_write(const char *path, const struct daemon_info *di,
         snprintf(num, sizeof(num), "%lld", (long long)s->installed_at); put_enc(f, "installed_at", num);
         snprintf(num, sizeof(num), "%lld", (long long)s->changed_at); put_enc(f, "changed_at", num);
         put_enc(f, "error", s->error);
+        if (s->on_failure) put_enc(f, "on_failure", s->on_failure == ON_FAILURE_KEEP ? "keep" : "remove");
         fputc('\n', f);
     }
     if (fflush(f) != 0 || fsync(fd) != 0) { int e = -errno; fclose(f); unlink(tmp); return e; }
@@ -944,6 +963,7 @@ int state_read(const char *path, struct daemon_info *di, struct slot **slots_out
             else if (!strcmp(k, "installed_at")) s->installed_at = (time_t)atoll(val);
             else if (!strcmp(k, "changed_at")) s->changed_at = (time_t)atoll(val);
             else if (!strcmp(k, "error")) snprintf(s->error, sizeof(s->error), "%s", val);
+            else if (!strcmp(k, "on_failure")) s->on_failure = !strcmp(val, "keep") ? ON_FAILURE_KEEP : !strcmp(val, "remove") ? ON_FAILURE_REMOVE : 0;
         }
         /* Drop records missing their identity rather than guessing. */
         if (s && (!s->iface[0] || (s->dir == DIR_XDP ? s->prio != 0 : s->prio <= 0) || s->status < 0)) n--;
@@ -968,6 +988,14 @@ void parse_name_line(const char *out, char *name, size_t namelen) {
         }
         p = nl ? nl + 1 : NULL;
     }
+}
+
+void meta_path(char *out, size_t outlen, const char *state_dir, const char *iface, int dir, int prio) {
+    snprintf(out, outlen, "%s/meta/%s.%s.%d", state_dir, iface, dir_name(dir), prio);
+}
+
+void generated_path(char *out, size_t outlen, const char *state_dir, const char *iface, int dir, int prio) {
+    snprintf(out, outlen, "%s/generated/%s.%s.%d.bpfc", state_dir, iface, dir_name(dir), prio);
 }
 
 void error_log_path(char *out, size_t outlen, const char *state_dir,

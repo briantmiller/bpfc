@@ -1,0 +1,7 @@
+! interfaces.d/eth2/ingress/5.acl: what may arrive on an access port that is
+! not IP. A MAC list sees only non-IP frames (IPv4 and IPv6 pass it), as on
+! IOS; give it an IP list too in the same file for those.
+mac access-list extended PORT-L2
+ permit any any 0x0806 0x0
+ permit any host 0180.c200.0000
+ deny any any log

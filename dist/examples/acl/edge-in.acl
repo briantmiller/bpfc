@@ -1,0 +1,22 @@
+! interfaces.d/eth0/ingress/10.acl: an internet edge, inbound.
+! A list defined here and nothing else: it applies to this interface and
+! direction (the directory says which).
+ip access-list extended EDGE-IN
+ remark anti-spoofing: our own and private space never comes from outside
+ 10 deny ip 10.0.0.0 0.255.255.255 any log
+ 20 deny ip 172.16.0.0 0.15.255.255 any log
+ 30 deny ip 192.168.0.0 0.0.255.255 any log
+ 40 deny ip 203.0.113.0 0.0.0.255 any log
+ remark replies to connections from the inside
+ 50 permit tcp any 203.0.113.0 0.0.0.255 established
+ remark services
+ 60 permit tcp any host 203.0.113.25 eq smtp
+ 70 permit udp any host 203.0.113.53 eq domain
+ 80 permit tcp any host 203.0.113.53 eq domain
+ 90 permit udp any eq domain 203.0.113.0 0.0.0.255
+ 100 permit udp any eq ntp 203.0.113.0 0.0.0.255 eq ntp
+ 110 permit icmp any any echo-reply
+ 120 permit icmp any any packet-too-big
+ 130 permit icmp any any time-exceeded
+ 140 permit icmp any any unreachable
+ 150 deny ip any any log

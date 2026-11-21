@@ -7,6 +7,7 @@ A spec is key=value words separated by commas:
     l3=4|6|arp  proto=udp|tcp|icmp|<n>  src=<addr> dst=<addr>  sport= dport=
     ident=<n> (IPv4 identification; IPv6: flow label)  tos=<n>  ttl=<n>
     vlan=<id>  frag=mf|off  ihl=<5-15>  hbh=1 (IPv6 hop-by-hop header first)
+    frag6=first|later|last (IPv6 fragment header)
     icmptype=<n> icmpid=<n>  tcpflags=<n> (default 24: PSH ACK; 2: SYN)
     len=<payload bytes>  count=<n>  gap=<seconds>
 """
@@ -85,8 +86,12 @@ def build(spec, smac, dmac):
             off = {17: 6, 6: 16, 58: 2}[pnum]
             l4 = l4[:off] + struct.pack("!H", c or 0xFFFF) + l4[off + 2:]
         nh, ext = pnum, b""
+        if p.get("frag6"):
+            off = {"first": 0x0001, "later": 0x0008 << 3 | 0x0001, "last": 0x0008 << 3}[p["frag6"]]
+            ext = struct.pack("!BBHI", nh, 0, off, 0x1234)
+            nh = 44
         if p.get("hbh"):
-            ext = struct.pack("!BB6s", pnum, 0, b"\x01\x04\0\0\0\0")
+            ext = struct.pack("!BB6s", nh, 0, b"\x01\x04\0\0\0\0") + ext
             nh = 0
         flow = int(p.get("ident", "1")) & 0xFFFFF
         l3b = struct.pack("!IHBB16s16s", 6 << 28 | int(p.get("tos", "0")) << 20 | flow,

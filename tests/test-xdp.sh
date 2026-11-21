@@ -313,9 +313,11 @@ id1=$(hid xdpdA)
 printf 'match udp; drop\n' > "$CFG/xdpdA/xdp.bpfc"; reload
 dcheck BD-XDP-edit-replaces       eval 'id=$(hid xdpdA); [ -n "$id" ] && [ "$id" != "$id1" ]'
 
+id2=$(hid xdpdA)
 printf 'set skb-mark 1\n' > "$CFG/xdpdA/xdp.bpfc"; reload
-dcheck BD-XDP-failed              is_status xdpdA failed
-dcheck BD-XDP-failed-removed      no_xdp xdpdA
+# on_failure = keep (the default): the previous XDP program stays attached
+dcheck BD-XDP-failed              is_status xdpdA failed-kept
+dcheck BD-XDP-failed-kept         eval '[ "$(hid xdpdA)" = "$id2" ]'
 dcheck BD-XDP-failed-error-log    eval 'grep -q "not available in XDP programs" "$T/run/errors/xdpdA.xdp.0.log"'
 dcheck BD-XDP-ctl-show-failed     eval '"$BPFCCTL" -s "$T/run" show xdpdA xdp | grep -q "not available in XDP"'
 

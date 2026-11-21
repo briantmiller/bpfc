@@ -20,6 +20,13 @@
 #include <linux/pkt_sched.h>
 #include <linux/tc_act/tc_bpf.h>
 #include <linux/if_ether.h>
+#include <pwd.h>
+#include <grp.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
+#include <time.h>
 
 // 1. Check for GCC/Clang built-in macros
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && defined(__ORDER_BIG_ENDIAN__)
@@ -206,7 +213,7 @@ static void emit_load_operand(int reg, const char *arg);
 /* --- Map Tracking (Symbol Table) --- */
 #define MAX_MAPS 16
 char verifier_log_buf[BPF_LOG_BUF_SIZE];
-struct { char name[32]; int fd; int is_buf; int is_array; int percpu; int is_lpm; uint32_t entries; uint32_t vsize; } maps[MAX_MAPS];
+struct { char name[32]; int fd; int is_buf; int is_array; int percpu; int is_lpm; int is_rb; uint32_t entries; uint32_t vsize; } maps[MAX_MAPS];
 int num_maps = 0;
 
 char bpf_map_dir[255] = BPF_FS_DIR;
@@ -376,6 +383,7 @@ static struct bpf_insn xdp_call(struct bpf_insn in) {
         return xdp_sub_call(in, XSUB_ROOM);
     case 39: /* skb_pull_data: XDP data is always linear */
         { struct bpf_insn z = BPF_MOV64_IMM(BPF_REG_0, 0); return z; }
+    case 130:                        /* ringbuf_output (log) */
     case 1: case 2: case 3:          /* map lookup/update/delete */
     case 5: case 6: case 7: case 8:  /* ktime, trace_printk, prandom, cpu */
     case 12:                         /* tail_call */
@@ -4831,6 +4839,13 @@ int map_is_array(int fd) {
     return 0;
 }
 
+/* True if fd is a ring buffer of this program. */
+int map_is_rb(int fd) {
+    for (int i = 0; i < num_maps; i++)
+        if (maps[i].fd == fd) return maps[i].is_rb;
+    return 0;
+}
+
 /* True if fd is a prefix map (LPM trie) of this program. */
 int map_is_lpm(int fd) {
     for (int i = 0; i < num_maps; i++)
@@ -4952,7 +4967,7 @@ int get_or_create_map(const char *name) {
         if (map_info(fd, &info) == 0) {
             entries = info.max_entries;
             if (info.type == BPF_MAP_TYPE_ARRAY && info.value_size == 8) is_array = 1;
-            if (info.type == BPF_MAP_TYPE_LPM_TRIE) is_lpm = 1;
+            if (info.type == BPF_MAP_TYPE_LPM_TRIE) is_lpm = info.key_size == 20 ? 2 : 1;
         }
     } else {
         // 4. If it doesn't exist globally, create it in the kernel...
@@ -7164,6 +7179,7 @@ void print_prog_info(int fd, const char *iface, const char *dir, int pri) {
  * Reads instructions from a file or STDIN into a dynamically allocated buffer.
  * Strips \n, \r, and \t characters, converting tabs to spaces.
  */
+static char *read_instructions_stream(FILE *f);
 char* read_instructions_from_file(const char *filename) {
     FILE *f;
     if (strcmp(filename, "-") == 0) {
@@ -7175,6 +7191,13 @@ char* read_instructions_from_file(const char *filename) {
             exit(1);
         }
     }
+    char *b = read_instructions_stream(f);
+    if (f != stdin) fclose(f);
+    return b;
+}
+
+/* Program text from a stream: '#' comments dropped, tabs as spaces. */
+static char *read_instructions_stream(FILE *f) {
 
     // Allocate an initial 8KB buffer
     size_t buf_size = 8192;
@@ -7226,9 +7249,178 @@ char* read_instructions_from_file(const char *filename) {
     }
     
     buffer[len] = '\0';
-    if (f != stdin) fclose(f);
-    
     return buffer;
+}
+
+/* ======================================================================
+ * Frontends: <priority>.<suffix> files other than .bpfc are translated into
+ * bpfc by an executable named after the suffix, found in BPFC_FRONTEND_DIRS
+ * (default /etc/bpfc/frontends, then /usr/libexec/bpfc/frontends: the
+ * administrator's override first). See bpfc(8), FRONTENDS.
+ *
+ *   <frontend> <file>        stdout: bpfc source; stderr: file:line: messages
+ *
+ * It runs with a clean environment (BPFC_FRONTEND_API=1, BPFC_FILE,
+ * BPFC_IFNAME, BPFC_IFINDEX, BPFC_IFKIND, BPFC_IFTYPE, BPFC_L3OFF, BPFC_HOOK,
+ * BPFC_PRIO, BPFC_CONF_DIR, BPFC_MAP_DIR, BPFC_BPFC, PATH), no stdin, in the
+ * file's directory, with a time limit (BPFC_FRONTEND_TIMEOUT, 10 s) and an
+ * output limit (16 MiB). Run by root, it runs as user bpfc (or nobody;
+ * BPFC_FRONTEND_USER picks another) with no new privileges: it only
+ * translates text. Its file and directory must not be writable by group or
+ * others, and must belong to root (or to the user running bpfc).
+ * ====================================================================== */
+#ifndef BPFC_FRONTEND_DIRS
+#define BPFC_FRONTEND_DIRS "/etc/bpfc/frontends:/usr/libexec/bpfc/frontends"
+#endif
+#define FRONTEND_MAX_OUT (16 << 20)
+static const char *pp_const_value(const char *name);
+static void pp_add_file(const char *path);
+
+/* The frontend type of a file name: its suffix if it is not .bpfc. */
+static int frontend_type_of(const char *file, char *type, size_t len) {
+    const char *base = strrchr(file, '/');
+    base = base ? base + 1 : file;
+    const char *dot = strrchr(base, '.');
+    if (!dot || dot == base || !dot[1] || !strcmp(dot, ".bpfc")) return 0;
+    for (const char *p = dot + 1; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9'))) return 0;
+    if (strlen(dot + 1) >= len) return 0;
+    snprintf(type, len, "%s", dot + 1);
+    return 1;
+}
+
+static int frontend_trusted(const char *path, const struct stat *st, char *why, size_t len) {
+    if (st->st_mode & (S_IWGRP | S_IWOTH)) { snprintf(why, len, "%s is writable by group or others", path); return 0; }
+    if (st->st_uid != 0 && st->st_uid != geteuid()) { snprintf(why, len, "%s is not owned by root", path); return 0; }
+    return 1;
+}
+
+/* Finds the frontend for type; 0 with its path, or -1 with a reason. */
+static int frontend_find(const char *type, char *path, size_t len, char *why, size_t wlen) {
+    const char *dirs = getenv("BPFC_FRONTEND_DIRS");
+    if (!dirs || !*dirs) dirs = BPFC_FRONTEND_DIRS;
+    char buf[4096];
+    snprintf(buf, sizeof(buf), "%s", dirs);
+    snprintf(why, wlen, "no frontend for '.%s' files (looked for '%s' in %s)", type, type, dirs);
+    for (char *save = NULL, *d = strtok_r(buf, ":", &save); d; d = strtok_r(NULL, ":", &save)) {
+        if ((size_t)snprintf(path, len, "%s/%s", d, type) >= len) continue;
+        struct stat st, dst;
+        if (stat(path, &st) < 0) continue;
+        if (!S_ISREG(st.st_mode) || !(st.st_mode & S_IXUSR)) { snprintf(why, wlen, "%s is not an executable file", path); return -1; }
+        if (stat(d, &dst) < 0) { snprintf(why, wlen, "%s: %s", d, strerror(errno)); return -1; }
+        if (!frontend_trusted(path, &st, why, wlen) || !frontend_trusted(d, &dst, why, wlen)) return -1;
+        return 0;
+    }
+    return -1;
+}
+
+/*
+ * Runs frontend fe on file and returns its output (malloc'd), or exits after
+ * an error. The environment describes the interface and hook.
+ */
+static char *run_frontend(const char *fe, const char *file, const char *iface, const char *dir, int pri,
+                          const char *map_dir) {
+    int out[2];
+    if (pipe(out) < 0) { perror("pipe"); exit(1); }
+    char absfile[4096];
+    if (file[0] == '/' || !getcwd(absfile, sizeof(absfile) - strlen(file) - 2)) snprintf(absfile, sizeof(absfile), "%s", file);
+    else { size_t n = strlen(absfile); snprintf(absfile + n, sizeof(absfile) - n, "/%s", file); }
+    char self[4096] = "bpfc";
+    ssize_t sl = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (sl > 0) self[sl] = 0;
+    int to = 10;
+    const char *tos = getenv("BPFC_FRONTEND_TIMEOUT");
+    if (tos && atoi(tos) > 0) to = atoi(tos);
+    const char *user = getenv("BPFC_FRONTEND_USER");
+    const char *confroot = getenv("BPFC_CONF_ROOT");
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); exit(1); }
+    if (pid == 0) {
+        dup2(out[1], 1);
+        close(out[0]); close(out[1]);
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) { dup2(devnull, 0); close(devnull); }
+        char dirbuf[4096];
+        snprintf(dirbuf, sizeof(dirbuf), "%s", absfile);
+        char *sl2 = strrchr(dirbuf, '/');
+        if (sl2) { *sl2 = 0; if (chdir(dirbuf[0] ? dirbuf : "/") < 0) { /* not fatal */ } }
+        if (geteuid() == 0 && !(user && !strcmp(user, "root"))) {
+            struct passwd *pw = getpwnam(user && *user ? user : "bpfc");
+            if (!pw && !(user && *user)) pw = getpwnam("nobody");
+            if (!pw) { fprintf(stderr, "Error: frontend: no user '%s' to run as\n", user && *user ? user : "bpfc"); _exit(126); }
+            if (setgroups(0, NULL) < 0 || setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0) {
+                fprintf(stderr, "Error: frontend: cannot run as %s: %s\n", pw->pw_name, strerror(errno));
+                _exit(126);
+            }
+        }
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        char e[16][4200];
+        int n = 0;
+        const char *ifn = iface ? iface : "";
+        const char *v;
+        snprintf(e[n++], sizeof(e[0]), "PATH=/usr/sbin:/usr/bin:/sbin:/bin");
+        snprintf(e[n++], sizeof(e[0]), "BPFC_FRONTEND_API=1");
+        snprintf(e[n++], sizeof(e[0]), "BPFC_FILE=%s", absfile);
+        snprintf(e[n++], sizeof(e[0]), "BPFC_IFNAME=%s", ifn);
+        snprintf(e[n++], sizeof(e[0]), "BPFC_IFINDEX=%s", (v = pp_const_value("IFINDEX")) && *ifn ? v : "");
+        snprintf(e[n++], sizeof(e[0]), "BPFC_IFKIND=%s", (v = pp_const_value("IFKIND")) && *ifn ? v : "");
+        snprintf(e[n++], sizeof(e[0]), "BPFC_IFTYPE=%s", (v = pp_const_value("IFTYPE")) && *ifn ? v : "");
+        snprintf(e[n++], sizeof(e[0]), "BPFC_L3OFF=%s", (v = pp_const_value("L3OFF")) ? v : "14");
+        snprintf(e[n++], sizeof(e[0]), "BPFC_HOOK=%s", dir ? dir : "");
+        if (pri) snprintf(e[n++], sizeof(e[0]), "BPFC_PRIO=%d", pri);
+        else snprintf(e[n++], sizeof(e[0]), "BPFC_PRIO=");
+        snprintf(e[n++], sizeof(e[0]), "BPFC_CONF_DIR=%s", confroot && *confroot ? confroot : "/etc/bpfc");
+        snprintf(e[n++], sizeof(e[0]), "BPFC_MAP_DIR=%s", map_dir);
+        snprintf(e[n++], sizeof(e[0]), "BPFC_BPFC=%s", self);
+        char *envp[17];
+        for (int i = 0; i < n; i++) envp[i] = e[i];
+        envp[n] = NULL;
+        char *av[] = {(char *)fe, absfile, NULL};
+        execve(fe, av, envp);
+        fprintf(stderr, "Error: cannot run frontend %s: %s\n", fe, strerror(errno));
+        _exit(127);
+    }
+    close(out[1]);
+    size_t cap = 65536, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { perror("malloc"); exit(1); }
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int timed_out = 0, too_big = 0;
+    for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long left = to * 1000L - ((now.tv_sec - t0.tv_sec) * 1000L + (now.tv_nsec - t0.tv_nsec) / 1000000L);
+        if (left <= 0) { timed_out = 1; break; }
+        struct pollfd pf = {.fd = out[0], .events = POLLIN};
+        int r = poll(&pf, 1, (int)left);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { timed_out = r == 0; break; }
+        if (len + 4096 + 1 > cap) {
+            if (cap >= FRONTEND_MAX_OUT) { too_big = 1; break; }
+            cap *= 2;
+            buf = realloc(buf, cap);
+            if (!buf) { perror("realloc"); exit(1); }
+        }
+        ssize_t k = read(out[0], buf + len, cap - len - 1);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) break;
+        len += (size_t)k;
+    }
+    close(out[0]);
+    if (timed_out || too_big) kill(pid, SIGKILL);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    buf[len] = 0;
+    if (timed_out) { fprintf(stderr, "Error: frontend %s: no result within %d s (BPFC_FRONTEND_TIMEOUT)\n", fe, to); exit(1); }
+    if (too_big) { fprintf(stderr, "Error: frontend %s: more than %d bytes of output\n", fe, FRONTEND_MAX_OUT); exit(1); }
+    if (!WIFEXITED(st) || WEXITSTATUS(st)) {
+        if (WIFSIGNALED(st)) fprintf(stderr, "Error: frontend %s was killed by signal %d\n", fe, WTERMSIG(st));
+        else fprintf(stderr, "Error: frontend %s failed for %s (exit status %d)\n", fe, file, WEXITSTATUS(st));
+        exit(1);
+    }
+    if (memchr(buf, 0, len)) { fprintf(stderr, "Error: frontend %s: its output contains a NUL byte\n", fe); exit(1); }
+    return buf;
 }
 
 
@@ -7250,7 +7442,9 @@ void help(const char *arg0) {
         "-K '<fields>'"	,"with -r/-R: decode keys as a pack of these fields (-K 'vlan-id ip-src'); values in decimal",
         "-V '<fields>'"	,"with -r: decode values as a pack of these fields",
         "-H '<hash|pack ...>'"	,"print the key 'hash'/'pack' gives for field=value pairs: -H 'hash 64 ip-src=10.0.0.1 ip-dst=10.0.0.2'",
-        "-f <file>"		,"read command instructions from file, - for STDIN",
+        "-f <file>"		,"read command instructions from file, - for STDIN; a file named <x>.<type> is translated by its frontend (see FRONTENDS in bpfc(8))",
+        "-F <type>"		,"the file's type, whatever its name: bpfc, or a frontend's (-F acl)",
+        "-G <file>"		,"write the bpfc a frontend generated to file (bpfcd keeps it for bpfcctl show --source)",
         "-E"			,"print the program after include, const, define, repeat and when are expanded, then exit",
         "-s <NAME>=<value>"	,"set const NAME (overrides 'const NAME' in the program); repeatable",
         "-L <dir>"		,"search dir for include files (before " BPFC_INCLUDE_DIR "); repeatable",
@@ -7272,7 +7466,11 @@ void help(const char *arg0) {
 	"count <MAP> [<BYTES_MAP>] <key...>"	,"atomically count packets (and bytes) per key",
 	"match seen <MAP> <key...> within <time> [refresh]","true when the key was seen less than <time> (50ms, 2s) ago",
 	"match over-rate <MAP> <key...> <rate> [burst <n>]","true above <rate> (100/s, 10mbit) per key: a policer",
-	"prefix-map <MAP> [entries]"		,"declare a longest-prefix-match table of IPv4 prefixes",
+	"prefix-map <MAP> [entries] [ipv6] [static]","declare a longest-prefix-match table of IPv4 (or IPv6) prefixes; static: only prefix lines fill it",
+	"prefix <MAP> <prefix> [value]"		,"an entry of a static prefix map, written when the program is attached",
+	"transport <P> <S> <D> <F> <T> <C> <O>"	,"read the transport header once: protocol (through IPv6 extension headers), ports, TCP flags, ICMP type/code, fragment offset; - skips one",
+	"ringbuf-map <MAP> [bytes]"		,"declare a ring buffer for log records (default 256k)",
+	"log <MAP> <id|%VAR> [bytes]"		,"put time, id, ifindex, length and the first bytes (96) of the frame in a ring buffer",
 	"match <ip-src|ip-dst|%VAR> in <MAP> [VAR]","true when the address is in a prefix of the prefix map",
 	"match host|net|port|src-port|dst-port <v>","tcpdump-style: IPv4 source or destination address, prefix or port",
 	"match dscp|ecn <name|n>"		,"DSCP (ef, af41, cs6, ...) or ECN (ce, ect0, ...); set dscp/ecn too",
@@ -7354,6 +7552,9 @@ void help(const char *arg0) {
 	"  break-repeat | next-repeat"		,"leave the innermost repeat | go on with its next copy",
 	"  when <expr> ... [otherwise ...] end-when","keep one branch, chosen at compile time; defined(NAME) tests a const",
 	"  $NAME  $(expr)  $$"			,"substitute a name, a constant expression (C operators, 64-bit) or a '$'",
+	"  depends <file>"			,"the program also depends on file (bpfc -M lists it; bpfcd reinstalls when it changes)",
+	"  meta <text>"				,"a line for bpfcd and bpfcctl (bpfc -I prints BPFC_META <text>)",
+	"  option on-failure keep|remove"	,"for bpfcd: when a new version fails, keep this program running (default) or remove it",
 	"Terminal Commands"			,"These commands stop further processing and must be the last command or followed by 'end-if' 'end-match' or 'else'",
 	"  continue"				,"continue processing packet - terminal command",
 	"  accept"				,"accept packet without continuing down processing chain - terminal command",
@@ -7405,6 +7606,8 @@ void help(const char *arg0) {
 	"src-port, dst-port"	,"TCP, UDP or SCTP port (0 for other protocols and fragments); set: TCP or UDP",
 	"icmp-id, icmp-code"	,"ICMP echo identifier, ICMP code - get only",
 	"dscp, ecn, ip-ttl"	,"DSCP and ECN bits of the TOS byte (get/set/match), TTL (get)",
+	"l4-proto, frag-off"	,"get: the transport protocol (IPv4, or IPv6 through extension headers), the fragment offset (0: not a later fragment)",
+	"tcp-flags"		,"get: the TCP flags byte (FIN 1, SYN 2, RST 4, PSH 8, ACK 16, URG 32)",
     };
     char *raw_fields[] = {
 	"bytes <off> <len> [VAL]"	,"get/set len bytes at offset in the packet",
@@ -7672,21 +7875,22 @@ static uint64_t kf_fmix(uint64_t k) {
 enum {
     KF_IP_SRC, KF_IP_DST, KF_IP_PROTO, KF_IP_TOS, KF_DSCP, KF_ECN, KF_IP_TTL, KF_IP_IDENT, KF_IP_LEN,
     KF_SRC_PORT, KF_DST_PORT, KF_TCP_SRC, KF_TCP_DST, KF_UDP_SRC, KF_UDP_DST,
-    KF_ICMP_TYPE, KF_ICMP_CODE, KF_ICMP_ID,
+    KF_ICMP_TYPE, KF_ICMP_CODE, KF_ICMP_ID, KF_TCP_FLAGS,
     KF_IP6_SRC, KF_IP6_DST, KF_IP6_PROTO, KF_IP6_FLOW, KF_IP6_TCLASS,
     KF_SRC_MAC, KF_DST_MAC, KF_ETH_PROTO, KF_VLAN_ID,
     KF_VAR, KF_CONST, KF_BYTES, KF_GET
 };
 
 /* fam: 4 IPv4, 6 IPv6, 'L' transport (IPv6 when the key has IPv6 fields,
- * else IPv4), 0 any packet. pair: fields swapped by reverse/symmetric. */
+ * else IPv4), 'F' an IP field of either family (DSCP, ECN: the TOS byte or
+ * the traffic class), 0 any packet. pair: fields swapped by reverse/symmetric. */
 static const struct kf_def { const char *name; int kind, width, fam, pair, src, partner; } kf_defs[] = {
     {"ip-src",     KF_IP_SRC,     32, 4,   1, 1, KF_IP_DST},
     {"ip-dst",     KF_IP_DST,     32, 4,   1, 0, KF_IP_SRC},
     {"ip-proto",   KF_IP_PROTO,    8, 4,   0, 0, 0},
     {"ip-tos",     KF_IP_TOS,      8, 4,   0, 0, 0},
-    {"dscp",       KF_DSCP,        6, 4,   0, 0, 0},
-    {"ecn",        KF_ECN,         2, 4,   0, 0, 0},
+    {"dscp",       KF_DSCP,        6, 'F', 0, 0, 0},
+    {"ecn",        KF_ECN,         2, 'F', 0, 0, 0},
     {"ip-ttl",     KF_IP_TTL,      8, 4,   0, 0, 0},
     {"ip-ident",   KF_IP_IDENT,   16, 4,   0, 0, 0},
     {"ip-len",     KF_IP_LEN,     16, 4,   0, 0, 0},
@@ -7699,6 +7903,7 @@ static const struct kf_def { const char *name; int kind, width, fam, pair, src, 
     {"icmp-type",  KF_ICMP_TYPE,   8, 'L', 0, 0, 0},
     {"icmp-code",  KF_ICMP_CODE,   8, 'L', 0, 0, 0},
     {"icmp-id",    KF_ICMP_ID,    16, 'L', 0, 0, 0},
+    {"tcp-flags",  KF_TCP_FLAGS,   8, 'L', 0, 0, 0},
     {"ip6-src",    KF_IP6_SRC,   128, 6,   5, 1, KF_IP6_DST},
     {"ip6-dst",    KF_IP6_DST,   128, 6,   5, 0, KF_IP6_SRC},
     {"ip6-proto",  KF_IP6_PROTO,   8, 6,   0, 0, 0},
@@ -7767,7 +7972,7 @@ struct kspec {
     int hash, bits, dir, seed_var;   /* dir: 0, 1 reverse, 2 symmetric */
     uint64_t buckets, seed;
     char seedname[32];
-    int n, fam, l4;
+    int n, fam, l4, force_fam;
     struct kfield f[KF_MAX];
 };
 
@@ -7799,6 +8004,11 @@ static int kf_user_value(struct kfield *f, const char *s, const char *what) {
         unsigned char b[16];
         if (inet_pton(AF_INET6, s, b) != 1) return kf_err(what, "%s=%s is not an IPv6 address", f->name, s);
         for (int i = 0; i < 8; i++) { f->v[0] = f->v[0] << 8 | b[i]; f->v[1] = f->v[1] << 8 | b[i + 8]; }
+        if (!f->is128) {          /* a prefix of 64 bits or fewer */
+            f->v[1] = f->prefix == 0 ? 0 : f->v[0] >> (64 - f->prefix);
+            f->v[0] = 0;
+            return 0;
+        }
         if (f->prefix >= 0) {
             int p = f->prefix;
             uint64_t mh = p >= 64 ? ~0ULL : p == 0 ? 0 : ~0ULL << (64 - p);
@@ -7906,6 +8116,8 @@ static int kspec_parse_fields(struct kspec *ks, char **tok, int n, int user, con
             f->is128 = d->width == 128;
             f->width = f->nat;
             if (f->prefix >= 0 && !f->is128) f->width = f->prefix;
+            /* an IPv6 prefix of 64 bits or fewer: its network bits, like an IPv4 prefix */
+            if (f->is128 && f->prefix >= 0 && f->prefix <= 64) { f->is128 = 0; f->width = f->prefix ? f->prefix : 1; }
             if (bits) {
                 if (f->is128) return kf_err(what, "'%s': an IPv6 address has no width option", tok[i]);
                 if (bits > f->width) return kf_err(what, "'%s': %s has only %d bits", tok[i], spec, f->width);
@@ -7980,8 +8192,11 @@ static int kspec_finish(struct kspec *ks, int user, const char *what) {
         }
         total += f->is128 ? 128 : f->width;
     }
+    int hasf = 0;
+    for (int i = 0; i < ks->n; i++) if (ks->f[i].fam == 'F') hasf = 1;
     if (has4 && has6) return kf_err(what, "a key has IPv4 or IPv6 fields, not both");
-    ks->fam = has6 ? 6 : (has4 || ks->l4) ? 4 : 0;
+    ks->fam = has6 ? 6 : (has4 || ks->l4 || hasf) ? 4 : 0;
+    if (ks->force_fam) ks->fam = ks->force_fam;
     if (!ks->hash) {
         for (int i = 0; i < ks->n; i++)
             if (ks->f[i].is128) return kf_err(what, "%s is 128 bits: a pack holds 64; use hash", ks->f[i].name);
@@ -8154,14 +8369,200 @@ static void kf_emit_family(int fam, jlist_t *absent) {
     ej_k(BPF_JNE, BPF_REG_1, fam);
 }
 
+/*
+ * IPv6: walks up to V6_EXT_MAX extension headers (hop-by-hop, routing,
+ * destination options, AH, fragment) to the transport header. PS_L4 = its
+ * offset, [slot] = its protocol; 0 when there is none to read: a fragment
+ * (every fragment with all_frags, else those after the first), more headers
+ * than that, or a short packet.
+ */
+#define V6_EXT_MAX 4
+/* mode: 0 later fragments have none, 1 no fragment has one, 2 the protocol
+ * itself, through fragment headers, 3 the fragment offset (in 8-byte units,
+ * 0 without a fragment header) instead of the protocol. */
+static void kf_emit_v6_walk(int mode, int slot) {
+    int all_frags = mode == 1;
+    jlist_t none = {0}, done = {0};
+    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_L4, l3off + 40));
+    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_BYTES, 0));
+    emit_ld_pkt(0, pkt_off(20), 1, PS_BYTES, &none);
+    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, slot));
+    for (int k = 0; k <= V6_EXT_MAX; k++) {
+        jlist_t gen = {0}, next = {0};
+        emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, slot));
+        jl_add(&gen); ej_k(BPF_JEQ, BPF_REG_1, 0);
+        jl_add(&gen); ej_k(BPF_JEQ, BPF_REG_1, 43);
+        jl_add(&gen); ej_k(BPF_JEQ, BPF_REG_1, 60);
+        int jah = ej_k(BPF_JEQ, BPF_REG_1, 51);
+        int jfr = ej_k(BPF_JEQ, BPF_REG_1, 44);
+        jl_add(&done);
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+        if (k == V6_EXT_MAX) {      /* still an extension header: give up */
+            jl_patch(&gen, prog_idx); ej_here(jah); ej_here(jfr);
+            jl_add(&none);
+            emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+            break;
+        }
+        /* hop-by-hop, routing, destination options: (len + 1) * 8 bytes; AH: (len + 2) * 4 */
+        for (int ah = 0; ah < 2; ah++) {
+            if (ah) ej_here(jah); else jl_patch(&gen, prog_idx);
+            emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_BYTES, 0));
+            emit_ld_pkt(PS_L4, 0, 2, PS_BYTES, &none);
+            emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+            emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, slot));
+            emit(BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_10, PS_BYTES + 1));
+            emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, ah ? 2 : 1));
+            emit(BPF_ALU64_IMM(BPF_LSH, BPF_REG_2, ah ? 2 : 3));
+            emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_L4));
+            emit(BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_2));
+            emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, PS_L4));
+            jl_add(&next);
+            emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+        }
+        /* fragment header: 8 bytes; offset (and the M flag) decide */
+        ej_here(jfr);
+        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_BYTES, 0));
+        emit_ld_pkt(PS_L4, 0, 4, PS_BYTES, &none);
+        emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, PS_BYTES + 2));
+#if defined(HOST_LITTLE_ENDIAN)
+        emit(((struct bpf_insn){.code = BPF_END | BPF_ALU | BPF_TO_BE, .dst_reg = BPF_REG_1, .imm = 16}));
+#endif
+        if (mode == 3) {
+            emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 3));
+            emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, slot));
+            jl_add(&done);
+            emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+        }
+        if (mode < 2) {
+            emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, all_frags ? 0xFFF9 : 0xFFF8));
+            jl_add(&none); ej_k(BPF_JNE, BPF_REG_1, 0);
+        }
+        if (mode != 3) {
+            emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+            emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, slot));
+            emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_L4));
+            emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 8));
+            emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, PS_L4));
+        }
+        jl_patch(&next, prog_idx);
+    }
+    jl_patch(&none, prog_idx);
+    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, slot, 0));
+    int jend = prog_idx;
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    jl_patch(&done, prog_idx);
+    /* mode 3: reached the transport header without a fragment header */
+    if (mode == 3) emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, slot, 0));
+    ej_here(jend);
+}
+
+static void kf_emit_family_split(jlist_t *v6, jlist_t *no);
+static void kf_ld(int off, int size, jlist_t *absent);
+/*
+ * transport <PROTO> <SPORT> <DPORT> <TCPFLAGS> <ICMPTYPE> <ICMPCODE> <FRAGOFF>:
+ * the transport header in one pass, for IPv4 and IPv6 (behind extension
+ * headers): the protocol (also for fragments), the ports (TCP, UDP, SCTP),
+ * TCP flags, ICMP/ICMPv6 type and code, and the fragment offset. The header
+ * fields are read from unfragmented packets and first fragments; they are 0
+ * otherwise, and everything is 0 for other packets. "-" skips an output.
+ * Rule sets (the ACL frontend) read them once and compare variables.
+ */
+static int compile_transport(char **tok, int t) {
+    if (t != 8) return kf_err("transport", "usage: transport <PROTO> <SPORT> <DPORT> <TCPFLAGS> <ICMPTYPE> <ICMPCODE> <FRAGOFF> (- to skip one)");
+    static const int sizes[7] = {1, 2, 2, 1, 1, 1, 2};
+    int off[7], sz[7];
+    for (int i = 0; i < 7; i++) {
+        off[i] = 0;
+        if (!strcmp(tok[1 + i], "-")) continue;
+        off[i] = allocate_var(tok[1 + i], sizes[i]);
+        sz[i] = get_var_size(tok[1 + i]);
+    }
+    /* scratch: PS_AUX proto, PS_AUX2 fragment offset, PS_CUR / PS_BYTES / PS_L4 for reading */
+    jlist_t no = {0}, v6 = {0}, have = {0}, out = {0};
+    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_AUX, 0));
+    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_AUX2, 0));
+    for (int i = 0; i < 7; i++) if (off[i]) { emit(BPF_MOV64_IMM(BPF_REG_1, 0)); emit_store_r1(off[i], sz[i]); }
+    kf_emit_family_split(&v6, &no);
+    emit_l4_offset(&no);
+    kf_ld(20, 2, &no);
+    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0x1FFF));
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, PS_AUX2));
+    kf_ld(23, 1, &no);
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, PS_AUX));
+    jl_add(&have);
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    jl_patch(&v6, prog_idx);
+    kf_emit_v6_walk(3, PS_AUX2);
+    kf_emit_v6_walk(2, PS_AUX);          /* last: leaves PS_L4 at the transport header */
+    jl_patch(&have, prog_idx);
+    if (off[0]) { emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_AUX)); emit_store_r1(off[0], sz[0]); }
+    if (off[6]) { emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_AUX2)); emit_store_r1(off[6], sz[6]); }
+    /* header fields only without a fragment offset */
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_AUX2));
+    jl_add(&out); ej_k(BPF_JNE, BPF_REG_1, 0);
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_AUX));
+    int jt = ej_k(BPF_JEQ, BPF_REG_1, 6), ju = ej_k(BPF_JEQ, BPF_REG_1, 17), js = ej_k(BPF_JEQ, BPF_REG_1, 132);
+    int ji4 = ej_k(BPF_JEQ, BPF_REG_1, 1), ji6 = ej_k(BPF_JEQ, BPF_REG_1, 58);
+    jl_add(&out);
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    /* ICMP: type and code */
+    ej_here(ji4); ej_here(ji6);
+    if (off[4] || off[5]) {
+        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_BYTES, 0));
+        emit_ld_pkt(PS_L4, 0, 2, PS_BYTES, &out);
+        if (off[4]) { emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES)); emit_store_r1(off[4], sz[4]); }
+        if (off[5]) { emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES + 1)); emit_store_r1(off[5], sz[5]); }
+    }
+    jl_add(&out);
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    /* TCP: flags, then the ports as for UDP and SCTP */
+    ej_here(jt);
+    if (off[3]) {
+        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_BYTES, 0));
+        emit_ld_pkt(PS_L4, 13, 1, PS_BYTES, &out);
+        emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+        emit_store_r1(off[3], sz[3]);
+    }
+    ej_here(ju); ej_here(js);
+    if (off[1] || off[2]) {
+        emit_ld_pkt(PS_L4, 0, 4, PS_BYTES, &out);
+        if (off[1]) { emit_ld_host(PS_BYTES, 2); emit_store_r1(off[1], sz[1]); }
+        if (off[2]) { emit_ld_host(PS_BYTES + 2, 2); emit_store_r1(off[2], sz[2]); }
+    }
+    jl_patch(&out, prog_idx);
+    jl_patch(&no, prog_idx);
+    return 0;
+}
+
+/*
+ * get l4-proto VAR: the transport protocol (IPv4: ip-proto; IPv6: after the
+ * extension headers, fragments too); get frag-off VAR: the fragment offset
+ * in 8-byte units (0: not a fragment, or the first one). 0 for other packets.
+ */
+static void compile_get_l4meta(int frag, const char *var) {
+    int v_off = allocate_var(var, frag ? 2 : 1);
+    int v_sz = get_var_size(var);
+    jlist_t no = {0}, v6 = {0}, end = {0};
+    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_AUX, 0));
+    kf_emit_family_split(&v6, &no);
+    if (frag) { kf_ld(20, 2, &no); emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0x1FFF)); }
+    else kf_ld(23, 1, &no);
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, PS_AUX));
+    jl_add(&end);
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    jl_patch(&v6, prog_idx);
+    kf_emit_v6_walk(frag ? 3 : 2, PS_AUX);
+    jl_patch(&end, prog_idx);
+    jl_patch(&no, prog_idx);
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_AUX));
+    emit_store_r1(v_off, v_sz);
+}
+
 /* PS_L4 = transport header offset; [lslot] = its protocol, 0 for fragments */
 static void kf_emit_l4(int fam, int lslot, jlist_t *absent) {
     if (fam == 6) {
-        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_L4, l3off + 40));
-        emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_BYTES, 0));
-        emit_ld_pkt(0, pkt_off(20), 1, PS_BYTES, absent);
-        emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
-        emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, lslot));
+        kf_emit_v6_walk(1, lslot);
         return;
     }
     emit_l4_offset(absent);
@@ -8219,8 +8620,12 @@ static void kf_emit_field(struct kfield *f, int fam, int lslot, jlist_t *absent)
     case KF_IP_DST:   kf_ld(30, 4, absent); break;
     case KF_IP_PROTO: kf_ld(23, 1, absent); break;
     case KF_IP_TOS:   kf_ld(15, 1, absent); break;
-    case KF_DSCP:     kf_ld(15, 1, absent); emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 2)); break;
-    case KF_ECN:      kf_ld(15, 1, absent); emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 3)); break;
+    case KF_DSCP: case KF_ECN:
+        if (fam == 6) { kf_ld(14, 2, absent); emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 4)); emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0xFF)); }
+        else kf_ld(15, 1, absent);
+        if (f->kind == KF_DSCP) emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 2));
+        else emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 3));
+        break;
     case KF_IP_TTL:   kf_ld(22, 1, absent); break;
     case KF_IP_IDENT: kf_ld(18, 2, absent); break;
     case KF_IP_LEN:   kf_ld(16, 2, absent); break;
@@ -8233,6 +8638,7 @@ static void kf_emit_field(struct kfield *f, int fam, int lslot, jlist_t *absent)
     case KF_ICMP_TYPE: kf_ld_l4(lslot, fam == 6 ? p_icmp6 : p_icmp4, NULL, 0, 1); break;
     case KF_ICMP_CODE: kf_ld_l4(lslot, fam == 6 ? p_icmp6 : p_icmp4, NULL, 1, 1); break;
     case KF_ICMP_ID:  kf_ld_l4(lslot, fam == 6 ? p_icmp6 : p_icmp4, fam == 6 ? t_echo6 : t_echo4, 4, 2); break;
+    case KF_TCP_FLAGS: kf_ld_l4(lslot, p_tcp, NULL, 13, 1); break;
     case KF_IP6_PROTO: kf_ld(20, 1, absent); break;
     case KF_IP6_FLOW:  kf_ld(14, 4, absent); emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0xFFFFF)); break;
     case KF_IP6_TCLASS: kf_ld(14, 4, absent); emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 20));
@@ -8305,6 +8711,17 @@ static void kf_emit_field(struct kfield *f, int fam, int lslot, jlist_t *absent)
         break;
     }
     case KF_IP6_SRC: case KF_IP6_DST:
+        if (!f->is128) {            /* a prefix of 64 bits or fewer: the high word's network bits */
+            emit_ld_pkt(0, pkt_off(f->kind == KF_IP6_SRC ? 22 : 38), 8, PS_BYTES, absent);
+            emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_BYTES));
+#if defined(HOST_LITTLE_ENDIAN)
+            emit(((struct bpf_insn){.code = BPF_END | BPF_ALU | BPF_TO_BE, .dst_reg = BPF_REG_1, .imm = 64}));
+#endif
+            if (f->prefix == 0) emit(BPF_MOV64_IMM(BPF_REG_1, 0));
+            else if (f->prefix < 64) emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 64 - f->prefix));
+            emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, f->slot));
+            return;
+        }
         emit_ld_pkt(0, pkt_off(f->kind == KF_IP6_SRC ? 22 : 38), 16, f->slot, absent);
         for (int w = 0; w < 2; w++) {
             emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, f->slot + 8 * w));
@@ -8518,16 +8935,43 @@ static int compile_hash_pack(int hash, char **tok, int t) {
     return 0;
 }
 
-/* A single field read the key way (get src-port V, get dscp V, ...). */
+/* A single field read the key way (get src-port V, get dscp V, ...): from
+ * IPv4, else from IPv6 (ports, DSCP, ECN, ICMP fields are in both). */
 static void compile_get_keyfield(const char *field, const char *var) {
     static struct kspec ks;
-    memset(&ks, 0, sizeof(ks));
     char fb[48];
-    snprintf(fb, sizeof(fb), "%s", field);
-    char *tk[1] = {fb};
-    if (kspec_parse_fields(&ks, tk, 1, 0, "get") || kspec_finish(&ks, 0, "get")) exit(1);
-    int w = ks.f[0].width;
-    compile_key(&ks, var, w <= 8 ? 1 : w <= 16 ? 2 : w <= 32 ? 4 : 8, NULL);
+    jlist_t not4 = {0};
+    for (int fam = 4; fam <= 6; fam += 2) {
+        memset(&ks, 0, sizeof(ks));
+        snprintf(fb, sizeof(fb), "%s", field);
+        char *tk[1] = {fb};
+        if (kspec_parse_fields(&ks, tk, 1, 0, "get")) exit(1);
+        int both = ks.f[0].fam == 'L' || ks.f[0].fam == 'F';
+        if (both) ks.force_fam = fam;
+        if (kspec_finish(&ks, 0, "get")) exit(1);
+        int w = ks.f[0].width;
+        if (!both || fam == 6) {
+            if (fam == 6) jl_patch(&not4, prog_idx);
+            compile_key(&ks, var, w <= 8 ? 1 : w <= 16 ? 2 : w <= 32 ? 4 : 8, NULL);
+            return;
+        }
+        compile_key(&ks, var, w <= 8 ? 1 : w <= 16 ? 2 : w <= 32 ? 4 : 8, &not4);
+        int j = prog_idx;
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+        jlist_t end = {0};
+        end.idx[end.n++] = j;
+        jl_patch(&not4, prog_idx);
+        not4.n = 0;
+        memset(&ks, 0, sizeof(ks));
+        snprintf(fb, sizeof(fb), "%s", field);
+        char *tk6[1] = {fb};
+        if (kspec_parse_fields(&ks, tk6, 1, 0, "get")) exit(1);
+        ks.force_fam = 6;
+        if (kspec_finish(&ks, 0, "get")) exit(1);
+        compile_key(&ks, var, w <= 8 ? 1 : w <= 16 ? 2 : w <= 32 ? 4 : 8, NULL);
+        jl_patch(&end, prog_idx);
+        return;
+    }
 }
 
 /*
@@ -8883,9 +9327,16 @@ static int compile_count(char **tok, int t) {
 /* ---- prefix maps (longest-prefix match on IPv4 addresses) ---- */
 
 int map_is_lpm(int fd);
+int map_is_rb(int fd);
+static int lpm_key(const char *s, uint32_t k[2]);
+static int lpm_key6(const char *s, unsigned char k[20]);
+static int compile_log(char **tok, int t);
+static int compile_prefix_entry(char **tok, int t);
+static int static_maps[MAX_MAPS];     /* static_maps[i]: map i's contents are the program's prefix lines */
 
-/* prefix-map <NAME> [entries]: an LPM trie of IPv4 prefixes -> 64-bit values */
-int get_or_create_prefix_map(const char *name, uint32_t entries) {
+/* prefix-map <NAME> [entries] [ipv6]: an LPM trie of IPv4 (or IPv6) prefixes -> 64-bit values */
+int get_or_create_prefix_map(const char *name, uint32_t entries, int v6) {
+    uint32_t ksz = v6 ? 20 : 8;
     check_map_name(name);
     if (entries == 0 || entries > (1U << 24)) {
         fprintf(stderr, "Error: prefix-map '%s' needs 1-16777216 entries\n", name);
@@ -8893,8 +9344,9 @@ int get_or_create_prefix_map(const char *name, uint32_t entries) {
     }
     for (int i = 0; i < num_maps; i++) {
         if (strcmp(maps[i].name, name)) continue;
-        if (!maps[i].is_lpm) {
-            fprintf(stderr, "Error: prefix-map '%s' must come before the map is first used\n", name);
+        if (!maps[i].is_lpm || maps[i].is_lpm != (v6 ? 2 : 1)) {
+            fprintf(stderr, "Error: prefix-map '%s' must come before the map is first used, and once%s\n", name,
+                    maps[i].is_lpm ? " (for IPv4 or IPv6, not both)" : "");
             exit(1);
         }
         return maps[i].fd;
@@ -8905,7 +9357,7 @@ int get_or_create_prefix_map(const char *name, uint32_t entries) {
     if (fd >= 0) {
         struct bpf_map_info info;
         if (map_info(fd, &info) == 0 &&
-            (info.type != BPF_MAP_TYPE_LPM_TRIE || info.key_size != 8 || info.value_size != 8 ||
+            (info.type != BPF_MAP_TYPE_LPM_TRIE || info.key_size != ksz || info.value_size != 8 ||
              info.max_entries != entries)) {
             char why[96];
             snprintf(why, sizeof(why), info.type != BPF_MAP_TYPE_LPM_TRIE ? "is pinned as another kind of map"
@@ -8915,7 +9367,7 @@ int get_or_create_prefix_map(const char *name, uint32_t entries) {
     }
     if (fd < 0) {
         union bpf_attr attr = {
-            .map_type = BPF_MAP_TYPE_LPM_TRIE, .key_size = 8, .value_size = 8, .max_entries = entries,
+            .map_type = BPF_MAP_TYPE_LPM_TRIE, .key_size = ksz, .value_size = 8, .max_entries = entries,
             .map_flags = 1 /* BPF_F_NO_PREALLOC, required */,
         };
         kernel_obj_name(attr.map_name, name);
@@ -8924,20 +9376,52 @@ int get_or_create_prefix_map(const char *name, uint32_t entries) {
         if (pin_map_fd(fd, pin_path) < 0) perror("Error pinning bpf map");
     }
     register_map(name, fd, 0, 0, 0, entries, 8);
-    maps[num_maps - 1].is_lpm = 1;
+    maps[num_maps - 1].is_lpm = v6 ? 2 : 1;
     return fd;
 }
 
-/* match|if <ip-src|ip-dst|%VAR> in <MAP> [VALUE_VAR] */
+/* match|if <ip-src|ip-dst|ip6-src|ip6-dst|%VAR> in <MAP> [VALUE_VAR] */
 static int compile_match_in(char **tok, int t) {
     const char *what = "match ... in";
-    if (t < 4 || t > 5) return kf_err(what, "usage: match <ip-src|ip-dst|%%VAR> in <PREFIX_MAP> [VALUE_VAR]");
+    if (t < 4 || t > 5) return kf_err(what, "usage: match <ip-src|ip-dst|ip6-src|ip6-dst|%%VAR> in <PREFIX_MAP> [VALUE_VAR]");
     int fd = get_or_create_map(tok[3]);
-    if (!map_is_lpm(fd)) return kf_err(what, "%s is not a prefix map: declare it first with prefix-map %s", tok[3], tok[3]);
+    int lpm = map_is_lpm(fd);
+    if (!lpm) return kf_err(what, "%s is not a prefix map: declare it first with prefix-map %s", tok[3], tok[3]);
+    int v6f = !strncmp(tok[1], "ip6-", 4) || (tok[1][0] == '%' && get_var_size(tok[1]) == 16);
+    if (v6f != (lpm == 2))
+        return kf_err(what, "%s is a prefix map of %s prefixes; %s is %s", tok[3], lpm == 2 ? "IPv6" : "IPv4", tok[1],
+                      v6f ? "an IPv6 address" : "an IPv4 address");
     int v_off = 0, v_sz = 0;
     if (t == 5) { v_off = allocate_var(tok[4], 8); v_sz = get_var_size(tok[4]); }
     start_match_block();
     jlist_t no = {0};
+    if (v6f) {
+        /* key: prefix length 128, then the 16 bytes */
+        if (tok[1][0] == '%') {
+            int vo = get_var_offset(tok[1]);
+            for (int w = 0; w < 4; w++) {
+                emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, vo + 4 * w));
+                emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -20 + 4 * w));
+            }
+        } else if (!strcmp(tok[1], "ip6-src") || !strcmp(tok[1], "ip6-dst")) {
+            kf_emit_family(6, &no);
+            emit_ld_pkt(0, pkt_off(!strcmp(tok[1], "ip6-src") ? 22 : 38), 16, -20, &no);
+        } else return kf_err(what, "'%s': ip6-src, ip6-dst or a 16-byte %%VAR", tok[1]);
+        emit(BPF_ST_MEM(BPF_W, BPF_REG_10, -24, 128));
+        emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .imm = fd}));
+        emit(((struct bpf_insn){.code = 0x00}));
+        emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+        emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -24));
+        emit(BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+        jl_add(&no);
+        ej_k(BPF_JEQ, BPF_REG_0, 0);
+        if (t == 5) {
+            emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_0, 0));
+            emit_store_r1(v_off, v_sz);
+        }
+        kf_nomatch(&no);
+        return 0;
+    }
     if (!strcmp(tok[1], "ip-src") || !strcmp(tok[1], "ip-dst")) {
         kf_emit_family(4, &no);
         emit_ld_pkt(0, pkt_off(!strcmp(tok[1], "ip-src") ? 26 : 30), 4, -4, &no);
@@ -8964,8 +9448,58 @@ static int compile_match_in(char **tok, int t) {
 
 /* ---- tcpdump-style matches: host, net, port, src-port, dst-port ---- */
 
-/* match host <addr|%VAR> / match net <prefix>: the IPv4 source or destination */
+/* match host/net for IPv6: 16 bytes compared as two masked words */
+static int compile_match_host6(const char *val, int is_net) {
+    unsigned char a[16] = {0}, m[16];
+    memset(m, 0xFF, 16);
+    if (val[0] != '%') {
+        char b[64];
+        snprintf(b, sizeof(b), "%s", val);
+        char *sl = strchr(b, '/');
+        uint64_t p = 128;
+        if (sl) {
+            *sl = 0;
+            if (!is_net) return kf_err("match host", "a host is one address; use match net for a prefix");
+            if (parse_num(sl + 1, 128, &p)) return kf_err("match net", "'%s': prefix 0-128", val);
+        }
+        if (inet_pton(AF_INET6, b, a) != 1) return kf_err(is_net ? "match net" : "match host", "'%s' is not an IPv6 %s", val, is_net ? "prefix" : "address");
+        for (int i = 0; i < 16; i++) {
+            int bits = (int)p - 8 * i;
+            m[i] = bits >= 8 ? 0xFF : bits <= 0 ? 0 : (unsigned char)(0xFF << (8 - bits));
+            a[i] &= m[i];
+        }
+    } else if (get_var_size(val) != 16) return kf_err("match host", "%s must be a 16-byte variable (an IPv6 address)", val);
+    start_match_block();
+    jlist_t no = {0}, yes = {0};
+    kf_emit_family(6, &no);
+    for (int side = 0; side < 2; side++) {
+        jlist_t miss = {0};
+        emit_ld_pkt(0, pkt_off(side ? 38 : 22), 16, PS_AUX2, &no);
+        for (int w = 0; w < 2; w++) {
+            emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_AUX2 + 8 * w));
+            if (val[0] == '%') emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, get_var_offset(val) + 8 * w));
+            else {
+                uint64_t mw, aw;
+                memcpy(&mw, m + 8 * w, 8);
+                memcpy(&aw, a + 8 * w, 8);
+                emit_and_mask(BPF_REG_1, mw);
+                char nb[24];
+                snprintf(nb, sizeof(nb), "%llu", (unsigned long long)aw);
+                emit_load_operand(BPF_REG_2, nb);
+            }
+            jl_add(side ? &no : &miss);
+            ej_x(BPF_JNE, BPF_REG_1, BPF_REG_2);
+        }
+        if (!side) { jl_add(&yes); emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA})); jl_patch(&miss, prog_idx); }
+    }
+    jl_patch(&yes, prog_idx);
+    kf_nomatch(&no);
+    return 0;
+}
+
+/* match host <addr|%VAR> / match net <prefix>: the IPv4 (or IPv6) source or destination */
 static int compile_match_host(const char *val, int is_net) {
+    if (strchr(val, ':') || (val[0] == '%' && get_var_size(val) == 16)) return compile_match_host6(val, is_net);
     uint32_t ip = 0, mask = 0xFFFFFFFF;
     if (val[0] != '%') {
         char b[64];
@@ -8998,8 +9532,34 @@ static int compile_match_host(const char *val, int is_net) {
     return 0;
 }
 
-/* match port|src-port|dst-port <n[-m]|%VAR>: TCP, UDP or SCTP over IPv4,
- * not a fragment after the first. port: either side. */
+/*
+ * Jumps to *v6 for IPv6, falls through for IPv4, adds a jump to *no for
+ * anything else (by EtherType behind an Ethernet header, then the version).
+ */
+static void kf_emit_family_split(jlist_t *v6, jlist_t *no) {
+    if (l3off == 14) {
+        emit_ld_pkt(0, 12, 2, PS_BYTES, no);
+        emit_ld_host(PS_BYTES, 2);
+        int j4 = ej_k(BPF_JEQ, BPF_REG_1, 0x0800);
+        jl_add(no); ej_k(BPF_JNE, BPF_REG_1, 0x86DD);
+        emit_ld_pkt(0, pkt_off(14), 1, PS_BYTES, no);
+        emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+        emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 4));
+        jl_add(no); ej_k(BPF_JNE, BPF_REG_1, 6);
+        jl_add(v6);
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+        ej_here(j4);
+    }
+    emit_ld_pkt(0, pkt_off(14), 1, PS_BYTES, no);
+    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+    emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 4));
+    jl_add(v6); ej_k(BPF_JEQ, BPF_REG_1, 6);
+    jl_add(no); ej_k(BPF_JNE, BPF_REG_1, 4);
+}
+
+/* match port|src-port|dst-port <n[-m]|%VAR>: TCP, UDP or SCTP over IPv4 or
+ * IPv6 (behind extension headers too), not a fragment after the first.
+ * port: either side. */
 static int compile_match_port(const char *which, const char *val) {
     uint16_t lo = 0, hi = 0;
     int is_var = val[0] == '%';
@@ -9015,16 +9575,22 @@ static int compile_match_port(const char *which, const char *val) {
     }
     int sides = !strcmp(which, "port") ? 3 : !strcmp(which, "src-port") ? 1 : 2;
     start_match_block();
-    jlist_t no = {0}, yes = {0}, l4ok = {0};
-    kf_emit_family(4, &no);
+    jlist_t no = {0}, yes = {0}, l4ok = {0}, v6 = {0};
+    kf_emit_family_split(&v6, &no);
     emit_l4_offset(&no);
     emit_ld_pkt(0, pkt_off(20), 2, PS_BYTES, &no);
     emit_ld_host(PS_BYTES, 2);
     emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0x1FFF));
     jl_add(&no);
     ej_k(BPF_JNE, BPF_REG_1, 0);                       /* later fragment: no ports */
-    emit_ld_pkt(0, pkt_off(23), 1, PS_BYTES, &no);
-    emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, PS_BYTES));
+    emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, PS_AUX, 0));
+    emit_ld_pkt(0, pkt_off(23), 1, PS_AUX, &no);
+    int jl4 = prog_idx;
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    jl_patch(&v6, prog_idx);
+    kf_emit_v6_walk(0, PS_AUX);
+    ej_here(jl4);
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_AUX));
     jl_add(&l4ok); ej_k(BPF_JEQ, BPF_REG_1, 6);
     jl_add(&l4ok); ej_k(BPF_JEQ, BPF_REG_1, 17);
     jl_add(&l4ok); ej_k(BPF_JEQ, BPF_REG_1, 132);
@@ -9053,18 +9619,30 @@ static int compile_match_port(const char *which, const char *val) {
     return 0;
 }
 
-/* match dscp <name|0-63>, match ecn <name|0-3> (IPv4) */
+/* match dscp <name|0-63>, match ecn <name|0-3>: the TOS byte (IPv4) or the
+ * traffic class (IPv6) */
 static int compile_match_dscp_ecn(int is_ecn, const char *val) {
     int v = is_ecn ? parse_ecn(val) : parse_dscp(val);
     if (v < 0) return kf_err(is_ecn ? "match ecn" : "match dscp", "'%s': %s", val,
                              is_ecn ? "not-ect, ect1, ect0, ce or 0-3" : "a DSCP name (ef, af41, cs6, ...) or 0-63");
     start_match_block();
-    match_l3_proto(0x0800, is_ecn ? "ecn" : "dscp");
-    compile_match_core(15, 1, is_ecn ? (uint32_t)v : (uint32_t)v << 2, is_ecn ? 0x03 : 0xFC, NULL);
+    jlist_t no = {0}, v6 = {0};
+    kf_emit_family_split(&v6, &no);
+    kf_ld(15, 1, &no);
+    int j = prog_idx;
+    emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+    jl_patch(&v6, prog_idx);
+    kf_ld(14, 2, &no);
+    emit(BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 4));
+    ej_here(j);
+    emit(BPF_ALU64_IMM(BPF_AND, BPF_REG_1, is_ecn ? 0x03 : 0xFC));
+    jl_add(&no); ej_k(BPF_JNE, BPF_REG_1, is_ecn ? v : v << 2);
+    kf_nomatch(&no);
     return 0;
 }
 
-/* set dscp|ecn <name|number|%VAR>: the other bits of the TOS byte stay; IPv4 only */
+/* set dscp|ecn <name|number|%VAR>: the other bits of the TOS byte (IPv4) or
+ * traffic class (IPv6) stay */
 static int compile_set_dscp_ecn(int is_ecn, const char *val) {
     char v[32];
     if (val[0] == '%') snprintf(v, sizeof(v), "%s", val);
@@ -9086,6 +9664,19 @@ static int compile_set_dscp_ecn(int is_ecn, const char *val) {
         kf_run("free __dv%d", u);
     } else kf_run("calc or __dt%d %d", u, is_ecn ? atoi(v) : atoi(v) << 2);
     kf_run("set ip-tos %%__dt%d", u);
+    kf_run("free __dt%d", u);
+    kf_run("end-match");
+    kf_run("match ip6");
+    kf_run("get ip6-tclass __dt%d", u);
+    kf_run("calc and __dt%d %d", u, is_ecn ? 0xFC : 0x03);
+    if (val[0] == '%') {
+        kf_run("set val __dv%d %s", u, v);
+        kf_run("calc and __dv%d %d", u, is_ecn ? 3 : 63);
+        if (!is_ecn) kf_run("calc lsh __dv%d 2", u);
+        kf_run("calc or __dt%d %%__dv%d", u, u);
+        kf_run("free __dv%d", u);
+    } else kf_run("calc or __dt%d %d", u, is_ecn ? atoi(v) : atoi(v) << 2);
+    kf_run("set ip6-tclass %%__dt%d", u);
     kf_run("free __dt%d", u);
     kf_run("end-match");
     return 0;
@@ -9178,6 +9769,7 @@ static int parse_layout(const char *text, struct klayout *lo, const char *what) 
         const char *dummy = "0";
         if (d && (d->kind == KF_IP_SRC || d->kind == KF_IP_DST)) dummy = "0.0.0.0";
         else if (d && (d->kind == KF_SRC_MAC || d->kind == KF_DST_MAC)) dummy = "0:0:0:0:0:0";
+        else if (d && (d->kind == KF_IP6_SRC || d->kind == KF_IP6_DST)) dummy = "::";
         if (isdigit((unsigned char)tok[i][0])) snprintf(vals[i], sizeof(vals[i]), "%s", tok[i]);
         else if (!d && !strchr(tok[i], ':')) snprintf(vals[i], sizeof(vals[i]), "%s:64=0", tok[i]);
         else snprintf(vals[i], sizeof(vals[i]), "%s=%s", tok[i], dummy);
@@ -9210,6 +9802,15 @@ static void print_layout(FILE *o, const struct klayout *lo, uint64_t v, const ch
                 fprintf(o, "%u.%u.%u.%u", (unsigned)(x >> 24), (unsigned)(x >> 16) & 255, (unsigned)(x >> 8) & 255, (unsigned)x & 255);
             else fprintf(o, "%llu", (unsigned long long)x);
             break;
+        case KF_IP6_SRC: case KF_IP6_DST: {
+            unsigned char a6[16] = {0};
+            uint64_t hi = f->prefix <= 0 ? 0 : f->prefix >= 64 ? x : x << (64 - f->prefix);
+            for (int b = 0; b < 8; b++) a6[b] = (unsigned char)(hi >> (56 - 8 * b));
+            char t6[64];
+            inet_ntop(AF_INET6, a6, t6, sizeof(t6));
+            fprintf(o, "%s/%d", t6, f->prefix);
+            break;
+        }
         case KF_SRC_MAC: case KF_DST_MAC:
             if (f->width == 48) {
                 for (int b = 5; b >= 0; b--) fprintf(o, "%02llx%s", (unsigned long long)(x >> (8 * b)) & 255, b ? ":" : "");
@@ -9266,8 +9867,31 @@ static int lpm_key(const char *s, uint32_t k[2]) {
     return 0;
 }
 
+/* An IPv6 LPM key (prefix length, 16 bytes) from addr[/len] */
+static int lpm_key6(const char *s, unsigned char k[20]) {
+    char b[80];
+    snprintf(b, sizeof(b), "%s", s);
+    uint64_t len = 128;
+    char *sl = strchr(b, '/');
+    if (sl) { *sl = 0; if (parse_num(sl + 1, 128, &len)) return -1; }
+    unsigned char a[16];
+    if (inet_pton(AF_INET6, b, a) != 1) return -1;
+    for (int i = 0; i < 16; i++) {
+        int bits = (int)len - 8 * i;
+        a[i] &= bits >= 8 ? 0xFF : bits <= 0 ? 0 : (unsigned char)(0xFF << (8 - bits));
+    }
+    uint32_t l32 = (uint32_t)len;
+    memcpy(k, &l32, 4);
+    memcpy(k + 4, a, 16);
+    return 0;
+}
+
 /* The key buffer for a map: 8 bytes, 4 for arrays, the LPM key for prefix maps. */
 static int cli_key(const struct bpf_map_info *info, const char *s, void *kbuf, const char *what) {
+    if (info->type == BPF_MAP_TYPE_LPM_TRIE && info->key_size == 20) {
+        if (lpm_key6(s, kbuf)) return kf_err(what, "'%s' is not an IPv6 prefix (addr/len)", s);
+        return 0;
+    }
     if (info->type == BPF_MAP_TYPE_LPM_TRIE) {
         if (lpm_key(s, kbuf)) return kf_err(what, "'%s' is not an IPv4 prefix (a.b.c.d/len)", s);
         return 0;
@@ -9288,7 +9912,7 @@ int map_write_cli(const char *map_name, const char *map_dir, const char *key_s, 
         close(fd);
         return 1;
     }
-    uint64_t kbuf[2] = {0, 0}, val;
+    uint64_t kbuf[3] = {0, 0, 0}, val;
     if (cli_key(&info, key_s, kbuf, "-w") || parse_key_arg(val_s, &val, "-w")) { close(fd); return 1; }
     union bpf_attr attr;
     memset(&attr, 0, sizeof(attr));
@@ -9306,7 +9930,7 @@ int map_delete_cli(const char *map_name, const char *map_dir, const char *key_s)
     struct bpf_map_info info;
     int fd = open_map_cli(map_name, map_dir, &info);
     if (fd < 0) return 1;
-    uint64_t kbuf[2] = {0, 0};
+    uint64_t kbuf[3] = {0, 0, 0};
     if (cli_key(&info, key_s, kbuf, "-x")) { close(fd); return 1; }
     union bpf_attr attr;
     memset(&attr, 0, sizeof(attr));
@@ -9334,7 +9958,7 @@ int map_dump_cli(const char *map_name, const char *map_dir, const char *klay, co
         dump_map_contents(map_name, map_dir);
         return 0;
     }
-    if (info.value_size != 8 || (!lpm && info.key_size != 8 && info.key_size != 4) ||
+    if (info.value_size != 8 || (!lpm && info.key_size != 8 && info.key_size != 4) || (lpm && info.key_size > 20) ||
         info.type == BPF_MAP_TYPE_PERCPU_ARRAY || info.type == BPF_MAP_TYPE_PERCPU_HASH ||
         info.type == BPF_MAP_TYPE_LRU_PERCPU_HASH) {
         fprintf(stderr, "Error: map '%s' does not hold 64-bit values\n", map_name);
@@ -9352,11 +9976,17 @@ int map_dump_cli(const char *map_name, const char *map_dir, const char *klay, co
     printf(" ");
     if (vlay) print_layout_header(stdout, &vl); else printf("value");
     putchar('\n');
-    uint64_t key[2] = {0, 0}, next[2] = {0, 0}, v;
+    uint64_t key[3] = {0, 0, 0}, next[3] = {0, 0, 0}, v;
     int res = bpf_map_get_next_key_user(fd, NULL, next);
     while (res == 0) {
         if (bpf_map_lookup_elem_user(fd, next, &v) == 0) {
-            if (lpm) {
+            if (lpm && info.key_size == 20) {
+                uint32_t l32;
+                char a6[64];
+                memcpy(&l32, next, 4);
+                inet_ntop(AF_INET6, (char *)next + 4, a6, sizeof(a6));
+                printf("%s/%u", a6, l32);
+            } else if (lpm) {
                 uint32_t k[2];
                 memcpy(k, next, 8);
                 uint32_t a = ntohl(k[1]);
@@ -9386,6 +10016,178 @@ static int join_layout_set = 0;
 static void kf_print_join_key(FILE *o, uint64_t k) {
     if (join_layout_set) print_layout(o, &join_layout, k, ",");
     else fprintf(o, "0x%016llx", (unsigned long long)k);
+}
+
+
+/* ---- event log: a ring buffer to user space (bpfcd reads it) ---- */
+
+#define BPF_FUNC_ringbuf_output 130
+#define BPF_MAP_TYPE_RINGBUF_COMPAT 27
+
+/* ringbuf-map <NAME> [bytes]: a ring buffer of power-of-two size (default 256 KiB) */
+static int get_or_create_ringbuf_map(const char *name, uint32_t bytes) {
+    check_map_name(name);
+    for (int i = 0; i < num_maps; i++)
+        if (!strcmp(maps[i].name, name)) {
+            if (!maps[i].is_rb) { fprintf(stderr, "Error: map '%s' is not a ring buffer\n", name); exit(1); }
+            return maps[i].fd;
+        }
+    if (bytes < 4096 || bytes > (1U << 30) || (bytes & (bytes - 1))) {
+        fprintf(stderr, "Error: ringbuf-map '%s': the size must be a power of two, 4096 to 1 GiB\n", name);
+        exit(1);
+    }
+    char pin_path[256];
+    snprintf(pin_path, sizeof(pin_path), "%s/%s", bpf_map_dir, name);
+    int fd = get_pinned_map_fd(pin_path);
+    if (fd >= 0) {
+        struct bpf_map_info info;
+        if (map_info(fd, &info) == 0 && (info.type != BPF_MAP_TYPE_RINGBUF_COMPAT || info.max_entries != bytes))
+            fd = replace_pinned(pin_path, fd, name, "is pinned as another kind of map or size");
+    }
+    if (fd < 0) {
+        union bpf_attr attr = {.map_type = BPF_MAP_TYPE_RINGBUF_COMPAT, .max_entries = bytes};
+        kernel_obj_name(attr.map_name, name);
+        fd = bpf_syscall(BPF_MAP_CREATE, &attr, sizeof(attr));
+        if (fd < 0) { perror("Failed to create ring buffer map (kernel 5.8 or later)"); exit(1); }
+        if (pin_map_fd(fd, pin_path) < 0) perror("Error pinning bpf map");
+    }
+    register_map(name, fd, 0, 0, 0, bytes, 0);
+    maps[num_maps - 1].is_rb = 1;
+    return fd;
+}
+
+/*
+ * log <MAP> <id|%VAR> [bytes]: one record to ring buffer MAP: time (ns,
+ * CLOCK_MONOTONIC), id (64 bits), ifindex (u32), packet length (u32), then
+ * the first <bytes> (default 96, a multiple of 8, at most 256) of the frame,
+ * zero padded. A full ring buffer drops the record.
+ */
+#define LOG_HDR 24
+static int compile_log(char **tok, int t) {
+    if (t < 3 || t > 4) return kf_err("log", "usage: log <RINGBUF_MAP> <id|%%VAR> [bytes]");
+    uint64_t n = 96;
+    if (t == 4 && (parse_num(tok[3], 256, &n) || n < 8 || n % 8))
+        return kf_err("log", "bytes: a multiple of 8, 8 to 256");
+    int fd = -1;
+    for (int i = 0; i < num_maps; i++) if (!strcmp(maps[i].name, tok[1])) fd = maps[i].fd;
+    if (fd < 0) fd = get_or_create_ringbuf_map(tok[1], 256 * 1024);
+    else if (!map_is_rb(fd)) return kf_err("log", "%s is not a ring buffer (ringbuf-map %s)", tok[1], tok[1]);
+    int size = LOG_HDR + (int)n;
+    emit_load_operand(BPF_REG_1, tok[2]);
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, PS_AUX));
+    int base = stack_scratch(size, "log");
+    for (int o = 0; o < size; o += 8) emit(BPF_ST_MEM(BPF_DW, BPF_REG_10, base + o, 0));
+    emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, PS_AUX));
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, base + 8));
+    emit(BPF_CALL_FUNC(BPF_FUNC_ktime_get_ns));
+    emit(BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, base));
+    emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, ifindex));
+    emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, base + 16));
+    emit_ctx_ld(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct __sk_buff, len));
+    emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, base + 20));
+    /* as much of the frame as there is: <bytes>, else 64, else 42 */
+    static const int tries[] = {0, 64, 42};
+    jlist_t done = {0};
+    for (int k = 0; k < 3; k++) {
+        int len = k ? tries[k] : (int)n;
+        if (k && len >= (int)n) continue;
+        jlist_t fail = {0};
+        emit_ld_pkt(0, 0, len, base + LOG_HDR, &fail);
+        jl_add(&done);
+        emit(((struct bpf_insn){.code = BPF_JMP | BPF_JA}));
+        jl_patch(&fail, prog_idx);
+    }
+    jl_patch(&done, prog_idx);
+    emit(((struct bpf_insn){.code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .imm = fd}));
+    emit(((struct bpf_insn){.code = 0x00}));
+    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, base));
+    emit(BPF_MOV64_IMM(BPF_REG_3, size));
+    emit(BPF_MOV64_IMM(BPF_REG_4, 0));
+    emit(BPF_CALL_FUNC(BPF_FUNC_ringbuf_output));
+    return 0;
+}
+
+/* ---- static prefix maps: the program's own entries, kept in step on load ---- */
+
+#define MAX_STATIC_PREFIXES 65536
+static struct sprefix { int map; uint32_t len; unsigned char a[16]; uint64_t val; } *sprefixes;
+static int nsprefixes, capsprefixes;
+
+/* prefix <MAP> <prefix> [value]: an entry of a static prefix map (default value 1) */
+static int compile_prefix_entry(char **tok, int t) {
+    if (t < 3 || t > 4) return kf_err("prefix", "usage: prefix <MAP> <address/len> [value]");
+    int idx = -1;
+    for (int i = 0; i < num_maps; i++) if (!strcmp(maps[i].name, tok[1])) idx = i;
+    if (idx < 0 || !maps[idx].is_lpm || !static_maps[idx])
+        return kf_err("prefix", "%s: declare it first with prefix-map %s ... static", tok[1], tok[1]);
+    uint64_t v = 1;
+    if (t == 4 && parse_num(tok[3], UINT64_MAX, &v)) return kf_err("prefix", "bad value '%s'", tok[3]);
+    if (nsprefixes >= MAX_STATIC_PREFIXES) return kf_err("prefix", "at most %d entries", MAX_STATIC_PREFIXES);
+    if (nsprefixes == capsprefixes) {
+        capsprefixes = capsprefixes ? capsprefixes * 2 : 64;
+        sprefixes = realloc(sprefixes, (size_t)capsprefixes * sizeof(*sprefixes));
+        if (!sprefixes) { perror("realloc"); exit(1); }
+    }
+    struct sprefix *e = &sprefixes[nsprefixes];
+    memset(e, 0, sizeof(*e));
+    e->map = idx;
+    e->val = v;
+    unsigned char k[20];
+    if (maps[idx].is_lpm == 2) {
+        if (lpm_key6(tok[2], k)) return kf_err("prefix", "'%s' is not an IPv6 prefix", tok[2]);
+        memcpy(&e->len, k, 4);
+        memcpy(e->a, k + 4, 16);
+    } else {
+        uint32_t k4[2];
+        if (lpm_key(tok[2], k4)) return kf_err("prefix", "'%s' is not an IPv4 prefix", tok[2]);
+        e->len = k4[0];
+        memcpy(e->a, &k4[1], 4);
+    }
+    nsprefixes++;
+    return 0;
+}
+
+/* After a successful load: each static prefix map holds exactly its entries
+ * (added or updated first, then the others deleted). */
+static void sync_static_prefix_maps(void) {
+    for (int m = 0; m < num_maps; m++) {
+        if (!static_maps[m]) continue;
+        int fd = maps[m].fd, ksz = maps[m].is_lpm == 2 ? 20 : 8;
+        for (int i = 0; i < nsprefixes; i++) {
+            if (sprefixes[i].map != m) continue;
+            unsigned char k[20];
+            memcpy(k, &sprefixes[i].len, 4);
+            memcpy(k + 4, sprefixes[i].a, ksz - 4);
+            union bpf_attr a;
+            memset(&a, 0, sizeof(a));
+            a.map_fd = fd; a.key = (unsigned long)k; a.value = (unsigned long)&sprefixes[i].val; a.flags = BPF_ANY;
+            if (bpf_syscall(BPF_MAP_UPDATE_ELEM, &a, sizeof(a)) < 0)
+                fprintf(stderr, "Warning: %s: cannot add a prefix: %s\n", maps[m].name, strerror(errno));
+        }
+        unsigned char key[20], next[20];
+        int first = 1;
+        for (int guard = 0; guard < 4 * MAX_STATIC_PREFIXES; guard++) {
+            union bpf_attr a;
+            memset(&a, 0, sizeof(a));
+            a.map_fd = fd; a.key = first ? 0 : (unsigned long)key; a.next_key = (unsigned long)next;
+            if (bpf_syscall(BPF_MAP_GET_NEXT_KEY, &a, sizeof(a)) < 0) break;
+            first = 0;
+            memcpy(key, next, ksz);
+            int keep = 0;
+            for (int i = 0; i < nsprefixes && !keep; i++) {
+                if (sprefixes[i].map != m) continue;
+                uint32_t l;
+                memcpy(&l, next, 4);
+                keep = l == sprefixes[i].len && !memcmp(next + 4, sprefixes[i].a, ksz - 4);
+            }
+            if (keep) continue;
+            memset(&a, 0, sizeof(a));
+            a.map_fd = fd; a.key = (unsigned long)next;
+            bpf_syscall(BPF_MAP_DELETE_ELEM, &a, sizeof(a));
+            first = 1;         /* start over after a delete */
+        }
+    }
 }
 
 static void kf_flow_key(const char *var, int mode) {
@@ -9592,8 +10394,15 @@ static int process_cmd_1(char *cmd, const char *dir) {
 		compile_fill_bytes(tok[1], tok[2], tok[3]); return 0;
 	}
 	if (strcmp(op, "get") == 0 && t > 2 &&
+	    (!strcmp(a1, "l4-proto") || !strcmp(a1, "frag-off"))) {
+		if (t != 3) { fprintf(stderr, "Error: get %s <VAR>\n", a1); return 1; }
+		compile_get_l4meta(!strcmp(a1, "frag-off"), a2);
+		return 0;
+	}
+	if (strcmp(op, "get") == 0 && t > 2 &&
 	    (!strcmp(a1, "src-port") || !strcmp(a1, "dst-port") || !strcmp(a1, "dscp") || !strcmp(a1, "ecn") ||
-	     !strcmp(a1, "ip-ttl") || !strcmp(a1, "icmp-id") || !strcmp(a1, "icmp-code") || !strcmp(a1, "icmp-type"))) {
+	     !strcmp(a1, "ip-ttl") || !strcmp(a1, "icmp-id") || !strcmp(a1, "icmp-code") || !strcmp(a1, "icmp-type") ||
+	     !strcmp(a1, "tcp-flags"))) {
 		if (t != 3) { fprintf(stderr, "Error: get %s <VAR>\n", a1); return 1; }
 		compile_get_keyfield(a1, a2);
 		return 0;
@@ -9607,8 +10416,30 @@ static int process_cmd_1(char *cmd, const char *dir) {
 	if (!strcmp(op, "unpack")) return compile_unpack(tok, t) ? 1 : 0;
 	if (!strcmp(op, "count")) return compile_count(tok, t) ? 1 : 0;
 	if (!strcmp(op, "prefix-map")) {
-		if (t < 2 || t > 3) { fprintf(stderr, "Error: usage: prefix-map <MAP> [entries]\n"); return 1; }
-		get_or_create_prefix_map(a1, t > 2 ? (uint32_t)strtoul(a2, NULL, 0) : DEFAULT_MAP_ENTRIES);
+		int v6 = 0, st = 0, nt = t;
+		while (nt > 2 && (!strcmp(tok[nt - 1], "ipv6") || !strcmp(tok[nt - 1], "static"))) {
+			if (!strcmp(tok[nt - 1], "ipv6")) v6 = 1; else st = 1;
+			nt--;
+		}
+		uint64_t ne = DEFAULT_MAP_ENTRIES;
+		if (nt < 2 || nt > 3 || (nt == 3 && parse_num(tok[2], 1U << 24, &ne))) {
+			fprintf(stderr, "Error: usage: prefix-map <MAP> [entries] [ipv6] [static]\n");
+			return 1;
+		}
+		int pfd = get_or_create_prefix_map(a1, (uint32_t)ne, v6);
+		for (int i = 0; i < num_maps; i++) if (maps[i].fd == pfd && st) static_maps[i] = 1;
+		return 0;
+	}
+	if (!strcmp(op, "prefix")) return compile_prefix_entry(tok, t) ? 1 : 0;
+	if (!strcmp(op, "log")) return compile_log(tok, t) ? 1 : 0;
+	if (!strcmp(op, "transport")) return compile_transport(tok, t) ? 1 : 0;
+	if (!strcmp(op, "ringbuf-map")) {
+		uint64_t sz = 256 * 1024;
+		if (t < 2 || t > 3 || (t == 3 && parse_num(a2, 1U << 30, &sz))) {
+			fprintf(stderr, "Error: usage: ringbuf-map <MAP> [bytes]\n");
+			return 1;
+		}
+		get_or_create_ringbuf_map(a1, (uint32_t)sz);
 		return 0;
 	}
 	if ((!strcmp(op, "match") || !strcmp(op, "if")) && t > 2) {
@@ -9813,6 +10644,10 @@ static int process_cmd_1(char *cmd, const char *dir) {
                 start_match_block();
                 match_l3_proto(0x0800, f);
                 compile_match_core(23,1,115,0xFFFFFFFF,NULL);
+            } else if (strcmp(f,"icmp6")==0) {
+                start_match_block();
+                match_l3_proto(0x86DD, f);
+                compile_match_core(20,1,58,0xFFFFFFFF,NULL);
             } else if (strcmp(f,"ip-df")==0) {
                 start_match_block();
                 match_l3_proto(0x0800, f);
@@ -10248,7 +11083,7 @@ static const char *pp_reserved[] = {
     "shared-buffer-map", "start-loop", "strip-l2", "tcp-option", "xor-packet", "xor-packet-keyed",
     "zero-buffer", "zero-buffer-keyed",
     "include", "const", "define", "end-define", "repeat", "end-repeat", "break-repeat",
-    "next-repeat", "when", "otherwise", "end-when", "name", "UNIQUE", NULL
+    "next-repeat", "when", "otherwise", "end-when", "name", "depends", "meta", "option", "UNIQUE", NULL
 };
 
 static void *pp_grow(void *p, int *cap, int need, size_t sz) {
@@ -10859,6 +11694,58 @@ static const char *pp_name_result(int *err) {
     return pp_prog_name;
 }
 
+/*
+ * depends <file>: the program depends on file (a frontend's input), so -M
+ * lists it and bpfcd sees its changes. No code.
+ * meta <text>: a line for bpfcd and bpfcctl (bpfc -I prints BPFC_META <text>).
+ * option on-failure keep|remove: what bpfcd does when a later version of this
+ * program fails (bpfc -I prints BPFC_OPTION on-failure <value>).
+ */
+static char **pp_meta;
+static int pp_nmeta, pp_capmeta;
+static char pp_opt_on_failure[8];
+
+static int pp_depends(const struct pp_cmd *c, const char *arg) {
+    if (!*arg || strchr(arg, ' ')) { pp_err(c, "usage: depends <file>"); return -1; }
+    char path[4096];
+    if (arg[0] == '/' || c->file[0] == '<') snprintf(path, sizeof(path), "%s", arg);
+    else {
+        char here[4096];
+        snprintf(here, sizeof(here), "%s", c->file);
+        char *slash = strrchr(here, '/');
+        if (slash) *slash = 0;
+        if (!slash || (size_t)snprintf(path, sizeof(path), "%.2000s/%.2000s", here, arg) >= sizeof(path))
+            snprintf(path, sizeof(path), "%s", arg);
+    }
+    for (int i = 0; i < pp_nfiles; i++) if (!strcmp(pp_files[i], path)) return 0;
+    pp_add_file(pp_strdup(path));
+    return 0;
+}
+
+static int pp_meta_cmd(const struct pp_cmd *c) {
+    const char *t = pp_rest(c->text);
+    if (!*t) { pp_err(c, "usage: meta <text>"); return -1; }
+    if (strlen(t) > 1024) { pp_err(c, "meta: longer than 1024 bytes"); return -1; }
+    for (const unsigned char *p = (const unsigned char *)t; *p; p++)
+        if (*p < 0x20 || *p == 0x7f) { pp_err(c, "meta: control characters are not allowed"); return -1; }
+    pp_meta = pp_grow(pp_meta, &pp_capmeta, pp_nmeta + 1, sizeof(*pp_meta));
+    pp_meta[pp_nmeta++] = pp_strdup(t);
+    return 0;
+}
+
+static int pp_option(const struct pp_cmd *c) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", pp_rest(c->text));
+    char *tok[4];
+    int t = pp_tokens(buf, tok, 3);
+    if (t == 2 && !strcmp(tok[0], "on-failure") && (!strcmp(tok[1], "keep") || !strcmp(tok[1], "remove"))) {
+        if (pp_inc_level == 0 || !pp_opt_on_failure[0]) snprintf(pp_opt_on_failure, sizeof(pp_opt_on_failure), "%s", tok[1]);
+        return 0;
+    }
+    pp_err(c, "usage: option on-failure keep|remove");
+    return -1;
+}
+
 static int pp_include(const struct pp_cmd *c, const char *arg, int depth) {
     char path[4096];
     size_t n = strlen(arg);
@@ -11053,6 +11940,16 @@ static int pp_expand(int start, int end, const struct pp_scope *sc, int depth) {
             if (r) return -1;
         } else if (!strcmp(w, "name")) {
             if (pp_name(&c, sc)) return -1;
+        } else if (!strcmp(w, "depends")) {
+            char *arg = pp_subst(pp_rest(c.text), sc, &c);
+            if (!arg) return -1;
+            int r = pp_depends(&c, arg);
+            free(arg);
+            if (r) return -1;
+        } else if (!strcmp(w, "meta")) {
+            if (pp_meta_cmd(&c)) return -1;
+        } else if (!strcmp(w, "option")) {
+            if (pp_option(&c)) return -1;
         } else if (!strcmp(w, "const")) {
             const char *rest = pp_rest(c.text);
             char name[PP_NAME_MAX];
@@ -11188,13 +12085,15 @@ int main(int argc, char **argv) {
     char *read_map = NULL, *join_maps = NULL;
     char *write_map = NULL, *write_key = NULL, *write_val = NULL;
     char *del_map = NULL, *del_key = NULL, *key_text = NULL, *klay = NULL, *vlay = NULL;
+    char *fe_force = NULL, *gen_out = NULL;
     int delete_prio = 0, show_info = 0, expand_only = 0, list_files = 0;
     for (int i = 1; i < argc; i++) {
         /* Options that take a value must not run past the end of argv. */
         int needs_arg = !strcmp(argv[i],"-i") || !strcmp(argv[i],"-d") || !strcmp(argv[i],"-p") ||
                         !strcmp(argv[i],"-m") || !strcmp(argv[i],"-r") || !strcmp(argv[i],"-R") || !strcmp(argv[i],"-f") ||
                         !strcmp(argv[i],"-n") || !strcmp(argv[i],"-s") || !strcmp(argv[i],"-L") ||
-                        !strcmp(argv[i],"-H") || !strcmp(argv[i],"-K") || !strcmp(argv[i],"-V");
+                        !strcmp(argv[i],"-H") || !strcmp(argv[i],"-K") || !strcmp(argv[i],"-V") ||
+                        !strcmp(argv[i],"-F") || !strcmp(argv[i],"-G");
         if (needs_arg && i + 1 >= argc) {
             fprintf(stderr, "Error: option %s requires an argument\n", argv[i]);
             return 1;
@@ -11220,6 +12119,8 @@ int main(int argc, char **argv) {
             del_map = argv[++i]; del_key = argv[++i];
         }
         else if (strcmp(argv[i],"-H")==0) key_text = argv[++i];
+        else if (strcmp(argv[i],"-F")==0) fe_force = argv[++i];
+        else if (strcmp(argv[i],"-G")==0) gen_out = argv[++i];
         else if (strcmp(argv[i],"-K")==0) klay = argv[++i];
         else if (strcmp(argv[i],"-V")==0) vlay = argv[++i];
         else if (strcmp(argv[i],"-f")==0) filename = argv[++i];
@@ -11281,10 +12182,24 @@ int main(int argc, char **argv) {
         return detach_bpf_prio(iface, dir, pri) < 0 ? 1 : 0;
     }
     if (delete_prio && is_xdp) return detach_bpf_xdp(iface) < 0 ? 1 : 0;
-    if (filename) {
+    /* <priority>.<suffix> files other than .bpfc go through a frontend (after
+     * the interface constants are known: the frontend gets them too). */
+    char fe_type[32] = "", fe_path[4096] = "";
+    if (filename && fe_force) {
+        if (!*fe_force || strlen(fe_force) >= sizeof(fe_type) || strspn(fe_force, "abcdefghijklmnopqrstuvwxyz0123456789") != strlen(fe_force)) {
+            fprintf(stderr, "Error: -F needs a frontend name ([a-z0-9]+)\n");
+            return 1;
+        }
+        if (strcmp(fe_force, "bpfc")) snprintf(fe_type, sizeof(fe_type), "%s", fe_force);
+    } else if (filename) frontend_type_of(filename, fe_type, sizeof(fe_type));
+    if (fe_type[0] && !strcmp(filename, "-")) {
+        fprintf(stderr, "Error: -F %s with -f -: give the file itself (frontends read files)\n", fe_type);
+        return 1;
+    }
+    if (filename && !fe_type[0]) {
         instr = read_instructions_from_file(filename);
     }
-    if (!instr) { printf("Usage: %s -i <iface> [-d ingress|egress|xdp] \"<cmds>\"\n", argv[0]); return 1; }
+    if (!instr && !fe_type[0]) { printf("Usage: %s -i <iface> [-d ingress|egress|xdp] \"<cmds>\"\n", argv[0]); return 1; }
 
     /* $IFNAME, $IFINDEX, $IFTYPE and $IFKIND for the -i interface (bpfcd
      * compiles a %all% or %<kind>% template once per interface). -s wins. */
@@ -11336,17 +12251,38 @@ int main(int argc, char **argv) {
     pp_set_const("XDP", is_xdp ? "1" : "0", 0, NULL);
     pp_set_const("HOOK", dir, 0, NULL);
 
+    if (fe_type[0]) {
+        char why[4400];
+        if (frontend_find(fe_type, fe_path, sizeof(fe_path), why, sizeof(why))) {
+            fprintf(stderr, "Error: %s: %s\n", filename, why);
+            return 1;
+        }
+        struct stat fst;
+        if (stat(filename, &fst) < 0) { fprintf(stderr, "Error: Could not open file '%s'\n", filename); return 1; }
+        char *gen = run_frontend(fe_path, filename, iface, dir, pri, bpf_map_dir);
+        if (gen_out) {
+            FILE *g = fopen(gen_out, "w");
+            if (!g || fputs(gen, g) < 0 || fclose(g) != 0)
+                fprintf(stderr, "Warning: cannot write %s: %s\n", gen_out, strerror(errno));
+        }
+        FILE *m = fmemopen(gen, strlen(gen), "r");
+        if (!m) { perror("fmemopen"); return 1; }
+        instr = read_instructions_stream(m);
+        fclose(m);
+        free(gen);
+    }
     instr = pp_run(instr, filename);
     if (!instr) return 1;
+    if (fe_path[0]) pp_add_file(fe_path);
     /* -I: the program's name (the name command), before compiling, so it is
      * known even when the kernel rejects the program. */
     {
         int err;
         const char *pname = pp_name_result(&err);
-        if (show_info && pname) {
-            printf("BPFC_NAME %s\n", pname);
-            fflush(stdout);
-        }
+        if (show_info && pname) printf("BPFC_NAME %s\n", pname);
+        if (show_info && pp_opt_on_failure[0]) printf("BPFC_OPTION on-failure %s\n", pp_opt_on_failure);
+        for (int i = 0; show_info && i < pp_nmeta; i++) printf("BPFC_META %s\n", pp_meta[i]);
+        if (show_info) fflush(stdout);
     }
     if (list_files) {
         pp_print_files(stdout);
@@ -11434,6 +12370,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Error: kernel rejected program: %s\n", strerror(errno));
             return 1;
         }
+        sync_static_prefix_maps();   /* the program verified: its prefix lists apply now */
         if (is_xdp) {
             if (attach_bpf_xdp(fd, iface) < 0) {
                 fprintf(stderr, "Error: failed to attach XDP program to %s\n", iface);

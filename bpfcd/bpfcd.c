@@ -1,7 +1,9 @@
 /*
  * bpfcd - keeps bpfc programs from /etc/bpfc/interfaces.d attached to interfaces.
  *
- * Layout: <config_dir>/<interface>/{ingress,egress}/<priority>.bpfc
+ * Layout: <config_dir>/<interface>/{ingress,egress}/<priority>.<type>
+ *         (type bpfc, or another frontend's: 20.acl is translated by
+ *         /usr/libexec/bpfc/frontends/acl; xdp.<type> for XDP)
  *         <config_dir>/%all%/...      every interface
  *         <config_dir>/%<kind>%/...   every interface of that kind (veth, gre,
  *                                     vxlan, ...; nic = no kind, lo = loopback)
@@ -31,6 +33,7 @@
  */
 #define _GNU_SOURCE
 #include "common.h"
+#include "acl.h"
 #include "netns.h"
 #include "json.h"
 #include "http.h"
@@ -318,6 +321,38 @@ static void warn_if_foreign(const struct slot *s, int ifindex) {
     free(f);
 }
 
+/* Is the slot's program (prog_id) still the one at its priority? */
+static int prog_still_attached(const struct slot *s) {
+    struct tc_filter *f = NULL;
+    int n = tc_dump_filters(s->ifindex, s->dir, &f);
+    int yes = 0;
+    for (int i = 0; i < n; i++)
+        if (f[i].prio == s->prio && f[i].prog_id == s->prog_id) { yes = 1; break; }
+    free(f);
+    return yes;
+}
+
+/* The BPFC_META lines of a run, for bpfcctl (ACL rules and the like). */
+static void write_meta(const struct slot *s, const char *out) {
+    char path[PATH_MAX + 64], tmp[PATH_MAX + 80], dir[PATH_MAX + 16];
+    meta_path(path, sizeof(path), cfg.state_dir, s->iface, s->dir, s->prio);
+    if (!out || !strstr(out, "BPFC_META ")) { unlink(path); return; }
+    snprintf(dir, sizeof(dir), "%s/meta", cfg.state_dir);
+    mkdir_p(dir, 0755);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) { logmsg(LOG_LVL_WARN, "cannot write %s: %s", tmp, strerror(errno)); return; }
+    fprintf(f, "# %s %s %d %s\n", s->iface, dir_name(s->dir), s->prio, s->path);
+    for (const char *p = out; (p = strstr(p, "BPFC_META "));) {
+        if (p != out && p[-1] != '\n') { p++; continue; }
+        const char *nl = strchr(p, '\n');
+        size_t l = nl ? (size_t)(nl - p) : strlen(p);
+        fprintf(f, "%.*s\n", (int)(l - 10), p + 10);
+        p += l;
+    }
+    if (fclose(f) != 0 || rename(tmp, path) < 0) { logmsg(LOG_LVL_WARN, "cannot write %s: %s", path, strerror(errno)); unlink(tmp); }
+}
+
 static void install_slot(struct slot *s, const char *why) {
     /* Waiting for the namespace: the current one is the host's, never touch it. */
     int ifindex = ns_active() ? (int)if_nametoindex(s->iface) : 0;
@@ -346,15 +381,40 @@ static void install_slot(struct slot *s, const char *why) {
     argv[a++] = "-n"; argv[a++] = name;
     argv[a++] = "-I";
     if (cfg.map_dir[0]) { argv[a++] = "-m"; argv[a++] = cfg.map_dir; }
+    /* A frontend's translation is kept for bpfcctl show --source. */
+    char gen[PATH_MAX + 64];
+    const char *base = strrchr(s->path, '/');
+    int is_fe = program_type(base ? base + 1 : s->path, NULL, 0) == 1;
+    generated_path(gen, sizeof(gen), cfg.state_dir, s->iface, s->dir, s->prio);
+    if (is_fe) {
+        char gdir[PATH_MAX + 16];
+        snprintf(gdir, sizeof(gdir), "%s/generated", cfg.state_dir);
+        mkdir_p(gdir, 0755);
+        argv[a++] = "-G"; argv[a++] = gen;
+    } else unlink(gen);
     argv[a++] = "-f"; argv[a++] = s->path;
     argv[a] = NULL;
 
-    struct run_result r;
-    int rc = run_capture(argv, &r, cfg.compile_timeout, cfg.state_dir);
+    struct run_result r = {0};
+    int rc;
+    if (s->conflict[0]) {
+        /* two files for one priority: neither is installed */
+        rc = 0;
+        r.exit_code = 1;
+        r.out = strdup(s->conflict);
+        r.outlen = r.out ? strlen(r.out) : 0;
+    } else rc = run_capture(argv, &r, cfg.compile_timeout, cfg.state_dir);
     struct slot probe = *s;
-    /* The name is printed before compiling, so a rejected program has one too. */
-    if (rc == 0) parse_name_line(r.out, s->name, sizeof(s->name));
+    /* The name and options are printed before compiling, so a rejected program has them too. */
+    int opt = 0;
+    if (rc == 0 && !s->conflict[0]) {
+        parse_name_line(r.out, s->name, sizeof(s->name));
+        const char *o = r.out ? strstr(r.out, "BPFC_OPTION on-failure ") : NULL;
+        if (o) opt = !strncmp(o + 23, "keep", 4) ? ON_FAILURE_KEEP : !strncmp(o + 23, "remove", 6) ? ON_FAILURE_REMOVE : 0;
+    }
     if (rc == 0 && r.exit_code == 0 && parse_info_line(r.out, &probe) == 0) {
+        s->on_failure = opt;
+        write_meta(s, r.out);
         s->prog_id = probe.prog_id;
         s->insns = probe.insns;
         snprintf(s->tag, sizeof(s->tag), "%s", probe.tag);
@@ -377,7 +437,28 @@ static void install_slot(struct slot *s, const char *why) {
     save_error_log(s, rc < 0 ? NULL : &r, summary);
     free(r.out);
 
+    /*
+     * on-failure: keep the program that runs (a firewall stays up when a new
+     * version of its rules has a typo), or remove it, so nothing older runs
+     * in place of what the file says. The failed version's own option decides
+     * when it got far enough to state one, else the running program's, else
+     * on_failure in bpfc.conf.
+     */
+    int policy = opt ? opt : s->on_failure ? s->on_failure : cfg.on_failure;
+    if (policy == ON_FAILURE_KEEP && s->prog_id && s->ifindex == ifindex && prog_still_attached(s)) {
+        char kept[600];
+        snprintf(kept, sizeof(kept), "%s (previous program kept, prog id %u)", summary, s->prog_id);
+        s->dirty = 0;
+        set_status(s, ST_KEPT, kept);
+        logmsg(LOG_LVL_ERR, "%s %s prio %d: %s failed: %s; the previous program stays attached "
+               "(on-failure keep; details: bpfcctl show %s %s %d)",
+               s->iface, dir_name(s->dir), s->prio, s->path, summary, s->iface, dir_name(s->dir), s->prio);
+        return;
+    }
     /* Never leave an older program running in place of one that failed (see bpfcd(8)). */
+    char mp[PATH_MAX + 64];
+    meta_path(mp, sizeof(mp), cfg.state_dir, s->iface, s->dir, s->prio);
+    unlink(mp);
     bpfc_delete(s);
     s->prog_id = 0;
     s->tag[0] = '\0';
@@ -400,20 +481,25 @@ static int xdp_still_ours(const struct slot *s) {
 
 static void uninstall_slot(struct slot *s, const char *why) {
     /* Only our own program is removed; a filter someone else put in its place is left alone. */
-    if (ns_active() && s->ifindex && if_nametoindex(s->iface) == (unsigned)s->ifindex && s->status == ST_INSTALLED &&
+    if (ns_active() && s->ifindex && if_nametoindex(s->iface) == (unsigned)s->ifindex && slot_live(s->status) &&
         (s->dir != DIR_XDP || xdp_still_ours(s))) {
         if (bpfc_delete(s) == 0)
             logmsg(LOG_LVL_INFO, "%s %s prio %d: removed (%s)", s->iface, dir_name(s->dir), s->prio, why);
     }
     clear_error_log(s);
+    char mp[PATH_MAX + 64];
+    meta_path(mp, sizeof(mp), cfg.state_dir, s->iface, s->dir, s->prio);
+    unlink(mp);
+    generated_path(mp, sizeof(mp), cfg.state_dir, s->iface, s->dir, s->prio);
+    unlink(mp);
 }
 
 /* ======================= scanning the config dir ======================= */
 
-/* Accepts "<1-65535>.bpfc" without leading zeros, so each priority has exactly one name. */
+/* Accepts "<1-65535>.<type>" without leading zeros, so each priority has exactly one name per type. */
 static int parse_prio_name(const char *name) {
     const char *dot = strrchr(name, '.');
-    if (!dot || strcmp(dot, ".bpfc") || dot == name || name[0] == '0') return -1;
+    if (!dot || program_type(name, NULL, 0) < 0 || dot == name || name[0] == '0') return -1;
     int v = 0;
     for (const char *p = name; p < dot; p++) {
         if (!isdigit((unsigned char)*p)) return -1;
@@ -456,6 +542,7 @@ struct source {
     int has_includes;
     int empty;
     int seen;
+    char conflict[640];
 };
 static struct source *sources;
 static int nsources, cap_sources;
@@ -470,14 +557,16 @@ static struct source *source_find(const char *scope, int dir, int prio) {
     return NULL;
 }
 
-/* No commands: only whitespace, ';' and # comments. */
+/* No commands: only whitespace, ';' and # comments (and ! comments in a frontend's file, as IOS writes them). */
 static int file_is_empty(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
+    const char *base = strrchr(path, '/');
+    int fe = program_type(base ? base + 1 : path, NULL, 0) == 1;
     int c, in_comment = 0, empty = 1;
     while ((c = fgetc(f)) != EOF) {
         if (in_comment) { if (c == '\n') in_comment = 0; continue; }
-        if (c == '#') { in_comment = 1; continue; }
+        if (c == '#' || (fe && c == '!')) { in_comment = 1; continue; }
         if (!isspace(c) && c != ';') { empty = 0; break; }
     }
     fclose(f);
@@ -487,9 +576,8 @@ static int file_is_empty(const char *path) {
 static void scan_file(const char *scope, int dir, const char *dirpath, const char *fname, int layer) {
     int prio = dir == DIR_XDP ? 0 : parse_prio_name(fname);
     if (prio < 0) {
-        const char *dot = strrchr(fname, '.');
-        if (dot && !strcmp(dot, ".bpfc"))
-            logmsg(LOG_LVL_WARN, "%s/%s: ignored, name must be <priority>.bpfc with priority 1-65535 "
+        if (program_type(fname, NULL, 0) >= 0)
+            logmsg(LOG_LVL_WARN, "%s/%s: ignored, name must be <priority>.<type> with priority 1-65535 "
                    "and no leading zeros", dirpath, fname);
         return;
     }
@@ -510,6 +598,17 @@ static void scan_file(const char *scope, int dir, const char *dirpath, const cha
 
     int64_t mtime = (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
     struct source *src = source_find(scope, dir, prio);
+    if (src && src->seen && src->layer == layer && strcmp(src->path, path)) {
+        /* 20.acl and 20.bpfc: one priority, one program. Neither is installed. */
+        const char *other = strrchr(src->path, '/');
+        snprintf(src->conflict, sizeof(src->conflict), "Error: two programs for one priority: %s and %s; remove one",
+                 other ? other + 1 : src->path, fname);
+        logmsg(LOG_LVL_ERR, "%s/%s: %s", dirpath, fname, src->conflict + 7);
+        char h[65];
+        snprintf(h, sizeof(h), "conflict-%.55s", src->sha256);
+        snprintf(src->sha256, sizeof(src->sha256), "%s", h);
+        return;
+    }
     if (!src) {
         if (nsources == cap_sources) {
             int nc = cap_sources ? cap_sources * 2 : 32;
@@ -529,6 +628,7 @@ static void scan_file(const char *scope, int dir, const char *dirpath, const cha
     snprintf(src->path, sizeof(src->path), "%s", path);
     src->layer = layer;
     src->overrides[0] = '\0';
+    if (src->conflict[0]) { src->conflict[0] = '\0'; src->sha256[0] = '\0'; }   /* resolved: hash again */
 
     /* Per bpfcd(8): only hash when the mtime moved; reload only when the hash differs too.
      * A program with includes is always re-hashed: an included file may have changed. */
@@ -541,7 +641,7 @@ static void scan_file(const char *scope, int dir, const char *dirpath, const cha
             src->has_includes = 0;
             rc = 0;
         } else {
-            rc = sha256_program(cfg.bpfc_path, path, cfg.compile_timeout, hex, &src->has_includes);
+            rc = sha256_program(cfg.bpfc_path, path, dir_name(dir), cfg.compile_timeout, hex, &src->has_includes);
         }
         if (rc < 0) {
             logmsg(LOG_LVL_ERR, "%s: cannot read: %s", path, strerror(-rc));
@@ -573,7 +673,8 @@ static void desire(const char *iface, const struct source *src, int from_templat
     }
     s->seen = 1;
     s->from_template = from_template;
-    s->excluded = src->empty;
+    s->excluded = src->empty && !src->conflict[0];
+    snprintf(s->conflict, sizeof(s->conflict), "%s", src->conflict);
     s->has_includes = src->has_includes;
     s->mtime_ns = src->mtime_ns;
     snprintf(s->path, sizeof(s->path), "%s", src->path);
@@ -639,11 +740,14 @@ static int scan_tree(const char *root, int layer) {
             }
             closedir(d);
         }
-        /* <if>/xdp.bpfc: the interface's XDP program */
-        char xpath[PATH_MAX];
-        struct stat xst;
-        if ((size_t)snprintf(xpath, sizeof(xpath), "%s/xdp.bpfc", ifdir) < sizeof(xpath) && lstat(xpath, &xst) == 0)
-            scan_file(de->d_name, DIR_XDP, ifdir, "xdp.bpfc", layer);
+        /* <if>/xdp.<type>: the interface's XDP program */
+        DIR *xd = opendir(ifdir);
+        struct dirent *xe;
+        while (xd && (xe = readdir(xd))) {
+            if (strncmp(xe->d_name, "xdp.", 4) || program_type(xe->d_name, NULL, 0) < 0 || strchr(xe->d_name + 4, '.')) continue;
+            scan_file(de->d_name, DIR_XDP, ifdir, xe->d_name, layer);
+        }
+        if (xd) closedir(xd);
     }
     closedir(top);
     return 0;
@@ -774,7 +878,7 @@ static void verify_iface_dir(int ifindex, int dir) {
     }
     for (int i = 0; i < nslots; i++) {
         struct slot *s = &slots[i];
-        if (s->ifindex != ifindex || s->dir != dir || s->status != ST_INSTALLED) continue;
+        if (s->ifindex != ifindex || s->dir != dir || !slot_live(s->status)) continue;
         const struct tc_filter *hit = NULL;
         for (int j = 0; j < n; j++)
             if (f[j].prio == s->prio) { hit = &f[j]; break; }
@@ -815,10 +919,10 @@ static void verify_all(void) {
     /* Each (ifindex, dir) pair is dumped once. */
     for (int i = 0; i < nslots; i++) {
         struct slot *s = &slots[i];
-        if (s->status != ST_INSTALLED || !s->ifindex) continue;
+        if (!slot_live(s->status) || !s->ifindex) continue;
         int dup = 0;
         for (int j = 0; j < i; j++)
-            if (slots[j].status == ST_INSTALLED && slots[j].ifindex == s->ifindex && slots[j].dir == s->dir) { dup = 1; break; }
+            if (slot_live(slots[j].status) && slots[j].ifindex == s->ifindex && slots[j].dir == s->dir) { dup = 1; break; }
         if (dup) continue;
         if (if_nametoindex(s->iface) != (unsigned)s->ifindex) continue; /* link event will handle it */
         verify_iface_dir(s->ifindex, s->dir);
@@ -857,7 +961,7 @@ static void adopt_previous_state(void) {
     int adopted = 0;
     for (int i = 0; i < n; i++) {
         struct slot *o = &old[i];
-        if (o->status != ST_INSTALLED || !o->prog_id) continue;
+        if (!slot_live(o->status) || !o->prog_id) continue;
         int ifindex = (int)if_nametoindex(o->iface);
         if (!ifindex || ifindex != o->ifindex) continue;
         struct tc_filter *f = NULL;
@@ -878,7 +982,9 @@ static void adopt_previous_state(void) {
             s->installed_at = o->installed_at;
             s->changed_at = o->changed_at;
             s->dirty = 0;
-            s->status = ST_INSTALLED;
+            s->status = o->status;          /* installed, or failed-kept */
+            s->on_failure = o->on_failure;
+            snprintf(s->error, sizeof(s->error), "%s", o->status == ST_KEPT ? o->error : "");
             adopted++;
         } else if (!s || !s->seen) {
             logmsg(LOG_LVL_INFO, "%s %s prio %d: %s was removed while bpfcd was stopped",
@@ -938,7 +1044,7 @@ static void on_link_new(const struct link_info *li) {
         if (s->ifindex == ifindex && strcmp(s->iface, name)) {
             logmsg(LOG_LVL_WARN, "%s was renamed to %s; removing %s prio %d from it",
                    s->iface, name, dir_name(s->dir), s->prio);
-            if (s->status == ST_INSTALLED) {
+            if (slot_live(s->status)) {
                 struct slot tmp = *s;
                 snprintf(tmp.iface, sizeof(tmp.iface), "%s", name);
                 bpfc_delete(&tmp);
@@ -988,7 +1094,7 @@ static void on_link_del(int ifindex, const char *name) {
 
 static int ifindex_is_managed(int ifindex) {
     for (int i = 0; i < nslots; i++)
-        if (slots[i].ifindex == ifindex && slots[i].status == ST_INSTALLED) return 1;
+        if (slots[i].ifindex == ifindex && slot_live(slots[i].status)) return 1;
     return 0;
 }
 
@@ -1015,7 +1121,7 @@ static void handle_netlink(void) {
                 apply(0);
                 for (int i = 0; i < nslots; i++) {
                     struct slot *s = &slots[i];
-                    if (s->excluded || s->status == ST_INSTALLED) continue;
+                    if (s->excluded || slot_live(s->status)) continue;
                     if (if_nametoindex(s->iface)) install_slot(s, "interface appeared");
                 }
                 schedule_verify();
@@ -1081,7 +1187,7 @@ static void ns_forget_programs(int remove) {
     for (int i = 0; i < nslots; i++) {
         struct slot *s = &slots[i];
         if (remove) uninstall_slot(s, "namespace changed");
-        if (s->status == ST_INSTALLED || s->status == ST_REMOVED_EXT || s->status == ST_REPLACED_EXT ||
+        if (slot_live(s->status) || s->status == ST_REMOVED_EXT || s->status == ST_REPLACED_EXT ||
             s->status == ST_DISABLED || s->status == ST_FAILED) {
             s->ifindex = 0;
             s->prog_id = 0;
@@ -1457,6 +1563,7 @@ static void run_check(const char *file, const char *iface, int dir, int prio, st
     if (dir != DIR_XDP) { argv[a++] = "-p"; argv[a++] = pr; }
     if (iface) { argv[a++] = "-i"; argv[a++] = (char *)iface; }
     if (cfg.map_dir[0]) { argv[a++] = "-m"; argv[a++] = cfg.map_dir; }
+    argv[a++] = "-F"; argv[a++] = "bpfc";   /* REST programs are bpfc; the file is a temporary name */
     argv[a++] = "-f"; argv[a++] = (char *)file;
     argv[a] = NULL;
     struct run_result r;
@@ -1736,14 +1843,14 @@ static void rest_put_file(const struct http_request *req, struct http_response *
 
     /* Did it install everywhere it applies? */
     int nfail = 0;
-    for (int i = 0; i < nslots; i++) if (!strcmp(slots[i].path, target) && slots[i].status == ST_FAILED) nfail++;
+    for (int i = 0; i < nslots; i++) if (!strcmp(slots[i].path, target) && (slots[i].status == ST_FAILED || slots[i].status == ST_KEPT)) nfail++;
     if (nfail) {
         /* The reply lists the failures first: their logs are gone once the rollback reinstalls. */
         char (*fifs)[IFNAMSIZ] = calloc((size_t)nfail, IFNAMSIZ);
         int k = 0;
         const struct slot *f0 = NULL;
         for (int i = 0; i < nslots && !f0; i++)
-            if (!strcmp(slots[i].path, target) && slots[i].status == ST_FAILED) f0 = &slots[i];
+            if (!strcmp(slots[i].path, target) && (slots[i].status == ST_FAILED || slots[i].status == ST_KEPT)) f0 = &slots[i];
         char first[700];
         snprintf(first, sizeof(first), "installing failed on %s: %s", f0->iface, f0->error);
         resp->status = 422;
@@ -1755,7 +1862,7 @@ static void rest_put_file(const struct http_request *req, struct http_response *
         jb_arr(b);
         for (int i = 0; i < nslots; i++) {
             const struct slot *s = &slots[i];
-            if (strcmp(s->path, target) || s->status != ST_FAILED) continue;
+            if (strcmp(s->path, target) || (s->status != ST_FAILED && s->status != ST_KEPT)) continue;
             if (fifs) snprintf(fifs[k++], IFNAMSIZ, "%s", s->iface);
             char lp[PATH_MAX + 64];
             error_log_path(lp, sizeof(lp), cfg.state_dir, s->iface, s->dir, s->prio);
@@ -2006,13 +2113,13 @@ static void notify_status(const char *prefix) {
     count_states(c);
     char msg[256];
     snprintf(msg, sizeof(msg), "%sSTATUS=%d installed, %d waiting for interface, %d failed, %d external change",
-             prefix, c[ST_INSTALLED], c[ST_PENDING], c[ST_FAILED] + c[ST_DISABLED],
+             prefix, c[ST_INSTALLED], c[ST_PENDING], c[ST_FAILED] + c[ST_DISABLED] + c[ST_KEPT],
              c[ST_REMOVED_EXT] + c[ST_REPLACED_EXT]);
     sd_notify_msg(msg);
-    int failed = c[ST_FAILED] + c[ST_DISABLED];
+    int failed = c[ST_FAILED] + c[ST_DISABLED] + c[ST_KEPT];
     logmsg(failed ? LOG_LVL_WARN : LOG_LVL_INFO,
-           "%d program(s) installed, %d waiting for interface, %d failed",
-           c[ST_INSTALLED], c[ST_PENDING], failed);
+           "%d program(s) installed, %d waiting for interface, %d failed%s",
+           c[ST_INSTALLED], c[ST_PENDING], failed, c[ST_KEPT] ? " (some kept their previous program)" : "");
 }
 
 static int reload_config_file(void) {
@@ -2100,6 +2207,61 @@ static void usage(const char *argv0) {
            "  -h, --help           this help\n"
            "Signals: SIGHUP rescans %s and bpfc.conf; SIGTERM/SIGINT stop.\n",
            argv0, DEFAULT_CONF_ROOT, DEFAULT_CONF_PATH, DEFAULT_CONFIG_DIR);
+}
+
+/* ===================== access-list logging ===================== */
+/*
+ * Entries with log (in an acl file) put the packet in the BPFC_ACL_LOG ring
+ * buffer; bpfcd turns each record into the line IOS would write
+ * (%SEC-6-IPACCESSLOGP: list ...) and logs it, and appends it to
+ * <state_dir>/acl.log (bpfcctl log). The ring buffer appears with the first
+ * list that logs, so bpfcd looks for it after every change.
+ */
+static struct acl_log *acl_log;
+static struct acl_table acl_meta;
+static time_t acl_meta_at;
+#define ACL_LOG_MAX (16 * 1024 * 1024)
+
+static const char *acl_map_dir(void) { return cfg.map_dir[0] ? cfg.map_dir : DEFAULT_MAP_ROOT; }
+
+static void acl_log_check(void) {
+    uint32_t id = acl_pinned_map_id(acl_map_dir(), "BPFC_ACL_LOG");
+    if (acl_log && acl_log_map_id(acl_log) == id) return;
+    acl_log_close(acl_log);
+    acl_log = id ? acl_log_open(acl_map_dir()) : NULL;
+    if (id && !acl_log) logmsg(LOG_LVL_WARN, "cannot read the access-list log %s/BPFC_ACL_LOG", acl_map_dir());
+}
+
+static void acl_emit(const char *line, void *ctx) {
+    FILE *f = ctx;
+    logmsg(LOG_LVL_INFO, "%s", line);
+    if (!f) return;
+    time_t now = time(NULL);
+    struct tm tm;
+    char ts[64];
+    localtime_r(&now, &tm);
+    strftime(ts, sizeof(ts), "%b %e %H:%M:%S", &tm);
+    fprintf(f, "%s: %s\n", ts, line);
+}
+
+static void acl_log_read(void) {
+    if (!acl_log) return;
+    time_t now = time(NULL);
+    if (now != acl_meta_at) {      /* the entries' names: reread at most once a second */
+        acl_table_free(&acl_meta);
+        acl_table_load(&acl_meta, cfg.state_dir);
+        acl_meta_at = now;
+    }
+    char p[PATH_MAX + 16], old[PATH_MAX + 32];
+    snprintf(p, sizeof(p), "%s/acl.log", cfg.state_dir);
+    struct stat st;
+    if (stat(p, &st) == 0 && st.st_size > ACL_LOG_MAX) {
+        snprintf(old, sizeof(old), "%s.1", p);
+        rename(p, old);
+    }
+    FILE *f = fopen(p, "a");
+    acl_log_drain(acl_log, &acl_meta, acl_emit, f);
+    if (f) fclose(f);
 }
 
 int main(int argc, char **argv) {
@@ -2218,24 +2380,27 @@ int main(int argc, char **argv) {
         verify_all();
     }
     dinfo.last_reload = time(NULL);
+    acl_log_check();
     rest_start();
     write_state();
     notify_status("READY=1\n");
 
     int running = 1;
     while (running) {
-        struct pollfd pfd[4 + HTTP_MAX_POLLFDS] = {
+        struct pollfd pfd[5 + HTTP_MAX_POLLFDS] = {
             {.fd = sigfd, .events = POLLIN}, {.fd = nlfd, .events = POLLIN}, {.fd = tfd, .events = POLLIN},
-            {.fd = nstfd, .events = POLLIN}};   /* negative fds (no monitor, no namespace) are skipped */
+            {.fd = nstfd, .events = POLLIN}, {.fd = acl_log_fd(acl_log), .events = POLLIN}};
+            /* negative fds (no monitor, no namespace, no access-list log) are skipped */
         struct http_server *polled = rest_srv;
-        int nh = polled ? http_pollfds(polled, pfd + 4, HTTP_MAX_POLLFDS) : 0;
-        if (poll(pfd, 4 + nh, polled ? http_timeout_ms(polled) : -1) < 0) {
+        int nh = polled ? http_pollfds(polled, pfd + 5, HTTP_MAX_POLLFDS) : 0;
+        if (poll(pfd, 5 + nh, polled ? http_timeout_ms(polled) : -1) < 0) {
             if (errno == EINTR) continue;
             logmsg(LOG_LVL_ERR, "poll: %s", strerror(errno));
             break;
         }
         /* REST first: a reload below may replace the server these pollfds belong to. */
-        if (polled) http_process(polled, pfd + 4, nh);
+        if (polled) http_process(polled, pfd + 5, nh);
+        if (pfd[4].revents & POLLIN) acl_log_read();
         if (pfd[1].revents & POLLIN) handle_netlink();
         if (pfd[2].revents & POLLIN) {
             uint64_t exp;
@@ -2272,6 +2437,7 @@ int main(int argc, char **argv) {
             }
         }
         if (state_dirty) write_state();
+        acl_log_check();        /* after any change: a list with log may have made the ring buffer */
     }
     shutdown_daemon();
     return 0;

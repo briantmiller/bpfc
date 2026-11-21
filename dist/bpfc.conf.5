@@ -17,7 +17,22 @@ which needs a restart.
 .BI config_dir " = " /etc/bpfc/interfaces.d
 Directory holding
 .IB interface / direction / priority .bpfc
-program files.
+program files, or
+.IB priority . type
+files that a frontend translates (\fB20.acl\fR: Cisco IOS access lists; see FRONTENDS in \fBbpfc\fR(8)).
+.TP
+.BR on_failure " = " keep | remove
+What to do with a running program when a new version of its file fails to
+compile or load.
+.B keep
+(default) leaves the previous program attached (status
+.BR failed-kept ,
+which counts as a problem); the error is in \fBbpfcctl show\fR.
+.B remove
+detaches it (status \fBfailed\fR). A program decides for itself with
+\fBoption on-failure keep|remove\fR (in an acl file:
+\fB! bpfc option on-failure remove\fR); when the broken file cannot say, the
+option of the program that is running counts.
 .TP
 .BR on_external_change " = " reinstall | log
 What to do when a program bpfcd installed is removed or replaced by anything

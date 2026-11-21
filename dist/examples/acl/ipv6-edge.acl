@@ -1,0 +1,14 @@
+! interfaces.d/eth0/ingress/30.acl: IPv6 inbound. Every IPv6 list ends in
+! permit icmp any any nd-na, nd-ns and deny ipv6 any any, as on IOS.
+ipv6 access-list EDGE6-IN
+ permit icmp any any packet-too-big
+ permit icmp any any echo-request
+ permit icmp any any echo-reply
+ permit icmp any any time-exceeded
+ permit icmp any any unreachable
+ permit icmp any any router-advertisement
+ permit tcp any 2001:db8:100::/48 established
+ permit tcp any host 2001:db8:100::25 eq smtp
+ permit tcp any host 2001:db8:100::80 eq www 443
+ permit udp any host 2001:db8:100::53 eq domain
+ deny ipv6 any any log

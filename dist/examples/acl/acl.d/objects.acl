@@ -1,0 +1,29 @@
+! /etc/bpfc/acl.d/objects.acl: definitions every .acl file can use.
+! Put shared object groups and access lists here; an interface's file
+! then only says which list applies (ip access-group NAME).
+object-group network WEB-SERVERS
+ description the public web farm
+ host 192.0.2.10
+ host 192.0.2.11
+ 198.51.100.0 255.255.255.128
+object-group network MGMT-STATIONS
+ 10.10.0.0/24
+ host 10.20.0.5
+object-group service WEB
+ tcp eq www
+ tcp eq 443
+ udp eq 443
+object-group service MGMT
+ tcp eq 22
+ udp eq snmp
+!
+ip access-list extended SERVERS-IN
+ remark the web farm, from anywhere
+ 10 permit object-group WEB any object-group WEB-SERVERS
+ remark management, from the management stations only
+ 20 permit object-group MGMT object-group MGMT-STATIONS object-group WEB-SERVERS
+ 30 permit icmp any object-group WEB-SERVERS echo
+ 40 permit icmp any any packet-too-big
+ 50 permit icmp any any unreachable
+ 60 deny ip any object-group WEB-SERVERS log
+ 70 permit ip any any

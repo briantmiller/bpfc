@@ -1,0 +1,7 @@
+! interfaces.d/eth0/ingress/10.acl: replies to what OUTBOUND let out, the
+! services we offer, and nothing else.
+ip access-list extended INBOUND
+ 10 evaluate MIRROR
+ 20 permit tcp any host 203.0.113.25 eq smtp
+ 30 permit icmp any any packet-too-big
+ 40 deny ip any any log

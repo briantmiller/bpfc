@@ -163,15 +163,18 @@ reload
 check "changed include replaces program"       diff_id $A egress 50 "$ID50"
 check "bpfcctl: no change after reload"        eval '! $BPFCCTL -s $T/run status | grep -E "^$A +egress +50 " | grep -q "modified, reload pending"'
 chmod o+w "$T/lib/blk.bpfc"; printf '# touched\n' >> "$T/lib/blk.bpfc"; reload
-check "world-writable include refused"         is_status $A egress 50 failed
+check "world-writable include refused (previous program kept)" is_status $A egress 50 failed-kept
 rm "$CFG/$A/egress/50.bpfc"; chmod o-w "$T/lib/blk.bpfc"; reload
 
 ID20=$(prog_at $A ingress 20)
 printf 'name Bad loop; start-loop; loop-reg\n' > "$CFG/$A/ingress/20.bpfc"; reload
-check "verifier rejection marked failed"       is_status $A ingress 20 failed
-check "old program removed, not kept"          no_prog $A ingress 20
+check "verifier rejection: failed, previous kept (on_failure keep)" is_status $A ingress 20 failed-kept
+check "...the previous program still runs"     same_id $A ingress 20 "$ID20"
 check "verifier reason recorded"               eval 'grep -q "error=verifier%20rejected%20program:%20R7%20!read_ok" $T/run/state'
 check "bpfcctl show prints failure output"     eval '$BPFCCTL -s $T/run show $A ingress 20 | grep -q "VERIFIER REJECTION"'
+printf 'option on-failure remove; name Bad loop; start-loop; loop-reg\n' > "$CFG/$A/ingress/20.bpfc"; reload
+check "option on-failure remove: marked failed" is_status $A ingress 20 failed
+check "...old program removed, not kept"       no_prog $A ingress 20
 check "rejected program keeps its name"        eval '$BPFCCTL -s $T/run status | grep -Eq "^$A +ingress +20 +Bad loop +failed "'
 printf 'match udp; drop\n' > "$CFG/$A/ingress/20.bpfc"; reload
 
