@@ -56,6 +56,9 @@ bad() {
 }
 check() { local n="$1"; shift; if "$@"; then ok "$n"; else bad "$n"; fi; }
 eventually() { for _ in $(seq 60); do "$@" && return 0; sleep 0.1; done; return 1; }
+# bpfcd has finished its startup pass: its state file names this pid and a last reload.
+# (The file appears earlier, before the first compile, so its existence is not enough.)
+started() { for _ in $(seq 300); do grep -qE "^daemon pid=$2 .*last_reload=[1-9]" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 
 # in_ns <ns-file|name> cmd... ; filters in a namespace given by name or file
 in_ns() { local n=$1; shift; case $n in /*) nsenter --net="$n" "$@" ;; *) ip netns exec "$n" "$@" ;; esac; }
@@ -79,7 +82,7 @@ start() {   # start <netns> -> sets LAST_PID
 	"$BPFCD" -n "$1" >> "$log" 2>&1 &
 	LAST_PID=$!
 	PIDS+=("$LAST_PID")
-	eventually test -s "$T/run/netns/$1/state"
+	started "$T/run/netns/$1/state" $LAST_PID
 }
 stop() { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null; }
 logged() { grep -q -- "$2" "$T/log.$1"; }

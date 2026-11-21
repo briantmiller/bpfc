@@ -306,6 +306,7 @@ static int config_set(struct config *c, const char *k, const char *v) {
     } else if (!strcmp(k, "rest_socket_owner")) {
         if (!owner_spec_valid(v) || strlen(v) >= sizeof(c->rest_owner)) return -2;
         snprintf(c->rest_owner, sizeof(c->rest_owner), "%s", v);
+        c->set |= CFG_SET_REST_OWNER;
     } else if (!strcmp(k, "rest_socket_mode")) {
         char *end;
         errno = 0;
@@ -396,6 +397,19 @@ static int resolve_part(const char *s, size_t n, const char *file, const char *w
     snprintf(err, errlen, "rest_socket_owner: no %s '%s' in %s (use a number for accounts from a "
              "directory service)", what, name, file);
     return -1;
+}
+
+int rest_owner_for(const struct config *c, uid_t *uid, gid_t *gid, char *err, size_t errlen,
+                   char *note, size_t notelen) {
+    if (notelen) note[0] = '\0';
+    if (rest_owner_resolve(c->rest_owner, uid, gid, err, errlen) == 0) return 0;
+    if (c->set & CFG_SET_REST_OWNER) return -1;
+    /* The default names the package's group; without it only root gets the socket. */
+    *uid = 0;
+    *gid = 0;
+    snprintf(note, notelen, "%s; the socket is root:root, so only root can use it "
+             "(create the group with groupadd -r bpfc, or set rest_socket_owner)", err);
+    return 0;
 }
 
 int rest_owner_resolve(const char *spec, uid_t *uid, gid_t *gid, char *err, size_t errlen) {

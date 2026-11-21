@@ -276,6 +276,9 @@ write_conf() {
 	EOF
 }
 eventually() { for _ in $(seq 50); do "$@" && return 0; sleep 0.1; done; return 1; }
+# bpfcd has finished its startup pass: its state file names this pid and a last reload.
+# (The file appears earlier, before the first compile, so its existence is not enough.)
+started() { for _ in $(seq 300); do grep -qE "^daemon pid=$2 .*last_reload=[1-9]" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 hid()        { ip -d link show "$1" 2>/dev/null | sed -n 's/.*prog\/xdp id \([0-9]*\).*/\1/p'; }
 has_xdp()    { [ -n "$(hid "$1")" ]; }
 no_xdp()     { [ -z "$(hid "$1")" ]; }
@@ -283,7 +286,7 @@ status_of()  { awk -v i="$1" '$1=="slot" { delete kv; for (n = 2; n <= NF; n++) 
                if (kv["iface"] == i && kv["dir"] == "xdp") print kv["status"] }' "$T/run/state"; }
 is_status()  { [ "$(status_of "$1")" = "$2" ]; }
 kind_of()    { ip -d link show "$1" | grep -o 'xdpgeneric\|xdpdrv' | head -1; }
-start_daemon() { "$BPFCD" -c "$T/etc/bpfc.conf" >> "$T/log" 2>&1 & DPID=$!; eventually test -s "$T/run/state"; }
+start_daemon() { "$BPFCD" -c "$T/etc/bpfc.conf" >> "$T/log" 2>&1 & DPID=$!; started "$T/run/state" $DPID; }
 stop_daemon()  { kill "$DPID"; wait "$DPID" 2>/dev/null; DPID=; }
 reload()       { "$BPFCCTL" -c "$T/etc/bpfc.conf" reload >/dev/null; }
 dcheck() { local n=$1; shift; if "$@"; then test_pass "$n"; else test_fail "$n"; [ $DEBUG -eq 1 ] && tail -15 "$T/log" | sed 's/^/    /'; fi; }

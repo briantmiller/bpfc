@@ -65,6 +65,9 @@ status_of() {
 reload_count() { sed -n 's/.* reload_count=\([0-9]*\).*/\1/p' "$T/run/state"; }
 # retry a condition for up to ~5s (the daemon reacts asynchronously)
 eventually() { for _ in $(seq 50); do "$@" && return 0; sleep 0.1; done; return 1; }
+# bpfcd has finished its startup pass: its state file names this pid and a last reload.
+# (The file appears earlier, before the first compile, so its existence is not enough.)
+started() { for _ in $(seq 300); do grep -qE "^daemon pid=$2 .*last_reload=[1-9]" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 has_prog()  { [ -n "$(prog_at "$1" "$2" "$3")" ]; }
 no_prog()   { [ -z "$(prog_at "$1" "$2" "$3")" ]; }
 is_status() { [ "$(status_of "$1" "$2" "$3")" = "$4" ]; }
@@ -81,7 +84,7 @@ write_conf() {
 	reinstall_limit = ${3:-5}
 	EOF
 }
-start_daemon() { $BPFCD -c "$T/etc/bpfc.conf" >> "$T/log" 2>&1 & DPID=$!; eventually test -s "$T/run/state"; }
+start_daemon() { $BPFCD -c "$T/etc/bpfc.conf" >> "$T/log" 2>&1 & DPID=$!; started "$T/run/state" $DPID; }
 stop_daemon()  { kill "$DPID"; wait "$DPID" 2>/dev/null; DPID=; }
 # SIGHUP and wait until the daemon reports the rescan finished
 reload() { $BPFCCTL -c "$T/etc/bpfc.conf" reload >/dev/null; }
@@ -201,7 +204,8 @@ check "reload restores logged slots"           eval 'has_prog $A ingress 10 && i
 
 echo "reinstall limit"
 write_conf reinstall no 2; reload
-for _ in 1 2 3 4; do tc filter del dev $A ingress pref 10 2>/dev/null; sleep 0.4; done
+# Each removal only counts once bpfcd has put the program back, so wait for that each time.
+for _ in 1 2 3 4; do eventually has_prog $A ingress 10 || break; tc filter del dev $A ingress pref 10 2>/dev/null; sleep 0.2; done
 check "gives up after reinstall_limit"         eventually is_status $A ingress 10 reinstall-limit
 reload
 check "reload re-arms it"                      eventually has_prog $A ingress 10
@@ -255,8 +259,8 @@ printf 'bpfc_path = %s\nconfig_dir = %s\nstate_dir = %s\n' "$BPFC" "$CFG2" "$T2/
 printf 'match tcp; match tcp-dst 9; drop\n' > "$CFG2/%all%/ingress/100.bpfc"
 # compiled per interface: drops TCP on vxlan only (seen in the instruction count)
 printf 'when $IFKIND == vxlan; match tcp; drop; otherwise; continue; end-when\n' > "$CFG2/%all%/egress/10.bpfc"
-nx $BPFCD -c "$T2/etc/bpfc.conf" >> "$T/log" 2>&1 & NPID=$!
-eventually test -s "$T2/run/state"
+ip netns exec $NS $BPFCD -c "$T2/etc/bpfc.conf" >> "$T/log" 2>&1 & NPID=$!   # exec: $! is bpfcd itself
+started "$T2/run/state" $NPID
 check "%all% installed on veth, vxlan and lo"    eventually eval 'nhas v0 ingress 100 && nhas v1 ingress 100 && nhas vx0 ingress 100 && nhas lo ingress 100'
 check "%all% also covers a raw-IP device (tun)"   eval 'nhas tun0 ingress 100 && nfrom tun0 ingress 100 %all%'
 check "filter named for the interface"           eval 'nx tc filter show dev vx0 ingress | grep -q "bpfcd:vx0/ingress/100"'
@@ -292,7 +296,7 @@ check "removing the exclusion reinstalls"        eventually eval 'nhas vx0 ingre
 check "bpfcctl status shows excluded slots"      eval '$BPFCCTL -s $T2/run status | grep -E "^v1 +ingress +100 " | grep -q excluded'
 ID_VX=$(nprog_at vx0 ingress 100); ID_TUN=$(nprog_at tun0 ingress 100)
 kill $NPID; wait $NPID 2>/dev/null
-nx $BPFCD -c "$T2/etc/bpfc.conf" >> "$T/log" 2>&1 & NPID=$!
+ip netns exec $NS $BPFCD -c "$T2/etc/bpfc.conf" >> "$T/log" 2>&1 & NPID=$!   # exec: $! is bpfcd itself
 check "restart adopts template programs"         eventually eval '[ "$(nprog_at vx0 ingress 100)" = "$ID_VX" ] && [ "$(nprog_at tun0 ingress 100)" = "$ID_TUN" ] && nstat vx0 ingress 100 installed'
 check "...and keeps the exclusion"               eval 'nstat v1 ingress 100 excluded && nnone v1 ingress 100'
 

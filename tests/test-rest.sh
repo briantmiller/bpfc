@@ -60,6 +60,9 @@ bad() {
 }
 check() { local n="$1"; shift; if "$@"; then ok "$n"; else bad "$n"; fi; }
 eventually() { for _ in $(seq 60); do "$@" && return 0; sleep 0.1; done; return 1; }
+# bpfcd has finished its startup pass: its state file names this pid and a last reload.
+# (The file appears earlier, before the first compile, so its existence is not enough.)
+started() { for _ in $(seq 300); do grep -qE "^daemon pid=$2 .*last_reload=[1-9]" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 
 # req METHOD PATH [BODY]: the reply body goes to $T/reply, headers to $T/hdr; prints the status code.
 req() {
@@ -80,7 +83,7 @@ start() {
 	"$BPFCD" "$@" >> "$LOG" 2>&1 &
 	LAST_PID=$!
 	PIDS+=("$LAST_PID")
-	eventually test -s "${STATE:-$T/run/state}"
+	started "${STATE:-$T/run/state}" $LAST_PID
 }
 stop() { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null; }
 logged() { grep -q -- "$1" "$LOG"; }
@@ -128,6 +131,14 @@ conf "rest_dir = $E/interfaces.d"
 check "refused: rest_dir = config_dir"               eval '! "$BPFCD" -t >/dev/null 2>&1'
 conf "rest_socket = $SOCK" "rest_socket_owner = no-such-user"
 check "-t reports an unknown owner"                  eval '"$BPFCD" -t | grep -q "error: rest_socket_owner: no user"'
+# The default owner is root:bpfc (the package creates the group). Without the group,
+# as after a plain make install, the socket is root-only and -t warns.
+conf "rest_socket = $SOCK"
+if getent group bpfc >/dev/null; then
+	check "default owner root:bpfc"                  eval '"$BPFCD" -t | grep -q "rest: *$SOCK (owner root:bpfc = 0:[0-9]*, mode 0660)"'
+else
+	check "default owner without a bpfc group: root:root, warned" eval '"$BPFCD" -t | grep -q "rest: *$SOCK (owner root:root = 0:0, mode 0660)" && "$BPFCD" -t | grep -q "warning: .*no group .bpfc.*only root can use it"'
+fi
 mkdir -p "$E/netns/brt-ns"
 conf "rest_socket = $SOCK"
 check "namespace fallback does not inherit the socket" eval '"$BPFCD" -n brt-ns -t | grep -q "rest: *off"'

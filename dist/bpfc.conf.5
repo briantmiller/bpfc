@@ -119,6 +119,14 @@ names from
 and
 .IR /etc/group ,
 or numbers (for accounts from a directory service). A missing part is root.
+If this setting is not given and the
+.B bpfc
+group does not exist (the package creates it; a plain
+.B make install
+does not), the socket is
+.B root:root
+so that only root can use it, and bpfcd logs a warning. An owner that is set
+and does not resolve leaves the API off.
 .TP
 .BI rest_socket_mode " = " 0660
 Permission bits of the socket, in octal. Everyone who can connect can read

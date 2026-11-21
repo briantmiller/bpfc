@@ -1228,13 +1228,14 @@ static void rest_start(void) {
     if (!cfg.rest_socket[0]) return;
     uid_t uid;
     gid_t gid;
-    char err[600];
+    char err[600], note[800];
     snprintf(rest_owner_cur, sizeof(rest_owner_cur), "%s", cfg.rest_owner);
     rest_mode_cur = cfg.rest_mode;
-    if (rest_owner_resolve(cfg.rest_owner, &uid, &gid, err, sizeof(err)) < 0) {
+    if (rest_owner_for(&cfg, &uid, &gid, err, sizeof(err), note, sizeof(note)) < 0) {
         logmsg(LOG_LVL_ERR, "rest: %s; not serving %s", err, cfg.rest_socket);
         return;
     }
+    if (note[0]) logmsg(LOG_LVL_WARN, "rest: %s", note);
     int fd = http_listen(cfg.rest_socket, uid, gid, (unsigned)cfg.rest_mode, err, sizeof(err));
     if (fd < 0) { logmsg(LOG_LVL_ERR, "rest: %s; the REST API is off", err); return; }
     rest_srv = http_server_new(fd, rest_handle);
@@ -1245,7 +1246,7 @@ static void rest_start(void) {
     int rc = mkdir_p(cfg.rest_dir, 0755);
     if (rc < 0) logmsg(LOG_LVL_WARN, "rest: cannot create %s: %s", cfg.rest_dir, strerror(-rc));
     logmsg(LOG_LVL_INFO, "rest: serving %s (owner %s, mode %04o); programs written to %s",
-           rest_serving, cfg.rest_owner, cfg.rest_mode, cfg.rest_dir);
+           rest_serving, note[0] ? "root:root" : cfg.rest_owner, cfg.rest_mode, cfg.rest_dir);
     state_dirty = 1;
 }
 
@@ -1257,8 +1258,8 @@ static void rest_reconfigure(void) {
     /* A new owner that does not resolve keeps the socket that works. */
     uid_t u;
     gid_t g;
-    char err[600];
-    if (rest_srv && cfg.rest_socket[0] && rest_owner_resolve(cfg.rest_owner, &u, &g, err, sizeof(err)) < 0) {
+    char err[600], note[800];
+    if (rest_srv && cfg.rest_socket[0] && rest_owner_for(&cfg, &u, &g, err, sizeof(err), note, sizeof(note)) < 0) {
         logmsg(LOG_LVL_ERR, "rest: %s; still serving %s as before", err, rest_serving);
         snprintf(rest_owner_cur, sizeof(rest_owner_cur), "%s", cfg.rest_owner);   /* log it once */
         rest_mode_cur = cfg.rest_mode;
@@ -2054,11 +2055,12 @@ static int check_only(void) {
     if (cfg.rest_socket[0]) {
         uid_t u;
         gid_t g;
-        char err[512];
-        int rc = rest_owner_resolve(cfg.rest_owner, &u, &g, err, sizeof(err));
-        printf("rest:     %s (owner %s = %u:%u, mode %04o)%s%s\n", cfg.rest_socket, cfg.rest_owner,
-               rc == 0 ? (unsigned)u : 0, rc == 0 ? (unsigned)g : 0, cfg.rest_mode, rc < 0 ? "\n          error: " : "",
-               rc < 0 ? err : "");
+        char err[512], note[800];
+        int rc = rest_owner_for(&cfg, &u, &g, err, sizeof(err), note, sizeof(note));
+        printf("rest:     %s (owner %s = %u:%u, mode %04o)%s%s%s%s\n", cfg.rest_socket,
+               note[0] ? "root:root" : cfg.rest_owner, rc == 0 ? (unsigned)u : 0, rc == 0 ? (unsigned)g : 0,
+               cfg.rest_mode, rc < 0 ? "\n          error: " : "", rc < 0 ? err : "",
+               note[0] ? "\n          warning: " : "", note);
     } else {
         printf("rest:     off (no rest_socket)\n");
     }

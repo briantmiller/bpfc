@@ -94,6 +94,7 @@ enum {
     CFG_SET_NETNS_PATH = 1u << 3,
     CFG_SET_NETNS_VETH = 1u << 4,
     CFG_SET_REST_DIR   = 1u << 5,
+    CFG_SET_REST_OWNER = 1u << 6,
 };
 
 void config_defaults(struct config *c);
@@ -123,6 +124,14 @@ const char *lib_root(void);
  * Returns 0, or -1 with a message in err.
  */
 int rest_owner_resolve(const char *spec, uid_t *uid, gid_t *gid, char *err, size_t errlen);
+/*
+ * The socket owner for c: rest_socket_owner resolved. When it was not set
+ * and the default (root:bpfc) does not resolve -- no bpfc group, as after a
+ * plain `make install` -- the socket is root:root (root only) and *note says
+ * why. Returns 0, or -1 with a message in err for a setting that does not resolve.
+ */
+int rest_owner_for(const struct config *c, uid_t *uid, gid_t *gid, char *err, size_t errlen,
+                   char *note, size_t notelen);
 
 /* Namespace names: 1-64 characters of [A-Za-z0-9_.-], not starting with '.' or '-'. */
 int netns_name_valid(const char *name);
