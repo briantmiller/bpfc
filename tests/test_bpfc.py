@@ -482,6 +482,18 @@ def test_push_eth():
     assert raw[14:14 + len(bytes(pkt))] == bytes(pkt), "the original frame does not follow the new header"
 
 
+def test_push_eth_vars():
+    """push-eth with MACs from variables: the new header swaps the frame's own addresses"""
+    bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match ip; match icmp; get src-mac S; get dst-mac D; push-eth %S %D'")
+    pkt = eth() / IP(src="10.0.0.1", dst="10.0.0.2") / ICMP()
+    raw_in = bytes(pkt)
+    out = send_and_capture(pkt, f"ether src {pkt[Ether].dst}")
+    assert out is not None
+    raw = bytes(out)
+    assert raw[0:6] == raw_in[6:12] and raw[6:12] == raw_in[0:6]
+    assert raw[14:14 + len(raw_in)] == raw_in, "the original frame does not follow the new header"
+
+
 def test_push_eth_then_pop_eth():
     """pop-eth removes what push-eth added"""
     bpfc(NS_TX, f"-i {VETH_TX} -d egress -p 100 'match ip; match icmp; push-eth 02:00:00:00:00:aa 02:00:00:00:00:bb'")
@@ -606,6 +618,16 @@ def test_debug_log_reaches_trace_pipe():
 def test_del_bytes_middle():
     """del-bytes 42 4 removes 4 bytes after the UDP header, the rest moves up"""
     bpfc(NS_TX, f"-i {VETH_TX} -d egress 'match udp; del-bytes 42 4'")
+    pkt = eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2) / b"AAAABBBBCCCC"
+    out = send_and_capture(pkt, "udp")
+    assert out is not None
+    raw = bytes(out)
+    assert len(raw) >= 50 and raw[42:50] == b"BBBBCCCC" and raw[:42] == bytes(pkt)[:42]
+
+
+def test_del_bytes_unrolled_fallback():
+    """del-bytes without its per-CPU buffer map (the unrolled copy) gives the same packet"""
+    ns_exec(NS_TX, f"env BPFC_TEST_NO_BUFFER_MAPS=1 {COMPILER_BIN} -i {VETH_TX} -d egress 'match udp; del-bytes 42 4'")
     pkt = eth() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=1, dport=2) / b"AAAABBBBCCCC"
     out = send_and_capture(pkt, "udp")
     assert out is not None

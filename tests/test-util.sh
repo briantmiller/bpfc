@@ -100,6 +100,21 @@ do
 done
 [ $PASS -eq 1 ] && test_pass Random
 
+# Attaching: a foreign filter at the priority, -I, -T, -D, -c
+H1() { ip netns exec H1 "$@"; }
+H1 tc filter add dev h2 egress prio 30 protocol ip bpf bytecode '1,6 0 0 4294967295,' 2>/dev/null
+out=$(H1 ./bpfc -i h2 -d egress -p 30 "continue" 2>&1)
+[[ "$out" == *"holds an incompatible filter (protocol 0x0800); replacing it non-atomically"* ]] &&
+	H1 tc filter show dev h2 egress | grep -q "protocol all pref 30 bpf" && test_pass Attach-replaces-foreign-filter || test_fail Attach-replaces-foreign-filter
+out=$(H1 ./bpfc -i h2 -d egress -p 31 -I -n util_info "continue" 2>&1)
+[[ "$out" == *"BPFC_INFO id="*"prio=31"*"name=util_info"* ]] && test_pass Attach-info || test_fail Attach-info
+out=$(H1 ./bpfc -i h2 -T "continue" 2>&1)
+[[ "$out" == *"the kernel accepts the program (not attached)"* ]] && ! H1 tc filter show dev h2 ingress | grep -q bpf &&
+	test_pass Check-only || test_fail Check-only
+H1 ./bpfc -i h2 -d egress -p 31 -D && ! H1 tc filter show dev h2 egress | grep -q "pref 31 " &&
+	H1 tc filter show dev h2 egress | grep -q "pref 30 " && test_pass Delete-one-priority || test_fail Delete-one-priority
+H1 ./bpfc -i h2 -d egress -c && [ -z "$(H1 tc filter show dev h2 egress)" ] && test_pass Clear || test_fail Clear
+
 #Cleanup
 for N in H1 H2
 do

@@ -245,6 +245,15 @@ check "set dst-port rewrote the port and the UDP checksum: delivered to 5555" gr
 rm -f /tmp/keys-rx.$$
 B $BPFC -i kb0 -c
 
+# set dscp/ecn from variables (used to fail: "Undefined variable '__dv0'")
+B $BPFC -m $MAPS -i kb0 -d ingress -p 10 'match udp; match dst-port 6001;
+  decl DV 1; set val DV 26; decl EV 4; set val EV 0x101; set dscp %DV; set ecn %EV;
+  get dscp D; set map KU 8 %D; get ecn E; set map KU 9 %E; end-match; end-match' >/dev/null
+send proto=udp,src=10.88.0.1,dst=10.88.0.2,sport=1234,dport=6001,tos=0,ttl=9,ident=2,len=5
+eqk "set dscp %VAR (af31, 26)" "$(v KU 8)" "$(printf 0x%016x 26)"
+eqk "set ecn %VAR: only its low 2 bits (1)" "$(v KU 9)" "$(printf 0x%016x 1)"
+B $BPFC -i kb0 -c
+
 echo "== seen"
 B $BPFC -m $MAPS -i kb0 -d ingress -p 10 'match udp; match dst-port 9001;
   match seen SEEN ip-src ip-dst ip-ident within 300ms; calc-map add SC 1 1; drop; end-match;

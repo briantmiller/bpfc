@@ -279,6 +279,129 @@ for c in "match arp" "match mpls" "match vlan" "match eth-proto 0x800" "get src-
 done
 badx CC-raw-err-l3off-value "L3OFF must be 14" -s L3OFF=4 "continue"
 
+# ---------------- coverage: options, verbose output, help ----------------
+# okx/badx (above) run bpfc with options; none of these is swept as XDP.
+okv() { local n=$1 want=$2; shift 2; local out; out=$("$BPFC" "$@" 2>&1)
+	if [ $? -eq 0 ] && [[ "$out" == *"$want"* ]]; then test_pass "$n"; else test_fail "$n"; echo "$out" | tail -3 | sed 's/^/    /'; fi; }
+okv CC-verbose-match  "END-MATCH"      -v "decl X 4; match ip-proto 6; set val X 1; else; set val X 2; end-match; match tcp; drop; else; accept; end-match"
+okv CC-verbose-if     "END-MATCH jump from"         -v "decl X 4; if val X eq 1; drop; else; continue; end-if"
+okv CC-verbose-loop   "LOOP EVAL"     -v "decl N 4; set val N 3; start-loop; calc sub N 1; loop N"
+okv CC-verbose-reg    "Loop target registered"           -v "set-reg-loop 3; start-loop; dec-reg-loop; loop-reg"
+okv CC-verbose-goto   "Resolved forward GOTO" -v "match tcp; goto L; end-match; drop; label L"
+okv CC-verbose-back   "Default continue" -v "decl N 4; set val N 2; label B; calc sub N 1; if val N ne 0; goto B; end-if"
+okv CC-help           "Usage:"         -h
+okv CC-help-long      "Terminal Commands" --help
+# Every command (the names a macro may not take, which are the commands)
+# is in -h, except reserved words that are not commands yet.
+H=$("$BPFC" -h | sed 's/zero-buffer\[-keyed\]/zero-buffer zero-buffer-keyed/')
+missing=
+for c in $(sed -n '/^static const char \*pp_reserved\[\] = {/,/};/p' "$(dirname "$BPFC")/bpfc.c" | grep -o '"[^"]*"' | tr -d '"'); do
+	case $c in del-head-bytes|pop-mac-bytes|push-mac-bytes|pop-net-bytes|push-net-bytes|fib-lookup6|otherwise|UNIQUE) continue ;; esac
+	grep -qE "(^|[[:space:]\"])$c([[:space:]<[]|$)" <<< "$H" || missing="$missing $c"
+done
+check "CC-help-lists-every-command${missing:+ (missing:$missing)}" [ -z "$missing" ]
+badx CC-err-opt-noarg      "option -i requires an argument" -i
+badx CC-err-priority       "priority must be between 0 and 65535" -i lo -p 70000 "continue"
+badx CC-err-clear-no-iface "-c and -D require -i"         -c
+badx CC-err-del-no-prio    "-D requires -p"               -D -i lo
+echo continue > prog.bpfc
+badx CC-err-frontend-name  "-F needs a frontend name"     -F 'BAD!' -f prog.bpfc
+badx CC-err-frontend-stdin "-F acl with -f -"             -F acl -f -
+badx CC-err-many-L         "at most"                      $(for i in $(seq 1 20); do printf -- '-L d%d ' $i; done) "continue"
+badx CC-err-no-program     "Usage:"
+
+# ---------------- coverage: commands and operand forms ----------------
+ok CC-get-l4-proto        "get l4-proto V"
+ok CC-get-frag-off        "get frag-off V"
+bad CC-err-get-l4-proto   "get l4-proto <VAR>"           "get l4-proto V W"
+# 8-byte variables (64-bit loads and stores) and variables as operands
+ok CC-get-tcp-seq-8 "decl V 8; get tcp-seq V"
+for f in ip-src ip-dst skb-mark ip-tos tcp-dst; do
+	ok "CC-get-$f-8"   "decl V 8; get $f V"
+	ok "CC-set-$f-8"   "decl V 8; set $f %V"
+	ok "CC-match-$f-8" "decl V 8; match $f %V"
+done
+ok CC-get-bytes-8         "decl V 8; get bytes 14 8 V; set bytes 14 8 %V"
+ok CC-get-bytes-var-8     "decl O 4; set val O 14; decl V 8; get bytes %O 8 V"
+ok CC-set-bytes-var-off   "decl O 4; set val O 14; decl V 4; set bytes %O 4 %V"
+ok CC-match-port-range-8  "decl V 8; set val V 80; match tcp-dst %V"
+ok CC-set-val-8           "decl V 8; decl W 8; set val V %W; set val W 5"
+ok CC-set-vlan-id-8       "decl V 8; set vlan-id %V"
+ok CC-push-vlan-vars      "decl I 4; decl P 4; set val I 100; set val P 3; push-vlan %I %P"
+ok CC-push-vlan-var-id    "decl I 4; push-vlan %I"
+ok CC-push-eth-vars       "get src-mac S; get dst-mac D; push-eth %S %D"
+ok CC-push-eth-var-src    "get src-mac S; push-eth 02:00:00:00:00:01 %S"
+bad CC-err-push-eth-size  "must be an 8-byte variable"   "decl V 4; push-eth %V 02:00:00:00:00:01"
+bad CC-err-push-eth-undef "must be an 8-byte variable"   "push-eth 02:00:00:00:00:01 %NOPE"
+ok CC-add-head-bytes-var  "decl L 4; set val L 4; add-head-bytes %L"
+ok CC-set-reg-loop-var    "decl N 4; set val N 3; set-reg-loop %N; start-loop; dec-reg-loop %N; loop-reg"
+ok CC-fib-src-var         "decl S 4; get ip-src S; fib-lookup src %S"
+ok CC-fib-src-ip          "fib-lookup src 10.0.0.1 10.0.0.2"
+ok CC-fib-src-flag        "fib-lookup src"
+ok CC-fib-iface           "fib-lookup iface lo"
+ok CC-fib-iface-var       "decl I 4; set val I 1; fib-lookup iface %I"
+ok CC-fib-options         "fib-lookup output skip-neigh tbid 100"
+bad CC-err-fib-var-size   "fib-lookup requires a 4-byte IPv4 variable" "decl D 8; fib-lookup %D"
+bad CC-err-fib-src        "is not a valid IPv4 address"  "fib-lookup src 1.2.3"
+bad CC-err-fib-tbid       "tbid needs a table number"    "fib-lookup tbid x"
+bad CC-err-fib-mark       "mark is not supported yet"    "fib-lookup mark"
+bad CC-err-fib-lookup6    "fib-lookup6 is not available yet" "fib-lookup6 2001:db8::1"
+ok CC-set-dscp-var        "decl V 1; set val V 46; set dscp %V"
+ok CC-set-ecn-var         "decl V 4; set ecn %V"
+ok CC-match-host-var      "decl V 4; get ip-dst V; match host %V"
+ok CC-match-host6         "match host 2001:db8::1"
+ok CC-match-host6-var     "decl V 16; get ip6-src V; match host %V"
+ok CC-match-port-var      "decl V 4; set val V 53; match port %V"
+ok CC-match-tcp-flags-all "match tcp-flags fin syn rst psh ack urg"
+bad CC-err-tcp-flag       "unknown flag 'BOGUS'"         "match tcp-flags SYN BOGUS"
+bad CC-err-match-port     "a port 0-65535"               "match port 70000"
+bad CC-err-set-dscp       "a DSCP name"                  "set dscp bogus"
+bad CC-err-set-ecn        "not-ect, ect1, ect0, ce"      "set ecn bogus"
+bad CC-err-match-var-op   "Invalid match val operation zz" "decl V 4; match V zz 1"
+bad CC-err-match-val-op2  "Invalid match val operation zz" "decl V 4; match val V zz 1"
+bad CC-err-set-bytes-len  "set bytes length must be 1, 2, 4, or 8" "set bytes 14 3 5"
+bad CC-err-set-bytes-vlen "set bytes length must be 1, 2, 4, or 8" "decl V 4; set bytes 14 3 %V"
+bad CC-err-get-bytes-vlen "get bytes length must be 1, 2, 4, or 8" "decl O 4; get bytes %O 3 V"
+bad CC-err-loop-reg       "without a preceding 'start-loop'" "loop-reg"
+bad CC-err-else-args      "Usage: else"                  "else 5"
+bad CC-err-get-skb-cb     "skb-cb index must be between 0 and 4" "get skb-cb 9 V"
+bad CC-err-match-skb-cb   "skb-cb index must be between 0 and 4" "match skb-cb 9 5"
+bad CC-err-too-many-insns "program exceeds"              "repeat 3000; set ip-tos 1; end-repeat"
+bad CC-err-too-many-gotos "unresolved gotos exceeded"    "repeat 1100; goto X; end-repeat; label X"
+
+# ---------------- coverage: keys, -H and the preprocessor ----------------
+ok CC-hash-bytes-var      "decl O 4; set val O 14; hash K 32 bytes %O 4"
+ok CC-pack-var            "decl V 4; pack K %V"
+ok CC-pack-ip-len         "pack K ip-len"
+ok CC-pack-ip6-tclass     "pack K ip6-tclass"
+ok CC-pack-var-bits       "decl V 4; pack K %V:16 ip-len"
+ok CC-hash-seed-var       "decl S 4; hash K 32 seed %S ip-src"
+bad CC-err-hash-families  "IPv4 or IPv6 fields, not both" "hash K 32 ip-len ip6-tclass"
+bad CC-err-hash-prefix    "only ip-src, ip-dst, ip6-src and ip6-dst take a /prefix" "hash K 32 tcp-dst/8"
+bad CC-err-hash-buckets   "buckets needs a count"        "hash K buckets x ip-src"
+bad CC-err-hash-usage     "usage: hash <VAR>"            "hash K"
+bad CC-err-pack-usage     "usage: pack <VAR>"            "pack K"
+okv CC-H-bytes            "0x"                           -H "pack bytes:14:2=5"
+okv CC-H-prefix           "0x"                           -H "pack ip-src/8=10.0.0.0"
+badx CC-err-H-form        "write 'hash <bits> [options]" -H "bogus"
+badx CC-err-H-novalue     "needs a value"                -H "hash 32 ip-src=10.0.0.1 reverse"
+badx CC-err-H-reverse     "reverse: give both"           -H "hash 64 reverse ip-src=10.0.0.1"
+badx CC-err-H-addr        "is not an IPv4 address"       -H "pack ip-src=x"
+badx CC-err-H-ip6-pack    "a pack holds 64; use hash"    -H "pack ip6-src=::1"
+bad CC-err-pp-dollar      "'\$' must be followed by a name" 'set val $ 5'
+bad CC-err-pp-const-name  "bad const name '9X'"          "const 9X 5"
+bad CC-err-pp-const-twice "const A is already defined"   "const A 1; const A 2"
+out=$("$BPFC" -s A=1 -E 'const A 2; debug-log $A' 2>&1)
+check CC-pp-s-overrides-const [ "$out" == "debug-log 1;" ]
+bad CC-err-pp-expr-short  "expression ends too early"    'debug-log $(1 + )'
+bad CC-err-pp-expr-junk   "unexpected '2' in expression" 'debug-log $(1 2)'
+bad CC-err-pp-option      "usage: option on-failure keep|remove" "option on-failure maybe"
+bad CC-err-pp-repeat-max  "is not 0-4096"                "repeat 100000; continue; end-repeat"
+bad CC-err-pp-runaway     "expansion produced more than" "repeat 4096; repeat 4096; set ip-tos 1; end-repeat; end-repeat"
+mkdir -p dep && echo 'depends data.txt' > dep/prog.bpfc && : > dep/data.txt
+out=$("$BPFC" -M -f dep/prog.bpfc 2>&1)
+check CC-pp-depends-relative eval '[[ "$out" == *dep/data.txt* ]]'
+
 # ---------------- commands that create maps (root) ----------------
 if [ "$(id -u)" -ne 0 ]; then
 	test_skip "CC-maps (creating maps needs root)"
@@ -294,6 +417,37 @@ for p in "set map M 1 5" "get map M 1 V" "calc-map add M 1 1" "calc-map xchg M 1
 	if out=$("$BPFC" $M "$p" 2>&1) && [[ "$out" == *Compiled* ]]; then test_pass "CC-map-$n ($p)"
 	else test_fail "CC-map-$n ($p)"; echo "$out" | grep -v -i pin | head -3 | sed 's/^/    /'; fi
 done
+
+# map commands: forms and errors (coverage)
+okm() { local n=$1; shift; local out; if out=$("$BPFC" $M "$@" 2>&1) && [[ "$out" == *Compiled* ]]; then test_pass "$n"; else test_fail "$n"; echo "$out" | grep -v -i pin | head -3 | sed 's/^/    /'; fi; }
+badm() { local n=$1 msg=$2; shift 2; local out; out=$("$BPFC" $M "$@" 2>&1); local rc=$?
+	if [ $rc -ne 0 ] && [ $rc -lt 128 ] && [[ "$out" == *"$msg"* ]]; then test_pass "$n"; else test_fail "$n"; echo "    want '$msg'; got exit $rc:"; echo "$out" | head -2 | sed 's/^/    /'; fi; }
+okm  CC-over-rate-gbit     "match over-rate OR1 ip-src 1gbit burst 1mb; drop"
+okm  CC-over-rate-burst-m  "match over-rate OR2 ip-src 10mbit burst 2m; drop"
+badm CC-err-seen-usage     "usage: match seen"            "match seen SN ip-src"
+badm CC-err-seen-junk      "unexpected 'junk' after the time" "match seen SN ip-src within 5s junk"
+badm CC-err-rate-usage     "usage: match over-rate"       "match over-rate OR3 ip-src"
+badm CC-err-rate-junk      "unexpected 'junk' after the rate" "match over-rate OR3 ip-src 10mbit junk"
+badm CC-err-in-usage       "usage: match <ip-src|ip-dst"  "match ip-src in"
+badm CC-err-in-not-prefix  "is not a prefix map"          "match ip-src in NOPE"
+okm  CC-in-var             "prefix-map PV 16; decl V 4; get ip-src V; match %V in PV; drop"
+okm  CC-in-ip6             "prefix-map PV6 16 ipv6; match ip6-src in PV6; drop"
+okm  CC-in-ip6-var         "prefix-map PV6 16 ipv6; decl V 16; get ip6-dst V; match %V in PV6; drop"
+badm CC-err-in-ip6-var     "is an IPv4 address"           "prefix-map PV6 16 ipv6; decl V 4; match %V in PV6"
+badm CC-err-in-ip6-field   "ip6-src, ip6-dst or a 16-byte %VAR" "prefix-map PV6 16 ipv6; match ip6-flow in PV6"
+badm CC-err-in-field       "a %VAR holding an address"    "prefix-map PV 16; match tcp-dst in PV"
+badm CC-err-log-bytes      "bytes: a multiple of 8"       "ringbuf-map RB; log RB 1 7"
+badm CC-err-ringbuf-usage  "usage: ringbuf-map"           "ringbuf-map"
+badm CC-err-ringbuf-args   "usage: ringbuf-map"           "ringbuf-map RB 1 2 3"
+badm CC-err-prefix-map     "usage: prefix-map"            "prefix-map"
+badm CC-err-prefix-undecl  "declare it first with prefix-map" "prefix NOPE 10.0.0.0/8"
+badm CC-err-prefix-ip6     "is not an IPv6 prefix"        "prefix-map PS6 10 ipv6 static; prefix PS6 bogus"
+okm  CC-prefix-static      "prefix-map PS4 10 static; prefix PS4 10.0.0.0/8 5; prefix PS4 10.1.0.0/16; match ip-dst in PS4; drop"
+okm  CC-prefix-static-ip6  "prefix-map PS6 10 ipv6 static; prefix PS6 2001:db8::/32 3; match ip6-dst in PS6; drop"
+badm CC-err-calc-map-op    "calc-map operation must be add, or, and, xor or xchg" "calc-map frob CM 1 1"
+badm CC-err-array-entries  "needs 1-16777216 entries"     "array-map AM 0"
+badm CC-err-prefix-entries "needs 1-16777216 entries"     "prefix-map PE 0"
+badm CC-err-buffer-size    "value size must be 16-65536"  "buffer-map BS 8"
 
 # hash-map: the size of a default (LRU hash) map; pinned maps need a bpffs
 mkdir -p "$TMP/bpf"
@@ -311,6 +465,28 @@ check CC-hash-map-undeclared eval 'hm "set map HM 2 6" | grep -q Compiled && ! h
 check CC-hash-map-after-use  eval 'hm "set map HM2 1 1; hash-map HM2 32" | grep -q "must come before"'
 check CC-hash-map-range      eval 'hm "hash-map HM3 0" | grep -q "needs 1-16777216 entries"'
 check CC-hash-map-array      eval 'hm "array-map HA 4; set map HA 1 1" >/dev/null && hm "hash-map HA 4; set map HA 1 1" | grep -q "pinned as another kind of map"'
+
+# Pinned maps of another kind or size are replaced; maps of other value
+# sizes cannot be read or written with -r/-w; -K/-V layouts (coverage)
+check CC-pin-prefix-v6       eval 'hm "prefix-map PX 16; match ip-src in PX; drop" | grep -q Compiled && hm "prefix-map PX 16 ipv6; match ip6-src in PX; drop" | grep -q "is pinned with another size; replacing"'
+check CC-pin-prefix-size     eval 'hm "prefix-map PX 32 ipv6; match ip6-src in PX; drop" | grep -q "replacing the pinned map"'
+check CC-pin-prefix-same     eval '! hm "prefix-map PX 32 ipv6; match ip6-src in PX; drop" | grep -q Warning'
+check CC-pin-prefix-late     eval 'hm "array-map AX 4; prefix-map AX 16" | grep -q "must come before the map is first used"'
+check CC-pin-ringbuf-size    eval 'hm "ringbuf-map RX 4096; log RX 1" | grep -q Compiled && hm "ringbuf-map RX 8192; log RX 1" | grep -q "pinned as another kind of map or size; replacing"'
+check CC-pin-ringbuf-kind    eval 'hm "array-map RY 4; ringbuf-map RY" | grep -q "is not a ring buffer"'
+check CC-pin-buffer-size     eval 'hm "buffer-map BX 512; save-packet BX 64" | grep -q Compiled && hm "buffer-map BX 1024; save-packet BX 64" | grep -q "pinned with 1 x 512 bytes, declared with 1 x 1024; replacing"'
+check CC-pin-buffer-shared   eval 'hm "shared-buffer-map BX 4 512; save-packet-keyed BX 1 64" | grep -q "declared with 4 x 512; replacing"'
+check CC-r-buffer-refused    eval 'hm -r BX | grep -q "only maps of 64-bit values can be dumped"'
+check CC-w-buffer-refused    eval 'hm -w BX 1 2 | grep -q "does not hold 64-bit values"'
+check CC-r-missing           eval 'hm -r NOPE | grep -q "Could not open map"'
+check CC-x-missing-key       eval 'hm "set map HX 1 5" >/dev/null; hm -x HX 99 | grep -q "could not delete"'
+check CC-K-too-wide          eval 'hm -K "ip-src/24 src-mac eth-proto" -r HX | grep -q "a pack holds 64"'
+"$BPFC" $M "pack K src-mac eth-proto; set map PK %K 1" >/dev/null 2>&1
+"$BPFC" $M -w PK "pack src-mac=02:00:00:00:00:01 eth-proto=0x800" 7 >/dev/null 2>&1
+check CC-K-mac-ethproto      eval 'hm -K "src-mac eth-proto" -r PK | grep -q "02:00:00:00:00:01.*0x0800\|02:00:00:00:00:01.*2048"'
+"$BPFC" $M -w PK "pack ip-src/16=10.1.0.0 dst-mac=02:00:00:00:00:02" 9 >/dev/null 2>&1
+check CC-K-prefix-mac        eval 'hm -K "ip-src/16 dst-mac" -r PK | grep -q "10.1.0.0/16.*02:00:00:00:00:02"'
+check CC-V-mac               eval 'hm -w PK 3 "pack src-mac=02:00:00:00:00:03" >/dev/null; hm -V "src-mac" -r PK | grep -q "02:00:00:00:00:03"'
 
 # -R: maps joined on their keys
 "$BPFC" $M "get map HJ 1 V" >/dev/null 2>&1        # creates HJ

@@ -50,7 +50,7 @@ RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
 TARBALL    = bpfc-$(VERSION).tar.gz
 
-.PHONY: fuzz check-compile check-dataplane check-ecmp check-linkcap check-all all clean install install-programs dist rpm srpm check
+.PHONY: coverage fuzz check-compile check-dataplane check-ecmp check-linkcap check-all all clean install install-programs dist rpm srpm check
 
 all: $(TARGET) $(DAEMON) $(CTL) $(FRONTENDS)
 
@@ -211,6 +211,23 @@ check-dataplane: $(TARGET)
 check-all: all
 	bash tests/run-tests.sh $(TESTFLAGS)
 
+# bpfc.c's test coverage: a gcov build of bpfc, the suites (all, or
+# COVERAGE_SUITES), a report in coverage/ (index.html, summary.txt,
+# coverage.json), then the normal bpfc again. Fails when a suite fails or
+# coverage drops below the minimums, which apply to a full run only (as
+# root; 97.4 % lines, 81.8 % branches measured on a 6.18 kernel).
+# Needs gcovr (pip install gcovr) and, for most suites, root.
+COVERAGE_SUITES ?=
+COVERAGE_MIN_LINES ?= $(if $(COVERAGE_SUITES),0,97)
+COVERAGE_MIN_BRANCHES ?= $(if $(COVERAGE_SUITES),0,81)
+coverage: $(DAEMON) $(CTL) $(FRONTENDS)
+	rm -rf coverage $(TARGET)
+	mkdir -p coverage && chmod 1777 coverage
+	$(CC) -O0 -g --coverage $(WARN) $(FEATURES) -c -o coverage/bpfc.o bpfc.c
+	$(CC) --coverage $(LDFLAGS) -o $(TARGET) coverage/bpfc.o
+	COVERAGE_SUITES='$(COVERAGE_SUITES)' COVERAGE_MIN_LINES='$(COVERAGE_MIN_LINES)' \
+	COVERAGE_MIN_BRANCHES='$(COVERAGE_MIN_BRANCHES)' TESTFLAGS='$(TESTFLAGS)' bash tests/coverage.sh
+
 # Feeds the HTTP and JSON parsers random and mutated input under ASan/UBSan.
 FUZZ_ITERS ?= 200000
 fuzz:
@@ -220,4 +237,4 @@ fuzz:
 
 clean:
 	rm -f $(TARGET) $(DAEMON) $(CTL) $(FRONTENDS) output.bpf $(TARBALL) tests/fuzz-rest
-	rm -rf $(RPMTOP) .dist
+	rm -rf $(RPMTOP) .dist coverage

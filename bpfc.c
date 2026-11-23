@@ -294,20 +294,6 @@ struct {
 } unresolved_gotos[MAX_UNRESOLVED_GOTOS];
 int num_unresolved_gotos = 0;
 
-void reset() {
-    prog_idx = 0;
-    num_labels = 0;
-    num_unresolved_gotos = 0;
-    num_safety_jumps = 0;
-    num_blocks = 0;
-    num_jumps = 0;
-    num_maps = 0;
-    target_tc_protocol = ETH_P_ALL;
-    num_loop_starts = 0;
-    num_vars = 0;
-    next_var_offset = VAR_TOP;
-}
-
 /*
  * XDP programs (-d xdp).
  *
@@ -796,6 +782,7 @@ void print_indent() {
     for (int i = 0; i < num_blocks; i++) printf("    ");
 }
 
+#ifdef BPFC_FIB_LOOKUP6
 /* Maps a variable name to an explicit offset on the stack without allocating new space */
 void define_var_at_offset(const char *name, int size, int stack_off) {
     for (int i = 0; i < num_vars; i++) {
@@ -811,7 +798,8 @@ void define_var_at_offset(const char *name, int size, int stack_off) {
     vars[num_vars].stack_off = stack_off;
     num_vars++;
 }
-    
+#endif
+
 int get_var_offset(const char *name) {
     if (name[0] == '%') name++;
     for (int i = 0; i < num_vars; i++)
@@ -828,99 +816,6 @@ int get_var_size(const char *name) {
                         return vars[i].size;
     return 4;
 } 
-
-/*
- * Emit a conditional comparison that jumps when the condition is FALSE.
- *
- * Syntax model:
- *   if <VAR1> <lt|gt|le|ge|eq|ne> <VAR2|integer>
- *
- * Returns the index of the emitted conditional jump.  The caller must
- * later patch prog[returned_index].off.
- */
-int emit_var_compare_false_jump(const char *var1_name,
-                                const char *op,
-                                const char *var2_or_val)
-{
-    int v1_off = get_var_offset(var1_name);
-    int v1_sz  = get_var_size(var1_name);
-
-    /* Load left-hand value into R1. */
-    if (v1_sz == 1)
-        emit(BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_10, v1_off));
-    else if (v1_sz == 2)
-        emit(BPF_LDX_MEM(BPF_H, BPF_REG_1, BPF_REG_10, v1_off));
-    else if (v1_sz == 4)
-        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v1_off));
-    else
-        emit(BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, v1_off));
-
-    /*
-     * Inverse comparison: jump when the requested condition fails.
-     *
-     * if A lt B  -> jump when A >= B
-     * if A eq B  -> jump when A != B
-     */
-    int false_jmp_opcode = -1;
-
-    if (strcmp(op, "lt") == 0)
-        false_jmp_opcode = BPF_JGE;
-    else if (strcmp(op, "gt") == 0)
-        false_jmp_opcode = BPF_JLE;
-    else if (strcmp(op, "le") == 0)
-        false_jmp_opcode = BPF_JGT;
-    else if (strcmp(op, "ge") == 0)
-        false_jmp_opcode = BPF_JLT;
-    else if (strcmp(op, "eq") == 0)
-        false_jmp_opcode = BPF_JNE;
-    else if (strcmp(op, "ne") == 0)
-        false_jmp_opcode = BPF_JEQ;
-    else {
-        fprintf(stderr, "Error: Unknown if operator '%s'\n", op);
-        exit(1);
-    }
-
-    /*
-     * Match the existing match-val behavior:
-     * use 32-bit jumps for variables <= 32 bits and 64-bit jumps otherwise.
-     */
-    int jmp_class = (v1_sz <= 4) ? BPF_JMP32 : BPF_JMP;
-    int jump_idx = prog_idx;
-
-    if (var2_or_val[0] == '%') {
-        int v2_off = get_var_offset(var2_or_val);
-        int v2_sz  = get_var_size(var2_or_val);
-
-        if (v2_sz == 1)
-            emit(BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_10, v2_off));
-        else if (v2_sz == 2)
-            emit(BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_10, v2_off));
-        else if (v2_sz == 4)
-            emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, v2_off));
-        else
-            emit(BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, v2_off));
-
-        emit(((struct bpf_insn) {
-            .code = jmp_class | false_jmp_opcode | BPF_X,
-            .dst_reg = BPF_REG_1,
-            .src_reg = BPF_REG_2,
-            .off = 0,
-            .imm = 0
-        }));
-    } else {
-        unsigned long imm = strtoul(var2_or_val, NULL, 0);
-
-        emit(((struct bpf_insn) {
-            .code = jmp_class | false_jmp_opcode | BPF_K,
-            .dst_reg = BPF_REG_1,
-            .src_reg = 0,
-            .off = 0,
-            .imm = (int)imm
-        }));
-    }
-
-    return jump_idx;
-}
 
 
 /* Overflowing these tables used to drop jumps silently, leaving them
@@ -949,48 +844,6 @@ void add_block_jump(void) {
 void add_safety_jump(void) {
     if (num_safety_jumps >= MAX_SAFETY_JUMPS) table_full("packet bounds checks", MAX_SAFETY_JUMPS);
     safety_jump_indices[num_safety_jumps++] = prog_idx;
-}
-
-void resolve_pending_jumps(void) {
-    int target_idx = prog_idx;
-    // Point jumps past the terminal action
-    for (int i = 0; i < num_jumps; i++) {
-        int j_idx = jump_patch_indices[i];
-        prog[j_idx].off = target_idx - j_idx - 1;
-    }
-    num_jumps = 0;
-    num_blocks = 0;
-}
-
-/*
- * Resolves only the single, most recently opened match block's jumps.
- * This acts as an implicit 'end-match' for nested terminal actions.
- */
-void resolve_local_block(void) {
-    if (num_blocks > 0) {
-        int jumps_to_resolve = block_jump_counts[--num_blocks];
-		
-	if (verbose_mode) {
-            print_indent();
-            printf("[%d] --> TERMINAL-ACTION AUTO-RESOLVE (Popping %d jumps from Block %d)\n", prog_idx, jumps_to_resolve, num_blocks + 1);
-        }
-		
-        for (int i = 0; i < jumps_to_resolve; i++) {
-            if (num_jumps > 0) {
-                int j_idx = jump_patch_indices[--num_jumps];
-                // Resolve the jump to point to the instruction AFTER this terminal block
-		if (verbose_mode) {
-                     print_indent();
-                     //printf("Setting %d jump offset to %d\n",prog_idx - j_idx - 1, j_idx);
-		     printf("[!] Setting %d (index %d) jump offset to %d\n", j_idx, num_jumps+1, prog_idx);
-		}
-                prog[j_idx].off = prog_idx - j_idx - 1;
-            }
-        }
-    } else {
-        // If we are at the root level (no active blocks), resolve any remaining global jumps
-        resolve_pending_jumps();
-    }
 }
 
 /*
@@ -1113,12 +966,6 @@ uint64_t parse_mac(const char *m) {
     uint64_t r=0;
     memcpy(&r, a, 6);
     return r;
-}
-
-void parse_hex(const char *h, uint8_t *b, int m) {
-    int l = strlen(h);
-    for (int i = 0; i < l / 2 && i < m; i++) 
-		sscanf(&h[i*2], "%2hhx", &b[i]);
 }
 
 unsigned int get_ifindex(const char *n) {
@@ -1280,7 +1127,6 @@ void compile_drop_packet(void) {
     emit(BPF_MOV64_IMM(BPF_REG_0, is_xdp ? XDP_ACT_DROP : TC_ACT_SHOT));
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
-    //resolve_local_block();
 }
 	
 void compile_continue_packet(void) { 
@@ -1288,14 +1134,12 @@ void compile_continue_packet(void) {
     emit(BPF_MOV64_IMM(BPF_REG_0, is_xdp ? XDP_ACT_PASS : TC_ACT_PIPE));
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
-    //resolve_local_block();
 }
 
 void compile_accept_packet(void) {
     emit(BPF_MOV64_IMM(BPF_REG_0, is_xdp ? XDP_ACT_PASS : TC_ACT_OK));
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
-    //resolve_local_block();
 }
 	
 /* tx: send the packet back out of the interface it arrived on (XDP_TX). */
@@ -1314,29 +1158,6 @@ void compile_reclassify(void) {
     emit(BPF_MOV64_IMM(BPF_REG_0, TC_ACT_RECLASSIFY));
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
-    //resolve_local_block();
-}
-
-/*
- * Emits bytecode to redirect a packet.
- * Supports static interface indices or dynamic variables.
- */
-void compile_redirect_core(const char *iface_arg, int flags) {
-    if (iface_arg[0] == '%') {
-        int v_off = get_var_offset(iface_arg);
-        // Interface indices are strictly 32-bit values (BPF_W)
-        emit(BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, v_off));
-    } else {
-        int idx = atoi(iface_arg);
-        if (!idx) idx = require_ifindex(iface_arg);
-        emit(BPF_MOV64_IMM(BPF_REG_1, idx));
-    }
-    
-    emit(BPF_MOV64_IMM(BPF_REG_2, flags));
-    emit(BPF_CALL_FUNC(BPF_FUNC_redirect));
-    emit(BPF_EXIT_INSN());
-    last_cmd_terminal = 1;
-    //resolve_local_block();
 }
 
 /*
@@ -1362,7 +1183,6 @@ void compile_redirect_neigh(const char *iface_arg) {
 
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
-    //resolve_local_block();
 }
 
 
@@ -1388,7 +1208,6 @@ void compile_redirect(const char *iface_arg, const char *d) {
     emit(BPF_CALL_FUNC(BPF_FUNC_redirect));
     emit(BPF_EXIT_INSN());
     last_cmd_terminal = 1;
-    //resolve_local_block();
 }
 
 void compile_clone(const char *iface_arg, const char *d) {
@@ -1563,60 +1382,6 @@ void compile_get_random(const char *var) {
     int d_off = allocate_var(var, 4);
     emit(BPF_CALL_FUNC(BPF_FUNC_get_prandom_u32));
     emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, d_off));
-}
-
-void compile_vlan_offset() {
-
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_1, is_xdp ? 0 : offsetof(struct __sk_buff, data)));
-    emit(BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_1, is_xdp ? 4 : offsetof(struct __sk_buff, data_end)));
-   
-    // Check if data + 14 > data_end
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_8));
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, 14));
-    int j_fail1 = prog_idx;
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_3, .src_reg=BPF_REG_9}));
-    
-    // Read EtherType at offset 12 into R4
-    emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_8, 12));
-    
-    // Check for 802.1Q (0x8100)
-    int j_not_vlan = prog_idx;
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_4, .imm=htons(0x8100)}));
-    
-    // It is 802.1Q. Shift offset accumulator by +4
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, 4));
-    int j_vlan_done = prog_idx;
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JA, .off=0}));
-    
-    // Backpatch j_not_vlan
-    prog[j_not_vlan].off = prog_idx - j_not_vlan - 1;
-    
-    // Check for 802.1ad QinQ (0x88a8)
-    int j_not_qinq = prog_idx;
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_4, .imm=htons(0x88A8)}));
-    
-    // It is QinQ. Shift offset by +4 for the outer tag.
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, 4));
-    
-    // Check if there is an inner tag by reading the next EtherType at offset 16
-    emit(BPF_MOV64_REG(BPF_REG_3, BPF_REG_8));
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, 18));
-    int j_fail2 = prog_idx;
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JGT|BPF_X, .dst_reg=BPF_REG_3, .src_reg=BPF_REG_9}));
-    
-    emit(BPF_LDX_MEM(BPF_H, BPF_REG_4, BPF_REG_8, 16));
-    int j_not_inner = prog_idx;
-    emit(((struct bpf_insn){.code=BPF_JMP|BPF_JNE|BPF_K, .dst_reg=BPF_REG_4, .imm=htons(0x8100)}));
-    
-    // Inner tag found. Shift offset by another +4 (Total +8)
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, 4));
-    
-    // Resolve branch targets
-    prog[j_fail1].off = prog_idx - j_fail1 - 1;
-    prog[j_fail2].off = prog_idx - j_fail2 - 1;
-    prog[j_not_qinq].off = prog_idx - j_not_qinq - 1;
-    prog[j_not_inner].off = prog_idx - j_not_inner - 1;
-    prog[j_vlan_done].off = prog_idx - j_vlan_done - 1;
 }
 
 /*
@@ -1899,6 +1664,12 @@ void compile_fib_lookup(int flags, const char *dst_ip_arg, const char *src_ip_ar
 }
 
 /*
+ * fib-lookup6 is refused at parse time until this is ported: it lacks the
+ * fixes fib-lookup got (flag bits, tbid, flow, ports, ...) and does not work
+ * as is. Build with -DBPFC_FIB_LOOKUP6 to work on it.
+ */
+#ifdef BPFC_FIB_LOOKUP6
+/*
  * Emits bytecode to perform an IPv6 FIB lookup.
  * Syntax: fib-lookup6 [flags] [dst_ip6_addr | %VAR]
  */
@@ -2020,6 +1791,7 @@ void compile_fib_lookup6(int flags, const char *dst_ip_arg, const char *src_ip_a
 
     emit(BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, res_off));
 }
+#endif /* BPFC_FIB_LOOKUP6 */
 
 /*
  * Emits bytecode to extract bytes from the packet into a variable.
@@ -3287,11 +3059,6 @@ void compile_set_icmp_type(uint8_t type, const char *var) {
     jl_patch(&skip, prog_idx);
 }
 
-/*
- * Emits bytecode to recalculate the Layer 4 (TCP or UDP) checksum for the entire packet.
- * Assumes a standard 14-byte Ethernet and 20-byte IPv4 header (Base L4 Offset = 34).
- */
-void compile_recalculate_l4_csum(int is_udp);
 void compile_l4_csum(int is_udp, const char *var, int l3off, int maxlen);
 
 void compile_set_l4_port(int is_udp, int is_dst, uint16_t p, const char *var) {
@@ -3336,39 +3103,6 @@ void compile_set_queue(uint32_t q_id, const char *var) {
         emit(BPF_STX_MEM(BPF_W, BPF_REG_1, BPF_REG_2, offsetof(struct __sk_buff, queue_mapping)));
     } else {
         emit(BPF_ST_MEM(BPF_W, BPF_REG_1, offsetof(struct __sk_buff, queue_mapping), q_id));
-    }
-}
-
-void compile_set_mark(uint32_t fwmark, const char *var) {
-    tc_only_ctx_store("XDP has no skb mark");
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    if (var) {
-        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, get_var_offset(var)));
-        emit(BPF_STX_MEM(BPF_W, BPF_REG_1, BPF_REG_2, offsetof(struct __sk_buff, mark)));
-    } else {
-        emit(BPF_ST_MEM(BPF_W, BPF_REG_1, offsetof(struct __sk_buff, mark), fwmark));
-    }
-}
-
-void compile_set_hash(uint32_t _hash, const char *var) {
-    tc_only_ctx_store("XDP has no skb hash");
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    if (var) {
-        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, get_var_offset(var)));
-        emit(BPF_STX_MEM(BPF_W, BPF_REG_1, BPF_REG_2, offsetof(struct __sk_buff, hash)));
-    } else {
-        emit(BPF_ST_MEM(BPF_W, BPF_REG_1, offsetof(struct __sk_buff, hash), _hash));
-    }
-}
-
-void compile_set_cb(uint8_t i, uint32_t val, const char *var) {
-    tc_only_ctx_store("XDP has no skb control block");
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    if (var) {
-        emit(BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, get_var_offset(var)));
-        emit(BPF_STX_MEM(BPF_W, BPF_REG_1, BPF_REG_2, offsetof(struct __sk_buff, cb)+(4*i)));
-    } else {
-        emit(BPF_ST_MEM(BPF_W, BPF_REG_1, offsetof(struct __sk_buff, cb)+(4*i), val));
     }
 }
 
@@ -3839,36 +3573,6 @@ void compile_push_qinq(uint16_t o_vid, uint16_t i_vid, uint8_t o_pcp, uint8_t i_
     emit(BPF_MOV32_IMM(BPF_REG_2, htons(ETH_P_8021AD)));
     emit(BPF_MOV64_IMM(BPF_REG_3, outer_tci));
     emit(BPF_CALL_FUNC(BPF_FUNC_skb_vlan_push));
-}
-
-void compile_push_bytes_net(uint32_t len) {
-
-    /*// 1. PRE-EXPAND THE TAIL: Prevent clipping bugs by allocating physical room first.
-    // Read current packet length (skb->len) into R8
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit_ctx_ld(BPF_W, BPF_REG_8, BPF_REG_1, offsetof(struct __sk_buff, len));
-    // R2 = new length (skb->len + requested expansion length)
-    emit(BPF_MOV64_REG(BPF_REG_2, BPF_REG_8));
-    emit(BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, len));
-    // Call bpf_skb_change_tail(skb, new_len, 0)
-    emit(BPF_MOV64_IMM(BPF_REG_3, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_change_tail));*/
-
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, len));
-    emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_NET));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));
-    add_safety_jump();
-}
-
-void compile_pop_bytes_net(uint32_t len) {
-    emit(BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
-    emit(BPF_MOV64_IMM(BPF_REG_2, -len));
-    emit(BPF_MOV64_IMM(BPF_REG_3, BPF_ADJ_ROOM_NET));
-    emit(BPF_MOV64_IMM(BPF_REG_4, 0));
-    emit(BPF_CALL_FUNC(BPF_FUNC_skb_adjust_room));
-    add_safety_jump();
 }
 
 
@@ -5047,6 +4751,9 @@ int map_index_by_fd(int fd) {
  */
 int get_or_create_buffer_map_sized(const char *name, int per_cpu, uint32_t entries, uint32_t vsize, int exonerr) {
     check_map_name(name);
+    /* Test hook (tests/test-bpfc.sh): act as if the map could not be
+     * created, so callers that have a fallback (del-bytes) take it. */
+    if (!exonerr && getenv("BPFC_TEST_NO_BUFFER_MAPS")) return -1;
     for (int i = 0; i < num_maps; i++) {
         if (strcmp(maps[i].name, name) == 0) return maps[i].fd;
     }
@@ -6600,8 +6307,6 @@ void compile_l4_csum(int is_udp, const char *var, int l3off, int maxlen) {
     for (int i = 0; i < n; i++) prog[ends[i]].off = prog_idx - ends[i] - 1;
 }
 
-void compile_recalculate_l4_csum(int is_udp) { compile_l4_csum(is_udp, NULL, 14, 9000); }
-
 /* -w <map> <key> <value>: write a 64-bit value into a pinned 8-byte map. */
 /*
  * Retrieves an active Map FD from the filesystem, iterates through all
@@ -7512,6 +7217,18 @@ void help(const char *arg0) {
 	"set-reg-loop <INT|0x00|%VAR>"		,"set loop register value to integer, hex or VAR value",
 	"dec-reg-loop"				,"decrement loop register value",
 	"loop-reg"				,"loop back to start of loop if loop register is not zero",
+	"label <NAME>"				,"a place goto can jump to",
+	"goto <NAME>"				,"jump to label NAME (forward, or back for a loop the verifier can bound)",
+	"debug-log <text>"			,"write text to the kernel trace buffer (trace_pipe)",
+	"push-eth <dst-mac|%VAR> <src-mac|%VAR>","put a new Ethernet header in front of the frame, keeping its EtherType",
+	"pop-eth"				,"remove the outer Ethernet header, leaving the inner one",
+	"push-vlan <vid> [pcp]"			,"insert an 802.1Q tag (vid, pcp: numbers or %VAR)",
+	"pop-vlan"				,"remove the outer VLAN tag",
+	"push-qinq <outer> <inner> [o-pcp] [i-pcp]","insert an 802.1ad outer and an 802.1Q inner tag",
+	"encap-gre ip-src <ip> ip-dst <ip> key <val>","put an outer IPv4/GRE header with that key in front of the packet",
+	"decap-gre"				,"remove the outer IPv4/GRE header",
+	"encap-mpls label <label> bos <0|1>"	,"push an MPLS label",
+	"decap-mpls"				,"remove one MPLS label (and a pseudowire control word after it)",
 	"ip-frag <size> <input-mtu-max>"	,"fragment IP packets into <size> payload packets up to <input-mtu-max>",
 	"ip-defrag"				,"reassemble fragmented IP packets into a single packet",
 	"save-packet <len> <src> <dst>"		,"save packet data of length into a per-CPU map, optionally specify src and/or dst offset variables supported",
@@ -7614,6 +7331,10 @@ void help(const char *arg0) {
 	"add-bytes <off> <len>"		,"insert len bytes at offset in the packet",
 	"del-bytes <off> <len>"		,"delete len bytes at offset in the packet",
 	"add-head-bytes <len>"		,"add len bytes to the beginning of the packet",
+	"add-l2-bytes <len>"		,"insert len bytes right after the Ethernet header (add-bytes 14 <len>)",
+	"del-l2-bytes <len>"		,"delete len bytes right after the Ethernet header (del-bytes 14 <len>)",
+	"fill-bytes <off> <len> <byte>"	,"overwrite 1-64 packet bytes with one value (each may be a %VAR); checksums are not updated",
+	"tcp-option <kind> <OFF> [LEN]"	,"find the first TCP option of kind: OFF gets its frame offset, LEN its length byte (0: none)",
     };
     char *skb_fields[] = {
 	"queue"			,"egress queue number",
@@ -9657,6 +9378,7 @@ static int compile_set_dscp_ecn(int is_ecn, const char *val) {
     kf_run("get ip-tos __dt%d", u);
     kf_run("calc and __dt%d %d", u, is_ecn ? 0xFC : 0x03);
     if (val[0] == '%') {
+        kf_run("decl __dv%d 4", u);
         kf_run("set val __dv%d %s", u, v);
         kf_run("calc and __dv%d %d", u, is_ecn ? 3 : 63);
         if (!is_ecn) kf_run("calc lsh __dv%d 2", u);
@@ -9670,6 +9392,7 @@ static int compile_set_dscp_ecn(int is_ecn, const char *val) {
     kf_run("get ip6-tclass __dt%d", u);
     kf_run("calc and __dt%d %d", u, is_ecn ? 0xFC : 0x03);
     if (val[0] == '%') {
+        kf_run("decl __dv%d 4", u);
         kf_run("set val __dv%d %s", u, v);
         kf_run("calc and __dv%d %d", u, is_ecn ? 3 : 63);
         if (!is_ecn) kf_run("calc lsh __dv%d 2", u);
@@ -10307,10 +10030,16 @@ static int process_cmd_1(char *cmd, const char *dir) {
 			fprintf(stderr, "Error: usage: push-qinq <outer-id 0-4095> <inner-id 0-4095> [outer-prio 0-7] [inner-prio 0-7]\n");
 			return 1;
 		}
-		if (!strcmp(op, "push-eth") && (t < 3 || !valid_mac(tok[1]) || !valid_mac(tok[2]))) {
-			fprintf(stderr, "Error: usage: push-eth <dst-mac> <src-mac>\n");
+		if (!strcmp(op, "push-eth") && (t < 3 || (tok[1][0] != '%' && !valid_mac(tok[1])) ||
+		                                (tok[2][0] != '%' && !valid_mac(tok[2])))) {
+			fprintf(stderr, "Error: usage: push-eth <dst-mac|%%VAR> <src-mac|%%VAR>\n");
 			return 1;
 		}
+		for (int k = 1; !strcmp(op, "push-eth") && k <= 2; k++)
+			if (tok[k][0] == '%' && get_var_size(tok[k]) != 8) {
+				fprintf(stderr, "Error: push-eth: %s must be an 8-byte variable holding a MAC address (get src-mac V)\n", tok[k]);
+				return 1;
+			}
 		if (!strcmp(op, "encap-gre") && (t < 7 || strcmp(tok[1], "ip-src") || strcmp(tok[3], "ip-dst") ||
 		                                 strcmp(tok[5], "key") || !valid_ip(tok[2], 0, 0) || !valid_ip(tok[4], 0, 0) ||
 		                                 parse_num(tok[6], 0xFFFFFFFFULL, &n))) {
@@ -10531,7 +10260,7 @@ static int process_cmd_1(char *cmd, const char *dir) {
                 }
 	    }
 	    else {
-                 printf("Invalid get instruction %s\n",f);
+                 fprintf(stderr, "Error: Invalid get instruction %s\n",f);
 		 return 1;
                  //exit(2);
             }
@@ -10593,7 +10322,7 @@ static int process_cmd_1(char *cmd, const char *dir) {
                 }
             }
 	    else {
-                 printf("Invalid set instruction %s\n",f);
+                 fprintf(stderr, "Error: Invalid set instruction %s\n",f);
 		 return 1;
                  //exit(2);
             }
@@ -10669,7 +10398,7 @@ static int process_cmd_1(char *cmd, const char *dir) {
                 start_match_block();
 		compile_match_outer_tag(htons(ETH_P_8021AD));
             } else {
-                 printf("Invalid match instruction %s\n",f);
+                 fprintf(stderr, "Error: Invalid match instruction %s\n",f);
 		 return 1;
                  //exit(2);
             }
@@ -10738,14 +10467,19 @@ static int process_cmd_1(char *cmd, const char *dir) {
 	    else if (strcmp(a1, "tcp-flags") == 0) {
                 start_match_block();
                 uint32_t flags_mask = 0;
+                /* An unknown flag used to be a warning and left out of the
+                 * mask: 'match tcp-flags syn' then matched every packet. */
                 for (int k = 2; k < t; k++) {
-                    if (strcmp(tok[k], "FIN") == 0) flags_mask |= 0x01;
-                    else if (strcmp(tok[k], "SYN") == 0) flags_mask |= 0x02;
-                    else if (strcmp(tok[k], "RST") == 0) flags_mask |= 0x04;
-                    else if (strcmp(tok[k], "PSH") == 0) flags_mask |= 0x08;
-                    else if (strcmp(tok[k], "ACK") == 0) flags_mask |= 0x10;
-                    else if (strcmp(tok[k], "URG") == 0) flags_mask |= 0x20;
-                    else fprintf(stderr, "Warning: Unknown TCP flag '%s'\n", tok[k]);
+                    if (strcasecmp(tok[k], "FIN") == 0) flags_mask |= 0x01;
+                    else if (strcasecmp(tok[k], "SYN") == 0) flags_mask |= 0x02;
+                    else if (strcasecmp(tok[k], "RST") == 0) flags_mask |= 0x04;
+                    else if (strcasecmp(tok[k], "PSH") == 0) flags_mask |= 0x08;
+                    else if (strcasecmp(tok[k], "ACK") == 0) flags_mask |= 0x10;
+                    else if (strcasecmp(tok[k], "URG") == 0) flags_mask |= 0x20;
+                    else {
+                        fprintf(stderr, "Error: match tcp-flags: unknown flag '%s' (FIN, SYN, RST, PSH, ACK, URG)\n", tok[k]);
+                        return 1;
+                    }
                 }
                 // The TCP flags byte is 13 bytes into the TCP header (any IHL; it
                 // was read at offset 47, wrong for packets with IP options).
@@ -10755,8 +10489,8 @@ static int process_cmd_1(char *cmd, const char *dir) {
 	    else if (strcmp(f, "val") == 0 && t > 4) {
 		 if (strcmp(tok[3],"gt") && strcmp(tok[3],"ge") && strcmp(tok[3],"lt") && strcmp(tok[3],"le") && strcmp(tok[3],"eq") && strcmp(tok[3],"ne") &&
 		     strcmp(tok[3],"seq-lt") && strcmp(tok[3],"seq-le") && strcmp(tok[3],"seq-gt") && strcmp(tok[3],"seq-ge")) {
-                     printf("Invalid match val operation %s\n",tok[3]);
-                     exit(2);
+                     fprintf(stderr, "Error: Invalid match val operation %s (gt, ge, lt, le, eq, ne, seq-lt, seq-le, seq-gt or seq-ge)\n", tok[3]);
+                     return 1;
 		 }
                 // Syntax: match val %VAR1 <op> <VAR2_OR_VAL>
                 compile_match_var(tok[2], tok[3], tok[4]);
@@ -10764,12 +10498,12 @@ static int process_cmd_1(char *cmd, const char *dir) {
 	    else if (t > 3) {
                 if (strcmp(tok[2],"gt") && strcmp(tok[2],"ge") && strcmp(tok[2],"lt") && strcmp(tok[2],"le") && strcmp(tok[2],"eq") && strcmp(tok[2],"ne") &&
                     strcmp(tok[2],"seq-lt") && strcmp(tok[2],"seq-le") && strcmp(tok[2],"seq-gt") && strcmp(tok[2],"seq-ge")) {
-                    printf("Invalid match val operation %s\n",tok[3]);
-		    exit(2);
+                    fprintf(stderr, "Error: Invalid match val operation %s (gt, ge, lt, le, eq, ne, seq-lt, seq-le, seq-gt or seq-ge)\n", tok[2]);
+		    return 1;
 		}
                 compile_match_var(f, tok[2], tok[3]);
 	    } else {
-                printf("Invalid match instruction %s\n",f);
+                fprintf(stderr, "Error: Invalid match instruction %s\n",f);
 		return 1;
             }
         }
@@ -10791,7 +10525,7 @@ static int process_cmd_1(char *cmd, const char *dir) {
             else if (strcmp(f,"bswap")==0 || strcmp(f,"hton")==0 || strcmp(f,"ntoh")==0)
                 compile_math_bswap(a2, a3 ? atoi(a3) : get_var_size(a2)*8);
 	    else {
-                 printf("Invalid math instruction %s\n",f);
+                 fprintf(stderr, "Error: Invalid math instruction %s\n",f);
 		 return 1;
                  //exit(2);
             }
@@ -10812,8 +10546,6 @@ static int process_cmd_1(char *cmd, const char *dir) {
 	 * deletion. (add-l2-bytes used to grow the packet at the tail without
 	 * moving the data, so writes at offset 14 overwrote the next header.) */
 	else if (strcmp(op, "add-l2-bytes")==0 && t>1) compile_insert_bytes(14, atoi(a1));
-        //else if (strcmp(op, "push-net-bytes")==0 && t>1) compile_push_bytes_net(atoi(a1));
-        //else if (strcmp(op, "pop-net-bytes")==0 && t>1) compile_pop_bytes_net(atoi(a1));
         else if (strcmp(op, "del-l2-bytes") == 0 && t > 1) compile_delete_bytes_buffered(14, atoi(a1));
 	else if (strcmp(op, "add-head-bytes") == 0 && t > 1) compile_add_head_bytes(a1);
 	//else if (strcmp(op, "del-head-bytes") == 0 && t > 1) compile_del_head_bytes(a1);
@@ -10825,6 +10557,12 @@ static int process_cmd_1(char *cmd, const char *dir) {
 	    compile_l4_csum(!strcmp(a1, "udp"), a2, t > 3 ? atoi(a3) : l3off, t > 4 ? atoi(tok[4]) : 9000);
 	else if (strcmp(op, "fib-lookup") == 0 || strcmp(op, "fib-lookup6") == 0) {
             int is_ipv6 = (strcmp(op, "fib-lookup6") == 0);
+#ifndef BPFC_FIB_LOOKUP6
+            if (is_ipv6) {
+                fprintf(stderr, "Error: fib-lookup6 is not available yet (IPv6 FIB lookups do not work); fib-lookup does IPv4\n");
+                exit(1);
+            }
+#endif
             int flags = 0;
             char *custom_src_ip = NULL;
 	    char *custom_dst_ip = NULL;
@@ -10866,17 +10604,21 @@ static int process_cmd_1(char *cmd, const char *dir) {
                     exit(1);
                 }
                 else if (strcmp(tok[k], "flow") == 0) {
+#ifdef BPFC_FIB_LOOKUP6
                     if (is_ipv6) {
                         fprintf(stderr, "Error: fib-lookup6 flow is not supported yet\n");
                         exit(1);
                     }
+#endif
                     fib_flow = 1;
                 }
                 else if (strcmp(tok[k], "ports") == 0) {
+#ifdef BPFC_FIB_LOOKUP6
                     if (is_ipv6) {
                         fprintf(stderr, "Error: fib-lookup6 ports is not supported yet\n");
                         exit(1);
                     }
+#endif
                     if (k + 1 >= t || tok[k + 1][0] != '%') {
                         fprintf(stderr, "Error: fib-lookup ports needs a %%VAR\n");
                         exit(1);
@@ -10889,8 +10631,11 @@ static int process_cmd_1(char *cmd, const char *dir) {
                     custom_dst_ip = tok[k];
             }
 
+#ifdef BPFC_FIB_LOOKUP6
             if (is_ipv6) compile_fib_lookup6(flags, custom_dst_ip, custom_src_ip, custom_iface);
-            else         compile_fib_lookup(flags, custom_dst_ip, custom_src_ip, custom_iface);
+            else
+#endif
+            compile_fib_lookup(flags, custom_dst_ip, custom_src_ip, custom_iface);
             fib_flow = 0;
             fib_tbid = -1;
             fib_ports = NULL;
@@ -10966,7 +10711,7 @@ static int process_cmd_1(char *cmd, const char *dir) {
             char *dst_off = t > 5 ? tok[5] : NULL;
             compile_load_packet(map_fd, tok[2], tok[3], src_off, dst_off);
         } else {
-             printf("Invalid instruction %s\n",op);
+             fprintf(stderr, "Error: Invalid instruction %s\n",op);
 	     //exit(2);
 	     return 1;
 	}
@@ -12199,7 +11944,7 @@ int main(int argc, char **argv) {
     if (filename && !fe_type[0]) {
         instr = read_instructions_from_file(filename);
     }
-    if (!instr && !fe_type[0]) { printf("Usage: %s -i <iface> [-d ingress|egress|xdp] \"<cmds>\"\n", argv[0]); return 1; }
+    if (!instr && !fe_type[0]) { fprintf(stderr, "Usage: %s -i <iface> [-d ingress|egress|xdp] \"<cmds>\"\n", argv[0]); return 1; }
 
     /* $IFNAME, $IFINDEX, $IFTYPE and $IFKIND for the -i interface (bpfcd
      * compiles a %all% or %<kind>% template once per interface). -s wins. */
