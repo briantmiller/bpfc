@@ -1,0 +1,269 @@
+# Builds every package type on GitHub-hosted runners, x86_64 and aarch64,
+# and attaches them to the release when one is published.
+#
+#   release published   build everything, then upload to the release
+#   workflow_dispatch   build everything (Actions tab, "Run workflow"); the
+#                       packages are kept as the run's artifacts
+#   pull_request        the same, when packaging files change
+#
+# Optional repository secrets/variables (Settings -> Secrets and variables):
+#   secret ABUILD_PRIVKEY, secret ABUILD_PUBKEY, variable ABUILD_KEYNAME
+#       an abuild key (abuild-keygen -n; ABUILD_KEYNAME is the file name,
+#       <email>-<hex>.rsa) to sign the Alpine packages (INSTALL.md); without them a
+#       throwaway key is used and the packages need apk add --allow-untrusted
+#   variable OPENWRT_BRANCH
+#       the OpenWrt release the OpenWrt packages are built for (default
+#       openwrt-24.10)
+name: Packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - Makefile
+      - debian/**
+      - dist/**
+      - programs/**
+      - .github/workflows/packages.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  source:
+    name: Source tarball and version check
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Check that the tag, the Makefile and debian/changelog agree
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(sed -n 's/^VERSION *?= *//p' Makefile)
+          deb=$(dpkg-parsechangelog -S Version | sed 's/-[^-]*$//')
+          if [ "$deb" != "$version" ]; then
+            echo "::error file=debian/changelog::debian/changelog is at $deb, the Makefile at $version (dch -v $version-1)"
+            exit 1
+          fi
+          if [ -n "$TAG" ] && [ "${TAG#v}" != "$version" ]; then
+            echo "::error::release tag $TAG does not match VERSION $version in the Makefile"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - run: make dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-source
+          path: bpfc-*.tar.gz
+
+  rpm:
+    name: RPM el${{ matrix.el }} ${{ matrix.runner == 'ubuntu-24.04-arm' && 'aarch64' || 'x86_64' }}
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        el: [9, 10]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    container: docker.io/library/almalinux:${{ matrix.el }}
+    steps:
+      # the build, plus what the compile suite uses (cmp, setsid, awk)
+      - run: dnf -y -q install gcc make kernel-headers rpm-build systemd-rpm-macros git-core tar gzip findutils diffutils util-linux gawk
+      - uses: actions/checkout@v4
+      - run: make check-compile
+      - run: make rpm
+      - name: Collect
+        run: |
+          mkdir out
+          cp rpmbuild/RPMS/*/*.rpm out/
+          # noarch packages and the source RPM once, from the x86_64 build
+          if [ "$(uname -m)" = x86_64 ]; then cp rpmbuild/SRPMS/*.src.rpm out/; else rm -f out/*.noarch.rpm; fi
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-rpm-el${{ matrix.el }}-${{ runner.arch }}
+          path: out/*
+
+  deb:
+    name: deb ${{ matrix.distro }} ${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: ['debian:12', 'debian:13', 'ubuntu:22.04', 'ubuntu:24.04']
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    container: docker.io/library/${{ matrix.distro }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Build dependencies
+        run: |
+          apt-get -q update
+          apt-get -q install -y --no-install-recommends build-essential debhelper dpkg-dev pkgconf git ca-certificates
+          # systemd.pc: systemd-dev from Debian 13 / Ubuntu 24.04, systemd before
+          apt-get -q install -y --no-install-recommends systemd-dev || apt-get -q install -y --no-install-recommends systemd
+      - uses: actions/checkout@v4
+      # amd64 builds everything; arm64 only the architecture-specific bpfc
+      - run: make deb DEBBUILD_OPTS=${{ matrix.runner == 'ubuntu-24.04-arm' && '-B' || '-b' }}
+      - name: Collect
+        run: |
+          . /etc/os-release
+          mkdir out
+          # The same file names come out of every distribution: add it to the
+          # name (bpfc_0.1.1-1+debian12_amd64.deb). The package versions
+          # inside are unchanged.
+          for f in debbuild/*.deb; do
+            b=${f##*/}; name=${b%%_*}; rest=${b#*_}; ver=${rest%%_*}; arch=${rest#*_}
+            cp "$f" "out/${name}_${ver}+${ID}${VERSION_ID}_${arch}"
+          done
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-deb-${{ strategy.job-index }}
+          path: out/*
+
+  apk:
+    name: Alpine ${{ matrix.runner == 'ubuntu-24.04-arm' && 'aarch64' || 'x86_64' }}
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Signing key
+        env:
+          ABUILD_PRIVKEY: ${{ secrets.ABUILD_PRIVKEY }}
+          ABUILD_PUBKEY: ${{ secrets.ABUILD_PUBKEY }}
+          ABUILD_KEYNAME: ${{ vars.ABUILD_KEYNAME }}
+        run: |
+          if [ -n "$ABUILD_PRIVKEY" ] && [ -n "$ABUILD_PUBKEY" ] && [ -n "$ABUILD_KEYNAME" ]; then
+            mkdir -m 700 "$RUNNER_TEMP/abuild-key"
+            printf '%s\n' "$ABUILD_PRIVKEY" > "$RUNNER_TEMP/abuild-key/$ABUILD_KEYNAME"
+            printf '%s\n' "$ABUILD_PUBKEY" > "$RUNNER_TEMP/abuild-key/$ABUILD_KEYNAME.pub"
+            chmod 600 "$RUNNER_TEMP/abuild-key/$ABUILD_KEYNAME"
+            echo "APK_KEY=$RUNNER_TEMP/abuild-key/$ABUILD_KEYNAME" >> "$GITHUB_ENV"
+          else
+            echo "::notice::no ABUILD_PRIVKEY/ABUILD_PUBKEY/ABUILD_KEYNAME: signing with a throwaway key"
+          fi
+      # make apk runs abuild in an alpine container with podman
+      - run: make apk APK_KEY="$APK_KEY"
+      - name: Collect
+        run: |
+          mkdir out
+          alpine=$(sed -n 's/^ALPINE_IMAGE ?= .*alpine://p' Makefile)
+          find apkbuild/packages -name '*.apk' | while read -r f; do
+            pkgarch=$(tar -xzOf "$f" .PKGINFO 2>/dev/null | sed -n 's/^arch = //p')
+            # noarch packages once, from the x86_64 build
+            [ "$pkgarch" = noarch ] && [ "$(uname -m)" != x86_64 ] && continue
+            b=${f##*/}
+            cp "$f" "out/${b%.apk}-alpine${alpine}-${pkgarch}.apk"
+          done
+          if [ "$(uname -m)" = x86_64 ]; then cp apkbuild/packages/*.rsa.pub out/; fi
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-apk-${{ runner.arch }}
+          path: out/*
+
+  arch:
+    name: Arch Linux x86_64
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # make arch runs makepkg in an archlinux container with podman
+      - run: make arch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-arch
+          path: archbuild/*.pkg.tar.*
+
+  openwrt:
+    name: OpenWrt ${{ matrix.arch }}
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        # package architectures; add the ones your routers use
+        arch:
+          - x86_64
+          - aarch64_cortex-a53
+          - aarch64_generic
+          - arm_cortex-a7_neon-vfpv4
+          - mipsel_24kc
+          - mips_24kc
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # The SDK container sees only the feed: a copy with the source in it.
+      - run: make openwrt-feed
+      - uses: openwrt/gh-action-sdk@v7
+        env:
+          ARCH: ${{ matrix.arch }}-${{ vars.OPENWRT_BRANCH || 'openwrt-24.10' }}
+          FEED_DIR: ${{ github.workspace }}/openwrt-feed
+          FEEDNAME: bpfc
+          PACKAGES: bpfc
+          NO_SHFMT_CHECK: 1
+          V: s
+      - name: Collect
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir out
+          # .ipk up to OpenWrt 24.10, .apk from 25.12
+          for f in bin/packages/"$ARCH"/bpfc/*.ipk bin/packages/"$ARCH"/bpfc/*.apk; do
+            [ -f "$f" ] || continue
+            case ${f##*/} in
+            # bpfc-programs is architecture "all": once, from the x86_64 build
+            bpfc-programs*) [ "$ARCH" = x86_64 ] || continue ;;
+            esac
+            cp "$f" out/
+          done
+          ls -l out
+          [ -n "$(ls out)" ] || { echo "::error::no packages in bin/packages/$ARCH/bpfc"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-openwrt-${{ matrix.arch }}
+          path: out/*
+
+  release:
+    name: Upload to the release
+    if: github.event_name == 'release' && !cancelled() && needs.source.result == 'success'
+    needs: [source, rpm, deb, apk, arch, openwrt]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: out
+          merge-multiple: true
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          cd out
+          sha256sum -- * > SHA256SUMS
+          ls -l
+          gh release upload --clobber --repo "$GITHUB_REPOSITORY" "$TAG" -- *
+          # Upload whatever was built, but fail when a build did.
+          failed=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success") | .key')
+          if [ -n "$failed" ]; then
+            echo "::error::builds that failed (their packages are missing from the release): $failed"
+            exit 1
+          fi

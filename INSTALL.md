@@ -9,6 +9,7 @@
 - [Alpine packages](#alpine-packages)
 - [Arch Linux packages](#arch-linux-packages)
 - [OpenWrt](#openwrt)
+- [Release packages (GitHub Actions)](#release-packages-github-actions)
 - [Static binaries](#static-binaries)
 - [After installing](#after-installing)
 - [Containers](#containers)
@@ -239,6 +240,52 @@ On OpenWrt:
 
 - **`/var` is in RAM.** Programs written through the REST API (`rest_dir`, `/var/lib/bpfc/interfaces.d` by default) are lost on reboot. Set `rest_dir` under `/etc/bpfc` to keep them, at the cost of flash writes.
 - **There's no `bpfc` group.** If you enable the REST API, set `rest_socket_owner = root:root` (or an existing group) in `bpfc.conf`.
+
+## Release packages (GitHub Actions)
+
+`.github/workflows/packages.yml` builds every package type on GitHub's hosted runners when a release is published, and attaches the packages to the release with a `SHA256SUMS` file. GitHub-hosted runners are free for public repositories, including the arm64 ones (`ubuntu-24.04-arm`), so no runners of your own are needed.
+
+| Job | Runs on | Builds |
+| :--- | :--- | :--- |
+| `source` | ubuntu-24.04 | checks that the tag, `VERSION` and `debian/changelog` agree; the source tarball |
+| `rpm` | AlmaLinux 9 and 10 containers, x86_64 and aarch64 | `make check-compile`, `make rpm` (el9 and el10 RPMs, the source RPM) |
+| `deb` | Debian 12, 13, Ubuntu 22.04, 24.04 containers, amd64 and arm64 | `make deb` (`+debian12`, `+ubuntu24.04`, ... added to the file names) |
+| `apk` | ubuntu-24.04, x86_64 and aarch64 | `make apk` (abuild in an Alpine container) |
+| `arch` | ubuntu-24.04 | `make arch` (makepkg in an Arch container); x86_64 only |
+| `openwrt` | ubuntu-24.04 | `make openwrt-feed`, then the [OpenWrt SDK action](https://github.com/openwrt/gh-action-sdk) for each package architecture listed in the workflow |
+| `release` | ubuntu-24.04 | uploads everything that was built to the release, then fails if any build did |
+
+Architecture-independent packages (`bpfc-programs`, `bpfc-container`, noarch RPMs, the Alpine `-doc` and `-openrc` packages) are taken from the x86_64 builds only.
+
+**To make a release:**
+
+```bash
+# 1. Set VERSION (and RELEASE) in the Makefile, and add a matching debian/changelog entry:
+dch -v 0.1.2-1 "New upstream release."
+git commit -am "Release 0.1.2" && git push
+# 2. Tag and publish the release (or use Releases -> Draft a new release on GitHub)
+gh release create v0.1.2 --title "bpfc 0.1.2" --generate-notes
+```
+
+The workflow starts when the release is published. The tag must be `v<VERSION>` (or `<VERSION>`), or the `source` job stops before anything is built. You can run the whole matrix without a release from the Actions tab (**Packages**, **Run workflow**); the packages are then kept as the run's artifacts. Pull requests that change packaging files (`Makefile`, `debian/`, `dist/`, `programs/`, the workflow) run it too.
+
+**Signing the Alpine packages.** Without a key, `make apk` signs with a throwaway key, and the packages need `apk add --allow-untrusted`. To sign with a key of your own, which users install once in `/etc/apk/keys`:
+
+```bash
+mkdir abuild-key
+podman run --rm -e PACKAGER="bpfc maintainers <brun064@gmail.com>" -v "$PWD/abuild-key":/out:Z \
+    docker.io/library/alpine:3.22 sh -c 'apk add -q abuild && abuild-keygen -n -q && cp /root/.abuild/*.rsa* /out/'
+key=$(cd abuild-key && ls *.rsa)                    # <email>-<hex>.rsa, after PACKAGER's address
+gh secret set ABUILD_PRIVKEY < "abuild-key/$key"
+gh secret set ABUILD_PUBKEY < "abuild-key/$key.pub"
+gh variable set ABUILD_KEYNAME --body "$key"
+```
+
+Keep `abuild-key/` somewhere safe, outside the repository. The public key is attached to each release (`/etc/apk/keys/<name>.rsa.pub` on the systems that install the packages). Locally, `make apk APK_KEY=path/to/<name>.rsa` signs with the same key.
+
+**OpenWrt release.** The OpenWrt packages are built for `openwrt-24.10`. Set the repository variable `OPENWRT_BRANCH` (`gh variable set OPENWRT_BRANCH --body openwrt-25.12`) to build for another release, and edit the `arch:` list in the workflow for your routers' package architectures (`opkg print-architecture` on the router shows it).
+
+**Self-hosted runners** are only needed for what GitHub's runners can't do: the root test suites on real NICs, say, or builds on hardware you must use. Register one under Settings, Actions, Runners, and change that job's `runs-on` to its labels (`[self-hosted, linux, arm64]`). The package jobs need only a container engine (podman or docker) on the runner.
 
 ## Static binaries
 

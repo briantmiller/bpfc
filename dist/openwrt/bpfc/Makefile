@@ -10,11 +10,14 @@
 #   make package/bpfc/compile V=s
 #
 # The packages land in bin/packages/<arch>/bpfc/. BPFC_SRC=<dir> builds
-# another checkout. See INSTALL.md, "OpenWrt", for the kernel options.
+# another checkout. `make openwrt-feed` makes a self-contained copy of this
+# feed (the source in bpfc/src/) for SDKs that see only the feed. See INSTALL.md, "OpenWrt", for the kernel options.
 #
 include $(TOPDIR)/rules.mk
 
-BPFC_SRC ?= $(abspath $(CURDIR)/../../..)
+# The source: src/ next to this Makefile in a feed made by `make openwrt-feed`,
+# else the tree this folder is in.
+BPFC_SRC ?= $(if $(wildcard $(CURDIR)/src/Makefile),$(CURDIR)/src,$(abspath $(CURDIR)/../../..))
 
 PKG_NAME:=bpfc
 PKG_VERSION:=$(shell sed -n 's/^VERSION *?= *//p' $(BPFC_SRC)/Makefile)

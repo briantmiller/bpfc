@@ -62,6 +62,7 @@ sudo make install     # install everything, including the bpfc-programs tools
 make rpm              # or build RPMs for RHEL 9/10 (in ./rpmbuild)
 make deb              # or .deb packages for Debian 12+ / Ubuntu 22.04+ (in ./debbuild)
 make apk              # or Alpine packages; make arch for Arch Linux
+# Published GitHub releases get every package type built and attached (INSTALL.md)
 ```
 
 You can also run `./bpfc` straight from the source tree. bpfc needs root (`CAP_NET_ADMIN` and `CAP_SYS_ADMIN`) and Linux 4.18 or later for TC programs; XDP programs need kernel 5.18+ or RHEL 9.2+. [INSTALL.md](INSTALL.md) has the full requirements, the install paths, the RPM, Debian, Alpine and Arch packages, the OpenWrt package, static builds and containers.

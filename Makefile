@@ -50,7 +50,7 @@ RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
 TARBALL    = bpfc-$(VERSION).tar.gz
 
-.PHONY: coverage fuzz check-compile check-dataplane check-ecmp check-linkcap check-all all clean install install-core install-container install-programs dist rpm srpm deb apk arch check
+.PHONY: coverage fuzz check-compile check-dataplane check-ecmp check-linkcap check-all all clean install install-core install-container install-programs dist rpm srpm deb apk arch openwrt-feed check
 
 all: $(TARGET) $(DAEMON) $(CTL) $(FRONTENDS)
 
@@ -216,17 +216,33 @@ deb: $(TARBALL)
 	cd $(DEBTOP)/bpfc-$(VERSION) && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL dpkg-buildpackage -us -uc $(DEBBUILD_OPTS)
 	@echo; echo "Packages:"; find $(DEBTOP) -maxdepth 1 -name '*.deb' -printf '  %p\n'
 
+# Building in a container (make apk, make arch): the build's files are handed
+# back to the user who ran make, also when the build fails. With podman the
+# container's root is that user (rootless) or root (sudo), so 0:0 is right.
+CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+CONTAINER_OWNER = $(if $(findstring podman,$(CONTAINER_ENGINE)),0:0,$(shell id -u):$(shell id -g))
+
 # Alpine packages (.apk) into ./apkbuild/packages, with abuild: on Alpine
 # itself (apk add alpine-sdk linux-headers bash coreutils; a user in the
 # abuild group with a key from abuild-keygen -a), or anywhere else in an
 # $(ALPINE_IMAGE) container run with podman or docker. The container signs
-# with a throwaway key: install its packages with apk add --allow-untrusted.
-#   APK_STATIC=1     statically linked binaries (musl)
-#   ALPINE_IMAGE=... another Alpine release
+# with APK_KEY, or else a throwaway key; the public key is copied next to
+# the packages (apk add --allow-untrusted for a throwaway one).
+#   APK_KEY=dir/name.rsa  sign with this abuild key (dir/name.rsa.pub next to it)
+#   APK_STATIC=1          statically linked binaries (musl)
+#   ALPINE_IMAGE=...      another Alpine release
 APKTOP     = $(CURDIR)/apkbuild
 ALPINE_IMAGE ?= docker.io/library/alpine:3.22
 APK_STATIC ?= 0
-CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+APK_KEY    ?=
+ifneq ($(APK_KEY),)
+APK_KEY_MOUNT = -v $(abspath $(dir $(APK_KEY))):/keys:ro,Z
+APK_KEY_SETUP = mkdir -p /root/.abuild && cp /keys/$(notdir $(APK_KEY)) /keys/$(notdir $(APK_KEY)).pub /root/.abuild/ && \
+	cp /keys/$(notdir $(APK_KEY)).pub /etc/apk/keys/ && \
+	echo PACKAGER_PRIVKEY=/root/.abuild/$(notdir $(APK_KEY)) > /root/.abuild/abuild.conf
+else
+APK_KEY_SETUP = abuild-keygen -a -i -n -q
+endif
 apk: $(TARBALL)
 	rm -rf $(APKTOP) && mkdir -p $(APKTOP)/src $(APKTOP)/packages
 	sed -e 's/@VERSION@/$(VERSION)/g' dist/alpine/APKBUILD.in > $(APKTOP)/src/APKBUILD
@@ -235,11 +251,12 @@ apk: $(TARBALL)
 	@if command -v abuild >/dev/null; then \
 		cd $(APKTOP)/src && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL BPFC_STATIC=$(APK_STATIC) REPODEST=$(APKTOP)/packages abuild -r; \
 	elif [ -n "$(CONTAINER_ENGINE)" ]; then \
-		$(CONTAINER_ENGINE) run --rm -v $(APKTOP):/work:Z -e BPFC_STATIC=$(APK_STATIC) $(ALPINE_IMAGE) sh -euc '\
+		$(CONTAINER_ENGINE) run --rm -v $(APKTOP):/work:Z $(APK_KEY_MOUNT) -e BPFC_STATIC=$(APK_STATIC) $(ALPINE_IMAGE) sh -euc '\
+			trap "chown -R $(CONTAINER_OWNER) /work" EXIT; \
 			apk add -q alpine-sdk linux-headers bash coreutils; \
-			abuild-keygen -a -i -n -q; \
+			$(APK_KEY_SETUP); \
 			cd /work/src && REPODEST=/work/packages abuild -F -r; \
-			chown -R $(shell id -u):$(shell id -g) /work'; \
+			cp /root/.abuild/*.rsa.pub /work/packages/'; \
 	else \
 		echo "neither abuild nor podman/docker found: run make apk on Alpine, or install podman"; exit 1; \
 	fi
@@ -264,14 +281,26 @@ arch: $(TARBALL)
 		cd $(ARCHTOP) && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL BPFC_STATIC=$(ARCH_STATIC) makepkg -f $(MAKEPKG_OPTS); \
 	elif [ -n "$(CONTAINER_ENGINE)" ]; then \
 		$(CONTAINER_ENGINE) run --rm -v $(ARCHTOP):/work:Z -e BPFC_STATIC=$(ARCH_STATIC) $(ARCH_IMAGE) bash -euc '\
+			trap "chown -R $(CONTAINER_OWNER) /work" EXIT; \
 			pacman -Syu --noconfirm --needed linux-api-headers >/dev/null; \
 			useradd -m build && chown -R build /work; \
-			su build -c "cd /work && makepkg -f $(MAKEPKG_OPTS)"; \
-			chown -R $(shell id -u):$(shell id -g) /work'; \
+			su build -c "cd /work && BPFC_STATIC=$(ARCH_STATIC) makepkg -f $(MAKEPKG_OPTS)"'; \
 	else \
 		echo "makepkg (not as root) or podman/docker needed: run make arch on Arch as a user, or install podman"; exit 1; \
 	fi
 	@echo; echo "Packages:"; find $(ARCHTOP) -maxdepth 1 -name '*.pkg.tar*' -printf '  %p\n'
+
+# A self-contained OpenWrt feed in ./openwrt-feed: dist/openwrt/bpfc with the
+# source tarball unpacked into its src/ folder, for builds that only see the
+# feed (the openwrt/gh-action-sdk action, a copy on another machine).
+#   ./scripts/feeds: src-link bpfc $(CURDIR)/openwrt-feed
+FEEDTOP    = $(CURDIR)/openwrt-feed
+openwrt-feed: $(TARBALL)
+	rm -rf $(FEEDTOP) && mkdir -p $(FEEDTOP)
+	cp -r dist/openwrt/bpfc $(FEEDTOP)/
+	mkdir -p $(FEEDTOP)/bpfc/src
+	tar -xzf $(TARBALL) -C $(FEEDTOP)/bpfc/src --strip-components=1 --exclude='*/dist/openwrt'
+	@echo "Feed: $(FEEDTOP) (package bpfc)"
 
 # Integration test for bpfcd/bpfcctl (needs root; creates and deletes veth pairs).
 # Test suites via tests/run-tests.sh, which totals pass/fail/skip at the end.
@@ -325,4 +354,4 @@ fuzz:
 
 clean:
 	rm -f $(TARGET) $(DAEMON) $(CTL) $(FRONTENDS) output.bpf $(TARBALL) tests/fuzz-rest
-	rm -rf $(RPMTOP) $(DEBTOP) $(APKTOP) $(ARCHTOP) .dist coverage
+	rm -rf $(RPMTOP) $(DEBTOP) $(APKTOP) $(ARCHTOP) $(FEEDTOP) .dist coverage

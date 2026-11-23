@@ -6,8 +6,10 @@ rpmbuild/
 debbuild/
 apkbuild/
 archbuild/
+openwrt-feed/
 bpfc-*.tar.gz
 **/__pycache__/
 tests/fuzz-rest
 frontends/acl
 coverage/
+abuild-key/
