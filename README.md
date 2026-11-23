@@ -1,40 +1,128 @@
-# Programmable eBPF Network Fabric Compiler & Dataplane
+# bpfc: an eBPF compiler and dataplane for network engineers
 
-A standalone, LLVM/Clang-independent eBPF assembler and dataplane written in pure C with zero library dependencies. This tool parses a custom, semicolon-separated instruction set to generate raw eBPF bytecode, load/verify into the kernel, and bind it to network interfaces via raw Netlink TC `clsact` queuing disciplines.
+bpfc turns short, readable packet-processing programs such as `match tcp; match tcp-dst 23; drop` into eBPF bytecode, has the kernel verify them, and attaches them to network interfaces at the TC (ingress and egress) or XDP hooks. It's a single program written in plain C with no library dependencies (no LLVM, clang or libbpf), small enough for embedded routers as well as servers.
 
-Designed to be a deployable eBPF dataplane and networking swiss army knife.  Useful for Red Team operations, SD-WAN edge routing, and high-performance network programming, it supports dynamic variables, stateful map sharing, nested branching logic, and on-the-fly L2-L4 encapsulation.
+Around the compiler there are `bpfcd`, a daemon that keeps programs attached from configuration files the way a router keeps its running config; a Cisco IOS-style access-list frontend; and a set of ready-made programs, from duplicate-packet removal and flow monitoring to bandwidth-aware ECMP and a FEC/ARQ dataplane for lossy satellite links.
+
+## Contents
+
+- [What eBPF is, and why bpfc](#what-ebpf-is-and-why-bpfc)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+  - [Command line](#command-line)
+  - [Language overview](#language-overview)
+  - [Compile-time preprocessor](#compile-time-preprocessor)
+  - [TC and XDP hooks](#tc-and-xdp-hooks)
+- [Simple examples](#simple-examples)
+- [bpfcd: keeping programs attached](#bpfcd-keeping-programs-attached)
+  - [File layout and naming](#file-layout-and-naming)
+  - [bpfcctl](#bpfcctl)
+  - [REST API](#rest-api)
+  - [Frontends: Cisco IOS access lists](#frontends-cisco-ios-access-lists)
+  - [Network namespaces and containers](#network-namespaces-and-containers)
+- [Included programs](#included-programs)
+  - [Duplicate-packet removal (dedup)](#duplicate-packet-removal-dedup)
+  - [Per-neighbor loss and capacity (linkcap)](#per-neighbor-loss-and-capacity-linkcap)
+  - [Flow monitor (flowmon)](#flow-monitor-flowmon)
+  - [Port-scan guard (portscan-guard)](#port-scan-guard-portscan-guard)
+  - [Bandwidth-aware ECMP (ecmp)](#bandwidth-aware-ecmp-ecmp)
+  - [FEC, ARQ and in-band telemetry dataplane (dataplane)](#fec-arq-and-in-band-telemetry-dataplane-dataplane)
+- [Advanced examples](#advanced-examples)
+- [Testing](#testing)
+- [Documentation](#documentation)
 
 ---
 
-## Requirements
-* Linux kernel 4.18+ (Includes native RHEL 8 / CentOS 8 verifier compatability)
-* Root privileges (`CAP_NET_ADMIN` / `CAP_SYS_ADMIN`)
-* XDP programs (`-d xdp`): kernel 5.18+ or RHEL 9.2+
+## What eBPF is, and why bpfc
+
+**eBPF** lets you run small programs inside the Linux kernel at fixed points, called hooks, in the packet path. Before a program runs, the kernel's *verifier* checks that it can't crash the kernel or loop forever. Once attached, the program sees every packet at its hook and can read and rewrite headers, drop the packet, redirect it to another interface, or keep state in *maps*: tables in kernel memory that the program and user-space tools share. Because this happens in the kernel, at the point a packet arrives or leaves, it's fast and needs no changes to applications or the rest of the network stack.
+
+There are two hooks for packets:
+
+- **TC** (traffic control), on ingress and egress of any interface. The packet is already a kernel socket buffer (skb), so a TC program can use its metadata (firewall marks, QoS priority, departure time), clone packets, and resize or re-encapsulate them freely. Several programs can be stacked on one interface by priority.
+- **XDP** (eXpress Data Path), on ingress only, before the kernel has even allocated an skb. It's the earliest and fastest point, used for filtering and forwarding at line rate. An interface has one XDP program.
+
+Normally an eBPF program is written in restricted C, compiled with clang/LLVM, and loaded with libbpf, which means a compiler toolchain, kernel headers and a build step on every system. **bpfc** replaces all of that with one small binary and a language made of networking operations:
+
+- **Packet-oriented commands.** `match tcp-dst 23`, `set ip-src 10.0.0.30` (with the IP and TCP/UDP checksums updated for you), `push-vlan 100`, `encap-gre`, `fib-lookup` against the kernel's routing table, `redirect eth1`.
+- **No toolchain on the target.** A program is a string on the command line or a text file, compiled on the spot, so routers and appliances can change their programs at run time.
+- **State without code.** Counters, flow tables, rate limiters and NAT state are a single command each (`count`, `match over-rate`, `hash`/`pack` flow keys, `set map`), and they can be read and written from the shell (`bpfc -r`, `-w`).
+- **Router-style operation.** `bpfcd` installs programs from `/etc/bpfc/interfaces.d`, keeps them attached across reboots and interface flaps, and reports what's running with `bpfcctl`. Access lists can be written in Cisco IOS syntax.
+
+Typical uses are SD-WAN edge routing and policy routing, firewalls and access lists, NAT, MPLS and GRE encapsulation, QoS marking and policing, traffic accounting, link-quality measurement, and lab or security testing.
 
 ---
 
-## Usage & CLI Flags
+## Installation
 
 ```bash
-# Install to an interface
-sudo ./bpfc -i <interface> [-d ingress|egress] [-p <priority>] [-m <map_dir>] [-v] "<instructions>"
+make                  # build bpfc, bpfcd, bpfcctl and the ACL frontend
+sudo make install     # install everything, including the bpfc-programs tools
+make rpm              # or build RPMs for RHEL 9/10 (in ./rpmbuild)
+```
 
-# Clean / Detach from an interface
-sudo ./bpfc -i <interface> -c
+You can also run `./bpfc` straight from the source tree. bpfc needs root (`CAP_NET_ADMIN` and `CAP_SYS_ADMIN`) and Linux 4.18 or later for TC programs; XDP programs need kernel 5.18+ or RHEL 9.2+. [INSTALL.md](INSTALL.md) has the full requirements, the install paths, the RPM packages, static builds and containers.
+
+---
+
+## Quick start
+
+Drop inbound telnet on `eth0`, check that it's there, and remove it again:
+
+```bash
+sudo ./bpfc -i eth0 -p 10 "match tcp; match tcp-dst 23; drop"
+tc filter show dev eth0 ingress                     # the program, attached at priority 10
+sudo ./bpfc -i eth0 -p 10 -D                        # remove it
+```
+
+Each `match` opens a block that runs only when the packet matches. `drop` ends the program and drops the packet; everything else continues on its way. To have the program put back automatically after a reboot, put it in a file and let [bpfcd](#bpfcd-keeping-programs-attached) manage it:
+
+```bash
+sudo mkdir -p /etc/bpfc/interfaces.d/eth0/ingress
+printf 'match tcp;\n  match tcp-dst 23;\n    drop\n' | sudo tee /etc/bpfc/interfaces.d/eth0/ingress/10.bpfc
+sudo systemctl enable --now bpfcd
+bpfcctl                                             # what's installed, from which file, and whether the kernel agrees
+```
+
+---
+
+## Usage
+
+### Command line
+
+```bash
+# Compile and attach to an interface (TC ingress by default)
+sudo bpfc -i <interface> [-d ingress|egress] [-p <priority>] [-m <map_dir>] [-v] "<instructions>"
+sudo bpfc -i <interface> -d egress -p 20 -f program.bpfc       # from a file
+
+# Check a program without attaching it: compile, and have the kernel verify it
+sudo bpfc -i <interface> -T -f program.bpfc
+
+# Remove one program, or everything bpfc attached to the interface
+sudo bpfc -i <interface> [-d ingress|egress] -p <priority> -D
+sudo bpfc -i <interface> -c
 
 # XDP: the interface's XDP program (generic mode), and removing it
-sudo ./bpfc -i <interface> -d xdp "match udp; match udp-dst 9; drop"
-sudo ./bpfc -i <interface> -d xdp -D
+sudo bpfc -i <interface> -d xdp "match udp; match udp-dst 9; drop"
+sudo bpfc -i <interface> -d xdp -D
+
+# Maps: read, write and delete entries
+sudo bpfc -m /sys/fs/bpf -r <map> [-K '<fields>']
+sudo bpfc -m /sys/fs/bpf -w <map> <key> <value>
 ```
 
 | Flag | Description |
 | :--- | :--- |
-| `-i <iface>` | Target network interface (e.g., `eth0`). If omitted, compiles to `output.bpf` locally. |
-| `-d <dir>` | Hook direction: `ingress` (default), `egress`, or `xdp` (see [XDP](#xdp)). |
-| `-p <prio>` | TC filter execution priority (e.g., `1`). Allows multiple stacked programs to execute sequentially. Re-running with the same priority replaces the program atomically. |
-| `-m <dir>` | Path to store pinned eBPF maps (e.g., `/sys/fs/bpf/my_ns/`). Crucial for network namespaces. |
-| `-f <file>` | Read instructions from a file (`-` for stdin). `#` comments run to the end of the line. |
-| `-c` | Cleanup mode. Atomically deletes the `clsact` qdisc, detaching all filters from the interface. With `-d xdp`: removes the XDP program. |
+| `-i <iface>` | Target network interface (e.g. `eth0`). If omitted, the program is compiled to `output.bpf` locally. |
+| `-d <dir>` | Hook: `ingress` (default), `egress`, or `xdp` (see [TC and XDP hooks](#tc-and-xdp-hooks)). |
+| `-p <prio>` | TC filter priority (e.g. `1`). Programs on one hook run in priority order, lowest first. Running again with the same priority replaces the program atomically. |
+| `-m <dir>` | Directory for pinned eBPF maps (default `/sys/fs/bpf`, e.g. `/sys/fs/bpf/my_ns/`). Programs that use the same directory share maps by name. Needed for network namespaces. |
+| `-f <file>` | Read instructions from a file (`-` for stdin). `#` comments run to the end of the line. A file named `<x>.<type>` is translated by its [frontend](#frontends-cisco-ios-access-lists) first. |
+| `-F <type>` | The file's type, whatever its name: `bpfc`, or a frontend's (`-F acl`). |
+| `-G <file>` | Write the bpfc that a frontend generated to `file`. |
+| `-T` | Check only: compile and have the kernel verify the program, then exit without attaching it or pinning maps. |
+| `-c` | Cleanup mode. Atomically deletes the `clsact` qdisc, detaching all filters from the interface. With `-d xdp`, removes the XDP program. |
 | `-D` | Delete only the program at `-p <prio>` on `-d <dir>` (`-d xdp`: the XDP program, no `-p`). |
 | `-n <name>` | Name the TC filter and the kernel program (shown by `tc filter show` and `bpftool prog`). |
 | `-I` | Print a `BPFC_INFO id=... tag=...` line after attaching, and first a `BPFC_NAME <text>` line for a program with a `name`. |
@@ -45,45 +133,283 @@ sudo ./bpfc -i <interface> -d xdp -D
 | `-w <map> <key> <value>` | Write a 64-bit value into a pinned map (e.g. runtime settings). The key or value may be a `pack ...`/`hash ...` text as for `-H`; for a prefix map the key is a prefix (`10.0.0.0/8`). |
 | `-x <map> <key>` | Delete an entry (key as for `-w`). |
 | `-H '<hash ...\|pack ...>'` | Print the key a program's `hash` or `pack` gives for these values: `bpfc -H 'hash 64 ip-src=10.0.0.1 ip-dst=10.0.0.2 ip-proto=6 src-port=1000 dst-port=80'`. See [doc/flow-tracking.md](doc/flow-tracking.md). |
-| `-v` | Verbose mode. Prints a trace of jump offset calculations and block resolutions. |
-| `-E` | Print the program after `include`, `const`, `define`, `repeat` and `when` are expanded, then exit. |
 | `-s <NAME>=<value>` | Set `const NAME`, overriding the program's own value. Repeatable. |
 | `-L <dir>` | Search `dir` for include files (before `/etc/bpfc/include`). Repeatable. |
+| `-E` | Print the program after `include`, `const`, `define`, `repeat` and `when` are expanded, then exit. |
 | `-M` | Print the program file and every file it includes, one per line, then exit. |
+| `-v` | Verbose mode. Prints a trace of jump offset calculations and block resolutions. |
+
+`bpfc -h` lists every option and command, and `bpfc(8)` describes them in full.
+
+### Language overview
+
+A program is a list of commands separated by semicolons. In a file you can also put one command per line, indent freely, and add `#` comments. This overview covers the commands you'll use most; [doc/language.md](doc/language.md) is the complete reference.
+
+```
+# Rewrite DNS queries from the guest network to our own resolver, and count them.
+match udp;                          # a block: runs only for UDP packets
+  match ip-src 192.168.50.0/24;     # blocks nest
+    match udp-dst 53;
+      set ip-dst 192.168.1.53;      # IP and UDP checksums are updated
+      calc-map add DNS_REWRITES 0 1;
+    end-match;
+  end-match;
+end-match;
+```
+
+**Blocks.** `match <field> <value>` (or `if`) opens a block that runs when the packet's field has that value (an address or subnet, a port or port range, a MAC, a number). `end-match` closes it, and `else` gives the other branch. Protocol shorthands need no value: `match ip`, `ip6`, `arp`, `tcp`, `udp`, `icmp`, `gre`, `vlan`, `mpls`, and more. There are tcpdump-style matches too: `match host 10.0.0.1`, `match net 10.0.0.0/8`, `match port 443`, `match dscp ef`, `match tcp-flags SYN`.
+
+**Fields.** The same field names work for `match`, `get <field> <VAR>` (copy into a variable) and `set <field> <value>` (rewrite the packet). Some of the most common:
+
+| Layer | Fields |
+| :--- | :--- |
+| Ethernet | `src-mac`, `dst-mac`, `eth-proto`, `vlan-id` |
+| IPv4 | `ip-src`, `ip-dst`, `ip-tos`, `dscp`, `ecn`, `ip-ttl`, `ip-proto` |
+| IPv6 | `ip6-src`, `ip6-dst`, `ip6-tclass`, `ip6-flow`, `ip6-proto` |
+| L4 | `tcp-src`, `tcp-dst`, `udp-src`, `udp-dst`, `src-port`, `dst-port`, `tcp-flags`, `icmp-type` |
+| Other | `mpls-label`, `gre-key`, the ARP fields, raw `bytes <offset> <length>` |
+| Packet metadata | `len`, `skb-mark`, `skb-priority`, `time`, `random`, `cpu` |
+
+**Variables.** `decl NAME <bytes>` declares one, `get` fills it, and `%NAME` reads it (`set ip-dst %ORIG`). `calc add|sub|mul|div|and|or|xor|lsh|rsh <VAR> <value>` does arithmetic, and `if VAR gt 10` compares.
+
+**Maps** keep state between packets and are shared with user space. They're pinned under `-m <dir>` by name:
+
+| Command | Does |
+| :--- | :--- |
+| `count PKTS BYTES ip-src` | Atomically add 1 (and the length) to the entry for this source address |
+| `calc-map add MAP <key> <value>` | Atomically add to an entry |
+| `get map MAP <key> VAR` / `set map MAP <key> <value>` | Read or write an entry |
+| `match over-rate MAP ip-src 100/s` | True for packets above the rate per key (a policer) |
+| `match seen MAP <key> within 2s` | True when the key was seen recently |
+| `hash VAR 64 ip-src ip-dst ...` / `pack VAR ip-src dst-port` | Build a flow key from packet fields ([doc/flow-tracking.md](doc/flow-tracking.md)) |
+
+**Actions** end the program for this packet: `drop`; `continue` (go on to the next filter, also what happens at the end of the program); `accept`; `redirect <iface> [ingress|egress]`; `redirect-neigh <iface>` (fills in the next hop's MACs); and `tx` (XDP: back out of the interface it arrived on). `clone <iface>` sends a copy and carries on.
+
+**Packet surgery.** `push-vlan`/`pop-vlan`, `push-qinq`, `encap-gre`/`decap-gre`, `encap-mpls`/`decap-mpls`, `push-eth`/`pop-eth`, `add-bytes`/`del-bytes`, `ip-frag`/`ip-defrag`, `recalc-tcp-csum`. `fib-lookup` asks the kernel's routing table for the next hop (`%FIB_IFINDEX`, `%FIB_DMAC`, ...).
+
+### Compile-time preprocessor
+
+Before compiling, bpfc expands constants, macros, includes and loops, so one file can serve many interfaces and be tuned without editing it. `bpfc -E` prints the expanded program.
+
+| Keyword | Does |
+| :--- | :--- |
+| `const NAME value` | Defines `$NAME`. `-s NAME=value` on the command line overrides it. |
+| `define NAME [PARAM ...]` ... `end-define` | A macro, used like a command: `NAME arg ...` |
+| `include file` | Reads a file once: next to this one, then the `-L` directories, then `/etc/bpfc/include` |
+| `repeat N [as I]` ... `end-repeat` | Copies the body N times with `$I` = 0, 1, ... (unrolled, so it loads on any kernel) |
+| `when <expr>` ... `otherwise` ... `end-when` | Keeps one branch, decided at compile time |
+| `name text` | A name for people, shown by `bpfcctl` |
+| `$(expr)` | Constant arithmetic: `$(14 + 20)` |
+| `$IFNAME`, `$IFINDEX`, `$IFMAC`, `$IFKIND`, `$HOOK`, `$XDP`, `$L3OFF` | The interface and hook the program is compiled for |
+
+```
+const LIMIT 100;
+define allow-port PORT;
+  match tcp-dst $PORT; accept; end-match;
+end-define;
+
+match tcp;
+  allow-port 22;
+  allow-port 443;
+  match over-rate SYNS_$IFNAME ip-src $LIMIT/s; drop; end-match;
+end-match;
+```
+
+`bpfc -i eth0 -s LIMIT=50 -f guard.bpfc` compiles it with a different limit. See [Constants, Macros, Includes and Unrolled Loops](doc/language.md#constants-macros-includes-and-unrolled-loops) for all of it.
+
+### TC and XDP hooks
+
+**TC** (`-d ingress`, the default, or `-d egress`) attaches the program as a `clsact` filter at `-p <priority>`. Several programs can share a hook, and run lowest priority first while each ends with `continue`. TC programs can use every command except `tx`. Note that TC ingress runs after GRO (the kernel merging TCP segments): a filter here sees merged packets, and covers bugs in TCP/IP processing but not in GRO or the driver. For those, use XDP.
+
+**XDP** (`-d xdp`) compiles the same language into an XDP program and attaches it as the interface's XDP program, in generic (skb) mode for now (native/driver mode later). It runs before GRO, TC and the stack. One program per interface; attaching replaces it atomically.
+
+* `accept` and `continue` pass the packet on (XDP_PASS), `drop` is XDP_DROP, `redirect <iface>` sends it out of that interface, and `tx` (XDP only) sends it back out of the interface it came in on.
+* Checksum-aware rewrites (`set ip-src`, ports, `ip-tos`, ...) update the IP and TCP/UDP checksums incrementally, as on TC. XDP sees complete checksums; a packet a local socket sent through a veth pair may carry a partial one (CHECKSUM_PARTIAL), which an L4 rewrite corrupts once the packet is forwarded: turn tx checksum offload off on such senders (`ethtool -K <dev> tx off`).
+* VLAN tags are in the packet: `match vlan`/`qinq`, `get`/`match vlan-id` read them there, `set vlan-id` rewrites the id in the tag (keeping priority and DEI; pushes an 802.1Q tag when there is none), and `push-`/`pop-vlan` insert or remove the 4-byte tag after the MAC addresses. A NIC that strips tags (`rxvlan` offload) may hand generic XDP packets without them.
+* Resizing works: `add-head-bytes`, `add-bytes`/`del-bytes`, `add-l2-bytes`/`del-l2-bytes`, `push-`/`pop-eth`, `push-`/`pop-vlan`, `push-qinq`, `encap-`/`decap-mpls`, `encap-`/`decap-gre`, `insert-l2`/`remove-l2`/`strip-l2` and `set len`, so the [MPLS pseudowire](#3-mpls-pseudowires) examples run as XDP programs too. The packet grows or shrinks at the front with `bpf_xdp_adjust_head` (up to 255 bytes at a time; generic mode has 256 bytes of headroom) and at the end with `bpf_xdp_adjust_tail`; inserted bytes are zero, as on TC. Growing at the end needs tailroom, which generic mode may not have.
+* Commands that need an skb are a compile error naming the command: `ip-frag`, `ip-defrag`, `clone`, `redirect-neigh`, `reclassify`, and the skb fields (`skb-mark`, `skb-hash`, `skb-priority`, `gso-segs`, `skb-cb`, `protocol`, `tstamp`, `set queue`). `get len`, `skb-ingress`/`skb-ifindex` (the ingress interface) and `queue` (the receive queue) work.
+* `$XDP` (1 in an XDP program) and `$HOOK` (`ingress`, `egress`, `xdp`) let one file serve several hooks: `when $XDP == 0; set skb-mark 5; end-when`.
+
+**Tunnel devices.** On devices without an Ethernet header (gre, ipip, sit, wireguard, tun, PPP) packets start with the IP header. bpfc reads the IP and L4 fields from there by itself (`$L3OFF` is 0 instead of 14), and Ethernet fields and commands are a compile error. See `$L3OFF` in [doc/language.md](doc/language.md#constants-macros-includes-and-unrolled-loops).
 
 ---
 
-## bpfcd: managing programs from files
+## Simple examples
 
-`bpfcd` keeps programs from `/etc/bpfc/interfaces.d` attached, so they survive reboots and interface re-creation:
+Each of these is a complete program. Attach it with the command shown, and remove it with `bpfc -i <iface> -p <prio> -D` (add `-d egress` for egress). Map contents are read with `bpfc -m /sys/fs/bpf -r <map>`.
+
+**Block a network.** Drop everything from 198.51.100.0/24 arriving on `eth0`:
+
+```bash
+bpfc -i eth0 -p 10 "match ip-src 198.51.100.0/24; drop"
+```
+
+**Rate-limit ping.** Allow each source 10 echo requests a second and drop the rest:
+
+```bash
+bpfc -i eth0 -p 20 "match icmp; match icmp-type 8; match over-rate PING ip-src 10/s; drop"
+```
+
+**Count traffic per host.** Packets and bytes per source address, in maps `PKTS` and `BYTES`:
+
+```bash
+bpfc -i eth0 -p 30 "match ip; count PKTS BYTES ip-src"
+bpfc -m /sys/fs/bpf -r PKTS -K 'ip-src'       # decode the key as an address
+# ip-src value
+127.0.0.1 16
+```
+
+**Mark voice for QoS.** Set DSCP EF on SIP signalling leaving `wan0`, so the queues along the path can prioritise it:
+
+```bash
+bpfc -i wan0 -d egress -p 10 "match udp; match dst-port 5060; set dscp ef"
+```
+
+**Mirror DNS to a capture host.** Send a copy of every DNS packet to `mon0`, and let the original continue:
+
+```bash
+bpfc -i eth0 -p 40 "match udp; match port 53; clone mon0 egress"
+```
+
+**A program file with a constant.** Files can be commented, indented and parameterised. This one drops a configurable network and counts the drops per interface:
 
 ```
-/etc/bpfc/interfaces.d/<interface>/ingress/<priority>.bpfc
-/etc/bpfc/interfaces.d/<interface>/egress/<priority>.bpfc
-/etc/bpfc/interfaces.d/%all%/{ingress,egress}/<priority>.bpfc      every interface
-/etc/bpfc/interfaces.d/%<kind>%/{ingress,egress}/<priority>.bpfc   every interface of that kind
-/etc/bpfc/interfaces.d/{<interface>,%all%,%<kind>%}/xdp.bpfc       the interface's XDP program
+# block.bpfc: drop traffic from a blocked network, and count what was dropped.
+const BLOCKED 198.51.100.0/24;
+name block $BLOCKED on $IFNAME;
+
+match ip; match ip-src $BLOCKED;
+  calc-map add DROPS_$IFNAME 0 1;
+  drop;
+end-match; end-match;
 ```
+
+```bash
+bpfc -i eth0 -p 10 -f block.bpfc                              # as written
+bpfc -i eth0 -p 10 -s BLOCKED=203.0.113.0/24 -f block.bpfc    # another network
+bpfc -i eth0 -E -f block.bpfc                                 # see what it expands to
+bpfc -m /sys/fs/bpf -r DROPS_eth0
+```
+
+Copied to `/etc/bpfc/interfaces.d/%all%/ingress/10.bpfc`, bpfcd puts it on every interface, each with its own `DROPS_<interface>` map.
+
+**NAT, two ways.** [Advanced example 4](#4-network-address-translation-nat) builds a NAT the long way, with the flow keys assembled by hand. `dist/examples/flow/nat-pack.bpfc` does the same in a few lines with `pack`, and [doc/flow-tracking.md](doc/flow-tracking.md#81-nat-three-ways) walks through both, and a third version with port translation.
+
+---
+
+## bpfcd: keeping programs attached
+
+`bpfcd` keeps the programs in `/etc/bpfc/interfaces.d` attached, so they survive reboots and interfaces being re-created. You edit files and reload, much as you'd edit a router's configuration:
 
 ```bash
 mkdir -p /etc/bpfc/interfaces.d/eth0/ingress
 printf 'match tcp;\n  match tcp-dst 23;\n    drop\n' > /etc/bpfc/interfaces.d/eth0/ingress/100.bpfc
 systemctl enable --now bpfcd
-bpfcctl                      # what is installed, from which file, and whether the kernel agrees
-bpfcctl show eth0 ingress 100 --bytecode
+systemctl reload bpfcd        # after changing files (or: bpfcctl reload)
+bpfcctl                       # what is installed, from which file, and whether the kernel agrees
 ```
 
-* **Reload** (`systemctl reload bpfcd` or `bpfcctl reload`): new and changed files are installed (atomic replace at the same priority), deleted files are detached. A file is only re-hashed when its mtime changes and only reinstalled when its SHA-256 differs. A program that uses `include` is hashed together with the files it includes (as listed by `bpfc -M`) on every reload, so editing a shared library reinstalls every program that uses it. Keep libraries outside `interfaces.d` (for example in `/etc/bpfc/include`), or bpfcd will try to install them as programs.
-* **Failures**: if a file does not compile or the verifier rejects it, its priority is left empty rather than running the old version; `bpfcctl show` prints the verifier log.
-* **Interfaces**: programs are installed when a configured interface appears and re-installed when it is re-created.
-* **All interfaces, or all of a kind**: `%all%/` applies to every interface; `%<kind>%/` to every interface of that kind as `ip -d link` shows it (`%veth%`, `%gre%`, `%vxlan%`, `%wireguard%`, `%tun%`, ...), `%nic%` to devices without a kind (physical NICs) and `%lo%` to loopback. On devices without an Ethernet header (gre, ipip, sit, wireguard, tun) packets start with the IP header and bpfc reads the IP fields there (see `$L3OFF`); a template that uses Ethernet fields (MACs, VLAN, ARP, MPLS) fails to compile on them (status `failed`, the other interfaces still get it), so guard that part with `when $L3OFF == 14` or put an empty file for that priority in `%gre%/`, `%wireguard%/`, ... For each direction and priority the most specific file wins: `<interface>/`, then `%<kind>%/`, then `%all%/`; other priorities still apply. An empty file (only comments) at a more specific level means nothing at that priority there: `eth1/ingress/100.bpfc` empty exempts eth1 from `%all%/ingress/100.bpfc` (status `excluded`). New interfaces get the programs when they appear; a template is compiled once per interface, with `$IFNAME`, `$IFINDEX`, `$IFTYPE` and `$IFKIND` set for it. Programs on stacked devices (a bridge and its ports, a bond and its slaves) see the same packet more than once. Only the default network namespace is managed.
-* **tc ingress runs after GRO**: a filter here covers bugs in TCP/IP processing, not in GRO or the driver; for those use `xdp.bpfc`.
-* **XDP**: `xdp.bpfc` in an interface's (or template's) directory is its XDP program, attached in generic mode, one per interface (no priority; `bpfcctl show eth0 xdp`). Templates, empty files, reloads, failures, adoption and external changes work as for TC. It runs before TC ingress.
-* **External changes**: if something else removes or replaces a managed program, bpfcd reinstalls it or only logs it, per `on_external_change` in `/etc/bpfc/bpfc.conf`.
-* **Tracking**: each program's id and tag are recorded with its file path and hash in `/run/bpfc/state`; filters are named `bpfcd:<iface>/<dir>/<prio>`.
-* **Network namespaces**: `bpfcd -n <name>` (usually `systemctl enable --now bpfcd-netns@<name>`) manages namespace `<name>` from `/etc/bpfc/netns/<name>/` (`bpfc.conf`, `interfaces.d/`), with its own state (`/run/bpfc/netns/<name>`) and pinned maps (`/sys/fs/bpf/netns/<name>`). The namespace is `/run/netns/<name>`, or `netns_path` (a namespace file or a symlink to one, re-followed every second), or `netns_veth` (the namespace holding the peer of a host-side veth: a pod or container). bpfcd waits for a namespace that is not there yet, moves its programs when the path or veth comes to point at another namespace, and lets a deleted one be freed. `bpfcctl -n <name>`, `bpfcctl --all-netns` and the `-n` option of the bpfc-programs tools work on it; `bpfcctl -n <name> exec <command>` runs a command inside it.
+See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)` for the details.
 
-* **REST API** (off by default): with `rest_socket = /run/bpfc/bpfcd.sock` in `bpfc.conf`, bpfcd serves HTTP on that unix socket (owner `root:bpfc`, mode `0660`: add users to the `bpfc` group; whoever can connect can change programs). `GET /` is the status as JSON; `GET /interfaces/<if>` one interface; `/interfaces/<if>/<ingress|egress>/<prio>` (and `/interfaces/<if>/xdp`) is a program file as a JSON array of lines: `GET` reads it, `POST`/`PUT` writes and installs it, `DELETE` removes it. Writes are checked with `bpfc -T` first and rolled back if installing fails; `?dry-run` only checks. Written files live in `/var/lib/bpfc/interfaces.d` and override the same file in `/etc/bpfc/interfaces.d`. `bpfcctl status --json` prints the same status locally.
+### File layout and naming
+
+```
+/etc/bpfc/interfaces.d/<interface>/ingress/<priority>.bpfc
+/etc/bpfc/interfaces.d/<interface>/egress/<priority>.bpfc
+/etc/bpfc/interfaces.d/<interface>/xdp.bpfc                        the interface's XDP program
+/etc/bpfc/interfaces.d/%all%/{ingress,egress}/<priority>.bpfc      every interface
+/etc/bpfc/interfaces.d/%<kind>%/{ingress,egress}/<priority>.bpfc   every interface of that kind
+/etc/bpfc/interfaces.d/{<interface>,%all%,%<kind>%}/xdp.bpfc
+/etc/bpfc/interfaces.d/<interface>/ingress/<priority>.<type>       translated by a frontend (10.acl)
+```
+
+* **The file name is the priority.** `ingress/100.bpfc` is attached at TC priority 100 on ingress, so programs on a hook run in the order of their file names' numbers. `xdp.bpfc` has no priority, since an interface has one XDP program (`bpfcctl show eth0 xdp`). It's attached in generic mode and runs before TC ingress. Templates, empty files, reloads, failures, adoption and external changes work for it as for TC.
+* **Other file types.** `<priority>.<type>`, such as `10.acl`, is translated into bpfc by the frontend for that type ([below](#frontends-cisco-ios-access-lists)).
+* **All interfaces, or all of a kind.** `%all%/` applies to every interface, and `%<kind>%/` to every interface of that kind as `ip -d link` shows it (`%veth%`, `%gre%`, `%vxlan%`, `%wireguard%`, `%tun%`, ...). `%nic%` covers devices without a kind (physical NICs), and `%lo%` loopback. A template is compiled once per interface, with `$IFNAME`, `$IFINDEX`, `$IFTYPE` and `$IFKIND` set for it, and new interfaces get the programs when they appear.
+* **The most specific file wins.** For each direction and priority, bpfcd uses `<interface>/` first, then `%<kind>%/`, then `%all%/`. Other priorities still apply.
+* **Opting out.** An empty file (or one with only comments) at a more specific level means nothing at that priority there. For example, an empty `eth1/ingress/100.bpfc` exempts eth1 from `%all%/ingress/100.bpfc`; `bpfcctl` shows it as `excluded`.
+* **Tunnel devices.** On devices without an Ethernet header (gre, ipip, sit, wireguard, tun), a template that uses Ethernet fields (MACs, VLAN, ARP, MPLS) fails to compile (status `failed`; the other interfaces still get it). Guard that part with `when $L3OFF == 14`, or put an empty file for that priority in `%gre%/`, `%wireguard%/`, ...
+* **Include files** go outside `interfaces.d`, for example in `/etc/bpfc/include`, or bpfcd will try to install them as programs.
+* **Stacked devices** (a bridge and its ports, a bond and its slaves) see the same packet more than once.
+
+How bpfcd handles changes:
+
+* **Reload** (`systemctl reload bpfcd` or `bpfcctl reload`). New and changed files are installed (an atomic replace at the same priority), and deleted files are detached. A file is only re-hashed when its mtime changes, and only reinstalled when its SHA-256 differs. A program that uses `include` is hashed together with the files it includes (as listed by `bpfc -M`) on every reload, so editing a shared library reinstalls every program that uses it.
+* **Failures.** If a new version of a file doesn't compile or the verifier rejects it, the previous program stays attached (status `failed-kept`) and `bpfcctl show` prints the error. With `on_failure = remove` in `bpfc.conf` (or `option on-failure remove` in the program) the priority is left empty instead.
+* **Interfaces.** Programs are installed when a configured interface appears, and re-installed when it is re-created.
+* **External changes.** If something else removes or replaces a managed program, bpfcd reinstalls it or only logs it, per `on_external_change` in `/etc/bpfc/bpfc.conf`.
+* **Tracking.** Each program's id and tag are recorded with its file path and hash in `/run/bpfc/state`, and filters are named `bpfcd:<iface>/<dir>/<prio>`. A restarted bpfcd adopts the programs that are still attached instead of reinstalling them.
+
+### bpfcctl
+
+| Command | Shows |
+| :--- | :--- |
+| `bpfcctl` (or `bpfcctl status [-a] [-l] [-j]`) | One line per program: interface, hook, priority, name, status, kernel program id and tag, a kernel check, and the file. `-a` also lists filters bpfcd doesn't manage, `-j` prints JSON. |
+| `bpfcctl show <iface> <ingress\|egress> <prio>` | One program in detail: its record, its source with line numbers and, for a failed program, the bpfc output and verifier log. `--source` adds the bpfc a frontend generated, and `--bytecode` the program as the kernel holds it. |
+| `bpfcctl show <iface> xdp` | The interface's XDP program, the same way |
+| `bpfcctl reload [--no-wait]` | Rescan the files and report failures |
+| `bpfcctl show access-lists [name] [interface <iface>]` | IOS-style access lists with per-entry hit counts |
+| `bpfcctl top [n [seconds]]` | The busiest access-list entries right now |
+| `bpfcctl log [-f]` | Access-list `log` entries, IOS-style (`%SEC-6-IPACCESSLOGP`) |
+| `bpfcctl clear access-list counters [name]` | Reset the hit counters |
+| `bpfcctl -n <netns> ...`, `bpfcctl --all-netns` | The same for a network namespace instance, or for all of them |
+
+Here `flowmon` from `%all%` is on every interface, two interfaces opt out of it with empty files, and `wan1` has a program of its own on ingress (abridged):
+
+```
+# bpfcctl
+bpfcd: running (pid 120, version 0.1.1), started 2026-11-23 10:46:19, last reload 2026-11-23 10:47:21
+programs: /etc/bpfc/interfaces.d    external changes: reinstall
+
+IFACE     DIR       PRIO  NAME                                             STATUS                 PROG  TAG               KERNEL    FILE
+lo        ingress     10  flowmon ingress: IPv4 flow and TCP loss monitor  installed              2550  ddccc0a2568fece4  ok        %all%/ingress/10.bpfc
+lo        egress      10  flowmon egress: IPv4 flow and TCP loss monitor   installed              2551  ddccc0a2568fece4  ok        %all%/egress/10.bpfc
+net0      ingress     10  -                                                excluded                  -  -                 -         net0/ingress/10.bpfc
+net0      egress      10  -                                                excluded                  -  -                 -         net0/egress/10.bpfc
+net0.501  ingress     10  flowmon ingress: IPv4 flow and TCP loss monitor  installed              2565  ddccc0a2568fece4  ok        %all%/ingress/10.bpfc
+net0.501  egress      10  flowmon egress: IPv4 flow and TCP loss monitor   installed              2566  ddccc0a2568fece4  ok        %all%/egress/10.bpfc
+wan0      ingress     10  -                                                excluded                  -  -                 -         wan0/ingress/10.bpfc
+wan0      egress      10  -                                                excluded                  -  -                 -         wan0/egress/10.bpfc
+wan1      ingress     10  -                                                installed              2549  cbfebffddcfc1437  ok        wan1/ingress/10.bpfc
+wan1      egress      10  flowmon egress: IPv4 flow and TCP loss monitor   installed              2552  ddccc0a2568fece4  ok        %all%/egress/10.bpfc
+wan1.100  ingress     10  flowmon ingress: IPv4 flow and TCP loss monitor  installed              2557  ddccc0a2568fece4  ok        %all%/ingress/10.bpfc
+wan1.100  egress      10  flowmon egress: IPv4 flow and TCP loss monitor   installed              2558  ddccc0a2568fece4  ok        %all%/egress/10.bpfc
+```
+
+The status is `installed`, `installing`, `pending-iface` (the interface doesn't exist yet), `failed`, `failed-kept`, `removed-externally`, `replaced-externally`, `reinstall-limit` or `excluded`. KERNEL is `ok` when the kernel has exactly the recorded program, and `MISSING` or `DIFFERS` when it doesn't.
+
+`bpfcctl show` gives one program in detail, followed by its source:
+
+```
+# bpfcctl show wan1.100 ingress 10
+wan1.100 ingress priority 10
+  name:       flowmon ingress: IPv4 flow and TCP loss monitor
+  status:     installed
+  file:       /etc/bpfc/interfaces.d/%all%/ingress/10.bpfc
+  sha256:     7dc4215cd694a8c5dc58adeada8cac4a0d1a7adc9af4c9b98f020aa405800bbf
+  program:    id 2557  tag ddccc0a2568fece4  1704 insns
+  kernel:     ok
+  installed:  2026-11-23 10:47:21   last change: 2026-11-23 10:47:21
+
+Source
+   1  # BPFC IPv4 flow monitor, TC ingress and egress (egress/10.bpfc includes this
+   2  # file). Read with bpfc-flows(8).
+  ...
+```
+
+### REST API
+
+The REST API is off by default. With `rest_socket = /run/bpfc/bpfcd.sock` in `bpfc.conf`, bpfcd serves HTTP on that unix socket. The socket is owned by `root:bpfc` with mode `0660`, so add users to the `bpfc` group; anyone who can connect can change programs.
+
+| Request | Does |
+| :--- | :--- |
+| `GET /` | The status as JSON (the same as `bpfcctl status --json`) |
+| `GET /interfaces/<if>` | One interface |
+| `GET /interfaces/<if>/<ingress\|egress>/<prio>`, `/interfaces/<if>/xdp` | A program file, as a JSON array of lines |
+| `POST` / `PUT` on the same | Write the file and install it |
+| `DELETE` on the same | Remove it |
+
+Writes are checked with `bpfc -T` first and rolled back if installing fails; `?dry-run` only checks. Files written through the API live in `/var/lib/bpfc/interfaces.d` and override the same file in `/etc/bpfc/interfaces.d`.
 
 ```bash
 curl --unix-socket /run/bpfc/bpfcd.sock http://localhost/interfaces/eth0
@@ -92,21 +418,11 @@ curl --unix-socket /run/bpfc/bpfcd.sock -X POST -d '["match tcp;", "  match tcp-
 curl --unix-socket /run/bpfc/bpfcd.sock -X DELETE http://localhost/interfaces/eth0/ingress/10
 ```
 
-```bash
-mkdir -p /etc/bpfc/netns/pod1/interfaces.d/eth0/ingress
-echo 'netns_veth = veth3f2a1c' > /etc/bpfc/netns/pod1/bpfc.conf   # the pod's host-side veth
-cp drop-telnet.bpfc /etc/bpfc/netns/pod1/interfaces.d/eth0/ingress/100.bpfc
-systemctl enable --now bpfcd-netns@pod1
-bpfcctl -n pod1
-```
+### Frontends: Cisco IOS access lists
 
-See `bpfcd(8)`, `bpfcctl(8)` and `bpfc.conf(5)`. Build an RPM (RHEL 9/10) with `make rpm`; run the daemon's integration and container tests with `make check` (root).
+A program file need not be bpfc. `<priority>.<type>` files are translated by a *frontend*: an executable named after the type, looked up as `/etc/bpfc/frontends/<type>`, then `/usr/libexec/bpfc/frontends/<type>`. It can be a shell script, a Python script or a binary (the contract is under FRONTENDS in `bpfc(8)`). bpfcd manages such files like `.bpfc` ones, and `bpfcctl show --source` shows the bpfc they were translated into.
 
----
-
-## Firewalls with Cisco IOS access lists
-
-A program file need not be bpfc: `<priority>.<type>` files are translated by a *frontend* (`/etc/bpfc/frontends/<type>`, then `/usr/libexec/bpfc/frontends/<type>`; a script or a binary, see FRONTENDS in `bpfc(8)`). bpfc ships one, `acl`, for IOS access lists:
+bpfc ships one frontend, `acl`, for IOS access lists:
 
 ```
 # /etc/bpfc/interfaces.d/eth0/ingress/10.acl
@@ -124,63 +440,101 @@ bpfcctl log -f                         # %SEC-6-IPACCESSLOGP: list EDGE-IN denie
 bpfcctl clear access-list counters EDGE-IN
 ```
 
-Standard, extended, IPv6 and MAC lists, numbered and named, object groups (shared ones in `/etc/bpfc/acl.d`), reflexive lists (`reflect`/`evaluate`), `established`, TCP flags, fragments, DSCP/precedence/TTL, `log` and `log-input`. Anything bpfc cannot apply exactly is an error, and a list that fails to load leaves the previous one running. [doc/firewall.md](doc/firewall.md) is the guide; examples are in `dist/examples/acl`.
+It supports standard, extended, IPv6 and MAC lists, numbered and named; object groups (shared ones go in `/etc/bpfc/acl.d`); reflexive lists (`reflect`/`evaluate`); `established`, TCP flags, fragments, DSCP/precedence/TTL; and `log` and `log-input`. Anything bpfc can't apply exactly is an error, and a list that fails to load leaves the previous one running. [doc/firewall.md](doc/firewall.md) is the guide, and the examples are in `dist/examples/acl`.
 
----
+### Network namespaces and containers
 
-## XDP
-
-`-d xdp` compiles the same language into an XDP program and attaches it as the interface's XDP program, in generic (skb) mode for now (native/driver mode later). It runs before GRO, TC and the stack. One program per interface; attaching replaces it atomically.
-
-* `accept` and `continue` pass the packet on (XDP_PASS), `drop` is XDP_DROP, `redirect <iface>` sends it out of that interface, and `tx` (XDP only) sends it back out of the interface it came in on.
-* Checksum-aware rewrites (`set ip-src`, ports, `ip-tos`, ...) update the IP and TCP/UDP checksums incrementally, as on TC. XDP sees complete checksums; a packet a local socket sent through a veth pair may carry a partial one (CHECKSUM_PARTIAL), which an L4 rewrite corrupts once the packet is forwarded: turn tx checksum offload off on such senders (`ethtool -K <dev> tx off`).
-* VLAN tags are in the packet: `match vlan`/`qinq`, `get`/`match vlan-id` read them there, `set vlan-id` rewrites the id in the tag (keeping priority and DEI; pushes an 802.1Q tag when there is none), and `push-`/`pop-vlan` insert or remove the 4-byte tag after the MAC addresses. A NIC that strips tags (`rxvlan` offload) may hand generic XDP packets without them.
-* Resizing works: `add-head-bytes`, `add-bytes`/`del-bytes`, `add-l2-bytes`/`del-l2-bytes`, `push-`/`pop-eth`, `push-`/`pop-vlan`, `push-qinq`, `encap-`/`decap-mpls`, `encap-`/`decap-gre`, `insert-l2`/`remove-l2`/`strip-l2` and `set len`, so the [MPLS pseudowire](#3-mpls-pseudowires) examples run as XDP programs too. The packet grows or shrinks at the front with `bpf_xdp_adjust_head` (up to 255 bytes at a time; generic mode has 256 bytes of headroom) and at the end with `bpf_xdp_adjust_tail`; inserted bytes are zero, as on TC. Growing at the end needs tailroom, which generic mode may not have.
-* Commands that need an skb are a compile error naming the command: `ip-frag`, `ip-defrag`, `clone`, `redirect-neigh`, `reclassify`, and the skb fields (`skb-mark`, `skb-hash`, `skb-priority`, `gso-segs`, `skb-cb`, `protocol`, `tstamp`, `set queue`). `get len`, `skb-ingress`/`skb-ifindex` (the ingress interface) and `queue` (the receive queue) work.
-* `$XDP` (1 in an XDP program) and `$HOOK` (`ingress`, `egress`, `xdp`) let one file serve several hooks: `when $XDP == 0; set skb-mark 5; end-when`.
-
----
-
-## Tests
-
-**Tests.** `./test.sh` runs every suite (root; about an hour) and ends with pass/fail/skip totals per suite; it exits non-zero if anything failed. Name suites to run only those (`./test.sh bpfc nat`), add `-f` to print failures only, or `-v` for each suite's full output; logs are kept under `/tmp/bpfc-tests.*`. `make check` (compile, preprocessor, stack, bpfcd, xdp, container, install), `make check-dataplane` (the dataplane suites and the verifier budget) and `make check-all` use the same runner; the `verifier-budget` suite loads every generated dataplane program (each profile, and the extremes of the structural settings) and fails if one uses more than `BUDGET_PCT` percent (default 85) of the verifier's 1,000,000-instruction limit (kernel 5.16+; it skips on older kernels); `make check-compile` needs no root and checks that every field and command compiles, that hex and decimal values give the same code, and that invalid programs are refused with a clear message; the `install` suite checks what `make install` and, when `rpmbuild` is present, the RPMs put where (binaries in bpfc; dataplane tools, every built-in profile and docs in bpfc-scripts) and runs the installed generator against the installed profiles; pass flags with `make check TESTFLAGS=-f`. Suites skip (rather than fail) when they are not run as root or need something the system lacks: a tool (tcpdump, ncat, iperf), kernel MPLS routing (`mpls_router`), or scapy for `tests/test_bpfc.py`. The fragmentation suites check each fragment size with three ordinary pings and, separately, the loss under load (100 parallel pings), which must stay below `STRESS_MAX_LOSS` hundredths of a percent (default 100, i.e. 1 %). New shell suites should `source tests/lib.sh` for `test_pass`/`test_fail`/`test_skip`, `check` and `tests_exit`. `make coverage` (root; needs `gcovr`, `pip install gcovr`) runs the suites against a gcov build of bpfc and writes bpfc.c's line, function and branch coverage to `coverage/` (`index.html`, `summary.txt`, and `coverage.json`, which `gcovr --add-tracefile a.json --add-tracefile b.json ...` merges with runs from other machines, e.g. a host with MPLS routing or `rpmbuild`); it fails when a suite fails or a full run drops below `COVERAGE_MIN_LINES`/`COVERAGE_MIN_BRANCHES` (percent). `COVERAGE_SUITES="compile keys"` runs only those (no minimum then). `BPFC_TEST_NO_BUFFER_MAPS=1` is a test hook: del-bytes then takes its unrolled fallback, as when its buffer map cannot be created.
-
----
-
-## Container integration
-
-**Containers (no systemd):** the `bpfc-container` package adds `/usr/sbin/bpfcd-entrypoint`, which runs bpfcd as the container's PID 1. Neither package requires systemd, and settings can be passed as `BPFCD_*` environment variables. See [dist/container/README.md](dist/container/README.md) for an example Containerfile and run options. `make rpm RPMBUILD_OPTS="--with static"` builds statically linked binaries for images without a matching libc.
-
----
-
-## Dataplane: FEC, ARQ, in-band telemetry and bandwidth probing
-
-`programs/dataplane/bpfc-dataplane-gen` generates bpfc programs for a point-to-point link (both ends run them): every IPv4 packet gets an 8-byte shim with a sequence number and timestamp, after the Ethernet header (EtherType 0x88B5) on a Layer-2 link, or inside UDP (`--carrier udp`: an outer IPv4/UDP header to the peer, for routed paths, the internet and NAT; `--carrier udp-inline`: UDP after the packet's own IP header, for a private routed WAN) for the remote prefixes given with `--protect`. The receiver measures loss, reordering, duplicates, jitter and queueing delay (no clock synchronisation needed) and reports back once a second. When loss crosses a threshold the sender adds XOR parity (forward error correction), scaled to the loss, and turns it off again after a cool-down; lost packets are also retransmitted from a short buffer (ARQ), and packet-pair probes estimate the link capacity (probe trains and a median on links that deliver in frames, such as Starlink: `--probe-train 20ms --capacity-percentile 50`, set in the `leo` profile). Each interface has its own maps.
-
-Both come in the optional `bpfc-programs` package (`dnf install bpfc-programs`; `make install` installs it too, or `make install-programs` alone): `bpfc-dataplane-gen` and `bpfc-dataplane-status` in `/usr/sbin`, the built-in profiles in `/usr/share/bpfc/dataplane/profiles/`, and DESIGN.md with example programs in `/usr/share/doc/bpfc-programs/dataplane/`. Both tools are bash scripts; from a source tree they also run in place (`programs/dataplane/bpfc-dataplane-gen` finds `programs/dataplane/profiles/` next to it).
-
-Profiles set the defaults for a kind of link (`direct`, `wan`, `geo`, `leo` built in; your own in `/etc/bpfc/dataplane/profiles.d/`), and `--link-rate` / `--rtt` size the retransmit ring and windows.
+**Network namespaces.** `bpfcd -n <name>` (usually `systemctl enable --now bpfcd-netns@<name>`) manages namespace `<name>` from `/etc/bpfc/netns/<name>/` (`bpfc.conf`, `interfaces.d/`), with its own state (`/run/bpfc/netns/<name>`) and pinned maps (`/sys/fs/bpf/netns/<name>`). The namespace is `/run/netns/<name>`, or `netns_path` (a namespace file or a symlink to one, re-followed every second), or `netns_veth` (the namespace holding the peer of a host-side veth: a pod or container). bpfcd waits for a namespace that isn't there yet, moves its programs when the path or veth comes to point at another namespace, and lets a deleted one be freed. `bpfcctl -n <name>`, `bpfcctl --all-netns` and the `-n` option of the bpfc-programs tools work on it, and `bpfcctl -n <name> exec <command>` runs a command inside it. The main bpfcd manages only the default namespace.
 
 ```bash
-bpfc-dataplane-gen -i eth0 --profile geo   # writes /etc/bpfc/interfaces.d/eth0/{egress,ingress}/*.bpfc
-bpfc-dataplane-gen --list-profiles
-bpfc-dataplane-gen --show-profile geo --rtt 650ms   # effective settings and buffer sizes
-bpfc-dataplane-gen -i eth0 --setup-hints   # MTU / offload settings for the link
-systemctl reload bpfcd
-bpfc-dataplane-status                      # one table row per interface (FRR style)
-bpfc-dataplane-status eth0 detail          # the full report; also -d
-bpfc-dataplane-status json                 # the same data as JSON; also -j (-1: key=value lines)
-bpfc-dataplane-status set eth0 fec-threshold 2
-# over the internet, the site behind (CG)NAT names the public one; the public one learns it
-bpfc-dataplane-gen -i wan0 --profile leo --carrier udp --peer 203.0.113.10 --protect 10.1.0.0/16   # NAT side
-bpfc-dataplane-gen -i eth0 --profile leo --carrier udp --peer learn --protect 10.2.0.0/16          # public side
+mkdir -p /etc/bpfc/netns/pod1/interfaces.d/eth0/ingress
+echo 'netns_veth = veth3f2a1c' > /etc/bpfc/netns/pod1/bpfc.conf   # the pod's host-side veth
+cp drop-telnet.bpfc /etc/bpfc/netns/pod1/interfaces.d/eth0/ingress/100.bpfc
+systemctl enable --now bpfcd-netns@pod1
+bpfcctl -n pod1
 ```
 
-See [programs/dataplane/DESIGN.md](programs/dataplane/DESIGN.md) for the wire format, the algorithms and the limits; `make check-dataplane` (root) runs its end-to-end tests (`dataplane`, `dataplane-udp`, `verifier-budget`).
+**Containers (no systemd).** The `bpfc-container` package adds `/usr/sbin/bpfcd-entrypoint`, which runs bpfcd as the container's PID 1. Neither package requires systemd, and settings can be passed as `BPFCD_*` environment variables. See [dist/container/README.md](dist/container/README.md) for an example Containerfile and run options, and [INSTALL.md](INSTALL.md#static-binaries) for statically linked builds for images without a matching libc.
 
-### Bandwidth-aware ECMP (`bpfc-ecmp-gen`)
+---
 
-A routing layer on a single router: it balances flows over the next hops of the kernel's multipath routes by measured load, with interface preferences per traffic class. It needs nothing from its neighbours and is independent of the FEC dataplane. Packets change only as in any router (TTL, IP checksum, MACs). IPv4.
+## Included programs
+
+These are complete applications built on bpfc. They come in the optional `bpfc-programs` package (`dnf install bpfc-programs`; `make install` installs them too, or `make install-programs` alone), one folder per program under `programs/` in the source. Most have a generator, which writes `.bpfc` files into `/etc/bpfc/interfaces.d` for bpfcd to install, and a status tool that reads the program's maps. The tools are bash scripts and also run in place from a source tree. They're listed here from the simplest to the most involved.
+
+| Program | What it does | Tools |
+| :--- | :--- | :--- |
+| [dedup](#duplicate-packet-removal-dedup) | Drops duplicate IPv4 packets, e.g. on 1+1 redundant paths | `bpfc-dedup` |
+| [linkcap](#per-neighbor-loss-and-capacity-linkcap) | Loss, delay and capacity per neighbor, from packet accounting | `bpfc-linkcap-gen`, `bpfc-linkcap-status` |
+| [flowmon](#flow-monitor-flowmon) | Per-flow traffic, and TCP retransmissions and loss | `bpfc-flows` |
+| [portscan-guard](#port-scan-guard-portscan-guard) | Detects and blocks port scans | `bpfc-portscanctl` |
+| [ecmp](#bandwidth-aware-ecmp-ecmp) | Balances flows over multipath routes by measured load | `bpfc-ecmp-gen`, `bpfc-ecmp-status` |
+| [dataplane](#fec-arq-and-in-band-telemetry-dataplane-dataplane) | FEC, retransmission and telemetry for lossy point-to-point links | `bpfc-dataplane-gen`, `bpfc-dataplane-status` |
+
+### Duplicate-packet removal (dedup)
+
+Drops the second copy of an IPv4 packet (same source, destination, protocol and IP ID, and the same length and TCP/UDP checksum). Include `dedup-iface.bpfc` (one table per interface and hook, ingress or egress) or `dedup-global.bpfc` (one table shared by the ingress of several interfaces, for 1+1 redundant paths), then call `dedup` inside the matches for the traffic that can be duplicated. Fragments pass untouched. An earlier packet stops counting after `DD_MS` milliseconds, once the sender's ID has advanced `DD_IDS` (rollover), or after `DD_PKTS` packets of its flow. The include files are installed in `/etc/bpfc/include`.
+
+```
+include dedup-iface.bpfc;
+match udp; match udp-dst 5000-5010; dedup; end-match; end-match;
+```
+
+```bash
+bpfc-dedup                 # counters, last duplicate and recent duplicates per table; -j for JSON, -z to reset
+```
+
+See [programs/dedup/README.md](programs/dedup/README.md).
+
+### Per-neighbor loss and capacity (linkcap)
+
+Every unicast IP packet leaving an interface is counted per neighbor: the next hop's MAC on Ethernet, the far end of a point-to-point link such as GRE, PPP or WireGuard, or the outer address on multipoint GRE. At each report interval, a clone of a packet becomes a small report with the cumulative counts and a timestamp. The neighbor answers with what it received by then, and the sender gets loss, delivered rate, queueing delay (no clock synchronisation needed) and RTT per interval. The status tool turns these into a capacity estimate: the median rate delivered while the queueing delay is above a threshold, or a lower bound while it isn't. Loss without a rise in delay is link loss, not congestion. Both ends must run it, and nothing is sent on idle links.
+
+```bash
+bpfc-linkcap-gen -i eth0 -i gre1            # /etc/bpfc/interfaces.d/<if>/{ingress/5,egress/60000}.bpfc
+bpfc-linkcap-gen -i wan0 --profile leo      # also: default, geo
+systemctl reload bpfcd
+bpfc-linkcap-status                         # one row per neighbor: state, capacity, lower bound, rate, loss, delay
+bpfc-linkcap-status -1                      # key=value per neighbor, for a shaper (-j: JSON)
+bpfc-linkcap-status set eth0 delay-threshold 20ms
+```
+
+See [programs/linkcap/DESIGN.md](programs/linkcap/DESIGN.md) for the frames, the samples and the limits.
+
+### Flow monitor (flowmon)
+
+A TC program for both hooks of every interface that records each IPv4 flow: bytes and packets in each direction, first and last seen, the interfaces and MACs it used, its VLAN and DSCP. For TCP it also tells retransmissions (data that already passed this point: loss downstream, or spurious) from loss (holes in the sequence space: loss upstream), and doesn't count reordering within `FM_REORDER_MS` (default 10 ms) as loss. `bpfc-flows` shows the flows like `top`, with rates since the previous sample.
+
+```bash
+cp -r /usr/share/doc/bpfc-programs/flowmon/examples/interfaces.d/%all% /etc/bpfc/interfaces.d/
+systemctl reload bpfcd
+bpfc-flows                                   # flows seen in the last 60 s, busiest first
+bpfc-flows -w 2 --limit 20                   # refresh every 2 s
+bpfc-flows -t --filter proto=tcp --sort retrans-pct    # TCP retransmission and loss columns
+bpfc-flows --filter src=10.1.0.0/16 --filter dscp=ef --json
+```
+
+`bpfc-flows --help` lists the sort keys and filters. The [bpfcctl](#bpfcctl) output above shows flowmon installed from `%all%`.
+
+### Port-scan guard (portscan-guard)
+
+Detects IPv4 TCP and UDP port scans. Each source's distinct `{protocol, destination port}` contacts within a scan window add to a score, and management and rarely legitimate ports weigh more. A source whose score crosses the threshold can be blocked for a time that grows with repeat offences. It starts in monitor mode. Once the threshold is tuned for your network, switch it to silent drops or TCP resets.
+
+```bash
+cp /usr/share/doc/bpfc-programs/portscan-guard/examples/interfaces.d/eth0/ingress/10.bpfc \
+   /etc/bpfc/interfaces.d/eth0/ingress/10.bpfc
+systemctl reload bpfcd
+bpfc-portscanctl status                     # sources, scores, recent services, block times
+bpfc-portscanctl set threshold 20
+bpfc-portscanctl set mode block             # monitor | block | reset
+bpfc-portscanctl unblock 198.51.100.7
+```
+
+The header of the program file describes the scoring and its maps.
+
+### Bandwidth-aware ECMP (ecmp)
+
+A routing layer for a single router. It balances flows over the next hops of the kernel's multipath routes by measured load, with interface preferences per traffic class. It needs nothing from its neighbours and is independent of the FEC dataplane. Packets change only as in any router (TTL, IP checksum, MACs). IPv4.
 
 ```bash
 sysctl -w net.ipv4.ip_forward=1 net.ipv4.fib_multipath_hash_policy=1
@@ -197,209 +551,38 @@ bpfc-ecmp-status bw wg0 80m            # new bandwidth, at once (an outside esti
 bpfc-ecmp-status set shed 60           # thresholds and timers at run time
 ```
 
-Every packet re-checks that its flow's interface is still a member of the route, so a withdrawn next hop is noticed on the next packet. See [programs/ecmp/DESIGN.md](programs/ecmp/DESIGN.md); `make check-ecmp` (root) runs the end-to-end tests.
+Every packet re-checks that its flow's interface is still a member of the route, so a withdrawn next hop is noticed on the next packet. See [programs/ecmp/DESIGN.md](programs/ecmp/DESIGN.md).
 
-### Per-neighbor loss and capacity (`bpfc-linkcap-gen`)
+### FEC, ARQ and in-band telemetry dataplane (dataplane)
 
-Every unicast IP packet leaving an interface is counted per neighbor (the next hop's MAC on Ethernet; the far end of a point-to-point link such as GRE, PPP or WireGuard; the outer address on multipoint GRE). At each report interval a clone of a packet becomes a small report with the cumulative counts and a timestamp, the neighbor answers with what it received by then, and the sender gets loss, delivered rate, queueing delay (no clock synchronisation) and RTT per interval. The status tool turns these into a capacity estimate: the median rate delivered while the queueing delay is above a threshold, or a lower bound while it is not; loss without a delay rise is link loss, not congestion. Both ends must run it; nothing is sent on idle links.
+`bpfc-dataplane-gen` generates bpfc programs for a point-to-point link, and both ends run them. Every IPv4 packet for the remote prefixes given with `--protect` gets an 8-byte shim with a sequence number and timestamp. On a Layer-2 link the shim goes after the Ethernet header (EtherType 0x88B5). It can go inside UDP instead: `--carrier udp` adds an outer IPv4/UDP header to the peer, for routed paths, the internet and NAT, and `--carrier udp-inline` puts UDP after the packet's own IP header, for a private routed WAN.
+
+The receiver measures loss, reordering, duplicates, jitter and queueing delay (no clock synchronisation needed) and reports back once a second. When loss crosses a threshold, the sender adds XOR parity (forward error correction) scaled to the loss, and turns it off again after a cool-down. Lost packets are also retransmitted from a short buffer (ARQ). Packet-pair probes estimate the link capacity; on links that deliver in frames, such as Starlink, it uses probe trains and a median (`--probe-train 20ms --capacity-percentile 50`, set in the `leo` profile). Each interface has its own maps.
+
+Profiles set the defaults for a kind of link: `direct`, `wan`, `geo` and `leo` are built in, and your own go in `/etc/bpfc/dataplane/profiles.d/`. `--link-rate` and `--rtt` size the retransmit ring and windows.
 
 ```bash
-bpfc-linkcap-gen -i eth0 -i gre1            # /etc/bpfc/interfaces.d/<if>/{ingress/5,egress/60000}.bpfc
-bpfc-linkcap-gen -i wan0 --profile leo      # also: default, geo
+bpfc-dataplane-gen -i eth0 --profile geo   # writes /etc/bpfc/interfaces.d/eth0/{egress,ingress}/*.bpfc
+bpfc-dataplane-gen --list-profiles
+bpfc-dataplane-gen --show-profile geo --rtt 650ms   # effective settings and buffer sizes
+bpfc-dataplane-gen -i eth0 --setup-hints   # MTU / offload settings for the link
 systemctl reload bpfcd
-bpfc-linkcap-status                         # one row per neighbor: state, capacity, lower bound, rate, loss, delay
-bpfc-linkcap-status -1                      # key=value per neighbor, for a shaper (-j: JSON)
-bpfc-linkcap-status set eth0 delay-threshold 20ms
+bpfc-dataplane-status                      # one table row per interface (FRR style)
+bpfc-dataplane-status eth0 detail          # the full report; also -d
+bpfc-dataplane-status json                 # the same data as JSON; also -j (-1: key=value lines)
+bpfc-dataplane-status set eth0 fec-threshold 2
+# over the internet, the site behind (CG)NAT names the public one; the public one learns it
+bpfc-dataplane-gen -i wan0 --profile leo --carrier udp --peer 203.0.113.10 --protect 10.1.0.0/16   # NAT side
+bpfc-dataplane-gen -i eth0 --profile leo --carrier udp --peer learn --protect 10.2.0.0/16          # public side
 ```
 
-See [programs/linkcap/DESIGN.md](programs/linkcap/DESIGN.md) for the frames, the samples and the limits; `make check-linkcap` (root) runs the end-to-end tests.
-
-### Duplicate-packet removal (`dedup`)
-
-Drops the second copy of an IPv4 packet (same source, destination, protocol and IP ID, and the same length and TCP/UDP checksum). Include `dedup-iface.bpfc` (one table per interface and hook, ingress or egress) or `dedup-global.bpfc` (one table shared by the ingress of several interfaces, for 1+1 redundant paths), then call `dedup` inside the matches for the traffic that can be duplicated. Fragments pass untouched. An earlier packet stops counting after `DD_MS` milliseconds, once the sender's ID has advanced `DD_IDS` (rollover), or after `DD_PKTS` packets of its flow. The include files are installed in `/etc/bpfc/include`.
-
-```
-include dedup-iface.bpfc;
-match udp; match udp-dst 5000-5010; dedup; end-match; end-match;
-```
-
-```bash
-bpfc-dedup                 # counters, last duplicate and recent duplicates per table; -j for JSON, -z to reset
-```
-
-See [programs/dedup/README.md](programs/dedup/README.md).
+The built-in profiles are installed in `/usr/share/bpfc/dataplane/profiles/`, and DESIGN.md with example programs in `/usr/share/doc/bpfc-programs/dataplane/`. See [programs/dataplane/DESIGN.md](programs/dataplane/DESIGN.md) for the wire format, the algorithms and the limits.
 
 ---
 
-## Language Syntax
+## Advanced examples
 
-Instructions are strictly **semicolon-separated**. Variables (denoted by `%`) are dynamically allocated on the 512-byte eBPF stack and natively converted to Host Byte Order for mathematical operations.
-
-### Variables
-* `decl <VAR> <size>` - Create a new variable of `<size>` bytes (1, 2, 4, 8 or 16). A 16-byte variable holds an IPv6 address in network byte order, for `get`, `set` and `match` of `ip6-src`/`ip6-dst`.
-* `set val <VAR> <%VAR | int>` - Set variable to integer value or value from another variable
-* `free <VAR>` - Free `VAR` from the stack, making space available for later variables.  
-
-**Stack layout.** The 512-byte stack holds 128 bytes of fixed scratch used inside single instructions, then one 8-byte slot per variable (two for a 16-byte one), as many as the program declares, up to 48 slots. Instructions that need more scratch (`fib-lookup`: 72 bytes, `push-eth`: 32, the byte-insertion and deletion commands) take it below the variables and give it back when they finish. `xor-packet` and the TCP/UDP checksums stage packet data in chunks of up to 256 bytes: with more than 16 variables the chunks get smaller (down to 8 and 4 bytes), which works the same but costs more verifier instructions. The variables `fib-lookup` adds (`FIB_RESULT`, `FIB_SMAC`, `FIB_DMAC`, `FIB_IP_DST`, `FIB_IFINDEX`) count as five. If something does not fit, bpfc says which instruction needs how much; `free` variables you no longer need.
-
-### Branching & Control Flow
-* `match|if <field> <value>` - Opens a conditional block. If the packet field does not match the value, execution jumps past the block.
-* `match|if val %VAR <op> <val | %VAR>` - Compares variables logically (`lt`, `gt`, `le`, `ge`, `eq`, `ne`). `seq-lt`, `seq-le`, `seq-gt`, `seq-ge` compare 32-bit wrapping counters such as TCP sequence numbers (serial-number order, RFC 1982: A is before B when `(int32)(A - B) < 0`), valid while the two are less than 2^31 apart.
-* `else` - Inverse of match/if criteria.
-* `end-match|end-if` - Closes the most recent conditional `match` block.
-* `continue` - Terminal. Exits eBPF, and tells kernel to evaluate the next TC rule.
-* `drop` - Terminal. Exits eBPF, and silently drops the packet.
-* `reclassify` - Terminal. Restarts TC evaluation from rule 0.
-
-Note - Terminal commands must be last command in program or be followed by 'end-match', 'else' or 'end-if'.
-
-### Protocol Shorthands
-Quick boolean filters for specific L2/L3 types. Use as standalone matches (e.g., `match tcp;`).
-* Supported: `ip`, `ip6`, `arp`, `icmp`, `gre`, `tcp`, `udp`, `igmp`, `ospf`, `pim`, `esp`, `rsvp`, `l2tp`, `vlan`, `qinq`.
-
-### tcpdump-style Matches
-* `match host <addr | %VAR>` / `match net <prefix>` - IPv4 source or destination.
-* `match port <n | lo-hi | %VAR>` - TCP, UDP or SCTP source or destination port (IPv4, not later fragments); `match src-port ...`, `match dst-port ...` one side.
-* `match dscp <name | 0-63>`, `match ecn <not-ect | ect1 | ect0 | ce | 0-3>` - IPv4. DSCP names: `default`/`be`/`cs0`, `le`, `cs1`-`cs7`, `af11`-`af43`, `va`, `ef`; `set dscp` / `set ecn` take them too.
-
-### Packet Data Fields (`get`, `set`, `match`)
-Fields support extraction (`get <field> <VAR>`), assignment (`set <field> <val | %VAR>`), and evaluation (`match <field> <val | %VAR>`). Subnets (`10.0.0.0/24`) and port ranges (`80-100`) are fully supported. Numbers may be decimal or `0x` hex anywhere. Values are checked when compiling: a number must fit the field (port 0-65535, `ip-tos` 0-255, `vlan-id` 0-4095, ...), addresses must be complete (`10.0.0.300`, `10.0.0` or a 5-byte MAC are errors), and a range must be low-high; `redirect`/`clone` to an interface that does not exist is an error too. Variables hold host-order values, so `match <field> %VAR` compares with what `get <field>` stored (for `mpls-label`, the label itself). `match vlan` / `match qinq` look at the offloaded tag, or at the frame when no tag is offloaded.
-
-* **L2:** `dst-mac`, `src-mac`, `eth-proto`, `vlan-id` (`set vlan-id` replaces the id of the tag and keeps its priority and TPID; without a tag it adds an 802.1Q one)
-* **IPv4:** `ip-src`, `ip-dst`, `ip-tos`, `ip-proto` (`set ip-src`/`ip-dst` update the IP checksum and the TCP/UDP checksum, whose pseudo-header covers the addresses; a UDP checksum of 0 stays 0)
-* **IPv6:** `ip6-src`, `ip6-dst`, `ip6-tclass`, `ip6-flow`, `ip6-proto`
-* **L4:** `tcp-src`, `tcp-dst`, `udp-src`, `udp-dst`, and `match tcp-flags <flag>...` (all of FIN, SYN, RST, PSH, ACK, URG given must be set; any case; an unknown flag is an error), `icmp-type`. These follow the real IPv4 header length (IHL), so packets with IP options are read and rewritten at the right place (they used to be read at fixed offsets that assume a 20-byte header). They are IPv4 fields: on another packet a match does not match, `get` stores 0 and `set` changes nothing.
-* **ARP:** `arp-htype`, `arp-ptype`, `arp-hlen`, `arp-plen`, `arp-oper`, `arp-sha`, `arp-tha`, `arp-spa`, `arp-tpa`
-* **MPLS:** `mpls-label`, `mpls-bos`
-* **GRE:** `gre-key`, `gre-proto` (any IHL; the key is found after the checksum when the C bit is set)
-* **TCP (IPv4, any IHL; `get` only):** `tcp-seq`, `tcp-ack`, `tcp-flags` (the flags byte: FIN 0x01, SYN 0x02, RST 0x04, PSH 0x08, ACK 0x10), `tcp-win` (unscaled), `tcp-hlen` (header length incl. options, bytes). 0 when the packet is not IPv4 TCP.
-* **Offsets and lengths (IPv4, any IHL; `get` only):** `l4-off` (offset of the TCP/UDP/... header in the frame), `payload-off` (TCP: after the options, UDP: after 8 bytes), `payload-len` (from the IP total length, so Ethernet padding is not counted). Use them with variable offsets: `get bytes %OFF 4 V`.
-* **Flow key (`get` only):** `flow-key [reverse | symmetric]` - the same as `hash VAR 64 [reverse | symmetric] ip-src ip-dst ip-proto src-port dst-port` (below): a 64-bit hash of the IPv4 addresses, protocol and TCP/UDP/SCTP ports (never 0; 0 for non-IPv4; ports 0 for fragments). `reverse` is the key of the opposite direction, so a returning ACK finds its data flow's map entry; `symmetric` is the same key for both directions. (Its values changed when `hash` was added: maps keyed by it start new entries after an upgrade.)
-* **Any-protocol fields (`get`, `set` ports):** `src-port`, `dst-port` (TCP, UDP or SCTP; 0 for other protocols and fragments; `set` rewrites TCP or UDP with the checksum), `dscp`, `ecn` (`set` keeps the other bits of the TOS byte; names below), `ip-ttl`, `icmp-type`, `icmp-code`, `icmp-id` (`get` only; `icmp-id` for echo requests and replies).
-* **Generic:** `bytes <offset | %VAR> <length>` - with a variable offset the bytes are read with `bpf_skb_load_bytes` (0 if outside the packet) and written with `bpf_skb_store_bytes` (nothing written if outside).
-
-### Context Metadata (`__sk_buff`)
-* `len` - Packet length (`u32`).
-* `protocol` - Protocol stored in sk_buff, as an EtherType (`match protocol 0x0800`; `get` stores it in host order).
-* `skb-ifindex` - Interface number associated with sk_buff.
-* `dev-type` (get/match), `dev-kind` (match) - The device type (`skb->dev->type`, ARPHRD: 1 Ethernet, 772 loopback, 778 GRE, 768 IPIP, 65534 none, e.g. wireguard and tun) and kind (`veth`, `gre`, `vxlan`, ...; `nic` without a kind, `lo`) of the `-i` interface. They are looked up when compiling (TC programs cannot read `skb->dev`), so a match costs no instructions: it is always true, or its block is never entered. Without `-i`, pass `-s IFTYPE=<n> -s IFKIND=<kind>`.
-* `skb-ingress` - Ingress interface number associated with sk_buff.
-* `skb-mark` - Netfilter/iptables firewall mark (`u32`).
-* `skb-hash` - RPS flow hash (`u32`).
-* `skb-priority` - `skb->priority`: the prio/pfifo_fast band, or an HTB class (major:minor as `0xMMMMmmmm`) the packet is queued in (`u32`).
-* `gso-segs` - (`get`/`match` only) the number of segments a GSO/GRO packet is made of (`skb->gso_segs`); 0 or 1 for an ordinary packet.
-* `tstamp` - `skb->tstamp`, 64-bit ns. On egress, a time in the future (CLOCK_MONOTONIC, as `get time`) holds the packet until then under the fq qdisc (earliest-departure-time pacing).
-* `skb-cb <0-4>` - 20-byte control buffer array (5x `u32` slots) for passing state across tail-calls and to the next TC priority.
-* `cpu` - (`get` only) number of the CPU running the program.
-* `time` - (`get` only) CLOCK_MONOTONIC in ns (`bpf_ktime_get_ns`), into an 8-byte variable.
-* `random` - (`get` only) a pseudo-random 32-bit number (`bpf_get_prandom_u32`).
-* `queue` - Hardware TX queue mapping.
-
-### ALU Math Engine (`calc`)
-Performs mathematically-safe eBPF operations on standard 32/64-bit variables.
-* `calc <op> <DST_VAR> <val | %SRC_VAR>`
-* Operators: `add`, `sub`, `mul`, `div`, `or`, `and`, `lsh`, `rsh`, `mod`, `xor`
-* `calc not <VAR>` - Unary bitwise inversion.
-* `calc bswap <VAR> <bits>` - Flips byte order (16, 32, or 64 bits).
-* `calc hton <VAR> [bits]` / `calc ntoh <VAR> [bits]` - Host/network byte order. `get bytes` returns host order; `set bytes` with a variable writes it as stored, so convert first.
-
-### eBPF Maps (State Tracking)
-Allows persistent data storage across packets and network interfaces.
-* `get map <MAP_NAME> <key | %VAR> <VAL_DST_VAR>` - Loads value into variable (defaults 0 if missing).
-* `set map <MAP_NAME> <key | %VAR> <val | %VAR>` - Updates or creates a 64-bit map entry.
-* `save-packet <MAP_NAME> <len | %VAR> [src-offset | %VAR [dst-offset | %VAR]]` - Save packet data of specified length into a per-CPU map.
-* `save-packet-keyed <MAP_NAME> <key | %VAR> <len | %VAR> [src-offset | %VAR [dst-offset | %VAR]]` - Save packet data of specified length into a global map into key number specified, allowing for storing packet contents for later recovery.
-* `load-packet <MAP_NAME> <len | %VAR> [src-offset | %VAR [dst-offset | %VAR]]` - Load data of specified length from per-CPU map into packet.
-* `load-packet-keyed <MAP_NAME> <key | %VAR> <len | %VAR> [src-offset | %VAR [dst-offset | %VAR]]` - Load data of specified length from keyed map into packet.
-* `buffer-map <MAP_NAME> [size]` / `shared-buffer-map <MAP_NAME> [entries [size]]` - Declare a buffer map with smaller values (default 18000 bytes, 10000 shared entries) before using it. A copy at a constant offset may fill the rest of the entry; with a variable offset, offset and length are each capped at size/2. A pinned map of other sizes is replaced.
-* Map names are pinned as `<map_dir>/<MAP_NAME>`: 1-31 characters, no `/`. The kernel keeps the last 15 characters of `[A-Za-z0-9_.]` as the map's own name (other characters become `_`), so names of 15 such characters or fewer show unchanged in `bpftool`.
-* `array-map <MAP_NAME> <entries>` - Declare an array of 64-bit values (keys 0..entries-1) instead of the default 10000-entry LRU hash map: never evicts, all entries start at 0. Works with `get map`, `set map`, `calc-map`, `-r` and `-w`. A pinned map of another size is replaced.
-* `hash-map <MAP_NAME> <entries>` - Declare the default LRU hash map with `entries` (1-16777216) instead of 10000. Comes before the map's first use; a pinned map of another size is replaced. Programs that use the map without declaring it take it as pinned.
-* `tcp-option <kind | %VAR> <OFF_VAR> [LEN_VAR]` - Walks the TCP options (IPv4, any IHL) and sets `OFF_VAR` to the frame offset of the first option of that kind and `LEN_VAR` to its length byte; both 0 if there is none. Read or change the option with `get bytes` / `set bytes` / `fill-bytes` at `%OFF_VAR`.
-* `fill-bytes <offset | %VAR> <len | %VAR> <byte | %VAR>` - Overwrite 1-64 packet bytes with one value (e.g. 1 to turn TCP options into NOPs). Nothing is written when the length is 0 or over 64, or the range is outside the packet. Checksums are not updated: on egress, locally sent TCP/UDP still has its checksum completed after the program (over the bytes as rewritten), so leave it; for forwarded or received packets follow with `recalc-tcp-csum`.
-* `calc-map <add|or|and|xor|xchg> <MAP_NAME> <key | %VAR> <val | %VAR> [OLD_VAR]` - Atomic update of a 64-bit map value (created as 0); `OLD_VAR` receives the previous value. Safe when several CPUs update the same key, unlike `get map` + `set map`.
-* `xor-packet <MAP_NAME> <len> [src [dst]]` / `xor-packet-keyed <MAP_NAME> <key> <len> [src [dst]]` - XOR packet bytes into a buffer (atomically; dst is a multiple of 8). Building block for XOR parity / FEC.
-* `zero-buffer <MAP_NAME> <len> [dst]` / `zero-buffer-keyed <MAP_NAME> <key> <len> [dst]` - Zero part of a buffer.
-
-### Flow Keys (`hash`, `pack`) and Commands Built on Them
-A key picks a map entry: per host, per flow, per conversation. [doc/flow-tracking.md](doc/flow-tracking.md) explains them for network engineers, with examples (NAT, load sharing, CoPP, policers, accounting, sampling, duplicate removal).
-* `pack <VAR> [symmetric|reverse] <field>[:bits] ...` - The fields side by side, the first in the highest bits: `pack K ip-src ip-dst` is `src << 32 | dst`. Exact and readable (`bpfc -r -K`), at most 64 bits. Fields have their natural width (address 32, port 16, VLAN 12, MAC 48, DSCP 6, ...); `ip-src/24` keeps the network bits (24), `:bits` the low bits, `%VAR[:bits]` a variable, `<n>:<bits>` a constant, `bytes <offset|%VAR> <1-8>` packet bytes, any other `get` field its value.
-* `hash <VAR> <bits | buckets N> [symmetric|reverse] [seed <n|%VAR>] <field> ...` - Any fields, IPv6 addresses (`ip6-src`, `ip6-dst`, `ip6-src/64`) included, mixed into 1-64 bits (MurmurHash3's finaliser over 64-bit words), or `buckets N` = 0..N-1 spread evenly. The same in user space: `bpfc -H`. 64 bits: never 0 for a packet that has the fields.
-* Keys of IPv4 (or IPv6) fields are 0 for other packets; ports are 0 for protocols without them and for every fragment. `reverse` swaps each source/destination pair (the reply's key); `symmetric` orders the pairs, the lower first, with one decision for all (both directions one key). Neither depends on the hook.
-* `unpack <%SRC> <VAR>:<bits> ...` - A packed value taken apart, the first variable from the highest bits.
-* `count <MAP> [<BYTES_MAP>] <key...>` - Atomically add 1 (and the frame length to the second map) to the key's entry. A key is a list of fields (packed when they fit in 64 bits, hashed otherwise), or one `%VAR`.
-* `match seen <MAP> <key...> within <time> [refresh]` - True when the key was seen less than `<time>` (`50ms`, `2s`) ago; every packet records itself, atomically (of two copies at once exactly one is seen). The window runs from the first sighting, or with `refresh` from the last.
-* `match over-rate <MAP> <key...> <rate> [burst <size>]` - True for packets above the rate per key: `100/s` (burst in packets) or `10mbit` (bit/s, burst in bytes, `64k` = 64 KiB); the burst defaults to 100 ms of the rate. A lock-free GCRA policer.
-* `prefix-map <MAP> [entries]` / `match <ip-src|ip-dst|%VAR> in <MAP> [VALUE_VAR]` - A longest-prefix-match table of IPv4 prefixes, filled with `bpfc -w MAP 10.0.0.0/8 1` (`-x` to remove).
-
-### Routing & Forwarding
-* `fib-lookup [options] [<address> | %VAR]` - Queries the kernel's routing tables (`bpf_fib_lookup`, IPv4), for the packet's destination unless an address is given. Populates `%FIB_RESULT`, `%FIB_SMAC`, `%FIB_DMAC`, `%FIB_IP_DST`, `%FIB_IFINDEX`. (`fib-lookup6` is refused for now: the IPv6 lookup does not work yet.) The address can be a 4-byte variable in host order, as `get ip-dst` gives it (`get ip-dst D; fib-lookup %D`); `%FIB_IP_DST` comes back in the same order. Options:
-  * `src <address | %VAR>` - the source to look up from (default: the packet's), so `ip rule from ...` applies; a bare `src` sets `BPF_FIB_LOOKUP_SRC`.
-  * `iface <iface | %VAR>` - the incoming interface (default: the packet's).
-  * `output` - look up as for a locally generated packet; `direct` - the main table, skipping ip rules; `tbid <table>` - that table (direct); `skip-neigh` - do not require a resolved neighbour.
-  * `flow` - IPv4: also give the packet's protocol, TCP/UDP/SCTP ports (not for fragments) and TOS, so a multipath route is chosen per flow (`fib_multipath_hash_policy=1`) the same way the kernel chooses it, and ip rules on ports, protocol or TOS apply.
-  * `ports %VAR` - IPv4: use `VAR` (low 16 bits the source port, next 16 the destination port) and protocol UDP as the multipath hash input, in place of the packet's. With `fib_multipath_hash_policy=1` a different value can select a different next hop of the route, so a program can find which next hops a route has, and keep a flow on one of them: the result can only be that next hop while it is still in the route. After `flow` it replaces the ports and protocol and keeps the TOS. `ip rule` matches on ports or protocol see these values.
-  * `%FIB_RESULT`: 0 success, 1 blackhole, 2 unreachable, 3 prohibit, 4 not forwarded (e.g. a local address), 5 forwarding disabled on the interface, 7 no neighbour entry (`%FIB_IFINDEX` is still set), 8 fragmentation needed.
-  * The option bits used to be one off (`output` was a direct lookup, `tbid` an output one, `src <address>` was ignored); they are the kernel's now.
-* `redirect <ifname | %VAR> [egress|ingress]`, `redirect-neigh` - Terminal forwarding actions. If direction is not specified, will use same direction as attached mode.
-* `clone <ifname | %VAR> [egress|ingress]` - Clone packet to specified interface. If direction is not specified, will use the same direction as attached mode.
-* `encap-gre ip-src <ip> ip-dst <ip> key <val>` / `decap-gre`
-* `encap-mpls label <label> bos <0|1>` / `decap-mpls` - `decap-mpls` removes one label (and a pseudowire control word when one follows) and sets the EtherType to 0x86DD when IPv6 follows, 0x0800 otherwise.
-* `push-vlan <vid> [pcp]` / `pop-vlan`
-* `push-qinq <outer_vid> <inner_vid> [o_pcp] [i_pcp]`
-* `push-eth <d_mac|%VAR> <s_mac|%VAR>` / `pop-eth` - `push-eth` puts a new Ethernet header in front of the frame; a MAC can come from an 8-byte variable (`get src-mac S; get dst-mac D; push-eth %S %D`). `pop-eth` removes the outer Ethernet header, leaving the inner one (IP packets).
-
-### Structural Manipulation & Checksums
-* `add-bytes <offset> <len>` / `del-bytes <offset> <len>` - Inserts `<len>` number of bytes at `<offset>` and shifts packet tail down/up.
-* `add-head-bytes <len>` - Adds bytes to head of packet.
-* `del-bytes <offset> <len>` - Delete bytes at specific offset. Will attempt to use buffer maps if available, then revert to unrolled loop if necessary.
-* `add-l2-bytes <len>` / `del-l2-bytes <len>` - Insert or remove `<len>` bytes right after the Ethernet header (offset 14), for any protocol; the same as `add-bytes 14 <len>` / `del-bytes 14 <len>`. For IPv4/IPv6 packets `insert-l2` / `strip-l2` are cheaper.
-* `insert-l2 <len> [ethertype]` - Insert `len` zero bytes after the Ethernet header (IPv4/IPv6 packets) and optionally set the EtherType. Headers behind it keep their place in memory, so checksum offload keeps working.
-* `remove-l2 <len> [ethertype]` - The counterpart of `insert-l2`: remove `len` bytes (1-64) after the Ethernet header of an IPv4/IPv6 packet and optionally set the EtherType. skb->protocol stays IPv4/IPv6 (`strip-l2` changes it), so the packet can be grown again with `insert-l2` later.
-* `strip-l2 <len> <ethertype>` - Remove `len` bytes (multiple of 4) after the Ethernet header and set the EtherType, for any protocol (`bpf_skb_adjust_room` refuses non-IP packets). No payload copy; the stack sees the new protocol directly.
-* `recalc-tcp-csum [l3 [max]]`, `recalc-udp-csum [l3 [max]]` - L4 checksum recomputed from scratch via `bpf_csum_diff`: any IHL, length from the IP header, packets up to `max` bytes (default 9000). On egress, locally sent TCP/UDP packets usually still have checksum offload pending (the kernel or NIC completes the checksum after the program), so recalculate on ingress or for forwarded packets.
-* `calc-csum <tcp|udp> <VAR> [l3 [max]]` - Compute the correct TCP/UDP checksum into `VAR` (host order) without changing the packet.
-* `ip-frag <len> <max-input-mtu>` - Fragment IP payloads into `<len>` size fragments up to `<max-input-mtu>` input size.  
-* `ip-defrag` - Reassemble fragmented IP packets back into a single packet. 
-
-### Constants, Macros, Includes and Unrolled Loops
-A preprocessing step runs before compilation; `bpfc -E` prints its output (plain bpfc commands). Programs that use none of these keywords and no `$` compile exactly as before.
-
-* `const <NAME> <value>` - Defines `$NAME`. A number or constant expression is stored as a number; anything else (an address, a MAC, an interface) as text. `-s NAME=VALUE` on the command line overrides it.
-* `define <NAME> [PARAM ...]` ... `end-define` - A macro, used like a command: `NAME arg1 arg2`. Parameters are `$PARAM` in the body. A macro body sees only its parameters and consts; `$UNIQUE` is a number unique to each use (for labels). Macro names may contain `-` but may not be bpfc commands.
-* `name <text>` - The program's name for people (up to 64 bytes): bpfcd records it, `bpfcctl status` shows it in a NAME column, and the REST API's JSON has it as `"name"`. No code is generated (`bpfc -I` prints it as `BPFC_NAME <text>`), and the filter and kernel program names (`-n`) do not change. `$` substitution applies (`name guard on $IFNAME`). The file being compiled wins over files it includes; two different names at the same level are an error.
-* `include <file>` - Reads a file once (later includes of the same file are skipped). Relative names are looked up next to the including file, then in `-L` directories, then in `/etc/bpfc/include`. World-writable files are refused.
-* `repeat <count> [as I]` ... `end-repeat` - The body is copied `count` times (0-4096) with `$I` = 0, 1, ...: straight-line code with no backward jump, so it loads on any kernel and needs no loop support from the verifier.
-* `repeat %VAR max <count> [as I]` ... `end-repeat` - The same, but stops once `%VAR <= $I`, so it runs `%VAR` times, at most `count`. `%VAR` is checked before each copy.
-* `break-repeat` / `next-repeat` - Leave the innermost repeat / skip to its next copy (a forward jump).
-* `when <expr>` ... [`otherwise` ...] `end-when` - Keep one branch, decided at compile time. `defined(NAME)` tests for a const; `when <word> == <word>` (or `!=`) compares text when a side is not a number, e.g. `when $IFKIND == gre`.
-* `$IFNAME`, `$IFINDEX`, `$IFTYPE`, `$IFKIND`, `$IFMAC` - The `-i` interface's name, index, device type (ARPHRD), kind (as for `dev-kind`) and MAC address, so one file can serve many interfaces (bpfcd's `%all%`): `set map CNT_$IFNAME 1 1`. `-s` overrides them.
-* `$L3OFF` - Where the IP header starts: 14 behind an Ethernet header, 0 on devices whose packets start with it (device types none, GRE, IP6GRE, IPIP, IPv6 tunnel, SIT, raw IP, PPP: tun, wireguard, gre, ipip, sit, ...). bpfc reads every IP and L4 field from there by itself; `match ip`/`ip6`/`tcp`/... check the IP version instead of the EtherType; Ethernet fields and commands (MACs, `eth-proto`, VLAN, ARP, MPLS, push/pop-eth, encap/decap, strip/insert-l2, fib-lookup, ip-frag) are an error. Raw offsets (`get bytes`, `add-bytes`, `xor-packet`, ...) are frame offsets, so write them as `$(L3OFF + 9)` in a program for both kinds of device. Set by `-i`, or `-s L3OFF=0`.
-* `$NAME`, `$(expr)`, `$$` - Substitution anywhere in a command, constant arithmetic (C operators and precedence on 64-bit integers; `>>` is logical), and a literal `$`. Names inside `$( )` need no `$`. A name runs until the first character that is not a letter, digit or `_`: write `$(I)_x`, not `$I_x`.
-
-```
-include fec-lib.bpfc;                   # const SHIM 8; define read-word ...
-const WORDS 4;
-decl W 4;
-decl N 4;
-get bytes 16 2 N;
-repeat %N max $WORDS as I;
-  get bytes $(14 + $SHIM + I*4) 4 W;
-  match val %W eq 0;
-    break-repeat;
-  end-match;
-  calc-map add WORDS $I %W;
-end-repeat
-```
-
-Each copy is real code: a 250-instruction body repeated 32 times is 8,000 instructions (bpfc allows 32,768; the kernel's limit is on instructions the verifier processes, 1,000,000). Repeats suit short bodies and small counts; `start-loop`/`loop` remains for long runtime loops on kernels 5.3+.
-
-### Diagnostics
-* `debug-log <string>` - Writes to `/sys/kernel/debug/tracing/trace_pipe`.
-
----
-
-## Advanced Examples
+Longer programs for real network problems. Examples 1–5 are written out the long way, command by command. Examples 6–19 use the preprocessor and are kept as files in `dist/examples/` (installed in `/usr/share/doc/bpfc/examples/`). The test suite runs the NAT example (4) and the example files (6–18) exactly as they're shown here.
 
 ### 1. ARP Spoofing / Reflection
 Intercept an ARP Request, flip it to a Reply, dynamically swap addresses, and reflect it out the same interface.
@@ -409,7 +592,7 @@ Intercept an ARP Request, flip it to a Reply, dynamically swap addresses, and re
     set arp-oper 2; \
     set arp-tha %S_MAC; set arp-tpa %S_IP; \
     set arp-sha aa:bb:cc:dd:ee:ff; set arp-spa %T_IP; \
-    redirect-egress eth0"
+    redirect eth0 egress"
 ```
 
 ### 2. SD-WAN Policy Routing (FIB Lookup + GRE)
@@ -429,46 +612,37 @@ Route UDP 5060 (VoIP) out a fast link, and GRE tunnel everything else via the ro
 ```
 
 ### 3. MPLS pseudowires
-Encapsulate all packets on an interface eth1 within MPLS pseudowire of label 16 and next-hop label of 20 and send to 10.0.0.6.
+Encapsulate all packets on interface eth1 in an MPLS pseudowire with label 16 and next-hop label 20, and send them to 10.0.0.6. The labels are built by hand to show the bit layout (label, traffic class, bottom of stack, TTL); `encap-mpls label 20 bos 0` pushes one in a single command. The program is read from stdin (`-f -`), so it can carry `#` comments:
 ```bash
-./bpfc -i eth1 -d ingress "decl MPLS1 4; \
-decl MPLS2 4; \
-fib-lookup 10.0.0.6; \ 
-match val %FIB_RESULT eq 0; \
-        add-head-bytes 22; \
-        #Next-hop label \
-        set val MPLS1 20; \
-        calc lsh MPLS1 3; \
-	#MPLS TC \
-        calc or MPLS1 0; \
-        calc lsh MPLS1 1; \
-        #Bottom of stack is zero on next-hop label \
-        calc or MPLS1 0; \
-        calc lsh MPLS1 8; \
-        #TTL \
-        calc or MPLS1 225; \
-        calc bswap MPLS1; \
-	#MPLS lable 16 \
-        set val MPLS2 16; \
-        calc lsh MPLS2 3; \
-	#MPLS TC \
-        calc or MPLS2 0; \
-        calc lsh MPLS2 1; \
-        #MPLS bottom of stack \
-        calc or MPLS2 1; \
-        calc lsh MPLS2 8; \
-        #TTL \
-        calc or MPLS2 225; \
-        calc bswap MPLS2; \
-        set bytes 14 4 %MPLS1; \
-        set bytes 18 4 %MPLS2; \
-        set eth-proto 0x8847; \
-        set dst-mac %FIB_DMAC; \
-        set src-mac %FIB_SMAC; \
-        redirect %FIB_IFINDEX egress"
+./bpfc -i eth1 -d ingress -f - <<'EOF'
+decl MPLS1 4;
+decl MPLS2 4;
+fib-lookup 10.0.0.6;
+match val %FIB_RESULT eq 0;
+  add-head-bytes 22;                  # room for a new Ethernet header (14) and two labels (8)
+  # Next-hop label 20: label, traffic class 0, bottom of stack 0, TTL 225
+  set val MPLS1 20;
+  calc lsh MPLS1 3; calc or MPLS1 0;  # traffic class
+  calc lsh MPLS1 1; calc or MPLS1 0;  # bottom of stack: not the last label
+  calc lsh MPLS1 8; calc or MPLS1 225;
+  calc bswap MPLS1;
+  # Pseudowire label 16: bottom of stack 1
+  set val MPLS2 16;
+  calc lsh MPLS2 3; calc or MPLS2 0;
+  calc lsh MPLS2 1; calc or MPLS2 1;
+  calc lsh MPLS2 8; calc or MPLS2 225;
+  calc bswap MPLS2;
+  set bytes 14 4 %MPLS1;
+  set bytes 18 4 %MPLS2;
+  set eth-proto 0x8847;
+  set dst-mac %FIB_DMAC;
+  set src-mac %FIB_SMAC;
+  redirect %FIB_IFINDEX egress;
+end-match;
+EOF
 ```
 
-Decapsulate pseudowire packets and send to interface eth2 - assume next-hop label `20` has been stripped off by PE router. 
+Decapsulate pseudowire packets and send them to interface eth2, assuming the PE router has already stripped next-hop label `20`:
 ```bash
 ./bpfc -i eth0 -d ingress "match mpls; \
         match mpls-label 16; \
@@ -476,11 +650,11 @@ Decapsulate pseudowire packets and send to interface eth2 - assume next-hop labe
         redirect eth2 egress"
 ```
 
-If control-words are desired, change `add-head-bytes 22` to `add-head-bytes 26` and `del-bytes 0 18` to `del-bytes 0 22` to account for the 4-byte control word.
+If control words are desired, change `add-head-bytes 22` to `add-head-bytes 26` and `del-bytes 0 18` to `del-bytes 0 22` to account for the 4-byte control word.
 
 The same programs work as XDP programs: use `-d xdp` instead of `-d ingress` (`./test.sh mpls-xdp` runs the pseudowire test that way).
 
-Note: The above MPLS encapsulation is not compatible with TCP Generic Receive Offload (GRO) or TCP Segmentation Offload (TSO). This is due to the behavior of combining multiple TCP segments into a single sk_buff and then processing that single sk_buff for all segments.  When this occurs, the large chunk of segments is encapsulated into the single MPLS packet often resulting in a packet larger than the interface MTU.  To overcome this, disable GRO and TSO on the interface using `ethtool -K eth1 tso off gro off`.
+Note: the MPLS encapsulation above doesn't work with TCP Generic Receive Offload (GRO) or TCP Segmentation Offload (TSO). These combine several TCP segments into a single sk_buff, which is then encapsulated as one MPLS packet, often larger than the interface MTU. To avoid this, disable GRO and TSO on the interface with `ethtool -K eth1 tso off gro off`.
 
 ### 4. Network Address Translation (NAT)
 
@@ -587,23 +761,23 @@ match udp; \
 	set ip-dst %IP_DST"
 ```
 
-### 5. IP Fragementation and Reassembly
+### 5. IP Fragmentation and Reassembly
 
-Segment oversized IPv4 packets into several packets of max size, even those with the DF-bit set. Optionally re-assemble the segments into the original packet, for instances where the application does not support reassembly.  
+Split oversized IPv4 packets into several packets of a maximum size, even those with the DF bit set. Optionally reassemble the fragments into the original packet, for cases where the application doesn't support reassembly.
 
 ```bash
-#Segment packets up to 9000 bytes into 1400 byte segments when received on eth0
+#Fragment packets of up to 9000 bytes into 1400-byte fragments when received on eth0
 bpfc -i eth0 -d ingress -p 100 "ip-frag 1400 9000;"
 
-#Re-assmble fragmented packets when sending to eth0
+#Reassemble fragmented packets when sending to eth0
 bpfc -i eth0 -d egress -p 100 "ip-defrag"
 ```
 
-Note: The `ip-frag <size> <max>` and `ip-defrag` commands will automatically install matching criteria for IPv4 packets, but will ignore the DF bit by design. If it is desired to not fragment packets with the DF-bit set, use `match ip-ndf` before `ip-frag` to only match packets without the DF-bit set.
+Note: the `ip-frag <size> <max>` and `ip-defrag` commands add the match for IPv4 packets by themselves, but ignore the DF bit by design. To leave packets with the DF bit set unfragmented, put `match ip-ndf` before `ip-frag`, so it only matches packets without the DF bit.
 
-When performing an `ip-defrag` the maximum reassembled size is limited by the interface MTU. When forwarding, it is recommended to attach the `ip-frag` to ingress and `ip-defrag` to egress.  When operating as the end host, do the opposite with `ip-frag` on the egress and `ip-defrag` on the ingress.   
+The largest reassembled packet `ip-defrag` can make is the interface MTU. When forwarding, attach `ip-frag` to ingress and `ip-defrag` to egress. On an end host, do the opposite: `ip-frag` on egress and `ip-defrag` on ingress.
 
-The examples below use the preprocessor (`const`, `define`, `include`, `repeat`, `when`, `$IFNAME`/`$IFINDEX`/`$IFMAC`/`$HOOK`) for common network problems: 6–12 are XDP programs (the earliest hook, for forwarding and filtering at line rate), 13–18 TC programs (both directions, and the kernel's skb metadata: marks for policy routing, departure times for pacing, clones for mirroring). They are installed in `/usr/share/doc/bpfc/examples/{xdp,tc}/` (`dist/examples/` in the source), and `tests/test-xdp-examples.sh` and `tests/test-tc-examples.sh` run each of them as it is. Attach one with `bpfc -i <iface> -d xdp -f <file>` (or `-d ingress|egress -p <prio>`), or let bpfcd do it: copy it to `/etc/bpfc/interfaces.d/<iface>/xdp.bpfc` or `.../<iface>/{ingress,egress}/<prio>.bpfc` (or `%all%/`, `%nic%/`, ... for every interface; `$IFNAME`, `$IFINDEX` and `$IFMAC` are then each interface's own). Constants can be changed without editing the file: `-s MSS=1400`.
+The examples below use the [preprocessor](#compile-time-preprocessor) (`const`, `define`, `include`, `repeat`, `when`, `$IFNAME`/`$IFINDEX`/`$IFMAC`/`$HOOK`) for common network problems: 6–12 are XDP programs (the earliest hook, for forwarding and filtering at line rate), 13–18 TC programs (both directions, and the kernel's skb metadata: marks for policy routing, departure times for pacing, clones for mirroring). They are installed in `/usr/share/doc/bpfc/examples/{xdp,tc}/` (`dist/examples/` in the source), and `tests/test-xdp-examples.sh` and `tests/test-tc-examples.sh` run each of them as it is. Attach one with `bpfc -i <iface> -d xdp -f <file>` (or `-d ingress|egress -p <prio>`), or let bpfcd do it: copy it to `/etc/bpfc/interfaces.d/<iface>/xdp.bpfc` or `.../<iface>/{ingress,egress}/<prio>.bpfc` (or `%all%/`, `%nic%/`, ... for every interface; `$IFNAME`, `$IFINDEX` and `$IFMAC` are then each interface's own). Constants can be changed without editing the file: `-s MSS=1400`.
 
 ### 6. Fast-path IPv4 routing in XDP
 
@@ -1007,3 +1181,33 @@ The departure times are CLOCK_MONOTONIC, as `get time` gives them. The next-depa
 ### 19. Flow tracking: NAT with port translation, load sharing, CoPP, accounting, sampling
 
 `dist/examples/flow` (installed to the doc directory, `examples/flow`) has programs built on `hash`, `pack`, `count`, `seen`, `over-rate` and prefix maps: NAT with exact keys and with port translation (`nat-pack.bpfc`, `nat-pat.bpfc`), symmetric firewall load sharing (`fw-loadshare.bpfc`), control-plane policing (`copp.bpfc`), a SYN guard per /24, a policer and a two-colour marker in one line each (`syn-guard-subnet.bpfc`, `policer-rate.bpfc`, `tenant-marker.bpfc`), per-customer and per-conversation accounting with readable tables (`customer-accounting.bpfc`, `conversations.bpfc`), whole-flow sampling (`flow-sample.bpfc`), duplicate removal (`dedup-simple.bpfc`) and storm control (`storm-control.bpfc`). [doc/flow-tracking.md](doc/flow-tracking.md) explains each of them, and how to choose a key, for network engineers.
+
+---
+
+## Testing
+
+```bash
+make check-compile        # compile tests: no root, no network
+sudo make check           # the main suites (root; creates namespaces and veth pairs)
+sudo ./test.sh            # every suite (about an hour)
+sudo ./test.sh nat xdp    # only these
+```
+
+[TESTING.md](TESTING.md) describes every suite, which ones need root, the tools each one needs, and coverage (`make coverage`) and fuzzing (`make fuzz`).
+
+---
+
+## Documentation
+
+| Document | Covers |
+| :--- | :--- |
+| [INSTALL.md](INSTALL.md) | Requirements, building, `make install`, RPM packages, static builds, containers |
+| [TESTING.md](TESTING.md) | The test suites, what they need, coverage and fuzzing |
+| [doc/language.md](doc/language.md) | The complete language reference |
+| [doc/flow-tracking.md](doc/flow-tracking.md) | Flow keys (`hash`, `pack`) for network engineers: NAT, load sharing, CoPP, policers, accounting, sampling |
+| [doc/firewall.md](doc/firewall.md) | The Cisco IOS access-list frontend |
+| [dist/container/README.md](dist/container/README.md) | Running bpfcd in a container |
+| `programs/*/DESIGN.md`, [programs/dedup/README.md](programs/dedup/README.md) | The included programs |
+| `bpfc(8)`, `bpfcd(8)`, `bpfcctl(8)`, `bpfc.conf(5)` | Man pages |
+
+bpfc is licensed under the GNU General Public License v3 (see [LICENSE](LICENSE)).

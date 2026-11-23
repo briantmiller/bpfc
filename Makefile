@@ -43,7 +43,7 @@ LOCALSTATEDIR ?= /var/lib
 DAEMON_CFLAGS = $(WARN) -Wno-format-truncation -DBPFC_VERSION='"$(VERSION)"'
 
 # Everything that goes into the source tarball used by `make rpm`.
-DIST_FILES = Makefile LICENSE README.md bpfc.8 bpfc.c test.sh tests doc \
+DIST_FILES = Makefile LICENSE README.md INSTALL.md TESTING.md bpfc.8 bpfc.c test.sh tests doc \
              bpfcd/*.c bpfcd/*.h dist programs frontends/*.c
 
 RPMTOP     = $(CURDIR)/rpmbuild
@@ -100,6 +100,8 @@ install: all install-programs
 	install -m 0644 README.md $(DESTDIR)$(DOCDIR)/README.md
 	install -m 0644 doc/flow-tracking.md $(DESTDIR)$(DOCDIR)/flow-tracking.md
 	install -m 0644 doc/firewall.md $(DESTDIR)$(DOCDIR)/firewall.md
+	install -m 0644 doc/language.md $(DESTDIR)$(DOCDIR)/language.md
+	install -m 0644 INSTALL.md TESTING.md $(DESTDIR)$(DOCDIR)/
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/acl/acl.d
 	install -m 0644 dist/examples/acl/*.acl $(DESTDIR)$(DOCDIR)/examples/acl/
 	install -m 0644 dist/examples/acl/acl.d/*.acl $(DESTDIR)$(DOCDIR)/examples/acl/acl.d/
