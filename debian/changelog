@@ -1,3 +1,10 @@
+bpfc (0.1.1-1) UNRELEASED; urgency=medium
+
+  * Initial GitHub release
+  * Initial GitHub release
+
+ -- millerbt <brianthomasmiller@gmail.com>  Mon, 23 Nov 2026 14:57:16 -0500
+
 bpfc (0.1.1-1) unstable; urgency=medium
 
   * Debian packaging: bpfc, bpfc-container and bpfc-programs, built with
