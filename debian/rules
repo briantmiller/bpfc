@@ -27,7 +27,8 @@ override_dh_auto_build:
 	dh_auto_build -- $(MAKE_VARS)
 
 # The root suites need namespaces and veth pairs, which a build chroot does
-# not have; the compile suite needs neither.
+# not have; the compile suite needs neither, and skips its map tests where
+# the kernel won't create BPF maps (rootless or unprivileged containers).
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	bash tests/run-tests.sh -f compile

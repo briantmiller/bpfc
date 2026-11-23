@@ -52,7 +52,7 @@ These compile programs but don't attach them, so they need no root and no networ
 
 | Suite | What it checks |
 | :--- | :--- |
-| `compile` | Every field and command compiles. Hex and decimal values give the same code. Invalid programs are refused with a clear message. The few commands that create maps need root (CAP_BPF) even to compile; that section runs only as root. |
+| `compile` | Every field and command compiles. Hex and decimal values give the same code. Invalid programs are refused with a clear message. The commands that create maps need CAP_BPF even to compile, so that section runs only where a test map can be created. It skips when not run as root, and in rootless or unprivileged containers such as a package build. |
 | `preprocessor` | `include`, `const`, `define`, `repeat` and `when`: what `bpfc -E` expands each to, and the error messages. A last check that loads a program into the kernel needs root. |
 | `stack` | The stack layout: variables take as many slots as the program declares, and instructions fit their scratch space into what is left. The kernel tests need root. |
 | `install` | What `make install` puts where, in a scratch `DESTDIR`: binaries, man pages, docs, and everything under `programs/`. As root, it also runs the installed dataplane generator against the installed profiles. When `rpmbuild` is installed, it builds the RPMs and checks their file lists and dependencies. When `dpkg-buildpackage` and the Debian build dependencies are installed, it does the same for the .debs (`INSTALL_RPM=0` / `INSTALL_DEB=0` skip either). |

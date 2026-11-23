@@ -2,7 +2,10 @@
 # Compile-only tests: no root, no network. Every field and command must
 # compile, hex and decimal values must give the same code, and invalid
 # programs must fail with a clear message. Commands that create maps need
-# root (CAP_BPF) even to compile; that section runs only as root.
+# CAP_BPF (or CAP_SYS_ADMIN) even to compile: that section runs only where
+# a test map can be created, so it skips when not run as root and in
+# containers without BPF access (rootless ones, or root without the
+# capability), as in a package build.
 
 cd "$(dirname "$0")/.." || exit 1
 source tests/lib.sh
@@ -402,12 +405,20 @@ mkdir -p dep && echo 'depends data.txt' > dep/prog.bpfc && : > dep/data.txt
 out=$("$BPFC" -M -f dep/prog.bpfc 2>&1)
 check CC-pp-depends-relative eval '[[ "$out" == *dep/data.txt* ]]'
 
-# ---------------- commands that create maps (root) ----------------
-if [ "$(id -u)" -ne 0 ]; then
-	test_skip "CC-maps (creating maps needs root)"
-	tests_exit
-fi
+# ---------------- commands that create maps ----------------
+# Being uid 0 is not enough: in a rootless container (a user namespace) or
+# a container without CAP_BPF/CAP_SYS_ADMIN the kernel still refuses
+# BPF_MAP_CREATE. Try one map; skip the section only when the kernel refused
+# it, so that a bpfc that fails for another reason still fails here.
 M="-m $TMP"
+if ! probe=$("$BPFC" $M "set map BPFC_PROBE 1 1" 2>&1) || [[ "$probe" != *Compiled* ]]; then
+	if [[ "$probe" == *"Failed to create BPF Map"* ]]; then
+		why=$(echo "$probe" | sed -n 's/.*Failed to create BPF Map[^:]*: //p' | head -1)
+		test_skip "CC-maps (cannot create BPF maps here: ${why:-refused}; needs CAP_BPF, which rootless and unprivileged containers lack)"
+		tests_exit
+	fi
+	test_fail "CC-maps-probe (set map: $(echo "$probe" | head -1))"
+fi
 for p in "set map M 1 5" "get map M 1 V" "calc-map add M 1 1" "calc-map xchg M 1 5 OLD" "array-map A 8; set map A 3 1" \
          "buffer-map B 512; save-packet B 64" "shared-buffer-map S 4 512; save-packet-keyed S 1 64; load-packet-keyed S 1 64" \
          "shared-buffer-map S 4 512; xor-packet-keyed S 0 64 42 0; zero-buffer-keyed S 0 64" "del-bytes 42 8" "del-l2-bytes 4" \
