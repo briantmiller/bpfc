@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ]; then
+    # The group that may use bpfcd's REST socket (rest_socket_owner =
+    # root:bpfc). Also declared in /usr/lib/sysusers.d/bpfc.conf.
+    getent group bpfc >/dev/null || groupadd --system bpfc
+fi
+
+#DEBHELPER#
+
+# Upgrade: restart the running per-namespace instances (bpfcd-netns@<name>).
+# The systemd helpers take unit names, not patterns. Their programs are
+# adopted, not reinstalled.
+if [ "$1" = configure ] && [ -n "$2" ] && [ -d /run/systemd/system ]; then
+    systemctl try-restart 'bpfcd-netns@*.service' >/dev/null 2>&1 || :
+fi
+
+exit 0

@@ -3,6 +3,7 @@ bpfcd/bpfcd
 bpfcd/bpfcctl
 output.bpf
 rpmbuild/
+debbuild/
 bpfc-*.tar.gz
 **/__pycache__/
 tests/fuzz-rest

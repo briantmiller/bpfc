@@ -5,6 +5,7 @@
 - [Running from the source tree](#running-from-the-source-tree)
 - [make install](#make-install)
 - [RPM packages (RHEL 9/10)](#rpm-packages-rhel-910)
+- [Debian packages (Debian, Ubuntu)](#debian-packages-debian-ubuntu)
 - [Static binaries](#static-binaries)
 - [After installing](#after-installing)
 - [Containers](#containers)
@@ -19,11 +20,13 @@
 dnf install gcc make kernel-headers rpm-build systemd-rpm-macros
 ```
 
+**To build .deb packages:** see [Debian packages](#debian-packages-debian-ubuntu).
+
 **To run:**
 
 | | |
 | :--- | :--- |
-| Packaged for | RHEL 9 and RHEL 10 |
+| Packaged for | RHEL 9 and RHEL 10 (RPM); Debian 12+ and Ubuntu 22.04+ (.deb) |
 | Kernel | 4.18 or later for TC programs (the RHEL 8 verifier). Some commands need newer kernels: `start-loop`/`loop` 5.3+; ring buffers (`ringbuf-map`, `log`) 5.8+ |
 | XDP programs (`-d xdp`) | kernel 5.18+ or RHEL 9.2+ |
 | Privileges | root, or `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` (`CAP_BPF` on newer kernels) |
@@ -55,6 +58,8 @@ No installation is needed to try bpfc: run `./bpfc` from the tree. The bpfc-prog
 
 ```bash
 make install                         # everything: bpfc, bpfcd, bpfcctl, frontends, docs, and the programs
+make install-core                    # only what goes in the bpfc package
+make install-container               # only what goes in bpfc-container
 make install-programs                # only what goes in bpfc-programs (everything under programs/)
 make install DESTDIR=/tmp/stage      # stage into a directory (for packaging)
 make install PREFIX=/usr/local
@@ -128,9 +133,34 @@ dnf install ./rpmbuild/RPMS/*/bpfc-[0-9]*.rpm ./rpmbuild/RPMS/*/bpfc-programs-*.
 
 Neither `bpfc` nor `bpfc-container` requires systemd. The unit files simply go unused in a container.
 
+## Debian packages (Debian, Ubuntu)
+
+```bash
+apt install build-essential debhelper pkgconf systemd-dev   # Debian 12 / Ubuntu 22.04: systemd in place of systemd-dev
+make deb                                       # binary and source packages in ./debbuild
+make deb DEBBUILD_OPTS=-b                      # binary packages only
+DEB_BUILD_PROFILES=pkg.bpfc.static make deb    # statically linked binaries
+DEB_BUILD_OPTIONS=nocheck make deb             # skip the compile tests run during the build
+```
+
+`make deb` builds from the source tarball (`make dist`), as `make rpm` does, and prints the paths of the packages it built. The three packages match the RPMs: `bpfc` (architecture-specific), and `bpfc-container` and `bpfc-programs` (architecture `all`). `bpfc-programs` depends on `bpfc` of the same build and on `gawk`.
+
+```bash
+apt install ./debbuild/bpfc_*.deb ./debbuild/bpfc-programs_*.deb     # apt resolves the dependencies
+```
+
+The packaging is in `debian/` and also builds with the usual Debian tools in an unpacked tree (`dpkg-buildpackage -us -uc -b`, `sbuild`, `pbuilder`). The version in `debian/changelog` must match `VERSION` in the Makefile: after changing `VERSION`, add a changelog entry (`dch -v <version>-1`), or `make deb` stops with a message saying so. The Debian revision (`-1`) is separate from the RPM `RELEASE`.
+
+Differences from the RPMs, following Debian conventions:
+
+- `bpfcd.service` isn't enabled on installation (`systemctl enable --now bpfcd`, as on RHEL). Once it's enabled, an upgrade restarts it, along with any running `bpfcd-netns@` instances. Their programs are adopted, not reinstalled.
+- The `bpfc` group is created in `postinst` with `groupadd --system`. Removing or purging the package leaves the group, as is usual on Debian.
+- Example programs under `/usr/share/doc` stay uncompressed, so they can be copied into `/etc/bpfc` as they are. The Markdown guides are compressed (`README.md.gz`).
+- Purging removes the configuration files the packages installed (`bpfc.conf`, the include files), but not your own program files in `/etc/bpfc/interfaces.d`, nor programs written through the REST API in `/var/lib/bpfc`.
+
 ## Static binaries
 
-`make STATIC=1` (or `make rpm RPMBUILD_OPTS="--with static"`, which needs `glibc-static`) links every binary statically. The binaries then run in images whose libc doesn't match the build host, or that have none (minimal or distroless containers).
+`make STATIC=1` (or `make rpm RPMBUILD_OPTS="--with static"`, which needs `glibc-static`, or `DEB_BUILD_PROFILES=pkg.bpfc.static make deb`) links every binary statically. The binaries then run in images whose libc doesn't match the build host, or that have none (minimal or distroless containers).
 
 ## After installing
 

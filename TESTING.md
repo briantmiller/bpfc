@@ -55,7 +55,7 @@ These compile programs but don't attach them, so they need no root and no networ
 | `compile` | Every field and command compiles. Hex and decimal values give the same code. Invalid programs are refused with a clear message. The few commands that create maps need root (CAP_BPF) even to compile; that section runs only as root. |
 | `preprocessor` | `include`, `const`, `define`, `repeat` and `when`: what `bpfc -E` expands each to, and the error messages. A last check that loads a program into the kernel needs root. |
 | `stack` | The stack layout: variables take as many slots as the program declares, and instructions fit their scratch space into what is left. The kernel tests need root. |
-| `install` | What `make install` puts where, in a scratch `DESTDIR`: binaries, man pages, docs, and everything under `programs/`. As root, it also runs the installed dataplane generator against the installed profiles. When `rpmbuild` is installed, it builds the RPMs and checks their file lists and dependencies. |
+| `install` | What `make install` puts where, in a scratch `DESTDIR`: binaries, man pages, docs, and everything under `programs/`. As root, it also runs the installed dataplane generator against the installed profiles. When `rpmbuild` is installed, it builds the RPMs and checks their file lists and dependencies. When `dpkg-buildpackage` and the Debian build dependencies are installed, it does the same for the .debs (`INSTALL_RPM=0` / `INSTALL_DEB=0` skip either). |
 
 ## Kernel and network tests (root)
 
@@ -131,6 +131,7 @@ Every suite needs `bash`, iproute2 (`ip`, `tc`) and a built tree. A suite that's
 | `unshare`, `nsenter`, `setpriv` (util-linux) | netns, container, dedup, flowmon, install |
 | `busybox` | container |
 | `rpmbuild` (rpm-build) | install (optional: the RPM checks) |
+| `dpkg-buildpackage`, debhelper, pkgconf, systemd-dev | install (optional: the .deb checks) |
 | kernel MPLS (`modprobe mpls_router mpls_iptunnel`) | mpls, mpls-xdp, mpls-frag |
 | `gcovr` (`pip install gcovr`) | `make coverage` |
 | `clang` or `gcc` with ASan/UBSan (libasan, libubsan) | `make fuzz`, and the short fuzz run in `rest` |
@@ -179,6 +180,7 @@ make fuzz FUZZ_ITERS=5000000
 | `BUDGET_PCT` | 85 | `verifier-budget`: fail above this share of the verifier's 1,000,000-instruction limit |
 | `STRESS_MAX_LOSS` | 100 | `frag`, `mpls-frag`: the most loss allowed under load, in hundredths of a percent (100 = 1 %) |
 | `RPMS` | | `container`: build the test image from these RPMs instead of `make install` |
+| `INSTALL_RPM=0`, `INSTALL_DEB=0` | | `install`: skip building the RPMs or the .debs |
 | `BPFC_TEST_NO_BUFFER_MAPS=1` | | Test hook for bpfc itself: `del-bytes` takes its unrolled fallback, as when its buffer map can't be created |
 
 Some suites take their own flags when run directly. For example, `bash tests/test-bpfcd.sh -d -k` shows the daemon log on failure and keeps the temporary directory, and `bash tests/test-dataplane.sh -k` keeps its namespaces afterwards. The header comment of each `tests/test-*.sh` lists its flags and draws its topology.

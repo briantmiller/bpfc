@@ -26,7 +26,7 @@
  * bpfcctl show access-lists reads. permit continues to the next program,
  * deny drops; each list ends in an implicit deny.
  *
- * Copyright (C) 2026
+ * Copyright (C) 2026 Brian Miller
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #define _GNU_SOURCE

@@ -1,7 +1,7 @@
 /*
  * Finding the network namespace a bpfcd instance manages.
  *
- * Copyright (C) 2026
+ * Copyright (C) 2026 Brian Miller
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef BPFC_NETNS_H

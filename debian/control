@@ -1,0 +1,64 @@
+Source: bpfc
+Section: net
+Priority: optional
+Maintainer: bpfc maintainers <brun064@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               linux-libc-dev,
+               pkgconf,
+               systemd-dev | systemd,
+Standards-Version: 4.6.2
+Homepage: https://github.com/briantmiller/bpfc
+Vcs-Git: https://github.com/briantmiller/bpfc.git
+Vcs-Browser: https://github.com/briantmiller/bpfc
+Rules-Requires-Root: no
+
+Package: bpfc
+Architecture: linux-any
+Depends: passwd,
+         ${misc:Depends},
+         ${shlibs:Depends},
+Suggests: bpfc-programs,
+Description: eBPF compiler for TC and XDP packet programs, with a daemon
+ bpfc compiles a small packet matching and rewriting language straight to
+ eBPF bytecode (no LLVM/Clang or libbpf), has the kernel verify it, and
+ attaches it to a network interface's TC ingress or egress hook or as its
+ XDP program.
+ .
+ bpfcd keeps the programs in /etc/bpfc/interfaces.d attached: it installs
+ them at boot and when interfaces appear, applies changes on reload with an
+ atomic replace, and reinstalls or reports programs removed by other tools.
+ bpfcctl shows what is installed and from which file. Program files can
+ also be Cisco IOS-style access lists (10.acl), translated by a frontend.
+
+Package: bpfc-container
+Architecture: all
+Depends: bpfc (>= ${source:Version}),
+         bpfc (<< ${source:Version}.1~),
+         ${misc:Depends},
+Description: entrypoint for running bpfcd in a container without systemd
+ bpfcd-entrypoint starts bpfcd as a container's main process (PID 1), with
+ no systemd. It checks the container's capabilities, prepares bpffs for
+ pinned maps and execs bpfcd in the foreground. Includes an example
+ Containerfile and run instructions.
+
+Package: bpfc-programs
+Architecture: all
+Depends: bpfc (>= ${source:Version}),
+         bpfc (<< ${source:Version}.1~),
+         gawk,
+         ${misc:Depends},
+Description: programs built on bpfc: dataplane, ECMP, flow and link monitoring
+ Everything in the bpfc source tree's programs/ folder: generators and
+ status tools that build on bpfc, with their profiles, include files,
+ design notes and example programs.
+ .
+  * dataplane: FEC, ARQ, in-band telemetry and capacity probing for
+    point-to-point links, over Layer 2 or UDP (bpfc-dataplane-gen,
+    bpfc-dataplane-status)
+  * ecmp: bandwidth-aware, policy-based ECMP over the kernel's multipath
+    routes (bpfc-ecmp-gen, bpfc-ecmp-status)
+  * linkcap: per-neighbor loss, delay and capacity from packet accounting
+    (bpfc-linkcap-gen, bpfc-linkcap-status)
+  * flowmon: per-flow traffic and TCP retransmission and loss (bpfc-flows)
+  * dedup: IPv4 duplicate-packet removal (bpfc-dedup)
+  * portscan-guard: port-scan detection and blocking (bpfc-portscanctl)

@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+# Removal: stop the per-namespace instances too. Their programs stay
+# attached unless remove_on_stop is set, as for bpfcd itself.
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+    systemctl --no-reload stop 'bpfcd-netns@*.service' >/dev/null 2>&1 || :
+fi
+
+#DEBHELPER#
+
+exit 0

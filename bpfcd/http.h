@@ -13,7 +13,7 @@
  * body, HTTP_MAX_CLIENTS connections, and HTTP_TIMEOUT_MS for a request to
  * arrive completely.
  *
- * Copyright (C) 2026
+ * Copyright (C) 2026 Brian Miller
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef BPFC_HTTP_H

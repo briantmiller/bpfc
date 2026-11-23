@@ -1,7 +1,7 @@
 /*
  * Small HTTP/1.1 server on a unix socket; see http.h.
  *
- * Copyright (C) 2026
+ * Copyright (C) 2026 Brian Miller
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #define _GNU_SOURCE

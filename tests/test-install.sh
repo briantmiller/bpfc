@@ -9,9 +9,12 @@
 # scratch /usr/share in place, so its default profile path is what gets
 # tested. When rpmbuild is installed, `make rpm` is built and the file lists
 # of bpfc and bpfc-programs checked too (on a system whose rpm database doesn't list the build
-# dependencies, such as Debian or Ubuntu, with --nodeps).
+# dependencies, such as Debian or Ubuntu, with --nodeps). When
+# dpkg-buildpackage and the Debian build dependencies are installed, `make
+# deb` is built and the three .debs checked the same way.
 #
 #   INSTALL_RPM=0   skip the RPM build
+#   INSTALL_DEB=0   skip the .deb build
 
 cd "$(dirname "$0")/.." || exit 1
 source tests/lib.sh
@@ -181,6 +184,71 @@ else
 			'grep -qx "bpfc = $(rpm -qp --qf "%{VERSION}-%{RELEASE}" "$rpmf")" "$T/requires" && grep -qx bash "$T/requires" && grep -qx gawk "$T/requires"'
 	else
 		test_fail "make rpm"; tail -20 "$T/rpm.log" | sed 's/^/    /'
+	fi
+	[ -n "$had_tarball" ] || rm -f bpfc-*.tar.gz
+fi
+
+# The .debs.
+if [ "${INSTALL_DEB:-1}" = 0 ]; then
+	test_skip "Debian packages (INSTALL_DEB=0)"
+elif ! command -v dpkg-buildpackage >/dev/null; then
+	test_skip "Debian packages (no dpkg-buildpackage: apt install dpkg-dev debhelper)"
+elif ! dpkg-checkbuilddeps debian/control >/dev/null 2>&1; then
+	test_skip "Debian packages (build dependencies missing: $(dpkg-checkbuilddeps debian/control 2>&1 | sed 's/.*Unmet build dependencies: //'))"
+else
+	had_tarball=; ls bpfc-*.tar.gz >/dev/null 2>&1 && had_tarball=1
+	if DEB_BUILD_OPTIONS=nocheck make -s deb DEBTOP="$T/debbuild" DEBBUILD_OPTS="-b" > "$T/deb.log" 2>&1; then
+		core=$(find "$T/debbuild" -maxdepth 1 -name 'bpfc_*.deb' | head -1)
+		progs=$(find "$T/debbuild" -maxdepth 1 -name 'bpfc-programs_*_all.deb' | head -1)
+		cont=$(find "$T/debbuild" -maxdepth 1 -name 'bpfc-container_*_all.deb' | head -1)
+		check "deb: bpfc, bpfc-programs (all) and bpfc-container (all) built" eval '[ -n "$core" ] && [ -n "$progs" ] && [ -n "$cont" ]'
+		dpkg-deb -c "$core" | awk '{print substr($6, 2)}' > "$T/deb-core"
+		dpkg-deb -c "$progs" | awk '{print substr($6, 2)}' > "$T/deb-files"
+		dpkg-deb -c "$cont" | awk '{print substr($6, 2)}' > "$T/deb-cont"
+		for f in $PROG_TOOLS; do
+			check "deb: bpfc-programs has /usr/sbin/$f" grep -qx "/usr/sbin/$f" "$T/deb-files"
+			check "deb: bpfc itself does not have $f" eval '! grep -qx "/usr/sbin/$f" "$T/deb-core"'
+		done
+		for n in $PROGRAMS; do
+			[ -d "programs/$n/examples" ] || continue
+			missing=
+			while IFS= read -r f; do
+				grep -qxF "/usr/share/doc/bpfc-programs/$n/$f" "$T/deb-files" || missing="$missing $f"
+			done < <(cd "programs/$n" && find examples -type f)
+			check "deb: bpfc-programs has every example of $n, uncompressed${missing:+ (missing:$missing)}" [ -z "$missing" ]
+		done
+		missing=
+		for p in $PROG_PROFILES; do
+			grep -qx "/usr/share/bpfc/$p" "$T/deb-files" || missing="$missing $p"
+		done
+		check "deb: bpfc-programs has every built-in profile${missing:+ (missing:$missing)}" [ -z "$missing" ]
+		for n in $PROGRAMS; do
+			ls "programs/$n"/profiles/*.profile >/dev/null 2>&1 || continue
+			check "deb: bpfc-programs has /etc/bpfc/$n/profiles.d" grep -qx "/etc/bpfc/$n/profiles.d/" "$T/deb-files"
+		done
+		check "deb: bpfc itself has no files of a program" eval '! grep -qE "dataplane|ecmp|flowmon|linkcap|bpfc-programs" "$T/deb-core"'
+		check "deb: bpfc has the binaries, the ACL frontend and the units" eval \
+			'grep -qx /usr/sbin/bpfc "$T/deb-core" && grep -qx /usr/sbin/bpfcd "$T/deb-core" &&
+			 grep -qx /usr/libexec/bpfc/frontends/acl "$T/deb-core" && grep -q "/systemd/system/bpfcd.service$" "$T/deb-core" &&
+			 grep -q "/systemd/system/bpfcd-netns@.service$" "$T/deb-core"'
+		check "deb: bpfc owns /var/lib/bpfc/interfaces.d and the sysusers file" eval \
+			'grep -qx /var/lib/bpfc/interfaces.d/ "$T/deb-core" && grep -qx /usr/lib/sysusers.d/bpfc.conf "$T/deb-core"'
+		check "deb: the container entrypoint is only in bpfc-container" eval \
+			'grep -qx /usr/sbin/bpfcd-entrypoint "$T/deb-cont" && ! grep -qx /usr/sbin/bpfcd-entrypoint "$T/deb-core"'
+		dpkg-deb --ctrl-tarfile "$core" | tar -xO ./conffiles > "$T/deb-conf" 2>/dev/null
+		dpkg-deb --ctrl-tarfile "$progs" | tar -xO ./conffiles > "$T/deb-pconf" 2>/dev/null
+		check "deb: bpfc.conf and the include files are conffiles" eval \
+			'grep -qx /etc/bpfc/bpfc.conf "$T/deb-conf" && grep -q "^/etc/bpfc/include/" "$T/deb-pconf"'
+		dpkg-deb --ctrl-tarfile "$core" | tar -xO ./postinst > "$T/deb-postinst" 2>/dev/null
+		check "deb: bpfc creates the bpfc group" grep -q 'groupadd --system bpfc' "$T/deb-postinst"
+		check "deb: bpfcd.service is not enabled on installation" eval '! grep -q "deb-systemd-helper enable .bpfcd.service" "$T/deb-postinst" || grep -q "was-enabled .bpfcd.service" "$T/deb-postinst"'
+		ver=$(dpkg-deb -f "$core" Version)
+		check "deb: bpfc-programs requires bpfc of the same build and gawk" eval \
+			'dpkg-deb -f "$progs" Depends | grep -q "bpfc (>= $ver), bpfc (<< $ver.1~)" && dpkg-deb -f "$progs" Depends | grep -qw gawk'
+		check "deb: debian/changelog is at the Makefile's version" eval \
+			'[ "${ver%-*}" = "$(sed -n "s/^VERSION *?= *//p" Makefile)" ]'
+	else
+		test_fail "make deb"; tail -20 "$T/deb.log" | sed 's/^/    /'
 	fi
 	[ -n "$had_tarball" ] || rm -f bpfc-*.tar.gz
 fi

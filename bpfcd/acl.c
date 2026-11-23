@@ -1,7 +1,7 @@
 /*
  * acl.c - access lists as bpfcctl and bpfcd see them (see acl.h).
  *
- * Copyright (C) 2026
+ * Copyright (C) 2026 Brian Miller
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #define _GNU_SOURCE

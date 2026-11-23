@@ -4,7 +4,7 @@
  * one "acl-rule" line per entry with its counter key), the counters
  * (BPFC_ACL_P, BPFC_ACL_B) and the log ring buffer (BPFC_ACL_LOG).
  *
- * Copyright (C) 2026
+ * Copyright (C) 2026 Brian Miller
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef BPFC_ACL_H

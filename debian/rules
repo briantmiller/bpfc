@@ -1,0 +1,53 @@
+#!/usr/bin/make -f
+# Debian packaging for bpfc: the same three packages as the RPMs (bpfc,
+# bpfc-container, bpfc-programs), each installed by its own make target.
+#
+#   make deb                                     (from the source tree)
+#   dpkg-buildpackage -us -uc -b                 (in an unpacked tree)
+#   DEB_BUILD_PROFILES=pkg.bpfc.static ...       statically linked binaries
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+include /usr/share/dpkg/pkg-info.mk
+
+# /lib/systemd/system on Debian 12, /usr/lib/systemd/system from Debian 13.
+UNITDIR := $(or $(shell pkg-config --variable=systemdsystemunitdir systemd 2>/dev/null),/usr/lib/systemd/system)
+STATIC := $(if $(filter pkg.bpfc.static,$(DEB_BUILD_PROFILES)),1,0)
+
+MAKE_VARS = VERSION=$(DEB_VERSION_UPSTREAM) STATIC=$(STATIC) \
+	PREFIX=/usr SYSCONFDIR=/etc LIBEXECDIR=/usr/libexec LOCALSTATEDIR=/var/lib \
+	UNITDIR=$(UNITDIR) SYSUSERSDIR=/usr/lib/sysusers.d \
+	DOCDIR=/usr/share/doc/bpfc CONTAINER_DOCDIR=/usr/share/doc/bpfc-container \
+	PROGRAMS_DOCDIR=/usr/share/doc/bpfc-programs
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	dh_auto_build -- $(MAKE_VARS)
+
+# The root suites need namespaces and veth pairs, which a build chroot does
+# not have; the compile suite needs neither.
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	bash tests/run-tests.sh -f compile
+endif
+
+override_dh_auto_install-arch:
+	$(MAKE) install-core DESTDIR=$(CURDIR)/debian/bpfc $(MAKE_VARS)
+	# How to build and install from source: not for an installed package.
+	rm -f debian/bpfc/usr/share/doc/bpfc/INSTALL.md
+
+override_dh_auto_install-indep:
+	$(MAKE) install-container DESTDIR=$(CURDIR)/debian/bpfc-container $(MAKE_VARS)
+	$(MAKE) install-programs DESTDIR=$(CURDIR)/debian/bpfc-programs $(MAKE_VARS)
+
+# Not enabled on installation (as on RHEL: `systemctl enable --now bpfcd`).
+# Once enabled, an upgrade restarts it, and the running programs are
+# adopted, not reinstalled.
+override_dh_installsystemd-arch:
+	dh_installsystemd -pbpfc --no-enable bpfcd.service
+
+# Example programs are copied into /etc/bpfc as they are: keep them plain.
+override_dh_compress:
+	dh_compress -X.bpfc -X.acl -XContainerfile

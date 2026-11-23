@@ -4,7 +4,7 @@
  * array of strings, one per program line), and the status objects both
  * programs print.
  *
- * Copyright (C) 2026
+ * Copyright (C) 2026 Brian Miller
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef BPFC_JSON_H

@@ -50,7 +50,7 @@ RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
 TARBALL    = bpfc-$(VERSION).tar.gz
 
-.PHONY: coverage fuzz check-compile check-dataplane check-ecmp check-linkcap check-all all clean install install-programs dist rpm srpm check
+.PHONY: coverage fuzz check-compile check-dataplane check-ecmp check-linkcap check-all all clean install install-core install-container install-programs dist rpm srpm deb check
 
 all: $(TARGET) $(DAEMON) $(CTL) $(FRONTENDS)
 
@@ -66,7 +66,12 @@ $(DAEMON): bpfcd/bpfcd.c $(COMMON_SRC) $(COMMON_HDR) $(HTTP_SRC) $(HTTP_HDR)
 $(CTL): bpfcd/bpfcctl.c $(COMMON_SRC) $(COMMON_HDR)
 	$(CC) $(CFLAGS) $(DAEMON_CFLAGS) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ bpfcd/bpfcctl.c $(COMMON_SRC)
 
-install: all install-programs
+# install = install-core (the bpfc package) + install-container
+# (bpfc-container) + install-programs (bpfc-programs), so packaging can
+# install each package's files on their own (debian/rules does).
+install: install-core install-container install-programs
+
+install-core: all
 	install -D -m 0755 $(TARGET) $(DESTDIR)$(SBINDIR)/bpfc
 	install -D -m 0755 $(DAEMON) $(DESTDIR)$(SBINDIR)/bpfcd
 	install -D -m 0755 $(CTL) $(DESTDIR)$(SBINDIR)/bpfcctl
@@ -105,6 +110,8 @@ install: all install-programs
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)/examples/acl/acl.d
 	install -m 0644 dist/examples/acl/*.acl $(DESTDIR)$(DOCDIR)/examples/acl/
 	install -m 0644 dist/examples/acl/acl.d/*.acl $(DESTDIR)$(DOCDIR)/examples/acl/acl.d/
+
+install-container:
 	install -D -m 0755 dist/container/bpfcd-entrypoint $(DESTDIR)$(SBINDIR)/bpfcd-entrypoint
 	install -D -m 0644 dist/container/README.md $(DESTDIR)$(CONTAINER_DOCDIR)/README.md
 	install -D -m 0644 dist/container/Containerfile $(DESTDIR)$(CONTAINER_DOCDIR)/Containerfile
@@ -187,6 +194,28 @@ srpm: $(TARBALL)
 	sed -e 's/@VERSION@/$(VERSION)/g' -e 's/@RELEASE@/$(RELEASE)/g' dist/bpfc.spec.in > $(RPMTOP)/SPECS/bpfc.spec
 	rpmbuild $(RPMBUILD_OPTS) --define "_topdir $(RPMTOP)" -bs $(RPMTOP)/SPECS/bpfc.spec
 
+# Builds .deb packages, and the source package, into ./debbuild (Debian 12+,
+# Ubuntu 22.04+: apt install build-essential debhelper pkgconf systemd-dev,
+# or systemd in place of systemd-dev before Debian 13). The upstream version
+# in debian/changelog must be $(VERSION).
+#   DEBBUILD_OPTS=-b                      binary packages only
+#   DEB_BUILD_PROFILES=pkg.bpfc.static    statically linked binaries
+#   DEB_BUILD_OPTIONS=nocheck             skip the compile tests
+DEBTOP     = $(CURDIR)/debbuild
+DEBBUILD_OPTS ?=
+deb: $(TARBALL)
+	@command -v dpkg-buildpackage >/dev/null || { echo "dpkg-buildpackage not found: apt install dpkg-dev debhelper"; exit 1; }
+	@v=$$(dpkg-parsechangelog -l debian/changelog -S Version | sed 's/-[^-]*$$//'); \
+	[ "$$v" = "$(VERSION)" ] || { echo "debian/changelog is at $$v, the Makefile at $(VERSION): add an entry (dch -v $(VERSION)-1)"; exit 1; }
+	rm -rf $(DEBTOP) && mkdir -p $(DEBTOP)
+	cp $(TARBALL) $(DEBTOP)/bpfc_$(VERSION).orig.tar.gz
+	tar -xzf $(TARBALL) -C $(DEBTOP)
+	cp -r debian $(DEBTOP)/bpfc-$(VERSION)/
+	# Without this make's variables: DEBTOP=... given here would reach the
+	# package's own `make clean` and delete the build directory.
+	cd $(DEBTOP)/bpfc-$(VERSION) && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL dpkg-buildpackage -us -uc $(DEBBUILD_OPTS)
+	@echo; echo "Packages:"; find $(DEBTOP) -maxdepth 1 -name '*.deb' -printf '  %p\n'
+
 # Integration test for bpfcd/bpfcctl (needs root; creates and deletes veth pairs).
 # Test suites via tests/run-tests.sh, which totals pass/fail/skip at the end.
 # TESTFLAGS=-f prints failures only; -v prints full suite output.
@@ -239,4 +268,4 @@ fuzz:
 
 clean:
 	rm -f $(TARGET) $(DAEMON) $(CTL) $(FRONTENDS) output.bpf $(TARBALL) tests/fuzz-rest
-	rm -rf $(RPMTOP) .dist coverage
+	rm -rf $(RPMTOP) $(DEBTOP) .dist coverage

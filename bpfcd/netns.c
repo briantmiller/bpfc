@@ -2,7 +2,7 @@
  * Finding the network namespace a bpfcd instance manages: /run/netns/<name>,
  * a netns_path (symlinks followed), or the namespace of a host veth's peer.
  *
- * Copyright (C) 2026
+ * Copyright (C) 2026 Brian Miller
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #define _GNU_SOURCE

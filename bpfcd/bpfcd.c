@@ -28,7 +28,7 @@
  *   configured from /etc/bpfc/netns/<name>/; see netns.c for how the
  *   namespace is found and the NETNS section below for following it.
  *
- * Copyright (C) 2026
+ * Copyright (C) 2026 Brian Miller
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #define _GNU_SOURCE
