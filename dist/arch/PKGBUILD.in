@@ -1,0 +1,66 @@
+# Generated into archbuild/PKGBUILD by `make arch`: @VERSION@ and
+# @PROGRAMS_BACKUP@ come from the Makefile, and `make arch` fills in
+# sha256sums.
+# Maintainer: bpfc maintainers <brun064@gmail.com>
+pkgbase=bpfc
+pkgname=(bpfc bpfc-container bpfc-programs)
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="eBPF compiler for TC and XDP packet programs, with a daemon to keep them attached"
+arch=(x86_64 aarch64 armv7h)
+url="https://github.com/briantmiller/bpfc"
+license=(GPL-3.0-or-later)
+makedepends=(linux-api-headers)
+checkdepends=(bash)
+source=("$pkgbase-$pkgver.tar.gz")
+sha256sums=(@SHA256@)
+
+# /usr/sbin is a symlink to /usr/bin on Arch: install there. The units'
+# /usr/sbin/bpfcd and bpfc.conf's bpfc_path still resolve through it.
+_make_vars=(
+	VERSION="$pkgver" PREFIX=/usr SBINDIR=/usr/bin SYSCONFDIR=/etc
+	LIBEXECDIR=/usr/libexec LOCALSTATEDIR=/var/lib
+	DOCDIR=/usr/share/doc/bpfc CONTAINER_DOCDIR=/usr/share/doc/bpfc-container
+	PROGRAMS_DOCDIR=/usr/share/doc/bpfc-programs
+)
+
+build() {
+	cd "$pkgbase-$pkgver"
+	make "${_make_vars[@]}" STATIC="${BPFC_STATIC:-0}"
+}
+
+check() {
+	cd "$pkgbase-$pkgver"
+	# Root suites need namespaces and veth pairs; the compile suite skips its
+	# map tests where the kernel won't create BPF maps (a build container).
+	bash tests/run-tests.sh -f compile
+}
+
+package_bpfc() {
+	depends=(glibc)
+	optdepends=('bpfc-programs: dataplane, ECMP, flow and link monitoring programs')
+	backup=(etc/bpfc/bpfc.conf)
+	cd "$pkgbase-$pkgver"
+	# The unit files and the sysusers.d file (the bpfc group) are applied by
+	# pacman's systemd hooks; bpfcd.service is not enabled.
+	make install-core DESTDIR="$pkgdir" "${_make_vars[@]}"
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+package_bpfc-container() {
+	pkgdesc="Entrypoint for running bpfcd in a container without systemd"
+	arch=(any)
+	depends=("bpfc=$pkgver-$pkgrel" sh)
+	cd "$pkgbase-$pkgver"
+	make install-container DESTDIR="$pkgdir" "${_make_vars[@]}"
+}
+
+package_bpfc-programs() {
+	pkgdesc="Programs built on bpfc: dataplane, ECMP, flow and link monitoring, dedup, port-scan guard"
+	arch=(any)
+	depends=("bpfc=$pkgver-$pkgrel" bash gawk coreutils)
+	backup=(@PROGRAMS_BACKUP@)
+	cd "$pkgbase-$pkgver"
+	# Everything under programs/, whatever it holds (see the Makefile).
+	make install-programs DESTDIR="$pkgdir" "${_make_vars[@]}"
+}

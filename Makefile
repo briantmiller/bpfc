@@ -50,7 +50,7 @@ RPMTOP     = $(CURDIR)/rpmbuild
 RPMBUILD_OPTS ?=
 TARBALL    = bpfc-$(VERSION).tar.gz
 
-.PHONY: coverage fuzz check-compile check-dataplane check-ecmp check-linkcap check-all all clean install install-core install-container install-programs dist rpm srpm deb check
+.PHONY: coverage fuzz check-compile check-dataplane check-ecmp check-linkcap check-all all clean install install-core install-container install-programs dist rpm srpm deb apk arch check
 
 all: $(TARGET) $(DAEMON) $(CTL) $(FRONTENDS)
 
@@ -216,6 +216,63 @@ deb: $(TARBALL)
 	cd $(DEBTOP)/bpfc-$(VERSION) && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL dpkg-buildpackage -us -uc $(DEBBUILD_OPTS)
 	@echo; echo "Packages:"; find $(DEBTOP) -maxdepth 1 -name '*.deb' -printf '  %p\n'
 
+# Alpine packages (.apk) into ./apkbuild/packages, with abuild: on Alpine
+# itself (apk add alpine-sdk linux-headers bash coreutils; a user in the
+# abuild group with a key from abuild-keygen -a), or anywhere else in an
+# $(ALPINE_IMAGE) container run with podman or docker. The container signs
+# with a throwaway key: install its packages with apk add --allow-untrusted.
+#   APK_STATIC=1     statically linked binaries (musl)
+#   ALPINE_IMAGE=... another Alpine release
+APKTOP     = $(CURDIR)/apkbuild
+ALPINE_IMAGE ?= docker.io/library/alpine:3.22
+APK_STATIC ?= 0
+CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+apk: $(TARBALL)
+	rm -rf $(APKTOP) && mkdir -p $(APKTOP)/src $(APKTOP)/packages
+	sed -e 's/@VERSION@/$(VERSION)/g' dist/alpine/APKBUILD.in > $(APKTOP)/src/APKBUILD
+	cp $(TARBALL) dist/alpine/bpfcd.initd dist/alpine/bpfcd.confd dist/alpine/bpfc.pre-install $(APKTOP)/src/
+	cd $(APKTOP)/src && printf 'sha512sums="\n%s\n"\n' "$$(sha512sum $(TARBALL) bpfcd.initd bpfcd.confd)" >> APKBUILD
+	@if command -v abuild >/dev/null; then \
+		cd $(APKTOP)/src && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL BPFC_STATIC=$(APK_STATIC) REPODEST=$(APKTOP)/packages abuild -r; \
+	elif [ -n "$(CONTAINER_ENGINE)" ]; then \
+		$(CONTAINER_ENGINE) run --rm -v $(APKTOP):/work:Z -e BPFC_STATIC=$(APK_STATIC) $(ALPINE_IMAGE) sh -euc '\
+			apk add -q alpine-sdk linux-headers bash coreutils; \
+			abuild-keygen -a -i -n -q; \
+			cd /work/src && REPODEST=/work/packages abuild -F -r; \
+			chown -R $(shell id -u):$(shell id -g) /work'; \
+	else \
+		echo "neither abuild nor podman/docker found: run make apk on Alpine, or install podman"; exit 1; \
+	fi
+	@echo; echo "Packages:"; find $(APKTOP)/packages -name '*.apk' -printf '  %p\n'
+
+# Arch Linux packages (.pkg.tar.zst) into ./archbuild, with makepkg: on Arch
+# itself (pacman -S base-devel linux-api-headers; not as root), or anywhere
+# else in an $(ARCH_IMAGE) container run with podman or docker.
+#   ARCH_STATIC=1    statically linked binaries
+#   MAKEPKG_OPTS=... more makepkg options (--nocheck, ...)
+ARCHTOP    = $(CURDIR)/archbuild
+ARCH_IMAGE ?= docker.io/library/archlinux:base-devel
+ARCH_STATIC ?= 0
+MAKEPKG_OPTS ?=
+arch: $(TARBALL)
+	rm -rf $(ARCHTOP) && mkdir -p $(ARCHTOP)
+	cp $(TARBALL) $(ARCHTOP)/
+	backup=$$(for f in programs/*/include/*.bpfc; do [ -f "$$f" ] && printf "'etc/bpfc/include/%s' " "$${f##*/}"; done); \
+	sed -e 's/@VERSION@/$(VERSION)/g' -e "s|@PROGRAMS_BACKUP@|$${backup% }|" \
+	    -e "s/@SHA256@/'$$(sha256sum $(TARBALL) | cut -d' ' -f1)'/" dist/arch/PKGBUILD.in > $(ARCHTOP)/PKGBUILD
+	@if command -v makepkg >/dev/null && [ "$$(id -u)" -ne 0 ]; then \
+		cd $(ARCHTOP) && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL BPFC_STATIC=$(ARCH_STATIC) makepkg -f $(MAKEPKG_OPTS); \
+	elif [ -n "$(CONTAINER_ENGINE)" ]; then \
+		$(CONTAINER_ENGINE) run --rm -v $(ARCHTOP):/work:Z -e BPFC_STATIC=$(ARCH_STATIC) $(ARCH_IMAGE) bash -euc '\
+			pacman -Syu --noconfirm --needed linux-api-headers >/dev/null; \
+			useradd -m build && chown -R build /work; \
+			su build -c "cd /work && makepkg -f $(MAKEPKG_OPTS)"; \
+			chown -R $(shell id -u):$(shell id -g) /work'; \
+	else \
+		echo "makepkg (not as root) or podman/docker needed: run make arch on Arch as a user, or install podman"; exit 1; \
+	fi
+	@echo; echo "Packages:"; find $(ARCHTOP) -maxdepth 1 -name '*.pkg.tar*' -printf '  %p\n'
+
 # Integration test for bpfcd/bpfcctl (needs root; creates and deletes veth pairs).
 # Test suites via tests/run-tests.sh, which totals pass/fail/skip at the end.
 # TESTFLAGS=-f prints failures only; -v prints full suite output.
@@ -268,4 +325,4 @@ fuzz:
 
 clean:
 	rm -f $(TARGET) $(DAEMON) $(CTL) $(FRONTENDS) output.bpf $(TARBALL) tests/fuzz-rest
-	rm -rf $(RPMTOP) $(DEBTOP) .dist coverage
+	rm -rf $(RPMTOP) $(DEBTOP) $(APKTOP) $(ARCHTOP) .dist coverage

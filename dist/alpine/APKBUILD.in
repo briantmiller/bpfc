@@ -1,0 +1,69 @@
+# Generated into apkbuild/src/APKBUILD by `make apk`; @VERSION@ comes from
+# the Makefile, and `make apk` fills in sha512sums.
+# Maintainer: bpfc maintainers <brun064@gmail.com>
+pkgname=bpfc
+pkgver=@VERSION@
+pkgrel=0
+pkgdesc="eBPF compiler for TC and XDP packet programs, with a daemon to keep them attached"
+url="https://github.com/briantmiller/bpfc"
+arch="all"
+license="GPL-3.0-or-later"
+makedepends="linux-headers"
+# The compile suite (tests/run-tests.sh) is bash and uses coreutils.
+checkdepends="bash coreutils"
+install="$pkgname.pre-install"
+subpackages="
+	$pkgname-doc
+	$pkgname-openrc
+	$pkgname-container:container:noarch
+	$pkgname-programs:programs:noarch
+	"
+source="$pkgname-$pkgver.tar.gz
+	bpfcd.initd
+	bpfcd.confd
+	"
+
+_make_vars() {
+	echo VERSION="$pkgver" PREFIX=/usr SYSCONFDIR=/etc LIBEXECDIR=/usr/libexec \
+		LOCALSTATEDIR=/var/lib DOCDIR=/usr/share/doc/bpfc \
+		CONTAINER_DOCDIR=/usr/share/doc/bpfc-container \
+		PROGRAMS_DOCDIR=/usr/share/doc/bpfc-programs
+}
+
+build() {
+	# shellcheck disable=SC2046
+	make $(_make_vars) STATIC="${BPFC_STATIC:-0}"
+}
+
+check() {
+	# Root suites need namespaces and veth pairs; the compile suite skips its
+	# map tests where the kernel won't create BPF maps (a build container).
+	bash tests/run-tests.sh -f compile
+}
+
+package() {
+	# shellcheck disable=SC2046
+	make install-core DESTDIR="$pkgdir" $(_make_vars)
+	# Alpine runs OpenRC: no systemd units, and the group comes from
+	# bpfc.pre-install, not sysusers.d.
+	rm -rf "$pkgdir"/usr/lib/systemd "$pkgdir"/usr/lib/sysusers.d
+	rmdir "$pkgdir"/usr/lib 2>/dev/null || true
+	install -Dm755 "$srcdir"/bpfcd.initd "$pkgdir"/etc/init.d/bpfcd
+	install -Dm644 "$srcdir"/bpfcd.confd "$pkgdir"/etc/conf.d/bpfcd
+}
+
+container() {
+	pkgdesc="Entrypoint for running bpfcd in a container without an init system"
+	depends="$pkgname=$pkgver-r$pkgrel"
+	# shellcheck disable=SC2046
+	make -C "$builddir" install-container DESTDIR="$subpkgdir" $(_make_vars)
+}
+
+programs() {
+	pkgdesc="Programs built on bpfc: dataplane, ECMP, flow and link monitoring, dedup, port-scan guard"
+	depends="$pkgname=$pkgver-r$pkgrel bash gawk coreutils"
+	# Everything under programs/, whatever it holds (see the Makefile). The
+	# example programs stay in this package: they are copied into /etc/bpfc.
+	# shellcheck disable=SC2046
+	make -C "$builddir" install-programs DESTDIR="$subpkgdir" $(_make_vars)
+}

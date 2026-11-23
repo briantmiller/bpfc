@@ -1,9 +1,11 @@
-bpfc
+/bpfc
 bpfcd/bpfcd
 bpfcd/bpfcctl
 output.bpf
 rpmbuild/
 debbuild/
+apkbuild/
+archbuild/
 bpfc-*.tar.gz
 **/__pycache__/
 tests/fuzz-rest

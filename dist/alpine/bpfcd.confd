@@ -1,0 +1,13 @@
+# /etc/conf.d/bpfcd: settings for /etc/init.d/bpfcd and its namespace
+# instances (/etc/init.d/bpfcd.<name>, a symlink to bpfcd). An instance
+# uses /etc/conf.d/bpfcd.<name> instead of this file when that exists.
+#
+# bpfcd's own settings are in /etc/bpfc/bpfc.conf (and, for an instance,
+# /etc/bpfc/netns/<name>/bpfc.conf).
+
+# Extra options for bpfcd, e.g. "-D" for debug logging.
+#bpfcd_opts=""
+
+# Mount bpffs at /sys/fs/bpf when it is not mounted yet: pinned maps live
+# there by default (map_dir in bpfc.conf). "no" to leave it alone.
+#bpfcd_mount_bpffs="yes"

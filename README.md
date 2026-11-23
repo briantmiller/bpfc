@@ -61,9 +61,10 @@ make                  # build bpfc, bpfcd, bpfcctl and the ACL frontend
 sudo make install     # install everything, including the bpfc-programs tools
 make rpm              # or build RPMs for RHEL 9/10 (in ./rpmbuild)
 make deb              # or .deb packages for Debian 12+ / Ubuntu 22.04+ (in ./debbuild)
+make apk              # or Alpine packages; make arch for Arch Linux
 ```
 
-You can also run `./bpfc` straight from the source tree. bpfc needs root (`CAP_NET_ADMIN` and `CAP_SYS_ADMIN`) and Linux 4.18 or later for TC programs; XDP programs need kernel 5.18+ or RHEL 9.2+. [INSTALL.md](INSTALL.md) has the full requirements, the install paths, the RPM and Debian packages, static builds and containers.
+You can also run `./bpfc` straight from the source tree. bpfc needs root (`CAP_NET_ADMIN` and `CAP_SYS_ADMIN`) and Linux 4.18 or later for TC programs; XDP programs need kernel 5.18+ or RHEL 9.2+. [INSTALL.md](INSTALL.md) has the full requirements, the install paths, the RPM, Debian, Alpine and Arch packages, the OpenWrt package, static builds and containers.
 
 ---
 
@@ -1202,7 +1203,7 @@ sudo ./test.sh nat xdp    # only these
 
 | Document | Covers |
 | :--- | :--- |
-| [INSTALL.md](INSTALL.md) | Requirements, building, `make install`, RPM and Debian packages, static builds, containers |
+| [INSTALL.md](INSTALL.md) | Requirements, building, `make install`, RPM, Debian, Alpine, Arch and OpenWrt packages, static builds, containers |
 | [TESTING.md](TESTING.md) | The test suites, what they need, coverage and fuzzing |
 | [doc/language.md](doc/language.md) | The complete language reference |
 | [doc/flow-tracking.md](doc/flow-tracking.md) | Flow keys (`hash`, `pack`) for network engineers: NAT, load sharing, CoPP, policers, accounting, sampling |

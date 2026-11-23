@@ -6,13 +6,16 @@
 - [make install](#make-install)
 - [RPM packages (RHEL 9/10)](#rpm-packages-rhel-910)
 - [Debian packages (Debian, Ubuntu)](#debian-packages-debian-ubuntu)
+- [Alpine packages](#alpine-packages)
+- [Arch Linux packages](#arch-linux-packages)
+- [OpenWrt](#openwrt)
 - [Static binaries](#static-binaries)
 - [After installing](#after-installing)
 - [Containers](#containers)
 
 ## Requirements
 
-**To build:** `gcc` (or another C compiler: `make CC=clang`), `make` and the kernel headers (`kernel-headers` on RHEL). bpfc is plain C with no library dependencies besides libc. It doesn't use LLVM, clang or libbpf.
+**To build:** `gcc` (or another C compiler: `make CC=clang`), `make` and the kernel headers (`kernel-headers` on RHEL, `linux-headers` on Alpine). bpfc is plain C with no library dependencies besides libc, and builds against glibc and musl. It doesn't use LLVM, clang or libbpf.
 
 **To build RPMs:** `rpm-build` and `systemd-rpm-macros`, plus `glibc-static` for a static build.
 
@@ -26,7 +29,7 @@ dnf install gcc make kernel-headers rpm-build systemd-rpm-macros
 
 | | |
 | :--- | :--- |
-| Packaged for | RHEL 9 and RHEL 10 (RPM); Debian 12+ and Ubuntu 22.04+ (.deb) |
+| Packaged for | RHEL 9 and RHEL 10 (RPM); Debian 12+ and Ubuntu 22.04+ (.deb); Alpine (.apk); Arch Linux; OpenWrt (a feed package) |
 | Kernel | 4.18 or later for TC programs (the RHEL 8 verifier). Some commands need newer kernels: `start-loop`/`loop` 5.3+; ring buffers (`ringbuf-map`, `log`) 5.8+ |
 | XDP programs (`-d xdp`) | kernel 5.18+ or RHEL 9.2+ |
 | Privileges | root, or `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` (`CAP_BPF` on newer kernels) |
@@ -158,9 +161,88 @@ Differences from the RPMs, following Debian conventions:
 - Example programs under `/usr/share/doc` stay uncompressed, so they can be copied into `/etc/bpfc` as they are. The Markdown guides are compressed (`README.md.gz`).
 - Purging removes the configuration files the packages installed (`bpfc.conf`, the include files), but not your own program files in `/etc/bpfc/interfaces.d`, nor programs written through the REST API in `/var/lib/bpfc`.
 
+## Alpine packages
+
+```bash
+make apk                     # on Alpine (abuild), or in an Alpine container with podman/docker
+make apk APK_STATIC=1        # statically linked against musl
+make apk ALPINE_IMAGE=docker.io/library/alpine:3.21
+```
+
+On Alpine itself, `make apk` runs `abuild`. That needs `apk add alpine-sdk linux-headers bash coreutils`, a user in the `abuild` group, and a signing key from `abuild-keygen -a -i`. Anywhere else, it runs `abuild` in an `alpine` container with podman (or docker), which signs the packages with a throwaway key. Either way the packages land in `./apkbuild/packages/<repo>/<arch>/`.
+
+| Package | Contents |
+| :--- | :--- |
+| `bpfc` | bpfc, bpfcd, bpfcctl, the ACL frontend, `/etc/bpfc` |
+| `bpfc-openrc` | the OpenRC service, `/etc/init.d/bpfcd` and `/etc/conf.d/bpfcd` (installed automatically with OpenRC) |
+| `bpfc-doc` | man pages, guides and examples (installed automatically with `docs`) |
+| `bpfc-container` | `bpfcd-entrypoint`, to run bpfcd as a container's PID 1 |
+| `bpfc-programs` | the included programs, their examples and profiles; depends on bash, gawk and coreutils |
+
+```bash
+apk add --allow-untrusted ./apkbuild/packages/*/x86_64/bpfc-0*.apk \
+    ./apkbuild/packages/*/x86_64/bpfc-openrc-*.apk     # --allow-untrusted: the container's key
+rc-update add bpfcd && rc-service bpfcd start
+rc-service bpfcd reload                                # rescan the files (bpfcctl reload)
+ln -s bpfcd /etc/init.d/bpfcd.pod1 && rc-update add bpfcd.pod1   # network namespace pod1
+```
+
+The OpenRC service mounts bpffs at `/sys/fs/bpf` if it isn't mounted yet (`bpfcd_mount_bpffs="no"` in `/etc/conf.d/bpfcd` turns that off), and runs bpfcd with `-b`, so it logs to syslog. A namespace instance `bpfcd.<name>` reads `/etc/bpfc/netns/<name>/` and uses `/etc/conf.d/bpfcd.<name>` when that exists. Alpine has no systemd, so the unit files and the sysusers.d file aren't packaged; the `bpfc` group is created when the package is installed.
+
+## Arch Linux packages
+
+```bash
+make arch                    # on Arch as a normal user (makepkg), or in an Arch container with podman/docker
+make arch ARCH_STATIC=1      # statically linked binaries
+make arch MAKEPKG_OPTS=--nocheck
+pacman -U archbuild/bpfc-0*.pkg.tar.zst archbuild/bpfc-programs-*.pkg.tar.zst
+systemctl enable --now bpfcd
+```
+
+`make arch` writes `archbuild/PKGBUILD` from `dist/arch/PKGBUILD.in` (version, checksum, and the include files as `backup`) and runs `makepkg`. makepkg refuses to run as root, so as root (or off Arch) `make arch` runs it in an `archlinux:base-devel` container as an unprivileged user. It builds the same three packages as the RPMs: `bpfc`, `bpfc-container` and `bpfc-programs`.
+
+The binaries go in `/usr/bin`, since `/usr/sbin` is a symlink to it on Arch (the units' `/usr/sbin/bpfcd` resolves through it). pacman's systemd hooks create the `bpfc` group from the sysusers.d file. `bpfcd.service` isn't enabled on installation.
+
+## OpenWrt
+
+`dist/openwrt/bpfc` is an OpenWrt package that builds this source tree. Add `dist/openwrt` as a feed to an OpenWrt build tree or SDK:
+
+```bash
+echo "src-link bpfc /path/to/bpfc/dist/openwrt" >> feeds.conf     # in the OpenWrt tree or SDK
+./scripts/feeds update bpfc && ./scripts/feeds install -a -p bpfc
+make menuconfig                                                    # Network -> bpfc, bpfc-programs
+make package/bpfc/compile V=s                                      # packages in bin/packages/<arch>/bpfc/
+```
+
+`BPFC_SRC=<dir>` builds another checkout. The package copies the tree, cleans out any host build and cross-compiles with the target's toolchain.
+
+| Package | Contents |
+| :--- | :--- |
+| `bpfc` | bpfc, bpfcd, bpfcctl, the ACL frontend, `/etc/bpfc`, a procd service `/etc/init.d/bpfcd`; depends on `kmod-sched-core` (clsact) and `kmod-sched-bpf` (cls_bpf) |
+| `bpfc-programs` | the included programs; depends on bash and gawk, which are large for a small router |
+
+There's no `bpfc-container` package for OpenWrt.
+
+**Kernel.** bpfc needs a kernel with the `bpf()` syscall (`CONFIG_BPF_SYSCALL`), and preferably the BPF JIT (`CONFIG_BPF_JIT`) for speed. If `bpfc -T "drop"` fails on the router, enable them with `make kernel_menuconfig` and rebuild the image. TC programs work on OpenWrt 23.05 (kernel 5.15). XDP programs need kernel 5.18 or later, so OpenWrt 24.10 (kernel 6.6) or later.
+
+**Service.**
+
+```bash
+/etc/init.d/bpfcd enable && /etc/init.d/bpfcd start
+/etc/init.d/bpfcd reload       # rescan the program files; also starts instances for new namespaces
+logread -e bpfcd
+```
+
+The service mounts bpffs at `/sys/fs/bpf` if needed, runs bpfcd under procd (which restarts it if it exits), and starts an instance for each `/etc/bpfc/netns/<name>/` that has a `bpfc.conf`. `sysupgrade` keeps `/etc/bpfc`.
+
+On OpenWrt:
+
+- **`/var` is in RAM.** Programs written through the REST API (`rest_dir`, `/var/lib/bpfc/interfaces.d` by default) are lost on reboot. Set `rest_dir` under `/etc/bpfc` to keep them, at the cost of flash writes.
+- **There's no `bpfc` group.** If you enable the REST API, set `rest_socket_owner = root:root` (or an existing group) in `bpfc.conf`.
+
 ## Static binaries
 
-`make STATIC=1` (or `make rpm RPMBUILD_OPTS="--with static"`, which needs `glibc-static`, or `DEB_BUILD_PROFILES=pkg.bpfc.static make deb`) links every binary statically. The binaries then run in images whose libc doesn't match the build host, or that have none (minimal or distroless containers).
+`make STATIC=1` (or `make rpm RPMBUILD_OPTS="--with static"`, which needs `glibc-static`, `DEB_BUILD_PROFILES=pkg.bpfc.static make deb`, `make apk APK_STATIC=1` or `make arch ARCH_STATIC=1`) links every binary statically. Against musl (Alpine, or `make CC=musl-gcc STATIC=1` with the kernel headers on musl-gcc's include path) the result is the smallest: about 320 KB for `bpfc`, stripped. The binaries then run in images whose libc doesn't match the build host, or that have none (minimal or distroless containers).
 
 ## After installing
 

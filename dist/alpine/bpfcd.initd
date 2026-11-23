@@ -1,0 +1,44 @@
+#!/sbin/openrc-run
+# bpfcd: keeps the programs in /etc/bpfc/interfaces.d attached.
+#
+# Network namespace <name>: ln -s bpfcd /etc/init.d/bpfcd.<name>, configured
+# from /etc/bpfc/netns/<name>/ (see bpfcd(8), NETWORK NAMESPACES):
+#   ln -s bpfcd /etc/init.d/bpfcd.pod1 && rc-update add bpfcd.pod1 && rc-service bpfcd.pod1 start
+
+description="bpfc eBPF program manager"
+extra_started_commands="reload"
+description_reload="Rescan the program files and report failures (bpfcctl reload)"
+
+_netns="${RC_SVCNAME#bpfcd.}"
+[ "$_netns" = "$RC_SVCNAME" ] && _netns=
+
+command=/usr/sbin/bpfcd
+# -b: bpfcd daemonizes, writes its pid file and logs to syslog.
+command_args="-b ${_netns:+-n $_netns} ${bpfcd_opts}"
+if [ -n "$_netns" ]; then
+	description="bpfc eBPF program manager for network namespace $_netns"
+	pidfile="/run/bpfc/netns/$_netns/bpfcd.pid"
+else
+	pidfile="/run/bpfc/bpfcd.pid"
+fi
+
+depend() {
+	need localmount
+	use logger
+	# Attach programs before interfaces are configured, as packet filters usually are.
+	before net
+	after sysfs
+}
+
+start_pre() {
+	checkpath -d -m 0755 /run/bpfc /var/lib/bpfc
+	if [ "${bpfcd_mount_bpffs:-yes}" = yes ] && ! grep -q ' /sys/fs/bpf bpf ' /proc/mounts; then
+		mount -t bpf bpf /sys/fs/bpf || ewarn "cannot mount bpffs at /sys/fs/bpf: programs that use maps will fail"
+	fi
+}
+
+reload() {
+	ebegin "Reloading $RC_SVCNAME"
+	/usr/sbin/bpfcctl ${_netns:+-n "$_netns"} reload
+	eend $?
+}

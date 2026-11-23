@@ -1,0 +1,4 @@
+#!/bin/sh
+# The group that may use bpfcd's REST socket (rest_socket_owner = root:bpfc).
+addgroup -S bpfc 2>/dev/null
+exit 0
