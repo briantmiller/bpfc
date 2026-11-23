@@ -241,7 +241,9 @@ APK_KEY_SETUP = mkdir -p /root/.abuild && cp /keys/$(notdir $(APK_KEY)) /keys/$(
 	cp /keys/$(notdir $(APK_KEY)).pub /etc/apk/keys/ && \
 	echo PACKAGER_PRIVKEY=/root/.abuild/$(notdir $(APK_KEY)) > /root/.abuild/abuild.conf
 else
-APK_KEY_SETUP = abuild-keygen -a -i -n -q
+# Not abuild-keygen -i: that copies the key with doas or sudo, even as root,
+# and the alpine image has neither.
+APK_KEY_SETUP = abuild-keygen -a -n -q && mkdir -p /etc/apk/keys && cp /root/.abuild/*.rsa.pub /etc/apk/keys/
 endif
 apk: $(TARBALL)
 	rm -rf $(APKTOP) && mkdir -p $(APKTOP)/src $(APKTOP)/packages
@@ -253,6 +255,7 @@ apk: $(TARBALL)
 	elif [ -n "$(CONTAINER_ENGINE)" ]; then \
 		$(CONTAINER_ENGINE) run --rm -v $(APKTOP):/work:Z $(APK_KEY_MOUNT) -e BPFC_STATIC=$(APK_STATIC) $(ALPINE_IMAGE) sh -euc '\
 			trap "chown -R $(CONTAINER_OWNER) /work" EXIT; \
+			export ABUILD_USERDIR=/root/.abuild; \
 			apk add -q alpine-sdk linux-headers bash coreutils; \
 			$(APK_KEY_SETUP); \
 			cd /work/src && REPODEST=/work/packages abuild -F -r; \
