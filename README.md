@@ -526,15 +526,19 @@ Detects IPv4 TCP and UDP port scans. Each source's distinct `{protocol, destinat
 A source is one address by default. `set prefix 24` makes it every address of the same /24: a scan spread over many addresses of a range adds up to one score, and the whole range is blocked. Many hosts of a range reaching the same port (clients behind a NAT pool) count that port once. A shorter prefix adds up more legitimate hosts too, so raise the threshold with it.
 
 ```bash
-cp /usr/share/doc/bpfc-programs/portscan-guard/examples/interfaces.d/eth0/ingress/10.bpfc \
-   /etc/bpfc/interfaces.d/eth0/ingress/10.bpfc
+D=/usr/share/doc/bpfc-programs/portscan-guard/examples/interfaces.d/eth0
+cp $D/ingress/10.bpfc /etc/bpfc/interfaces.d/eth0/ingress/10.bpfc
+cp $D/egress/10.bpfc  /etc/bpfc/interfaces.d/eth0/egress/10.bpfc   # trusts UDP replies (DNS, NTP)
 systemctl reload bpfcd
 bpfc-portscanctl status                     # sources, scores, recent services, block times
 bpfc-portscanctl set threshold 20
 bpfc-portscanctl set mode block             # monitor | block | reset
 bpfc-portscanctl set prefix 24              # track and block per /24 (default 32: per address)
 bpfc-portscanctl unblock 198.51.100.0/24    # or one address: its /32 and the /24 holding it
+bpfc-portscanctl udp                        # outgoing UDP flows whose replies are trusted
 ```
+
+UDP has no handshake, so a DNS resolver answering from port 53 to a new client port for every query looks like a scan. The egress program records each outgoing UDP flow; a UDP packet that answers one (same remote address, remote port and local port, within `set udp-timeout`, default 60 s) is not scored and passes even while its source is blocked. Only outgoing packets keep a flow open.
 
 The header of the program file describes the scoring and its maps.
 

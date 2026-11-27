@@ -35,6 +35,8 @@ Commands:
   status                         Show source state, score, recent service, and block time.
   flows [--age SECONDS]          Show recent source/protocol/destination-port contacts.
                                  Default age is the configured scan window.
+  udp [--all]                    Show outgoing UDP flows whose replies are trusted
+                                 (--all: also expired ones still in the table).
   stats                          Show global counters.
   config                         Show runtime configuration.
   set threshold N                Set distinct-services-per-window threshold (1..65535).
@@ -45,6 +47,8 @@ Commands:
   set mode monitor|block|reset   Select monitor-only, silent-drop, or TCP-reset operation.
   set prefix LENGTH              Track and block sources per IPv4 prefix of this length
                                  (1..32; 32 = each address alone, 24 = per /24).
+  set udp-timeout SECONDS        Trust UDP replies this long after the last outgoing
+                                 packet of their flow (1..86400; default 60).
   block SOURCE [SECONDS]         Manually block a source; default is configured duration.
   unblock SOURCE                 Clear only a source block entry.
   clear SOURCE                   Clear a source's block, current suspect score, and tracking state.
@@ -53,6 +57,9 @@ A SOURCE is an address (198.51.100.7) or a prefix (198.51.100.0/24). Host
 bits of a prefix are ignored. `block` takes /32 or the configured prefix
 length, the two a packet is checked against. For an address, `unblock` and
 `clear` act on the address's /32 entry and on the configured prefix holding it.
+
+UDP replies are trusted only with the egress program installed on the same
+interface (examples/interfaces.d/eth0/egress/10.bpfc).
 USAGE
 }
 
@@ -242,6 +249,7 @@ show_config() {
     *) printf '  4: mode (0=monitor, 1=drop, 2=reset) = unknown (%s)\n' "$mode" ;;
   esac
   printf '  5: source prefix length (1..32) = /%s\n' "$(cfg_prefix)"
+  printf '  6: UDP reply trust timeout (seconds) = %s\n' "$(cfg_value 6 60)"
 }
 
 show_stats() {
@@ -252,11 +260,39 @@ show_stats() {
   printf '  automatic enforcement entries issued: %s\n' "${STATS[1]:-0}"
   printf '  packets handled while enforcement was active: %s\n' "${STATS[2]:-0}"
   printf '  qualifying TCP SYNs observed: %s\n' "${STATS[3]:-0}"
-  printf '  UDP packets observed: %s\n' "${STATS[4]:-0}"
+  printf '  UDP packets observed (untrusted): %s\n' "${STATS[4]:-0}"
+  printf '  trusted UDP replies passed: %s\n' "${STATS[5]:-0}"
+}
+
+# PS_UDPOUT key: (remote address << 32) | (remote port << 16) | local port.
+show_udp() {
+  local all=${1:-0} now timeout key seen age rows state
+  local -A UDP CFG
+  load_map PS_UDPOUT UDP
+  load_map PS_CFG CFG
+  timeout=$(cfg_value 6 60)
+  now=$(mono_seconds)
+  printf 'Outgoing UDP flows (replies trusted for %ss after the last outgoing packet)\n' "$timeout"
+  printf '%-16s %11s %10s %8s %-8s\n' 'REMOTE' 'REMOTE PORT' 'LOCAL PORT' 'AGE' 'STATE'
+  printf '%s\n' '-----------------------------------------------------------'
+  rows=$(
+    for key in "${!UDP[@]}"; do
+      seen=${UDP[$key]}
+      (( seen )) || continue
+      age=$(( now - seen )); (( age >= 0 )) || age=0
+      if (( age < timeout )); then state=trusted; else (( all )) || continue; state=expired; fi
+      printf '%020d\t%s\t%d\t%d\t%s\t%s\n' "$seen" "$(fmt_ip $(( key >> 32 )))" $(( (key >> 16) & 0xffff )) $(( key & 0xffff )) "$(fmt_age "$seen" "$now")" "$state"
+    done | sort -t $'\t' -k1,1nr
+  )
+  [[ -n $rows ]] || { printf '(none; is the egress program installed?)\n'; return; }
+  while IFS=$'\t' read -r _seen remote rport lport age state; do
+    printf '%-16s %11d %10d %8s %-8s\n' "$remote" "$rport" "$lport" "$age" "$state"
+  done <<< "$rows"
 }
 
 show_status() {
   local -A SCORE LAST LASTIP BLOCK BACKOFF CFG KEYS SOURCE_SCORE
+  KEYS=(); SOURCE_SCORE=()
   local key score_key score backoff last_record observed proto port until status detail age wall left lasthost
   local now btime threshold window mode prefix window_id rows len priority score_len
   load_map PS_SCORE SCORE
@@ -480,6 +516,10 @@ set_config() {
       printf 'Note: state recorded under the previous length stays until it ages out; its blocks are no longer\n'
       printf 'enforced unless they are /32 entries. `status` lists them as INACTIVE.\n'
       return ;;
+    udp-timeout)
+      is_positive_integer "$value_text" || die 'udp-timeout must be a positive integer'
+      (( 10#$value_text <= 86400 )) || die 'udp-timeout must be <= 86400 seconds'
+      index=6; value=$((10#$value_text)) ;;
     *) die "unknown setting: $setting" ;;
   esac
   write_map PS_CFG "$index" "$value"
@@ -514,6 +554,12 @@ case $command in
       age=$((10#$2))
     fi
     show_flows "$age" ;;
+  udp)
+    case "$*" in
+      '') show_udp 0 ;;
+      --all) show_udp 1 ;;
+      *) die 'udp accepts only --all' ;;
+    esac ;;
   stats)
     (( $# == 0 )) || die 'stats takes no arguments'
     show_stats ;;
@@ -521,7 +567,7 @@ case $command in
     (( $# == 0 )) || die 'config takes no arguments'
     show_config ;;
   set)
-    (( $# == 2 )) || die 'usage: set threshold|duration|max-duration|window|log|mode|prefix VALUE'
+    (( $# == 2 )) || die 'usage: set threshold|duration|max-duration|window|log|mode|prefix|udp-timeout VALUE'
     set_config "$1" "$2" ;;
   block)
     (( $# == 1 || $# == 2 )) || die 'usage: block SOURCE [SECONDS]'

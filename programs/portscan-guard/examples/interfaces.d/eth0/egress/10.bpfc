@@ -1,0 +1,39 @@
+# portscan-guard egress: UDP connection tracking for the ingress guard.
+#
+# UDP has no handshake, so the ingress guard cannot tell a reply from a probe
+# by the packet alone. A DNS resolver answers from port 53 to a new client
+# port for every query; without this program each answer counts as a contact
+# to a new service and the resolver is soon blocked.
+#
+# This program records every UDP packet leaving the interface under the key
+# its replies will carry: remote address, remote port, local port
+# ("pack reverse" reads ip-dst, dst-port, src-port of the outgoing packet).
+# The ingress guard looks a UDP packet up with its own ip-src, src-port,
+# dst-port. A packet that answers a flow sent within the UDP timeout
+# (PS_CFG key 6, default 60 s) is trusted: it is not scored, and it passes even
+# while its source is blocked, since it reaches only a port this host chose to
+# talk from, and only from the address and port it talked to.
+#
+# Only this host's (or, on a router, its forwarded) outgoing packets refresh
+# an entry; replies do not, so a remote peer cannot keep a flow open alone.
+#
+# Install it on the egress of each interface that has the ingress guard.
+#
+# Map:
+#   PS_UDPOUT key=(remote IPv4 << 32) | (remote port << 16) | local port;
+#             value=CLOCK_MONOTONIC second of the last outgoing packet.
+#             An LRU hash map of 65536 entries: the oldest flows are evicted
+#             first under load. Declared with the same size in the ingress file.
+
+hash-map PS_UDPOUT 65536;
+
+match ip;
+  match udp;
+    decl UDP_NOW 8;
+    decl UDP_KEY 8;
+    get time UDP_NOW;
+    calc div UDP_NOW 1000000000;
+    pack UDP_KEY reverse ip-src src-port dst-port;
+    set map PS_UDPOUT %UDP_KEY %UDP_NOW;
+  end-match;
+end-match;

@@ -13,6 +13,7 @@ require_cmds portscan python3 ip tc
 
 BPFC=$PWD/bpfc
 PROG=$PWD/programs/portscan-guard/examples/interfaces.d/eth0/ingress/10.bpfc
+EGRESS=$PWD/programs/portscan-guard/examples/interfaces.d/eth0/egress/10.bpfc
 CTL_BIN=$PWD/programs/portscan-guard/bpfc-portscanctl
 SEND=$PWD/tests/keys-send.py
 MAPS=/run/bpfc-portscan-$$
@@ -29,6 +30,7 @@ for h in ingress egress xdp; do
 	if $BPFC -m $MAPS -T -d $h -f $PROG >/dev/null 2>&1; then test_pass "load-$h"
 	else test_fail "load-$h"; $BPFC -m $MAPS -T -d $h -f $PROG 2>&1 | tail -2; fi
 done
+check "load-egress-companion" eval "$BPFC -m $MAPS -T -d egress -f $EGRESS >/dev/null"
 
 for n in PA PR; do ip netns add $n; ip -n $n link set lo up; done
 ip link add pa0 netns PA type veth peer name pr0 netns PR
@@ -43,7 +45,11 @@ attach() {
 	R $BPFC -m $MAPS -i pr0 -d ingress -p 10 -f "${1:-$PROG}" >/dev/null || test_fail "attach guard"
 	R $BPFC -m $MAPS -i pr0 -d ingress -p 200 "match ip; count PASS ip-src; end-match" >/dev/null || test_fail "attach counter"
 }
-reset() { R $BPFC -i pr0 -c; rm -f $MAPS/[A-Z]*; }
+reset() { R $BPFC -i pr0 -c; R $BPFC -i pr0 -d egress -c; rm -f $MAPS/[A-Z]*; }
+AMAC=$(ip -n PA -o link show pa0 | sed 's/.*link\/ether \([0-9a-f:]*\).*/\1/')
+# out SPEC...: frames leaving pr0 (through its TC egress) towards PA
+out() { R python3 -I $SEND pr0 $AMAC "$@"; sleep 0.3; }
+stat() { CTL stats | awk -v t="$1" 'index($0, t) { print $NF }'; }
 # passed ADDR: packets from ADDR that got past the guard
 passed() {
 	local k v
@@ -152,5 +158,62 @@ check "its neighbour passes" [ "$(passed 10.77.10.2)" -eq 1 ]
 send proto=udp,src=10.77.10.3,dst=10.66.0.2,dport=53
 check "UDP from another address passes" [ "$(passed 10.77.10.3)" -eq 1 ]
 
+echo "== UDP: without the egress program, DNS answers look like a scan"
+reset; attach
+CTL set mode block >/dev/null
+specs=()
+for i in $(seq 1 15); do specs+=(proto=udp,src=10.77.53.53,dst=10.66.0.2,sport=53,dport=$((33000 + i * 7))); done
+send "${specs[@]}"
+check "the resolver is BLOCKED" has status '^10\.77\.53\.53 +BLOCKED'
+
+echo "== UDP: with the egress program, answers to our queries are trusted"
+reset; attach
+R $BPFC -m $MAPS -i pr0 -d egress -p 10 -f $EGRESS >/dev/null || test_fail "attach egress"
+CTL set mode block >/dev/null
+q=(); a=()
+for i in $(seq 1 15); do
+	q+=(proto=udp,src=10.66.0.2,dst=10.77.53.53,sport=$((33000 + i * 7)),dport=53)
+	a+=(proto=udp,src=10.77.53.53,dst=10.66.0.2,sport=53,dport=$((33000 + i * 7)))
+done
+out "${q[@]}"
+check "udp lists 15 trusted flows" [ "$(CTL udp | grep -c '^10\.77\.53\.53 .* trusted')" -eq 15 ]
+send "${a[@]}"
+check "all 15 answers passed" [ "$(passed 10.77.53.53)" -eq 15 ]
+check "the resolver is not tracked" hasnt status '^10\.77\.53\.53 '
+check "stats: 15 trusted UDP replies" [ "$(stat 'trusted UDP replies')" -eq 15 ]
+check "stats: no untrusted UDP" [ "$(stat 'UDP packets observed')" -eq 0 ]
+
+echo "== UDP: what is not an answer is still scored"
+specs=()
+for i in $(seq 1 15); do specs+=(proto=udp,src=10.77.54.54,dst=10.66.0.2,sport=53,dport=$((40000 + i))); done
+send "${specs[@]}"
+check "port 53 answers nobody asked for: BLOCKED" has status '^10\.77\.54\.54 +BLOCKED'
+check "11 of them passed" [ "$(passed 10.77.54.54)" -eq 11 ]
+u=$(stat 'UDP packets observed')
+send proto=udp,src=10.77.53.53,dst=10.66.0.2,sport=54,dport=33007
+check "a queried resolver from another port is untrusted" [ "$(stat 'UDP packets observed')" -eq $((u + 1)) ]
+send proto=udp,src=10.77.53.99,dst=10.66.0.2,sport=53,dport=33007
+check "another address to a queried port is untrusted" [ "$(stat 'UDP packets observed')" -eq $((u + 2)) ]
+
+echo "== UDP: an answer passes while its source is blocked"
+out proto=udp,src=10.66.0.2,dst=10.77.54.54,sport=45000,dport=53
+send proto=udp,src=10.77.54.54,dst=10.66.0.2,sport=53,dport=45000
+check "answer from the blocked resolver passed" [ "$(passed 10.77.54.54)" -eq 12 ]
+send proto=udp,src=10.77.54.54,dst=10.66.0.2,sport=53,dport=45001
+check "other packets from it are still dropped" [ "$(passed 10.77.54.54)" -eq 12 ]
+check "and the block stays" has status '^10\.77\.54\.54 +BLOCKED'
+
+echo "== UDP: the trust expires"
+check "set udp-timeout 1" eval 'CTL set udp-timeout 1 >/dev/null && has config "UDP reply trust timeout \(seconds\) = 1$"'
+check "set udp-timeout 0 refused" fails set udp-timeout 0
+out proto=udp,src=10.66.0.2,dst=10.77.55.55,sport=46000,dport=123
+sleep 2.2
+before=$(stat 'trusted UDP replies')
+send proto=udp,src=10.77.55.55,dst=10.66.0.2,sport=123,dport=46000
+check "an answer after the timeout is not trusted" [ "$(stat 'trusted UDP replies')" -eq "$before" ]
+check "and is tracked as a contact" has status '^10\.77\.55\.55 +TRACKING'
+check "udp --all lists it expired" eval 'CTL udp --all | grep -qE "^10\.77\.55\.55 +123 +46000 .* expired"'
+
+R $BPFC -i pr0 -d egress -c
 R $BPFC -i pr0 -c
 tests_exit

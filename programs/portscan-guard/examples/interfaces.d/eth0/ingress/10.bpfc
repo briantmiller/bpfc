@@ -7,6 +7,13 @@
 #   * UDP: records the first observed packet for each source/protocol/
 #     destination-port tuple during the scan window; UDP has no connection
 #     handshake, so this is an inferred service-contact record.
+#   * UDP replies: with the companion egress program (egress/10.bpfc) on the
+#     same interface, a UDP packet that answers a flow this side sent within
+#     the UDP timeout (remote address, remote port and local port all match)
+#     is trusted: it is not scored and passes even while its source is
+#     blocked. DNS, NTP and similar answers arrive at a new local port for
+#     each query and would otherwise look like a scan. Without the egress
+#     program nothing is trusted and UDP is scored as before.
 #   * Sources are tracked per IPv4 prefix: every address in the same
 #     /PREFIX (PS_CFG key 5, 1..32, default DEFAULT_PREFIX = 32) shares one
 #     score, one service list and one block. With /24, a scan spread over
@@ -42,13 +49,19 @@
 #              A packet is checked against its /32 entry and its /PREFIX entry,
 #              so manual host blocks keep working under any prefix length.
 #   PS_BACKOFF key=SRC; value=exponential backoff level during active enforcement.
+#   PS_UDPOUT  key=(remote IPv4 << 32) | (remote port << 16) | local port;
+#              value=second of the last outgoing UDP packet of that flow.
+#              Written by the egress program, only read here.
 #   PS_LIMIT   key=0; value=maximum enforcement duration seconds.
 #   PS_CFG     array: 0 threshold; 1 base enforcement duration seconds; 2 debug logging;
 #              3 scan window seconds; 4 enforcement mode (0 monitor, 1 drop, 2 reset);
-#              5 source prefix length (1..32; 0 or out of range = DEFAULT_PREFIX).
+#              5 source prefix length (1..32; 0 or out of range = DEFAULT_PREFIX);
+#              6 UDP timeout seconds: how long after the last outgoing packet
+#                of a flow its replies are trusted (0 = DEFAULT_UDP_TIMEOUT).
 #   PS_STATS   array: 0 new distinct services; 1 enforcement entries issued;
 #            2 enforcement packets (dropped or TCP-reset);
-#            3 TCP SYNs observed; 4 UDP packets observed.
+#            3 TCP SYNs observed; 4 UDP packets observed (untrusted);
+#            5 trusted UDP replies passed.
 #
 # The generic hash maps are 10,000-entry LRU maps. PS_FLOW, PS_SCORE,
 # PS_BACKOFF, and PS_LIMIT are bounded operational state, not a forensic event
@@ -71,9 +84,11 @@ const DEFAULT_BLOCK_SECS 900;
 const DEFAULT_MAX_BLOCK_SECS 86400;
 const DEFAULT_WINDOW 60;
 const DEFAULT_PREFIX 32;
+const DEFAULT_UDP_TIMEOUT 60;
 
 array-map PS_CFG 8;
-array-map PS_STATS 5;
+array-map PS_STATS 8;
+hash-map PS_UDPOUT 65536;
 
 # Send a TCP RST/ACK that a normal client generally interprets as a closed port.
 # The incoming SYN is rewritten in place and returned on the same interface.
@@ -416,6 +431,32 @@ match ip;
     set map PS_CFG 3 %WINDOW;
   end-if;
   get map PS_CFG 4 MODE;
+
+  # A UDP reply to a flow the egress program saw leave within the timeout is
+  # trusted: hand it on unscored, before the block check. Its key, read from
+  # the reply itself, is the one egress stored with "pack reverse".
+  match udp;
+    decl UDP_KEY 8;
+    decl UDP_SEEN 8;
+    decl UDP_TIMEOUT 8;
+    pack UDP_KEY ip-src src-port dst-port;
+    get map PS_UDPOUT %UDP_KEY UDP_SEEN;
+    if UDP_SEEN ne 0;
+      get map PS_CFG 6 UDP_TIMEOUT;
+      if UDP_TIMEOUT eq 0;
+        set val UDP_TIMEOUT $DEFAULT_UDP_TIMEOUT;
+      end-if;
+      calc add UDP_SEEN %UDP_TIMEOUT;
+      if NOW lt %UDP_SEEN;
+        calc-map add PS_STATS 5 1;
+        continue;
+      end-if;
+    end-if;
+    free UDP_KEY;
+    free UDP_SEEN;
+    free UDP_TIMEOUT;
+  end-match;
+
   get map PS_CFG 5 PLEN;
   if PLEN eq 0;
     set val PLEN $DEFAULT_PREFIX;
