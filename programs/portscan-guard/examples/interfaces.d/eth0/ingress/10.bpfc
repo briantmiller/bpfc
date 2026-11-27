@@ -7,27 +7,45 @@
 #   * UDP: records the first observed packet for each source/protocol/
 #     destination-port tuple during the scan window; UDP has no connection
 #     handshake, so this is an inferred service-contact record.
-#   * A "new service" is a distinct {source IPv4, protocol, destination port}
-#     contact that has not been observed during WINDOW seconds.
+#   * Sources are tracked per IPv4 prefix: every address in the same
+#     /PREFIX (PS_CFG key 5, 1..32, default DEFAULT_PREFIX = 32) shares one
+#     score, one service list and one block. With /24, a scan spread over
+#     198.51.100.1, .2, .3 ... adds up as if one host sent it, and the whole
+#     198.51.100.0/24 is blocked. /32 tracks each address on its own.
+#   * A "new service" is a distinct {source prefix, protocol, destination port}
+#     contact that has not been observed during WINDOW seconds. Many hosts of
+#     one prefix reaching the same port (clients behind a NAT pool reaching a
+#     web server) count that port once.
 #   * Each new service contact contributes a static risk weight: 1 for ordinary
 #     ports, 2 for selected management/data/control-plane ports, and 3 for a
 #     short list of rarely legitimate, high-risk administration/data services.
 #     These weights are transport-agnostic in this static version; dynamic,
 #     protocol-aware policy maps can replace them later.
 #
+# Keys: NET is the source address with the host bits cleared (host order),
+# PLEN the prefix length it was taken with. SRC = (PLEN << 32) | NET names one
+# tracked source: 0x18c6336400 is 198.51.100.0/24, 0x20c6336407 is
+# 198.51.100.7/32. Keeping PLEN in the keys keeps state recorded under one
+# prefix length apart from state recorded under another.
+#
 # Maps:
-#   PS_FLOW  key=(src IPv4 << 32) | (proto << 16) | destination port;
+#   PS_FLOW  key=(NET << 32) | (PLEN << 24) | (proto << 16) | destination port;
 #            value=last observed CLOCK_MONOTONIC second for that tuple.
 #            It is atomically exchanged to claim a first contact safely.
-#   PS_SCORE key=(floor(monotonic-second / WINDOW) << 32) | source IPv4;
-#            value=atomic weighted score for that fixed scan-time bucket.
-#   PS_LAST  key=source IPv4; value=(last observation second << 32) |
+#   PS_SCORE key=(PLEN << 58) | ((floor(monotonic-second / WINDOW) & 0x3ffffff)
+#            << 32) | NET; value=atomic weighted score for that fixed
+#            scan-time bucket (the bucket number wraps after 2^26 windows).
+#   PS_LAST  key=SRC; value=(last observation second << 32) |
 #            (protocol << 16) | destination port.
-#   PS_BLOCK   key=source IPv4; value=block-until CLOCK_MONOTONIC second (0=not enforced).
-#   PS_BACKOFF key=source IPv4; value=exponential backoff level during active enforcement.
+#   PS_LASTIP  key=SRC; value=the address within the prefix that sent that contact.
+#   PS_BLOCK   key=SRC; value=block-until CLOCK_MONOTONIC second (0=not enforced).
+#              A packet is checked against its /32 entry and its /PREFIX entry,
+#              so manual host blocks keep working under any prefix length.
+#   PS_BACKOFF key=SRC; value=exponential backoff level during active enforcement.
 #   PS_LIMIT   key=0; value=maximum enforcement duration seconds.
 #   PS_CFG     array: 0 threshold; 1 base enforcement duration seconds; 2 debug logging;
-#              3 scan window seconds; 4 enforcement mode (0 monitor, 1 drop, 2 reset).
+#              3 scan window seconds; 4 enforcement mode (0 monitor, 1 drop, 2 reset);
+#              5 source prefix length (1..32; 0 or out of range = DEFAULT_PREFIX).
 #   PS_STATS   array: 0 new distinct services; 1 enforcement entries issued;
 #            2 enforcement packets (dropped or TCP-reset);
 #            3 TCP SYNs observed; 4 UDP packets observed.
@@ -38,18 +56,24 @@
 #
 # IMPORTANT: Start in monitor mode (the default), tune the threshold for the
 # environment, then set PS_CFG key 4 to 1 for silent drops or 2 for TCP RST/ACK
-# responses to qualifying TCP SYNs. Use portscanctl.sh to inspect and update
+# responses to qualifying TCP SYNs. Use bpfc-portscanctl to inspect and update
 # runtime settings.
+#
+# Choosing a prefix: a shorter prefix catches scans spread over more addresses
+# but also adds up every legitimate host in it, and blocks all of them
+# together. Raise the threshold when shortening it, and prefer /24 or longer
+# for sources on the Internet. A change applies to the next packet; state
+# recorded under the old length stays in the maps until it ages out, and its
+# blocks are no longer enforced (except /32 entries).
 
 const DEFAULT_THRESHOLD 12;
 const DEFAULT_BLOCK_SECS 900;
 const DEFAULT_MAX_BLOCK_SECS 86400;
 const DEFAULT_WINDOW 60;
+const DEFAULT_PREFIX 32;
 
-array-map PS_CFG 5;
+array-map PS_CFG 8;
 array-map PS_STATS 5;
-
-set map PS_CFG 4 1;
 
 # Send a TCP RST/ACK that a normal client generally interprets as a closed port.
 # The incoming SYN is rewritten in place and returned on the same interface.
@@ -150,20 +174,26 @@ define track-service PROTO PORT TCP_RESET_OK;
   decl UNTIL_$UNIQUE 8;
 
   # A source-centric tuple is used deliberately: varying TCP source ports or
-  # retransmitted SYNs do not inflate the distinct-service score.
-  set val KEY_$UNIQUE %IP;
+  # retransmitted SYNs do not inflate the distinct-service score. The source
+  # is the prefix, so hosts of one prefix share their tuples.
+  set val KEY_$UNIQUE %NET;
   calc lsh KEY_$UNIQUE 32;
+  set val PROTO_$UNIQUE %PLEN;
+  calc lsh PROTO_$UNIQUE 24;
+  calc or KEY_$UNIQUE %PROTO_$UNIQUE;
   set val PROTO_$UNIQUE $PROTO;
   calc lsh PROTO_$UNIQUE 16;
   calc or KEY_$UNIQUE %PROTO_$UNIQUE;
   calc or KEY_$UNIQUE $PORT;
 
   # PS_LAST is the status-view record: monotonic second, protocol, target port.
+  # PS_LASTIP keeps which address of the prefix sent it.
   set val RECORD_$UNIQUE %NOW;
   calc lsh RECORD_$UNIQUE 32;
   calc or RECORD_$UNIQUE %PROTO_$UNIQUE;
   calc or RECORD_$UNIQUE $PORT;
-  set map PS_LAST %IP %RECORD_$UNIQUE;
+  set map PS_LAST %SRC %RECORD_$UNIQUE;
+  set map PS_LASTIP %SRC %IP;
 
   # Atomically claim/refresh the tuple's observation time. xchg returns the
   # previous timestamp, so parallel packets for the same tuple cannot all claim
@@ -279,8 +309,12 @@ define track-service PROTO PORT TCP_RESET_OK;
     # multiple receive CPUs process this source concurrently.
     set val SCORE_KEY_$UNIQUE %NOW;
     calc div SCORE_KEY_$UNIQUE %WINDOW;
+    calc and SCORE_KEY_$UNIQUE 0x3ffffff;
     calc lsh SCORE_KEY_$UNIQUE 32;
-    calc or SCORE_KEY_$UNIQUE %IP;
+    calc or SCORE_KEY_$UNIQUE %NET;
+    set val SCORE_$UNIQUE %PLEN;
+    calc lsh SCORE_$UNIQUE 58;
+    calc or SCORE_KEY_$UNIQUE %SCORE_$UNIQUE;
     calc-map add PS_SCORE %SCORE_KEY_$UNIQUE %WEIGHT_$UNIQUE SCORE_OLD_$UNIQUE;
     set val SCORE_$UNIQUE %SCORE_OLD_$UNIQUE;
     calc add SCORE_$UNIQUE %WEIGHT_$UNIQUE;
@@ -297,8 +331,8 @@ define track-service PROTO PORT TCP_RESET_OK;
         else;
           calc add UNTIL_$UNIQUE %BLOCK_SECS;
         end-if;
-        set map PS_BLOCK %IP %UNTIL_$UNIQUE;
-        set map PS_BACKOFF %IP 0;
+        set map PS_BLOCK %SRC %UNTIL_$UNIQUE;
+        set map PS_BACKOFF %SRC 0;
         calc-map add PS_STATS 1 1;
         if LOG ne 0;
           debug-log ps_enforced;
@@ -334,6 +368,11 @@ end-define;
 match ip;
   decl NOW 8;
   decl IP 4;
+  decl PLEN 8;
+  decl NET 8;
+  decl SRC 8;
+  decl BKEY 8;
+  decl HOST_UNTIL 8;
   decl THRESHOLD 8;
   decl BLOCK_SECS 8;
   decl MAX_BLOCK_SECS 8;
@@ -377,14 +416,46 @@ match ip;
     set map PS_CFG 3 %WINDOW;
   end-if;
   get map PS_CFG 4 MODE;
+  get map PS_CFG 5 PLEN;
+  if PLEN eq 0;
+    set val PLEN $DEFAULT_PREFIX;
+  end-if;
+  if PLEN gt 32;
+    set val PLEN $DEFAULT_PREFIX;
+  end-if;
 
-  get map PS_BLOCK %IP BLOCK_UNTIL;
+  # NET = IP with its host bits cleared; SRC names the tracked prefix.
+  # HOST_UNTIL holds the shift (32 - PLEN) until it is used for a block time.
+  set val HOST_UNTIL 32;
+  calc sub HOST_UNTIL %PLEN;
+  set val NET %IP;
+  calc rsh NET %HOST_UNTIL;
+  calc lsh NET %HOST_UNTIL;
+  set val SRC %PLEN;
+  calc lsh SRC 32;
+  calc or SRC %NET;
+
+  # Enforce the later-expiring of the prefix's block and the address's own
+  # /32 block (a manual `block` of one host, or state from a /32 setting).
+  set val BKEY %SRC;
+  get map PS_BLOCK %SRC BLOCK_UNTIL;
+  if PLEN ne 32;
+    set val BKEY 32;
+    calc lsh BKEY 32;
+    calc or BKEY %IP;
+    get map PS_BLOCK %BKEY HOST_UNTIL;
+    if HOST_UNTIL gt %BLOCK_UNTIL;
+      set val BLOCK_UNTIL %HOST_UNTIL;
+    else;
+      set val BKEY %SRC;
+    end-if;
+  end-if;
   if BLOCK_UNTIL ne 0;
     if NOW lt %BLOCK_UNTIL;
       # Exponential sliding enforcement: every later inbound packet advances
       # PS_BACKOFF atomically. Renewals are base*2, base*4, base*8, and so on,
       # capped by MAX_BLOCK_SECS. A fast sender reaches the cap quickly.
-      calc-map add PS_BACKOFF %IP 1 BACKOFF_OLD;
+      calc-map add PS_BACKOFF %BKEY 1 BACKOFF_OLD;
       set val BACKOFF_LEVEL %BACKOFF_OLD;
       calc add BACKOFF_LEVEL 1;
       set val ENFORCE_SECS %BLOCK_SECS;
@@ -399,7 +470,7 @@ match ip;
       end-if;
       set val BLOCK_UNTIL %NOW;
       calc add BLOCK_UNTIL %ENFORCE_SECS;
-      set map PS_BLOCK %IP %BLOCK_UNTIL;
+      set map PS_BLOCK %BKEY %BLOCK_UNTIL;
       calc-map add PS_STATS 2 1;
       if LOG ne 0;
         debug-log ps_enforced;
@@ -419,8 +490,8 @@ match ip;
       drop;
     else;
       # Full silence expires enforcement and starts the next incident at base.
-      set map PS_BLOCK %IP 0;
-      set map PS_BACKOFF %IP 0;
+      set map PS_BLOCK %BKEY 0;
+      set map PS_BACKOFF %BKEY 0;
     end-if;
   end-if;
 

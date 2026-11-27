@@ -17,7 +17,7 @@ The tests live in `tests/`. One runner, `tests/run-tests.sh` (or `./test.sh`, wh
 | Command | Root | What it runs |
 | :--- | :--- | :--- |
 | `make check-compile` | no | `compile`: every field and command compiles, and bad programs get clear errors |
-| `make check` | yes | compile, preprocessor, stack, keys, bpfcd, netns, rest, xdp, xdp-examples, tc-examples, flow-examples, acl, frontends, dedup, ecmp, container, install |
+| `make check` | yes | compile, preprocessor, stack, keys, bpfcd, netns, rest, xdp, xdp-examples, tc-examples, flow-examples, acl, frontends, dedup, portscan, ecmp, container, install |
 | `make check-dataplane` | yes | `verifier-budget`, `dataplane`, `dataplane-udp` |
 | `make check-ecmp` | yes | `ecmp` |
 | `make check-linkcap` | yes | `linkcap` |
@@ -104,6 +104,7 @@ These attach programs to real interfaces inside network namespaces and send traf
 | Suite | What it checks |
 | :--- | :--- |
 | `dedup` | `dedup-iface.bpfc` and `dedup-global.bpfc` on `lo` in a new network and mount namespace, with crafted frames (`tests/dedup-send.py`), and `bpfc-dedup` reading the maps. |
+| `portscan` | portscan-guard with `bpfc-portscanctl`, with packets built by `tests/keys-send.py`: monitor mode drops nothing, a scan spread over one /24 is missed at /32 and caught and blocked as a whole at /24, a NAT pool reaching one port counts once, manual /32 and prefix blocks, unblock, clear, and blocks left INACTIVE by a prefix change. |
 | `flowmon` | The flow monitor on both hooks of `lo`. Crafted TCP segments (`tests/flowmon-send.py`) check how retransmissions, loss and reordering are classified, and `bpfc-flows` reads the maps. |
 | `linkcap` | Per-neighbor loss and capacity, end to end: an Ethernet path, one through a rate-limited, lossy emulator (`tests/link-emulator.py`), and a point-to-point raw-IP path over tun devices. Multipoint GRE is only compiled. |
 | `ecmp` | The bandwidth-aware ECMP layer on a router with three Ethernet members and a tunnel: the generator, flow placement per mode (l4, l3, l3+tos, l3-sym), fragments, that packets are forwarded as a router would forward them, load-based moves and policies, and `bpfc-ecmp-status`. |
@@ -116,7 +117,7 @@ Every suite needs `bash`, iproute2 (`ip`, `tc`) and a built tree. A suite that's
 
 | Tool (RHEL package) | Needed by |
 | :--- | :--- |
-| `python3` | acl, keys, flow-examples, xdp, xdp-examples, tc-examples, dedup, flowmon, linkcap, ecmp, rest, dataplane, dataplane-udp |
+| `python3` | acl, keys, flow-examples, xdp, xdp-examples, tc-examples, dedup, portscan, flowmon, linkcap, ecmp, rest, dataplane, dataplane-udp |
 | `python3-scapy` | cve-2026-98432, pytest |
 | `python3-pytest` | pytest |
 | `tcpdump` | bpfc, nat, xdp, xdp-examples, tc-examples, pytest (optional in dataplane-udp, linkcap) |

@@ -523,6 +523,8 @@ bpfc-flows --filter src=10.1.0.0/16 --filter dscp=ef --json
 
 Detects IPv4 TCP and UDP port scans. Each source's distinct `{protocol, destination port}` contacts within a scan window add to a score, and management and rarely legitimate ports weigh more. A source whose score crosses the threshold can be blocked for a time that grows with repeat offences. It starts in monitor mode. Once the threshold is tuned for your network, switch it to silent drops or TCP resets.
 
+A source is one address by default. `set prefix 24` makes it every address of the same /24: a scan spread over many addresses of a range adds up to one score, and the whole range is blocked. Many hosts of a range reaching the same port (clients behind a NAT pool) count that port once. A shorter prefix adds up more legitimate hosts too, so raise the threshold with it.
+
 ```bash
 cp /usr/share/doc/bpfc-programs/portscan-guard/examples/interfaces.d/eth0/ingress/10.bpfc \
    /etc/bpfc/interfaces.d/eth0/ingress/10.bpfc
@@ -530,7 +532,8 @@ systemctl reload bpfcd
 bpfc-portscanctl status                     # sources, scores, recent services, block times
 bpfc-portscanctl set threshold 20
 bpfc-portscanctl set mode block             # monitor | block | reset
-bpfc-portscanctl unblock 198.51.100.7
+bpfc-portscanctl set prefix 24              # track and block per /24 (default 32: per address)
+bpfc-portscanctl unblock 198.51.100.0/24    # or one address: its /32 and the /24 holding it
 ```
 
 The header of the program file describes the scoring and its maps.

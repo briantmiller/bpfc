@@ -43,9 +43,16 @@ Commands:
   set window SECONDS             Set scan window (positive integer).
   set log on|off                 Enable or disable static bpfc debug-log markers.
   set mode monitor|block|reset   Select monitor-only, silent-drop, or TCP-reset operation.
-  block IPv4 [SECONDS]           Manually block a source; default is configured duration.
-  unblock IPv4                   Clear only a source block entry.
-  clear IPv4                     Clear a source's block, current suspect score, and tracking state.
+  set prefix LENGTH              Track and block sources per IPv4 prefix of this length
+                                 (1..32; 32 = each address alone, 24 = per /24).
+  block SOURCE [SECONDS]         Manually block a source; default is configured duration.
+  unblock SOURCE                 Clear only a source block entry.
+  clear SOURCE                   Clear a source's block, current suspect score, and tracking state.
+
+A SOURCE is an address (198.51.100.7) or a prefix (198.51.100.0/24). Host
+bits of a prefix are ignored. `block` takes /32 or the configured prefix
+length, the two a packet is checked against. For an address, `unblock` and
+`clear` act on the address's /32 entry and on the configured prefix holding it.
 USAGE
 }
 
@@ -94,6 +101,47 @@ ipv4_key() {
     [[ $octet =~ ^[0-9]{1,3}$ ]] && (( 10#$octet <= 255 )) || return 1
   done
   printf '%d\n' $(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
+}
+
+# parse_source TEXT: sets SRC_NET (host bits cleared), SRC_LEN (32 when TEXT
+# has no /length) and SRC_GIVEN (1 if TEXT had a /length). Returns 1 if invalid.
+parse_source() {
+  local text=$1 addr len=32 ip
+  SRC_GIVEN=0
+  if [[ $text == */* ]]; then
+    addr=${text%/*}; len=${text#*/}
+    [[ $len =~ ^[0-9]{1,2}$ ]] && (( 10#$len >= 1 && 10#$len <= 32 )) || return 1
+    len=$((10#$len)); SRC_GIVEN=1
+  else
+    addr=$text
+  fi
+  ip=$(ipv4_key "$addr") || return 1
+  SRC_LEN=$len
+  SRC_NET=$(( ip >> (32 - len) << (32 - len) & 0xffffffff ))
+}
+
+# src_key NET LEN: the tracked-source key, (LEN << 32) | NET.
+src_key() {
+  printf '%d' $(( ($2 << 32) | $1 ))
+}
+
+# fmt_src KEY: 198.51.100.0/24, or the bare address for /32.
+fmt_src() {
+  local len=$(( ($1 >> 32) & 0xff ))
+  if (( len == 32 )); then fmt_ip "$1"; else printf '%s/%d' "$(fmt_ip "$1")" "$len"; fi
+}
+
+# valid_src KEY: the key carries a prefix length (keys written before
+# prefixes existed hold a bare address and are skipped).
+valid_src() {
+  local len=$(( $1 >> 32 ))
+  (( len >= 1 && len <= 32 ))
+}
+
+# Configured prefix length from the CFG array (loaded by the caller).
+cfg_prefix() {
+  local value=${CFG[5]:-0}
+  if (( value >= 1 && value <= 32 )); then printf '%d' "$value"; else printf '32'; fi
 }
 
 proto_name() {
@@ -184,7 +232,7 @@ show_config() {
   printf 'Runtime configuration\n'
   printf '  0: threshold (distinct services/window) = %s\n' "$threshold"
   printf '  1: base enforcement duration (seconds) = %s\n' "$duration"
-  printf '  5: maximum enforcement duration (seconds) = %s\n' "$max_duration"
+  printf '  -: maximum enforcement duration (seconds, PS_LIMIT) = %s\n' "$max_duration"
   if (( log )); then printf '  2: debug log (0=off, 1=on) = on\n'; else printf '  2: debug log (0=off, 1=on) = off\n'; fi
   printf '  3: scan window (seconds) = %s\n' "$window"
   case $mode in
@@ -193,6 +241,7 @@ show_config() {
     2) printf '  4: mode (0=monitor, 1=drop, 2=reset) = reset (TCP RST/ACK for qualifying SYNs)\n' ;;
     *) printf '  4: mode (0=monitor, 1=drop, 2=reset) = unknown (%s)\n' "$mode" ;;
   esac
+  printf '  5: source prefix length (1..32) = /%s\n' "$(cfg_prefix)"
 }
 
 show_stats() {
@@ -207,11 +256,12 @@ show_stats() {
 }
 
 show_status() {
-  local -A SCORE LAST BLOCK BACKOFF CFG KEYS SOURCE_SCORE
-  local key score_key source_key score_window score backoff last_record observed proto port until status detail age wall left
-  local now btime threshold window mode window_id rows
+  local -A SCORE LAST LASTIP BLOCK BACKOFF CFG KEYS SOURCE_SCORE
+  local key score_key score backoff last_record observed proto port until status detail age wall left lasthost
+  local now btime threshold window mode prefix window_id rows len priority score_len
   load_map PS_SCORE SCORE
   load_map PS_LAST LAST
+  load_map PS_LASTIP LASTIP
   load_map PS_BLOCK BLOCK
   load_map PS_BACKOFF BACKOFF
   load_map PS_CFG CFG
@@ -220,39 +270,33 @@ show_status() {
   threshold=$(cfg_value 0 12)
   window=$(cfg_value 3 60)
   mode=${CFG[4]:-0}
-  window_id=$(( now / window ))
-  keycount=0
+  prefix=$(cfg_prefix)
+  window_id=$(( (now / window) & 0x3ffffff ))
 
-  # PS_SCORE uses (fixed-window number << 32) | source IPv4 as its key. Only
-  # the current window contributes to detection or the displayed score.
+  # PS_SCORE key: (prefix length << 58) | (window number << 32) | network.
+  # Only the current window contributes to detection or the displayed score.
   for score_key in "${!SCORE[@]}"; do
-    score_window=$(( score_key >> 32 ))
-    (( score_window == window_id )) || continue
-    source_key=$(( score_key & 0xffffffff ))
-    SOURCE_SCORE[$source_key]=${SCORE[$score_key]}
-    KEYS[$source_key]=1
+    (( ((score_key >> 32) & 0x3ffffff) == window_id )) || continue
+    score_len=$(( (score_key >> 58) & 0x3f ))
+    key=$(( (score_len << 32) | (score_key & 0xffffffff) ))
+    valid_src "$key" || continue
+    SOURCE_SCORE[$key]=${SCORE[$score_key]}
+    (( SCORE[$score_key] )) && KEYS[$key]=1
   done
-  for key in "${!LAST[@]}" "${!BLOCK[@]}" "${!BACKOFF[@]}"; do
-    [[ -n ${key:-} ]] || continue
-    if [[ -v BLOCK[$key] ]] && (( BLOCK[$key] == 0 )) && [[ ! -v LAST[$key] && ! -v SOURCE_SCORE[$key] ]]; then
-      continue
-    fi
-        keycount=$(( $keycount + 1 ))
-    KEYS[$key]=1
-  done
+  # Zero values are entries cleared by `unblock`/`clear` (bpfc -w cannot delete).
+  for key in "${!LAST[@]}"; do (( LAST[$key] )) && valid_src "$key" && KEYS[$key]=1; done
+  for key in "${!BLOCK[@]}"; do (( BLOCK[$key] > now )) && valid_src "$key" && KEYS[$key]=1; done
 
-  printf 'Source states (score is authoritative for the current fixed scan-time bucket)\n'
-  printf '%-16s %-9s %5s %7s %-12s %-9s %-21s %10s\n' 'SOURCE' 'STATE' 'SCORE' 'LEVEL' 'LAST SERVICE' 'LAST SEEN' 'UTC (approx.)' 'ENFORCE LEFT'
-  printf '%s\n' '------------------------------------------------------------------------------------------------------------'
-  if [ $keycount -gt 0 ]
-  then
-    ((${#KEYS[@]}))
-  else
-    printf '(no qualifying TCP SYN or UDP observations recorded)\n'; return;
+  printf 'Source states, tracked per /%s (score is authoritative for the current fixed scan-time bucket)\n' "$prefix"
+  printf '%-18s %-9s %5s %7s %-15s %-12s %-9s %-21s %10s\n' 'SOURCE' 'STATE' 'SCORE' 'LEVEL' 'LAST HOST' 'LAST SERVICE' 'LAST SEEN' 'UTC (approx.)' 'ENFORCE LEFT'
+  printf '%s\n' '------------------------------------------------------------------------------------------------------------------------------'
+  if (( ${#KEYS[@]} == 0 )); then
+    printf '(no qualifying TCP SYN or UDP observations recorded)\n'; return
   fi
 
   rows=$(
     for key in "${!KEYS[@]}"; do
+      len=$(( key >> 32 ))
       score=${SOURCE_SCORE[$key]:-0}
       backoff=${BACKOFF[$key]:-0}
       last_record=${LAST[$key]:-0}
@@ -260,7 +304,10 @@ show_status() {
       proto=$(( (last_record >> 16) & 0xff ))
       port=$(( last_record & 0xffff ))
       until=${BLOCK[$key]:-0}
-      if (( until > now )); then
+      if (( until > now )) && (( len != 32 && len != prefix )); then
+        # Recorded under another prefix length: packets no longer look it up.
+        status=INACTIVE; priority=4
+      elif (( until > now )); then
         if (( mode == 2 )); then status=TCP-RST; else status=BLOCKED; fi
         priority=0
       elif (( score >= threshold )); then
@@ -271,20 +318,22 @@ show_status() {
         status=ALLOWED; priority=3
       fi
       if (( last_record )); then detail="$(proto_name "$proto")/$port"; else detail='-'; fi
+      if [[ -n ${LASTIP[$key]:-} ]] && (( LASTIP[$key] )); then lasthost=$(fmt_ip "${LASTIP[$key]}"); else lasthost='-'; fi
       age=$(fmt_age "$observed" "$now")
       wall=$(fmt_wall "$observed" "$btime")
       left=$(( until > now ? until - now : 0 ))
-      printf '%s\t%020d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$priority" "$score" "$(fmt_ip "$key")" "$status" "$backoff" "$detail" "$age" "$wall" "$left"
+      printf '%s\t%020d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$priority" "$score" "$(fmt_src "$key")" "$status" "$backoff" "$lasthost" "$detail" "$age" "$wall" "$left"
     done | sort -t $'\t' -k1,1n -k2,2nr -k3,3
   )
-  while IFS=$'\t' read -r _priority _score source status backoff detail age wall left; do
+  while IFS=$'\t' read -r _priority _score source status backoff lasthost detail age wall left; do
     [[ -n ${source:-} ]] || continue
     if (( left )); then block_text="${left}s"; else block_text='-'; fi
-    printf '%-16s %-9s %5d %7d %-12s %-9s %-21s %10s\n' "$source" "$status" "$((10#$_score))" "$backoff" "$detail" "$age" "$wall" "$block_text"
+    printf '%-18s %-9s %5d %7d %-15s %-12s %-9s %-21s %10s\n' "$source" "$status" "$((10#$_score))" "$backoff" "$lasthost" "$detail" "$age" "$wall" "$block_text"
   done <<< "$rows"
 }
+
 show_flows() {
-  local requested_age=${1:-} age_limit now btime seen key source proto port age rows
+  local requested_age=${1:-} age_limit now btime seen key source proto port age rows len
   local -A FLOW CFG
   load_map PS_FLOW FLOW
   load_map PS_CFG CFG
@@ -297,77 +346,85 @@ show_flows() {
   btime=$(boot_epoch || true)
 
   printf 'Recently observed qualifying service contacts (age <= %ss)\n' "$age_limit"
-  printf '%-16s %-7s %8s %8s %-21s\n' 'SOURCE' 'PROTO' 'DST PORT' 'AGE' 'UTC (approx.)'
-  printf '%s\n' '----------------------------------------------------------------------'
+  printf '%-18s %-7s %8s %8s %-21s\n' 'SOURCE' 'PROTO' 'DST PORT' 'AGE' 'UTC (approx.)'
+  printf '%s\n' '------------------------------------------------------------------------'
 
+  # PS_FLOW key: (network << 32) | (prefix length << 24) | (protocol << 16) | port.
   rows=$(
     for key in "${!FLOW[@]}"; do
       seen=${FLOW[$key]}
+      (( seen )) || continue
       age=$(( now - seen )); (( age >= 0 )) || age=0
       (( age <= age_limit )) || continue
-      source=$(( key >> 32 ))
+      len=$(( (key >> 24) & 0x3f ))
+      source=$(( (len << 32) | ((key >> 32) & 0xffffffff) ))
+      valid_src "$source" || continue
       proto=$(( (key >> 16) & 0xff ))
       port=$(( key & 0xffff ))
-      printf '%020d\t%s\t%s\t%s\t%s\t%s\n' "$seen" "$(fmt_ip "$source")" "$(proto_name "$proto")" "$port" "$(fmt_age "$seen" "$now")" "$(fmt_wall "$seen" "$btime")"
+      printf '%020d\t%s\t%s\t%s\t%s\t%s\n' "$seen" "$(fmt_src "$source")" "$(proto_name "$proto")" "$port" "$(fmt_age "$seen" "$now")" "$(fmt_wall "$seen" "$btime")"
     done | sort -t $'\t' -k1,1nr
   )
   [[ -n $rows ]] || { printf '(none in the selected interval)\n'; return; }
   while IFS=$'\t' read -r _seen source proto port age wall; do
     [[ -n ${source:-} ]] || continue
-    printf '%-16s %-7s %8d %8s %-21s\n' "$source" "$proto" "$port" "$age" "$wall"
+    printf '%-18s %-7s %8d %8s %-21s\n' "$source" "$proto" "$port" "$age" "$wall"
   done <<< "$rows"
 }
 
+# source_keys TEXT: the PS_BLOCK/PS_LAST keys TEXT names, one per line.
+# A prefix names itself. An address names its /32 entry and, when the
+# configured prefix is shorter, the prefix holding it.
+source_keys() {
+  local text=$1 prefix
+  local -A CFG
+  parse_source "$text" || die "invalid IPv4 address or prefix: $text"
+  src_key "$SRC_NET" "$SRC_LEN"; printf '\n'
+  (( SRC_GIVEN )) && return
+  load_map PS_CFG CFG
+  prefix=$(cfg_prefix)
+  (( prefix != 32 )) || return
+  src_key $(( SRC_NET >> (32 - prefix) << (32 - prefix) & 0xffffffff )) "$prefix"; printf '\n'
+}
+
 # Clear current operational state for a source. This is intentionally broader
-# than `unblock`: it removes the active block, the current fixed-window score,
-# the last-contact record, and all source-matching PS_FLOW tuple timestamps.
+# than `unblock`: it removes the active block, the current fixed-window scores,
+# the last-contact record, and all matching PS_FLOW tuple timestamps.
 # `bpfc -w` updates map values rather than deleting keys; a zero PS_FLOW value
 # makes a later contact eligible to be claimed as new again.
 clear_source() {
-  local text_ip=$1 ip now window window_id score_key key source
-  local flow_count=0 score_count=0
-  local -A CFG SCORE FLOW
+  local text=$1 key k keys_text flow_count=0 score_count=0 names=() keys=()
+  local -A SCORE FLOW WANT
+  keys_text=$(source_keys "$text") || exit 2
+  mapfile -t keys <<< "$keys_text"
+  for k in "${keys[@]}"; do WANT[$k]=1; names+=("$(fmt_src "$k")"); done
 
-  ip=$(ipv4_key "$text_ip") || die "invalid IPv4 address: $text_ip"
-  load_map PS_CFG CFG
-  window=$(cfg_value 3 60)
-  now=$(mono_seconds)
-  window_id=$(( now / window ))
-
-  # Clear all retained score-bucket entries for the source, including the
-  # current bucket that determines SUSPECT status.
   load_map PS_SCORE SCORE
   for key in "${!SCORE[@]}"; do
-    source=$(( key & 0xffffffff ))
-    if (( source == ip )); then
+    k=$(( (((key >> 58) & 0x3f) << 32) | (key & 0xffffffff) ))
+    if [[ -v WANT[$k] ]] && (( SCORE[$key] )); then
       write_map PS_SCORE "$key" 0
       ((score_count += 1))
     fi
   done
-  # Ensure a current-bucket map entry is cleared even if it was not present in
-  # the dump at the instant above.
-  score_key=$(( (window_id << 32) | ip ))
-  if [[ ! -v SCORE[$score_key] ]]; then
-    write_map PS_SCORE "$score_key" 0
-  fi
 
-  write_map PS_BLOCK "$ip" 0
-  write_map PS_BACKOFF "$ip" 0
-  write_map PS_LAST "$ip" 0
+  for k in "${keys[@]}"; do
+    write_map PS_BLOCK "$k" 0
+    write_map PS_BACKOFF "$k" 0
+    write_map PS_LAST "$k" 0
+    write_map PS_LASTIP "$k" 0
+  done
 
-  # Clear all retained tuple timestamps for this source so it no longer appears
-  # in the flow view and can begin a fresh tracking interval if it returns.
   load_map PS_FLOW FLOW
   for key in "${!FLOW[@]}"; do
-    source=$(( (key >> 32) & 0xffffffff ))
-    if (( source == ip )); then
+    k=$(( (((key >> 24) & 0x3f) << 32) | ((key >> 32) & 0xffffffff) ))
+    if [[ -v WANT[$k] ]] && (( FLOW[$key] )); then
       write_map PS_FLOW "$key" 0
       ((flow_count += 1))
     fi
   done
 
   printf 'Cleared %s: enforcement, backoff level, %d score bucket(s), last-contact record, and %d flow tuple(s).\n' \
-    "$text_ip" "$score_count" "$flow_count"
+    "${names[*]}" "$score_count" "$flow_count"
   printf 'Note: if the source is still sending traffic, packet processing can recreate state immediately.\n'
 }
 
@@ -413,6 +470,16 @@ set_config() {
         *) die 'mode must be monitor, block/drop, or reset' ;;
       esac
       index=4 ;;
+    prefix)
+      value_text=${value_text#/}
+      [[ $value_text =~ ^[0-9]{1,2}$ ]] && (( 10#$value_text >= 1 && 10#$value_text <= 32 )) \
+        || die 'prefix must be a length from 1 to 32'
+      index=5; value=$((10#$value_text))
+      write_map PS_CFG "$index" "$value"
+      printf 'Set prefix to /%s: sources are now tracked and blocked per /%s.\n' "$value" "$value"
+      printf 'Note: state recorded under the previous length stays until it ages out; its blocks are no longer\n'
+      printf 'enforced unless they are /32 entries. `status` lists them as INACTIVE.\n'
+      return ;;
     *) die "unknown setting: $setting" ;;
   esac
   write_map PS_CFG "$index" "$value"
@@ -454,30 +521,38 @@ case $command in
     (( $# == 0 )) || die 'config takes no arguments'
     show_config ;;
   set)
-    (( $# == 2 )) || die 'usage: set threshold|duration|max-duration|window|log|mode VALUE'
+    (( $# == 2 )) || die 'usage: set threshold|duration|max-duration|window|log|mode|prefix VALUE'
     set_config "$1" "$2" ;;
   block)
-    (( $# == 1 || $# == 2 )) || die 'usage: block IPv4 [SECONDS]'
-    ip=$(ipv4_key "$1") || die "invalid IPv4 address: $1"
+    (( $# == 1 || $# == 2 )) || die 'usage: block SOURCE [SECONDS]'
+    parse_source "$1" || die "invalid IPv4 address or prefix: $1"
+    declare -A CFG
+    load_map PS_CFG CFG
+    prefix=$(cfg_prefix)
+    (( SRC_LEN == 32 || SRC_LEN == prefix )) \
+      || die "packets are checked against /32 and the configured /$prefix only; block a /32, a /$prefix, or change the prefix first"
     if (( $# == 2 )); then
       is_positive_integer "$2" || die 'block duration must be a positive integer'
       seconds=$((10#$2))
     else
-      declare -A CFG
-      load_map PS_CFG CFG
       seconds=$(cfg_value 1 900)
     fi
-    write_map PS_BLOCK "$ip" "$(( $(mono_seconds) + seconds ))"
-    write_map PS_BACKOFF "$ip" 0
-    printf 'Blocked %s for %s seconds.\n' "$1" "$seconds" ;;
+    key=$(src_key "$SRC_NET" "$SRC_LEN")
+    write_map PS_BLOCK "$key" "$(( $(mono_seconds) + seconds ))"
+    write_map PS_BACKOFF "$key" 0
+    printf 'Blocked %s for %s seconds.\n' "$(fmt_src "$key")" "$seconds" ;;
   unblock)
-    (( $# == 1 )) || die 'usage: unblock IPv4'
-    ip=$(ipv4_key "$1") || die "invalid IPv4 address: $1"
-    write_map PS_BLOCK "$ip" 0
-    write_map PS_BACKOFF "$ip" 0
-    printf 'Cleared enforcement and backoff level for %s.\n' "$1" ;;
+    (( $# == 1 )) || die 'usage: unblock SOURCE'
+    keys_text=$(source_keys "$1") || exit 2
+    names=()
+    while read -r key; do
+      write_map PS_BLOCK "$key" 0
+      write_map PS_BACKOFF "$key" 0
+      names+=("$(fmt_src "$key")")
+    done <<< "$keys_text"
+    printf 'Cleared enforcement and backoff level for %s.\n' "${names[*]}" ;;
   clear)
-    (( $# == 1 )) || die 'usage: clear IPv4'
+    (( $# == 1 )) || die 'usage: clear SOURCE'
     clear_source "$1" ;;
   -h|--help|help)
     usage ;;
